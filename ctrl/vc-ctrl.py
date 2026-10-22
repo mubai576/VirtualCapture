@@ -34,7 +34,8 @@ def verdict_t1(sstats, rstats, steady=None, sender_cadence=None):
         if mm != 0: reasons.append("hash_mismatch=%s != 0" % mm)
         # complete==sent (allow receiver file-mode unknown? strict for T1)
         if comp != sent: reasons.append("complete(%s)!=sent(%s)" % (comp, sent))
-        p99 = rstats.get("inter_arrival_p99_ms", None)
+        _sp99 = (steady or {}).get("r_p99", None)
+        p99 = _sp99 if _sp99 is not None else rstats.get("inter_arrival_p99_ms", None)
         if p99 is not None:
             try:
                 if float(p99) >= 8.3: reasons.append("inter_arrival_p99 %.3f >= 8.3ms (2 frames)" % float(p99))

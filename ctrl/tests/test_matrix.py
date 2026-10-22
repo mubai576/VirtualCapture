@@ -363,6 +363,17 @@ def test_verdict_d1_steady_and_cadence():
     ok, rs = verdict_t1(base_tx, base_rx, {"r_avg": 4.17}, {"cadence_ms": 5.0})
     assert ok is False and any("sender_cadence" in r for r in rs)
     assert verdict_t1(base_tx, base_rx, {"r_avg": 4.17}, {"cadence_ms": None})[0] is True
+def test_verdict_d1_steady_p99_beats_drain_tail():
+    # drain-contaminated terminal ring p99 must not fail a run whose steady window is clean (rings 2026-10-22: full 8.534 vs steady 6.899)
+    base_tx = {"sent_frames": 14400}
+    drain_rx = {"complete": 14400, "dropped": 0, "hash_mismatch": 0, "inter_arrival_p99_ms": 8.534, "inter_arrival_avg_ms": 12.613}
+    ok, _ = verdict_t1(base_tx, drain_rx, {"r_avg": 4.158, "r_p99": 6.899}, {"cadence_ms": 4.177})
+    assert ok is True
+    ok, rs = verdict_t1(base_tx, drain_rx, {"r_avg": 4.158, "r_p99": 8.9}, {"cadence_ms": 4.177})
+    assert ok is False and any("inter_arrival_p99" in r for r in rs)
+    ok, _ = verdict_t1(base_tx, drain_rx, None, {"cadence_ms": 4.177})
+    assert ok is False
+
 def test_stub_report_has_steady_keys():
     # P1-1: missing adapter gives 400 without report; steady keys covered by live runs when VC_ADAPTER set.
     rep = _run_stub_case(seconds=2)

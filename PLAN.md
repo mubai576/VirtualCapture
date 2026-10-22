@@ -124,7 +124,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 禁止：改阈值数字（D1 除外）；改代码。
 ```
 
-### P2 0.3.8 发布 + T-06 正式关闭（需 D1/D3~D6 + 双机）
+### DONE P2 done（2026-10-22 晚，T-06 关闭）
 
 ```text
 P2-1 代码：receiver hashlog 加 qpc_ns（D3）；dda selftest 无屏 SKIP（D4）；--batch 默认 69（D5）；
@@ -136,6 +136,7 @@ P2-3 联调（scripts/run_T1.ps1 / ctrl/bringup.py，单播 --dst-mac）：T0 �
      用 receiver qpc_ns 定位 ~1s 卡顿（gap_any.py 两端同法），给出 PC2 侧根因假设。
      直连线到位后：广播 vs 单播 T2 各一次。
 验收：docs/bringup-<日期>.md；T1 五档 + T2 按新判据全绿；全部 receiver hashlog 本地留档；T-06 关闭。
+交付：docs/bringup-20261022.md；T0 + T1 五档 + T2 144000/144000 全绿（rings 判据 bug 修一次、noise 外部 stop 重跑一次）；hashlog 留档（T2 全量因 /files 413 上限留 PC2，判据以 in-run 全量校验为准）。
 ```
 
 ### P3 OTA 0.4.0（需 D2；碰 agent/、scripts/、ctrl/tests/）
