@@ -40,3 +40,9 @@
 
 - 本文件不写代码不动现网；主 agent（18080）与 PC2 零接触。
 - 参考：MS Learn IMFVirtualCamera（learn.microsoft.com），OBS 虚拟机 DShow 路线说明，MFCreateVirtualCamera 需 Win11 说明。
+
+## 8. owner 批示 2026-10-22
+
+- 路线：DShow 优先（对标 OBS 虚拟机；推理端已有 AverMedia USB 采集卡，DShow 生态直接可用）。参考设备 ID 见 owner 原话（USB VID_07CA 系）。
+- 副作用利好：DShow 在 Win10/Win11 通吃，系统版本问题不再是门槛（§4 问 2 自动消解）。
+- Win11 MF 方案降为备选。

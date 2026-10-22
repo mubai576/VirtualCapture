@@ -44,9 +44,9 @@ Impl: `agent/vc-agent.py` single-file zero-dep (same code both PCs; --role is la
 - Zip allowlist：顶层 `vc-agent.exe|vc-agent.py|vc-sender.exe|vc-receiver.exe|version.json` 加 `scripts/*.ps1`；`version.json` 必带；zip-slip（`..`/absolute）400。
 - stage 包不含自更新条目时（只换 sender/receiver exe）直接 live 应用并返回 `{updated, version, restart:none}`（先停 sender/receiver 会话）。
 - 自更新条目（`vc-agent.exe|vc-agent.py`）若落不到 ROOT 下，整包 400 拒绝（不静默跳过）；冻结模式 ROOT 默认为 exe 所在目录，生产布局不受影响。
-- 回滚用 `prev/mirror` 走同一 activate 路径；空备份 → 409；stage 版本不符 → 409；staged agent.py 编译失败 → 500。
+- 回滚用 `prev/mirror` 走同一 activate 路径；空备份 → 409；stage 版本不符 → 409；staged agent.py 编译失败 → 500；中途失败一律 500 JSON（不断连接），轮询 `/version` 为准。
 - 调用方：`scripts/update.ps1` 与 `ctrl/run_remote.py --update/--rollback` 做 stage→activate→poll `/version`；
   `health.updater` 非 ps-ok 拒绝（该处走 install-pc2.ps1）。同版本重复 stage 保留更旧的 prev 备份。
-- Windows 下 CPython execv 表现为子进程接管 + 父进程退出（非同 PID）；以 version 翻转 + 单监听 + updates.log 链为准，不以 PID 不变论。
+- Windows 下 CPython execv 表现为子进程接管 + 父进程退出（非同 PID）；以 version 翻转 + 单监听 + updates.log 链为准，不以 PID 不变论。同版本冻结重装时目标即运行中镜像，apply 自动改用时间戳唯一文件名并更新指针（老文件下次启动 GC）。
 
 

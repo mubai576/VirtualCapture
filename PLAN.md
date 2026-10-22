@@ -14,8 +14,8 @@
 | dda 采集 | 🟡 最小实现可用，仅 ~10fps；夜间无屏 selftest SKIP（D4） |
 | 调用链止血（原 T-07） | ❌ DONE:`--adapter` 仍可空、无 `/adapters`、全错发送 exit 0、无 live 测试 |
 | 构建/版本管理（原 T-08） | ❌ DONE:无 git、无 docs/build.md、CMake 不回退 thirdparty、`run/` 594 文件 |
-| OTA | 🟡 P3 本地全绿（e01af52：test_ota 10× + run_remote 端到端）；待 PC2 实推；detached helper 已删 |
-| 版本 | 本地 0.3.8 PC2 0.3.8（2026-10-22 晚手工装机 + 同版本热更新实证，冻结版 + exe 指针）；release/vc-0.3.8.zip 已同步最新代码 |
+| OTA | ✅ stage/activate + execv 接管已验证（本地 10×/冻结/CLI + PC2 推→回滚→再推全绿，含 T2 9MB 分页全量对账）；detached helper 已删 |
+| 版本 | 本地 0.4.0（文件；主 agent 待重启生效） PC2 0.4.0（已验证 execv 接管 + 分页拉取）；release/vc-0.4.0.zip 为当前包 |
 | 产品链路 | ⬜ 未开始：2K240 实时采集裁 640@240、端到端延迟 <4.16ms、PC2 虚拟采集卡、推理端联调 |
 
 环境：MSVC 19.44（cmake VS 生成器直连，cl 不在 PATH）、python 3.14、Npcap 运行时、
@@ -134,12 +134,12 @@ P2-2 安装：install-pc2.ps1 手工通道装 PC2（禁止 POST /update），双
 P2-3 联调（scripts/run_T1.ps1 / ctrl/bringup.py，单播 --dst-mac）：T0 → T1 五档 → T2 10min soak；
      每次结束立即 /files 拉回 receiver hashlog 做全量 reconcile（hist S35 教训）。
      用 receiver qpc_ns 定位 ~1s 卡顿（gap_any.py 两端同法），给出 PC2 侧根因假设。
-     直连线到位后：广播 vs 单播 T2 各一次。
+     直连线：owner 决定短期不考虑，广播 vs 单播 T2 dropped。
 验收：docs/bringup-<日期>.md；T1 五档 + T2 按新判据全绿；全部 receiver hashlog 本地留档；T-06 关闭。
-交付：docs/bringup-20261022.md；T0 + T1 五档 + T2 144000/144000 全绿（rings 判据 bug 修一次、noise 外部 stop 重跑一次）；hashlog 留档（T2 全量因 /files 413 上限留 PC2，判据以 in-run 全量校验为准）。
+交付：docs/bringup-20261022.md；T0 + T1 五档 + T2 144000/144000 全绿（rings 判据 bug 修一次、noise 外部 stop 重跑一次）；hashlog 留档（T2 9MB 已用 /files 分页全量拉回并离线对账零错） |
 ```
 
-### P3 OTA 0.4.0（需 D2；碰 agent/、scripts/、ctrl/tests/）
+### DONE P3 done（2026-10-22 晚，PC2 推→回滚→再推全绿）
 
 ```text
 先读 docs/plan-history.md S19/S29/S31/S37。
@@ -153,6 +153,8 @@ P2-3 联调（scripts/run_T1.ps1 / ctrl/bringup.py，单播 --dst-mac）：T0 �
 进展（本地，e01af52）：test_update_roundtrip_and_rollback 10×全绿；run_remote --update/--rollback 对临时 agent 端到端 exit 0；待 PC2 实推 0.4.0→回滚→再推。
 进展（冻结模式，本地验证）：dist/vc-agent.exe 冷启动 0.3.8 → stage/activate 到 9.9.98-frozen（版本化 exe + 指针切换，单监听）→ rollback 回 0.3.8；run_remote --update/--rollback 均 exit 0。
 进展（PC2，2026-10-22）：0.3.8 已上线；同版本 stage→activate 实证通过（PID 10316→2528，单监听，updates.log 有链）；注意 prev 快照停在 0.3.5（手工安装不快照），首次回滚将回到 0.3.5 而非 0.3.7，下一次异版本 OTA 后自动纠正；0.4.0 实推待发版。
+交付（PC2，2026-10-22）：0.4.0 同版本 stage→activate 接管（PID 换代）；T2 hashlog 9MB 分页全量拉回并对账 144000/144000 零错；rollback 回 0.3.8；re-push 回 0.4.0。全部 exit 0，单监听。
+后续（未排期，不阻塞 DONE）：receiver stop 日志记来源 IP（排障用）；activate 应答与 execv race 仍返回 RST，轮询确认为准。 stop 来源 IP 记录排入下个版本。
 ```
 
 ### P4 产品链路（新立项，按 需求文档.md；P4-1 可与 P3 并行）
@@ -167,4 +169,5 @@ P4-3 PC2 虚拟采集卡：先出 DShow vs MF 选型报告（MF 可见性、推�
      NV12 640x640、AvgTimePerFrame=41666、只留最新 1 帧、不跟墙钟。
 P4-4 推理端联调：枚举到虚拟设备、逐字节无损（与发端 hash 对账）、FIFO 堆积为 0。
 范围外：独占全屏 Hook、分辨率超 2.5G 链路后的编解码方案（另立项，hist S24）。
+owner 批示 2026-10-22：P4-1 不回退 CPU（显式报错）已批，门限数字待测量改对 + 实测分布后再定；P4-2 确认包格式可行，门限指标改为 R(N) 重组段（RTT/2 只做上界交叉验证）；P4-3 DShow 优先（对标 OBS 虚拟机，推理端 AverMedia USB 07CA 系），Win11 MF 降为备选。
 ```
