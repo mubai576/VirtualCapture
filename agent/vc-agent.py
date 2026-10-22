@@ -643,8 +643,10 @@ def handle_update_binary(body):
                 continue
             pairs.append((rel, live, n))
         if not pairs:
-            return 400, {"error": "no applicable files for this layout"}
-        pass
+            return 400, {'error': 'no applicable files for this layout'}
+        for _n, _rel in items:
+            if _rel in ('vc-agent.exe', 'vc-agent.py') and _rel not in [r for r, _lv, _nn in pairs]:
+                return 400, {'error': 'self update not applicable: ' + _rel + ' outside ROOT'}
         self_up = [r for r, live, n in pairs if r in ("vc-agent.exe", "vc-agent.py")]
         if not self_up:
             for _sk in ("sender", "receiver"):

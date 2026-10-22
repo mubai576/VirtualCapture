@@ -165,3 +165,73 @@ def test_update_roundtrip_and_rollback():
         assert os.path.isfile(os.path.join(troot, "run", "updates.log")), "audit trail missing"
     finally:
         _ota_cleanup(proc, troot, seen)
+
+def _fz_cleanup(proc, base, troot, seen):
+    try:
+        hp = _ota_health(base)
+        if hp.get('pid'): seen.add(hp.get('pid'))
+    except Exception:
+        pass
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    for _pid in [int(x) for x in seen]:
+        try:
+            subprocess.run(['taskkill', '/PID', str(_pid), '/F'], capture_output=True, timeout=15)
+        except Exception:
+            pass
+    _tsh.rmtree(troot, ignore_errors=True)
+
+def test_frozen_roundtrip_and_rollback():
+    import pytest as _pt
+    if os.name != 'nt':
+        _pt.skip('frozen execv flow is Windows-first')
+    _exe = os.path.join(ROOT, 'dist', 'vc-agent.exe')
+    if not os.path.isfile(_exe):
+        _pt.skip('dist/vc-agent.exe not built')
+    troot = _ttf.mkdtemp(prefix='vc-fz-')
+    _live = os.path.join(troot, 'vc-agent.exe')
+    _tsh.copy2(_exe, _live)
+    with open(os.path.join(troot, 'version.json'), 'w', encoding='utf-8') as f:
+        f.write(json.dumps({'version': '0.3.8'}))
+    port = _free_port()
+    proc = subprocess.Popen([_live, '--role', 'sender', '--port', str(port), '--root', troot], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base = 'http://127.0.0.1:%d' % port
+    seen = {proc.pid}
+    try:
+        assert _wait_health(base, timeout=30), 'frozen agent up'
+        assert _ota_health(base).get('version') == '0.3.8'
+        zp = os.path.join(troot, 'up.zip')
+        with _tzf.ZipFile(zp, 'w', _tzf.ZIP_DEFLATED) as zf:
+            zf.writestr('version.json', json.dumps({'version': '9.9.97-frozen'}))
+            with open(_exe, 'rb') as _ef:
+                zf.writestr('vc-agent.exe', _ef.read())
+            zf.writestr('scripts/ok.ps1', 'Write-Host fz-ok')
+        code, res = _ota_post_zip(base, zp)
+        assert code == 200 and res.get('staged') is True, (code, res)
+        assert _ota_health(base).get('version') == '0.3.8', 'stage must not apply'
+        code, res = _post_start(base, '/activate', {'version': 'wrong'})
+        assert code == 409, (code, res)
+        assert _ota_health(base).get('version') == '0.3.8'
+        _ota_activate(base, {'version': '9.9.97-frozen'})
+        assert _wait_version(base, '9.9.97-frozen', tries=45), 'frozen activate stalled'
+        hp = _ota_health(base)
+        assert hp.get('version') == '9.9.97-frozen', hp
+        seen.add(hp.get('pid'))
+        import glob as _gg
+        assert _gg.glob(os.path.join(troot, 'vc-agent-*.exe')), 'no versioned exe'
+        assert json.loads(open(os.path.join(troot, 'version.json'), encoding='utf-8').read()).get('exe', '').startswith('vc-agent-'), 'exe pointer missing'
+        code, res = _post_start(base, '/activate', {'rollback': True})
+        assert code == 200, (code, res)
+        assert _wait_version(base, '0.3.8', tries=45), 'frozen rollback stalled'
+        assert os.path.isfile(os.path.join(troot, 'run', 'updates.log')), 'audit trail missing'
+    finally:
+        _fz_cleanup(proc, base, troot, seen)
