@@ -235,3 +235,33 @@ def test_frozen_roundtrip_and_rollback():
         assert os.path.isfile(os.path.join(troot, 'run', 'updates.log')), 'audit trail missing'
     finally:
         _fz_cleanup(proc, base, troot, seen)
+
+def test_same_version_keeps_prev():
+    import pytest as _pt
+    if os.name != 'nt':
+        _pt.skip('execv flow is Windows-first')
+    troot = _ttf.mkdtemp(prefix='vc-same-')
+    proc, base, port = _ota_spawn(troot, '0.2.0')
+    seen = {proc.pid}
+    try:
+        zp = os.path.join(troot, 'up.zip')
+        _ota_mkpkg(zp, '1.0.0', 'first')
+        code, res = _ota_post_zip(base, zp)
+        assert code == 200 and res.get('staged') is True, (code, res)
+        _ota_activate(base, {'version': '1.0.0'})
+        assert _wait_version(base, '1.0.0', tries=45)
+        seen.add(_ota_health(base).get('pid'))
+        _pv = os.path.join(troot, 'prev', 'mirror', 'version.json')
+        assert json.loads(open(_pv, encoding='utf-8').read()).get('version') == '0.2.0'
+        _ota_mkpkg(zp, '1.0.0', 'second')
+        code, res = _ota_post_zip(base, zp)
+        assert code == 200 and res.get('staged') is True, (code, res)
+        _ota_activate(base, {'version': '1.0.0'})
+        assert _wait_version(base, '1.0.0', tries=45)
+        seen.add(_ota_health(base).get('pid'))
+        assert json.loads(open(_pv, encoding='utf-8').read()).get('version') == '0.2.0', 'same-version re-apply must keep older prev'
+        code, res = _post_start(base, '/activate', {'rollback': True})
+        assert code == 200, (code, res)
+        assert _wait_version(base, '0.2.0', tries=45), 'rollback should reach pre-1.0.0'
+    finally:
+        _ota_cleanup(proc, troot, seen)
