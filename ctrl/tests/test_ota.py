@@ -363,3 +363,41 @@ def test_stage_rejects_unmappable_self_update():
         assert proc.poll() is None, 'agent must survive rejected stage'
     finally:
         _ota_cleanup(proc, base, troot, seen)
+
+def test_files_pagination_roundtrip():
+    import pytest as _pt
+    if os.name != 'nt':
+        _pt.skip('files pagination is Windows-first')
+    import urllib.error as _ue2
+    troot = _ttf.mkdtemp(prefix='vc-pg-')
+    proc, base, port = _ota_spawn(troot, '0.3.8')
+    seen = {proc.pid}
+    try:
+        blob = bytes((i % 26) + 65 for i in range(300000))
+        with open(os.path.join(troot, 'big.bin'), 'wb') as f:
+            f.write(blob)
+        want = blob.decode('ascii')
+        with urllib.request.urlopen(base + '/files?path=big.bin', timeout=15) as r:
+            res0 = json.loads(r.read().decode())
+        assert res0.get('truncated') is True and len(res0.get('content', '')) == 262144, res0
+        got = []
+        off = 0
+        for _ in range(10):
+            with urllib.request.urlopen(base + ('/files?path=big.bin&offset=%d&limit=100000' % off), timeout=15) as r:
+                res = json.loads(r.read().decode())
+            assert res.get('size') == 300000, res
+            got.append(res.get('content', ''))
+            if res.get('next_offset') is None:
+                break
+            off = int(res['next_offset'])
+        else:
+            assert False, 'paging did not terminate'
+        assert ''.join(got) == want, 'paged bytes must reassemble exactly'
+        try:
+            with urllib.request.urlopen(base + '/files?path=big.bin&offset=abc', timeout=15) as r:
+                _ = r.read()
+            assert False, 'bad offset should 400'
+        except _ue2.HTTPError as e:
+            assert e.code == 400, e.code
+    finally:
+        _ota_cleanup(proc, base, troot, seen)

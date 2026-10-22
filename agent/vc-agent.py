@@ -342,8 +342,18 @@ UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-recei
 
 
 FILES_MAX_BYTES = 262144
-
-def read_root_file(rel):
+def read_root_file(rel, offset=0, limit=0):
+    try:
+        offset = int(offset or 0)
+        limit = int(limit or 0)
+    except Exception:
+        return 400, {'error': 'bad offset/limit'}
+    if offset < 0:
+        offset = 0
+    if limit < 0:
+        limit = 0
+    if limit > 1048576:
+        limit = 1048576
     """Read-only file fetch under ROOT for automation/diagnosis. Returns (code, obj)."""
     if not rel or not isinstance(rel, str):
         return 400, {"error": "path required"}
@@ -361,10 +371,12 @@ def read_root_file(rel):
         size = os.path.getsize(full)
         if size > 4 * 1024 * 1024:
             return 413, {"error": "file too large"}
-        with open(full, "rb") as f:
-            data = f.read(FILES_MAX_BYTES + 1)
-        trunc = len(data) > FILES_MAX_BYTES
-        data = data[:FILES_MAX_BYTES]
+        with open(full, 'rb') as f:
+            f.seek(offset)
+            want = limit if limit else FILES_MAX_BYTES
+            data = f.read(want + 1)
+        trunc = len(data) > want
+        data = data[:want]
         try:
             text = data.decode("utf-8")
         except Exception:
@@ -372,7 +384,11 @@ def read_root_file(rel):
                 text = data.decode("cp936")
             except Exception:
                 text = data.decode("utf-8", "replace")
-        return 200, {"path": nn, "size": size, "truncated": trunc, "content": text}
+        if trunc:
+            nxt = offset + want
+        else:
+            nxt = None
+        return 200, {'path': nn, 'size': size, 'offset': offset, 'truncated': trunc, 'next_offset': nxt, 'content': text}
     except Exception as e:
         return 500, {"error": str(e)}
 
@@ -745,14 +761,16 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/receiver/report":
             # bundle stats + versions + file existence for ctrl packaging
             self._j({"version": read_version(), "sender": slot_stats("sender"), "receiver": slot_stats("receiver")})
-        elif self.path == "/files" or self.path.startswith("/files?"):
+        elif self.path == '/files' or self.path.startswith('/files?'):
             try:
                 import urllib.parse as _up2
-                q = _up2.urlparse(self.path).query
-                rel = (_up2.parse_qs(q).get("path", [""])[0])
+                q = _up2.parse_qs(_up2.urlparse(self.path).query)
+                rel = (q.get('path', [''])[0])
+                _off = (q.get('offset', ['0'])[0])
+                _lim = (q.get('limit', ['0'])[0])
             except Exception:
-                rel = ""
-            code, res = read_root_file(rel)
+                rel = ''; _off = 0; _lim = 0
+            code, res = read_root_file(rel, _off, _lim)
             self._j(res, code)
         elif self.path == "/exec/log" or self.path.startswith("/exec/log?"):
             try:
