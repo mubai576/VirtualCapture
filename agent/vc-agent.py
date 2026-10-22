@@ -859,6 +859,12 @@ class H(BaseHTTPRequestHandler):
                     with open(tmp, "w", encoding="utf-8") as f: json.dump(d, f)
                     os.replace(tmp, p)
             except Exception: pass
+            try:
+                os.makedirs(RUN_DIR, exist_ok=True)
+                with EXEC_LOCK:
+                    with open(os.path.join(RUN_DIR, "exec.log"), "a", encoding="utf-8") as _f:
+                        _f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "client": self.client_address[0] if self.client_address else "?", "op": kind + "/stop", "session_id": sid}) + chr(10))
+            except Exception: pass
             self._j({"session_id": sid, "stopped": True})
         elif self.path == "/exec":
             if not isinstance(args, dict):
