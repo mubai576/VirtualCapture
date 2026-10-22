@@ -83,7 +83,7 @@ def _assert_handover(proc, base, pid0, want):
     return hp
 
 
-def _ota_cleanup(proc, troot, extra=()):
+def _ota_cleanup(proc, base, troot, extra=()):
     try:
         proc.terminate()
     except Exception:
@@ -95,13 +95,32 @@ def _ota_cleanup(proc, troot, extra=()):
             proc.kill()
         except Exception:
             pass
-    for _pid in [proc.pid] + [int(x) for x in (extra or [])]:
+    _pids = [proc.pid] + [int(x) for x in (extra or [])]
+    for _pid in _pids:
         try:
-            import subprocess as _sp3
-            _sp3.run(["taskkill", "/PID", str(_pid), "/F"], capture_output=True, timeout=15)
+            subprocess.run(['taskkill', '/PID', str(_pid), '/F'], capture_output=True, timeout=15)
         except Exception:
             pass
-    _tsh.rmtree(troot, ignore_errors=True)
+    import time as _tc
+    for _r in range(3):
+        try:
+            with urllib.request.urlopen(base + '/health', timeout=5) as _hr:
+                _hr.read()
+        except Exception:
+            break
+        _tc.sleep(2)
+        for _pid in _pids:
+            try:
+                subprocess.run(['taskkill', '/PID', str(_pid), '/F'], capture_output=True, timeout=15)
+            except Exception:
+                pass
+    else:
+        raise AssertionError('temp agent still listening on ' + base + '; refusing to rmtree a live root')
+    try:
+        _tsh.rmtree(troot)
+    except Exception:
+        _tc.sleep(2)
+        _tsh.rmtree(troot, ignore_errors=True)
 
 
 def _ota_mkpkg(path, ver, tag):
@@ -164,7 +183,7 @@ def test_update_roundtrip_and_rollback():
         seen.add(hp.get("pid"))
         assert os.path.isfile(os.path.join(troot, "run", "updates.log")), "audit trail missing"
     finally:
-        _ota_cleanup(proc, troot, seen)
+        _ota_cleanup(proc, base, troot, seen)
 
 def _fz_cleanup(proc, base, troot, seen):
     try:
@@ -188,7 +207,26 @@ def _fz_cleanup(proc, base, troot, seen):
             subprocess.run(['taskkill', '/PID', str(_pid), '/F'], capture_output=True, timeout=15)
         except Exception:
             pass
-    _tsh.rmtree(troot, ignore_errors=True)
+    import time as _tc2
+    for _r in range(3):
+        try:
+            with urllib.request.urlopen(base + '/health', timeout=5) as _hr:
+                _hr.read()
+        except Exception:
+            break
+        _tc2.sleep(2)
+        for _pid in [int(x) for x in seen]:
+            try:
+                subprocess.run(['taskkill', '/PID', str(_pid), '/F'], capture_output=True, timeout=15)
+            except Exception:
+                pass
+    else:
+        raise AssertionError('temp agent still listening on ' + base + '; refusing to rmtree a live root')
+    try:
+        _tsh.rmtree(troot)
+    except Exception:
+        _tc2.sleep(2)
+        _tsh.rmtree(troot, ignore_errors=True)
 
 def test_frozen_roundtrip_and_rollback():
     import pytest as _pt
@@ -265,7 +303,7 @@ def test_same_version_keeps_prev():
         assert _wait_version(base, '0.2.0', tries=45), 'rollback should reach pre-1.0.0'
         seen.add(_ota_health(base).get('pid'))
     finally:
-        _ota_cleanup(proc, troot, seen)
+        _ota_cleanup(proc, base, troot, seen)
 
 def test_run_remote_cli_update_and_rollback():
     import pytest as _pt
@@ -305,4 +343,4 @@ def test_run_remote_cli_update_and_rollback():
         assert _wait_version(base, '0.2.0', tries=45)
         seen.add(_ota_health(base).get('pid'))
     finally:
-        _ota_cleanup(proc, troot, seen)
+        _ota_cleanup(proc, base, troot, seen)
