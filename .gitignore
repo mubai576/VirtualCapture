@@ -1,0 +1,17 @@
+build/
+run/
+*.tmp
+__pycache__/
+.pytest_cache/
+dist/
+archive/
+release/
+pkg*/
+staging/
+prev/
+*.bak*
+*.exe
+*.zip
+*.log
+thirdparty/ninja-win.zip
+
