@@ -17,8 +17,11 @@
   发布包解压目录, 默认本脚本所在目录。
 .PARAMETER ControlSubnet
   控制面放行网段, 默认 192.168.2.0/24。
+.PARAMETER TaskName
+  计划任务与防火墙规则名前缀, 默认 vc-agent；并存验证时改名（如 vc-agent-38）。
 .EXAMPLE
   pwsh -ExecutionPolicy Bypass -File install-pc2.ps1 -Role receiver -WhatIf
+  pwsh -ExecutionPolicy Bypass -File install-pc2.ps1 -Role receiver -Port 18081 -InstallDir C:\vc38 -TaskName vc-agent-38
 #>
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
@@ -26,7 +29,8 @@ param(
   [int]$Port = 18080,
   [string]$InstallDir = "C:\vc",
   [string]$PackageDir = (Split-Path $PSCommandPath -Parent),
-  [string]$ControlSubnet = "192.168.2.0/24"
+  [string]$ControlSubnet = "192.168.2.0/24",
+  [string]$TaskName = "vc-agent"
 )
 $ErrorActionPreference = "Stop"
 # 0. 管理员检查(写 C 盘/计划任务/防火墙都要管理员)
@@ -58,7 +62,7 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "拷贝文件")) {
   Write-Host "[install] 文件落盘完成。"
 }
 # 4. 计划任务开机自启(SYSTEM, 最高权限)
-$taskName = "vc-agent"
+$taskName = $TaskName
 $exe = Join-Path $InstallDir "vc-agent.exe"
 $args = "--role $Role --port $Port"
 if ($PSCmdlet.ShouldProcess($taskName, "创建开机自启计划任务")) {
@@ -67,15 +71,15 @@ if ($PSCmdlet.ShouldProcess($taskName, "创建开机自启计划任务")) {
 }
 # 5. 防火墙仅放行控制面网段
 if ($PSCmdlet.ShouldProcess("firewall", "放行 TCP $Port 给 $ControlSubnet")) {
-  netsh advfirewall firewall delete rule name="vc-agent" | Out-Null
-  netsh advfirewall firewall add rule name="vc-agent" dir=in action=allow protocol=TCP localport=$Port remoteip=$ControlSubnet | Out-Null
+  netsh advfirewall firewall delete rule name="$taskName" | Out-Null
+  netsh advfirewall firewall add rule name="$taskName" dir=in action=allow protocol=TCP localport=$Port remoteip=$ControlSubnet | Out-Null
   Write-Host "[install] 防火墙已放行 $Port 给 $ControlSubnet。"
 }
 # 5b. watchdog backstop (SYSTEM, every 5 min).
 $wdScript = Join-Path $InstallDir "scripts/watchdog.ps1"
-if ($PSCmdlet.ShouldProcess("vc-agent-watchdog", "create probe task")) {
+if ($PSCmdlet.ShouldProcess(($taskName + '-watchdog'), 'create probe task')) {
   $wdTr = "powershell.exe -NoProfile -ExecutionPolicy Bypass -File `"" + $wdScript + "`" -Port " + $Port
-  schtasks /create /tn "vc-agent-watchdog" /tr $wdTr /sc minute /mo 5 /ru SYSTEM /rl highest /f
+  schtasks /create /tn ($taskName + '-watchdog') /tr $wdTr /sc minute /mo 5 /ru SYSTEM /rl highest /f
   Write-Host "[install] watchdog task created."
 }
 # 6. 启动并验证 /health + /version
