@@ -31,7 +31,7 @@ python -m PyInstaller --onefile --name vc-agent agent/vc-agent.py
 保留所有 report json
 保留被报告引用的 session 文件
 保留最近 5 轮 其余进 run/archive.d
-本次 310 进 55 出 归档 255 件
+本次 310 进 59 出 归档含活网验证报告
 ## 仓库治理
 pkg034x pkg035 bak 移到 archive
 scripts py 移到 scripts/analysis 保留不删
