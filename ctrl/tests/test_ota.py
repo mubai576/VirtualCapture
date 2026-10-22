@@ -263,5 +263,46 @@ def test_same_version_keeps_prev():
         code, res = _post_start(base, '/activate', {'rollback': True})
         assert code == 200, (code, res)
         assert _wait_version(base, '0.2.0', tries=45), 'rollback should reach pre-1.0.0'
+        seen.add(_ota_health(base).get('pid'))
+    finally:
+        _ota_cleanup(proc, troot, seen)
+
+def test_run_remote_cli_update_and_rollback():
+    import pytest as _pt
+    if os.name != 'nt':
+        _pt.skip('execv flow is Windows-first')
+    import importlib.util as _ilu
+    _spec = _ilu.spec_from_file_location('run_remote', os.path.join(ROOT, 'ctrl', 'run_remote.py'))
+    _rr = _ilu.module_from_spec(_spec); _spec.loader.exec_module(_rr)
+    troot = _ttf.mkdtemp(prefix='vc-rr-')
+    proc, base, port = _ota_spawn(troot, '0.2.0')
+    seen = {proc.pid}
+    try:
+        zp = os.path.join(troot, 'up.zip')
+        _ota_mkpkg(zp, '7.7.7-rr', 'rr')
+        import sys as _sys
+        _old = _sys.argv
+        try:
+            _sys.argv = ['run_remote.py', '--agent', base, '--update', zp, '--force']
+            try:
+                _code = _rr.main()
+            except SystemExit as _e:
+                _code = _e.code
+            assert _code == 0, _code
+        finally:
+            _sys.argv = _old
+        assert _wait_version(base, '7.7.7-rr', tries=45)
+        seen.add(_ota_health(base).get('pid'))
+        try:
+            _sys.argv = ['run_remote.py', '--agent', base, '--rollback']
+            try:
+                _code = _rr.main()
+            except SystemExit as _e:
+                _code = _e.code
+            assert _code == 0, _code
+        finally:
+            _sys.argv = _old
+        assert _wait_version(base, '0.2.0', tries=45)
+        seen.add(_ota_health(base).get('pid'))
     finally:
         _ota_cleanup(proc, troot, seen)
