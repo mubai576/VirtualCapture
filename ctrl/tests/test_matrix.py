@@ -305,81 +305,6 @@ def _mkzip(path, files):
         for name, data in files.items():
             z.writestr(name, data)
 
-def test_update_roundtrip_and_rollback():
-    import pytest as _pt
-    if os.name != "nt":
-        _pt.skip("restart helper is Windows .bat")
-    troot = _tf.mkdtemp(prefix="vc-upd-")
-    with open(os.path.join(troot, "version.json"), "w", encoding="utf-8") as f:
-        f.write(json.dumps({"version": "0.2.0"}))
-    port = _free_port()
-    agent = os.path.join(ROOT, "agent", "vc-agent.py")
-    proc = subprocess.Popen([sys.executable, agent, "--role", "sender", "--port", str(port),
-                             "--root", troot],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    base = "http://127.0.0.1:%d" % port
-    dead = []
-    try:
-        assert _wait_health(base, timeout=15), "agent up"
-        zp = os.path.join(troot, "up.zip")
-        _mkzip(zp, {"version.json": json.dumps({"version": "0.9.9-test"}),
-                    "scripts/ok.ps1": "Write-Host ok\n"})
-        with open(zp, "rb") as f:
-            data = f.read()
-        req = urllib.request.Request(base + "/update", data=data,
-                                     headers={"Content-Type": "application/zip"}, method="POST")
-        with urllib.request.urlopen(req, timeout=20) as r:
-            res = json.loads(r.read().decode())
-        assert res.get("updated") is True and res.get("version") == "0.9.9-test", res
-        # agent exits itself; helper restarts it with same root/port
-        ver = ""
-        for _ in range(30):
-            time.sleep(2)
-            try:
-                with urllib.request.urlopen(base + "/version", timeout=5) as r:
-                    ver = json.loads(r.read().decode()).get("version", "")
-                if ver == "0.9.9-test":
-                    break
-            except Exception:
-                pass
-        assert ver == "0.9.9-test", "restarted agent serves new version, got %r" % ver
-        assert json.loads(open(os.path.join(troot, "version.json"), encoding="utf-8").read())["version"] == "0.9.9-test"
-        assert json.loads(open(os.path.join(troot, "prev", "mirror", "version.json"), encoding="utf-8").read())["version"] == "0.2.0"
-        assert os.path.isfile(os.path.join(troot, "scripts", "ok.ps1"))
-        # rollback
-        req = urllib.request.Request(base + "/update",
-                                     data=json.dumps({"rollback": True}).encode(),
-                                     headers={"Content-Type": "application/json"}, method="POST")
-        with urllib.request.urlopen(req, timeout=20) as r:
-            res = json.loads(r.read().decode())
-        assert res.get("rollback") is True, res
-        ver = ""
-        for _ in range(30):
-            time.sleep(2)
-            try:
-                with urllib.request.urlopen(base + "/version", timeout=5) as r:
-                    ver = json.loads(r.read().decode()).get("version", "")
-                if ver == "0.2.0":
-                    break
-            except Exception:
-                pass
-        assert ver == "0.2.0", "rollback restored, got %r" % ver
-    finally:
-        try:
-            c = None
-            import subprocess as _sp2
-            out = _sp2.run(["powershell", "-NoProfile", "-Command",
-                            "(Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess" % port],
-                           capture_output=True, text=True, timeout=15)
-            pid = (out.stdout or "").strip()
-            if pid.isdigit():
-                _sp2.run(["taskkill", "/PID", pid, "/F"], capture_output=True, timeout=15)
-        except Exception:
-            pass
-        try: proc.terminate()
-        except Exception: pass
-        time.sleep(1)
-        _sh.rmtree(troot, ignore_errors=True)
 import importlib.util as _ilu2
 import os as _os
 _spec2 = _ilu2.spec_from_file_location("bringup", _os.path.join(ROOT, "ctrl", "bringup.py"))
@@ -417,50 +342,6 @@ def _wait_version(base, want, tries=30):
             pass
     return False
 
-def test_update_same_version_keeps_prev():
-    import pytest as _pt
-    if os.name != "nt":
-        _pt.skip("restart helper is Windows .vbs")
-    troot = _tf.mkdtemp(prefix="vc-updsame-")
-    with open(os.path.join(troot, "version.json"), "w", encoding="utf-8") as f:
-        f.write(json.dumps({"version": "0.3.1"}))
-    port = _free_port()
-    agent = os.path.join(ROOT, "agent", "vc-agent.py")
-    proc = subprocess.Popen([sys.executable, agent, "--role", "sender", "--port", str(port),
-                             "--root", troot],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    base = "http://127.0.0.1:%d" % port
-    try:
-        assert _wait_health(base, timeout=15), "agent up"
-        zp = os.path.join(troot, "up.zip")
-        _mkzip(zp, {"version.json": json.dumps({"version": "0.9.9A"})})
-        with open(zp, "rb") as f:
-            data = f.read()
-        for _ in range(2):
-            req = urllib.request.Request(base + "/update", data=data,
-                                         headers={"Content-Type": "application/zip"}, method="POST")
-            with urllib.request.urlopen(req, timeout=20) as r:
-                res = json.loads(r.read().decode())
-            assert res.get("updated") is True, res
-            assert _wait_version(base, "0.9.9A"), "reached 0.9.9A"
-        pv = os.path.join(troot, "prev", "mirror", "version.json")
-        assert os.path.isfile(pv), "prev backup exists"
-        assert json.loads(open(pv, encoding="utf-8").read())["version"] == "0.3.1", \
-            "same-version re-apply must not clobber prev"
-    finally:
-        try:
-            out = subprocess.run(["powershell", "-NoProfile", "-Command",
-                                  "(Get-NetTCPConnection -LocalPort %d -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1).OwningProcess" % port],
-                                 capture_output=True, text=True, timeout=15)
-            pid = (out.stdout or "").strip()
-            if pid.isdigit():
-                subprocess.run(["taskkill", "/PID", pid, "/F"], capture_output=True, timeout=15)
-        except Exception:
-            pass
-        try: proc.terminate()
-        except Exception: pass
-        time.sleep(1)
-        _sh.rmtree(troot, ignore_errors=True)
 def test_sender_cadence_ms(tmp_path):
     p = tmp_path / "s.hash.jsonl"
     p.write_text("{\"frame_id\": 0, \"qpc_ns\": 1000000000}\n{\"frame_id\": 1, \"qpc_ns\": 1005000000}\n{\"frame_id\": 2, \"qpc_ns\": 1010000000}\n", encoding="utf-8")

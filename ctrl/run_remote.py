@@ -3,6 +3,8 @@ Usage:
   python ctrl/run_remote.py --agent http://192.168.2.59:18080 --timeout 30 -- ipconfig /all
   python ctrl/run_remote.py --agent http://127.0.0.1:18081 -- python --version
   python ctrl/run_remote.py --agent http://127.0.0.1:18081 --log --lines 10
+  python ctrl/run_remote.py --agent http://192.168.2.59:18080 --update release/vc-0.4.0.zip
+  python ctrl/run_remote.py --agent http://192.168.2.59:18080 --rollback
 Exit code = remote exit code (None/timed-out -> 1, transport error -> 2, denied -> 3).
 """
 import argparse, json, sys
@@ -19,6 +21,24 @@ def post(base, argv, timeout):
         try: return e.code, json.loads(e.read().decode())
         except Exception: return e.code, {"denied": str(e)}
 
+
+def poll_version(base, want, timeout=180):
+    import time as _t
+    _dead = _t.time() + timeout
+    while _t.time() < _dead:
+        try:
+            with urllib.request.urlopen(base + '/version', timeout=10) as r:
+                _v = json.loads(r.read().decode()).get('version', '')
+            print('version=%s' % _v)
+            if _v and _v == want:
+                print('confirmed at %s' % want)
+                return 0
+        except Exception as e:
+            print('poll: %s' % e)
+        _t.sleep(3)
+    print('not confirmed within %ss (want %s)' % (timeout, want))
+    return 1
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", required=True)
@@ -31,40 +51,90 @@ def main():
     ap.add_argument("argv", nargs="*")
     a = ap.parse_args()
     if a.update:
-        import os as _os
+        import zipfile as _zf
         if not a.force:
             try:
-                with urllib.request.urlopen(a.agent + "/health", timeout=15) as r:
+                with urllib.request.urlopen(a.agent + '/health', timeout=15) as r:
                     h = json.loads(r.read().decode())
             except Exception:
-                print("health check failed, refuse to push")
+                print('health check failed, refuse to push')
                 return 2
-            if h.get("updater") != "ps-ok":
-                print("updater not ready, refuse to push")
+            if h.get('updater') != 'ps-ok':
+                print('updater not ready, refuse to push')
                 return 2
-        data = open(a.update, "rb").read()
-        req = urllib.request.Request(a.agent + "/update", data=data,
-                                     headers={"Content-Type": "application/zip"}, method="POST")
+        try:
+            with _zf.ZipFile(a.update) as _z:
+                _exp = json.loads(_z.read('version.json').decode()).get('version', '')
+        except Exception as _e:
+            print('bad version zip: %s' % _e)
+            return 2
+        if not _exp:
+            print('version.json missing version, refuse to push')
+            return 2
+        data = open(a.update, 'rb').read()
+        req = urllib.request.Request(a.agent + '/update', data=data,
+                                     headers={'Content-Type': 'application/zip'}, method='POST')
         try:
             with urllib.request.urlopen(req, timeout=120) as r:
-                print(r.status, r.read().decode()[:500])
+                _st = r.status
+                _sb = r.read().decode()
+                print(_st, _sb[:500])
         except urllib.error.HTTPError as e:
             print(e.code, e.read().decode()[:500])
             return 2
-        print("posted; agent restarts itself, poll /version to confirm")
-        return 0
-    if a.rollback:
-        data = json.dumps({"rollback": True}).encode()
-        req = urllib.request.Request(a.agent + "/update", data=data,
-                                     headers={"Content-Type": "application/json"}, method="POST")
+        except Exception as e:
+            print('stage POST failed: %s' % e)
+            return 2
+        if 'staged' not in _sb:
+            print('stage rejected, aborting before activate')
+            return 2
+        _ab = json.dumps({'version': _exp}).encode()
+        _aq = urllib.request.Request(a.agent + '/activate', data=_ab,
+                                     headers={'Content-Type': 'application/json'}, method='POST')
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with urllib.request.urlopen(_aq, timeout=120) as r:
                 print(r.status, r.read().decode()[:500])
         except urllib.error.HTTPError as e:
             print(e.code, e.read().decode()[:500])
             return 2
-        print("posted; agent restarts itself, poll /version to confirm")
-        return 0
+        except Exception as e:
+            print('activate sent, no response (execv handover); polling: %s' % e)
+        return poll_version(a.agent, _exp)
+    if a.rollback:
+        data = json.dumps({'rollback': True}).encode()
+        req = urllib.request.Request(a.agent + '/activate', data=data,
+                                     headers={'Content-Type': 'application/json'}, method='POST')
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                _rb = r.read().decode()
+                print(r.status, _rb[:500])
+        except urllib.error.HTTPError as e:
+            print(e.code, e.read().decode()[:500])
+            return 2
+        except Exception as e:
+            print('activate sent, no response (execv handover); polling: %s' % e)
+            _rb = '{}'
+        try:
+            _want = json.loads(_rb).get('version', '')
+        except Exception:
+            _want = ''
+        if _want:
+            return poll_version(a.agent, _want)
+        import time as _t2
+        _dead = _t2.time() + 180
+        while _t2.time() < _dead:
+            try:
+                with urllib.request.urlopen(a.agent + '/version', timeout=10) as r:
+                    _v = json.loads(r.read().decode()).get('version', '')
+                print('version=%s' % _v)
+                if _v:
+                    print('agent reachable at %s' % _v)
+                    return 0
+            except Exception as e:
+                print('poll: %s' % e)
+            _t2.sleep(3)
+        print('rollback target not reachable within 180s')
+        return 1
     if a.log:
         with urllib.request.urlopen(a.agent + "/exec/log?lines=%d" % a.lines, timeout=15) as r:
             for e in json.loads(r.read().decode()).get("entries", []):

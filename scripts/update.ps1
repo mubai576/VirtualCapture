@@ -1,11 +1,11 @@
 <#
 .SYNOPSIS
-  update.ps1 — 推版本到双机 agent (T-05)。调双端 POST /update，轮询 /version 一致才退出 0。
+  update.ps1 — 推版本到双机 agent (P3)。双端 stage→activate→poll /version 一致才退出 0；无 detached 进程。
 .DESCRIPTION
-  MVP: 版本以 version.json 为准，zip 推包待 agent /updateBinary 落地后启用；
-  当前先比对双端 /version，一致才算成功 (避免跨版本对账错位)。
+  P3 流程: POST zip 到 /update 只做 stage(校验+解压+prev 快照，不重启)；
+  再 POST /activate 原地 execv 接管，最后轮询双端 /version 一致才算成功。
 .PARAMETER VersionZip
-  版本 zip 路径 (当前仅归档记录，实际比对走 /version)。
+  版本 zip 路径 (必含 version.json；stage 用；缺省只比对双端版本)。
 .PARAMETER SenderIP
   PC1 控制面 IP (192.168.2.x)。
 .PARAMETER ReceiverIP
@@ -27,7 +27,7 @@ $ErrorActionPreference = "Stop"
 $sender = "http://${SenderIP}:${Port}"
 $receiver = "http://${ReceiverIP}:${Port}"
 # 1. 干跑提示
-if (-not $PSCmdlet.ShouldProcess("$sender, $receiver", "POST /update 并轮询 /version")) {
+if (-not $PSCmdlet.ShouldProcess($sender + ', ' + $receiver, 'stage/activate 并轮询 /version')) {
   Write-Host "[update] WhatIf 干跑: 不发包。"; exit 0
 }
 # 2. 读本地期望版本 (zip 名或 version.json)
@@ -41,29 +41,39 @@ if ($VersionZip -and (Test-Path $VersionZip)) {
   $zf.Dispose()
   Write-Host (("[update] expected version: {0}" -f $expected))
 }
-# 3. 推包: 版本 zip 二进制 POST 到双端 /update(原子替换+自重启)
+# 3. stage: 版本 zip 二进制 POST 到双端 /update(只校验+解压+prev 快照，不重启)
 foreach ($base in @($sender, $receiver)) {
-# 2b. updater preflight: refuse when helper channel is not ps-ok
-foreach ($ep in @($sender, $receiver)) {
   try {
-    $h = Invoke-RestMethod -Uri "$ep/health" -TimeoutSec 10
-    if ($h.updater -ne "ps-ok") { Write-Error "UPDATER-NOT-READY"; exit 1 }
-    Write-Host "GATE-OK"
-  } catch { Write-Error "HEALTH-CHECK-FAILED"; exit 1 }
-}
-  Write-Host (("[update] POST {0}/update ..." -f $base))
+    $h = Invoke-RestMethod -Uri ($base + '/health') -TimeoutSec 10
+    if ($h.updater -ne 'ps-ok') { Write-Error 'UPDATER-NOT-READY'; exit 1 }
+    Write-Host 'GATE-OK'
+  } catch { Write-Error 'HEALTH-CHECK-FAILED'; exit 1 }
+  Write-Host ('[update] stage ' + $base + '/update ...')
   if ($VersionZip -and (Test-Path $VersionZip)) {
     try {
       $bytes = [System.IO.File]::ReadAllBytes((Resolve-Path $VersionZip).Path)
-      $req = [System.Net.HttpWebRequest]::Create("$base/update")
-      $req.Method = "POST"; $req.ContentType = "application/zip"; $req.Timeout = 60000
+      $req = [System.Net.HttpWebRequest]::Create($base + '/update')
+      $req.Method = 'POST'; $req.ContentType = 'application/zip'; $req.Timeout = 60000
       $rs = $req.GetRequestStream(); $rs.Write($bytes, 0, $bytes.Length); $rs.Close()
       $resp = New-Object System.IO.StreamReader($req.GetResponse().GetResponseStream())
-      Write-Host ($resp.ReadToEnd()); $resp.Close()
-    } catch { Write-Warning (("POST failed, poll phase decides: {0}" -f $_.Exception.Message)) }
+      $staged = $resp.ReadToEnd(); $resp.Close()
+      Write-Host $staged
+      if (($staged -notmatch 'staged') -or ($expected -and ($staged -notmatch [regex]::Escape($expected)))) { Write-Error ('STAGE-REJECTED: ' + $staged); exit 1 }
+    } catch { Write-Warning ('stage 失败，终止(不进 activate): ' + $_.Exception.Message); exit 1 }
   } else {
-    Write-Warning "VersionZip missing, skip push, version check only."
+    Write-Warning 'VersionZip missing, skip push, version check only.'
   }
+}
+if ($VersionZip -and (Test-Path $VersionZip) -and $expected) {
+foreach ($base in @($sender, $receiver)) {
+  Write-Host ('[update] activate ' + $base + '/activate ...')
+  $qq = [char]34
+  $body = ('{' + $qq + 'version' + $qq + ':' + $qq + $expected + $qq + '}')
+  try {
+    $r = Invoke-RestMethod -Uri ($base + '/activate') -Method Post -ContentType 'application/json' -Body $body -TimeoutSec 60
+    Write-Host ('[update] activate 应答: ' + ($r | ConvertTo-Json -Compress))
+  } catch { Write-Warning ('activate POST 异常(可能已 execv，轮询裁决): ' + $_.Exception.Message) }
+}
 }
 $deadline = (Get-Date).AddSeconds($TimeoutS)
 while ($true) {

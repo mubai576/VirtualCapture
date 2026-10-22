@@ -5,10 +5,11 @@ Base: `http://<ctrl-ip>:18080`. 全部 JSON. `start` 幂等（先停旧会话）
 
 | 方法 | 路径 | 入参 | 出参 |
 |---|---|---|---|
-| GET | `/health` | — | `{ok, version, role, running, updater}` |
+| GET | `/health` | — | `{ok, version, role, running, updater, pid, staged}` |
 | GET | `/version` | — | `{version[, git_sha]}` |
 | GET | `/adapters` | — | `{text, names[], exe}`（调 exe --list-adapters，不拉起进程） |
-| POST | `/update` | 二进制 zip 或 `{rollback:true}` | `{updated, version}`（原子替换+重启） |
+| POST | `/update` | 二进制 zip → `{staged, version}`（只 stage，不重启）；`{rollback:true}` → 经 activate 回滚 prev |
+| POST | `/activate` | `{version}` 或 `{rollback:true}` | `{activated, version, rollback, restart}`（`restart=execv`，原地接管，无 detached 进程） |
 | POST | `/sender/start` | `{mode, pattern, fps, frames, ethertype, mtu, pacing_us, adapter*, dst_mac, ...}`（*adapter 必填，缺省 400 + adapters 列表，不拉起进程） | `{session_id, args}` |
 | POST | `/sender/stop` | — | `{session_id, stopped}` |
 | GET | `/sender/stats` | — | `{session_id, running, sent_frames, sent_packets, pps, bps, fps_actual, send_errors, pattern, gpu_ms, cpu_pct}` |
@@ -33,18 +34,18 @@ Impl: `agent/vc-agent.py` single-file zero-dep (same code both PCs; --role is la
 - Every call appended to `run/exec.log` (ts/client/argv/exit/duration; outputs stay inline-only).
 - Server is threaded (`ThreadingHTTPServer`), so a running /exec does not block /health|stats.
 
-## /update channel (real since 0.3.0; was stub before)
+## /update + /activate channel (P3，自 0.4.0；detached-helper 已删除）
 
-- `POST /update` with raw zip bytes (`Content-Type: application/zip`, max 100MB)
-  or JSON `{rollback:true}`.
-- Zip allowlist: top-level `vc-agent.exe|vc-agent.py|vc-sender.exe|vc-receiver.exe|version.json`
-  plus `scripts/*.ps1`; `version.json` required; zip-slip (`..`/absolute) rejected 400.
-- Flow: validate -> extract to staging mirror of the live tree -> snapshot current files
-  to `prev/mirror` -> spawn detached PowerShell helper -> respond `{updated, version}` -> agent exits.
-  Helper waits for agent PID, `robocopy` mirror over live dirs, restarts agent with identical
-  argv, deletes itself. `run/updates.log` records every apply/rollback. Helper passes exe argv as array, polls /health, auto-rolls-back on failure. /health.updater reports ps-ok/ps-missing; update.ps1 and run_remote --update refuse non-ps-ok targets (use install-pc2.ps1 there). Same-version re-apply keeps the older prev backup.
-- Rollback replays `prev/mirror` the same way; empty backup -> 409.
-- Only entries applicable to the running layout are applied (frozen exe vs script);
-  nothing under `run/` is ever replaced. Poll `/version` to confirm (agent is briefly down).
+- `POST /update` 只做 stage：raw zip bytes（`Content-Type: application/zip`，max 100MB）
+  校验 → 解压到 `staging/mirror-<ver>` → 全树快照当前文件到 `prev/mirror` → 应答 `{staged:true, version}`，不重启、不碰 live 文件。
+- `POST /activate {version}`（缺省用已 stage 版本）或 `{rollback:true}`（用 prev）：拷贝适用条目到 live 位 →
+  应答 `{activated, version, rollback, restart}`（`restart=execv`）→ 原地 `os.execv` 接管（同 argv；冻结模式切 `version.json` exe 指针到版本化 exe 并 GC 旧版）。
+- 交接期 `health/version` 短暂不可达，轮询确认；`run/updates.log` 记录每次 stage/apply/rollback。
+- Zip allowlist：顶层 `vc-agent.exe|vc-agent.py|vc-sender.exe|vc-receiver.exe|version.json` 加 `scripts/*.ps1`；`version.json` 必带；zip-slip（`..`/absolute）400。
+- stage 包不含自更新条目时（只换 sender/receiver exe）直接 live 应用并返回 `{updated, version, restart:none}`（先停 sender/receiver 会话）。
+- 回滚用 `prev/mirror` 走同一 activate 路径；空备份 → 409；stage 版本不符 → 409；staged agent.py 编译失败 → 500。
+- 调用方：`scripts/update.ps1` 与 `ctrl/run_remote.py --update/--rollback` 做 stage→activate→poll `/version`；
+  `health.updater` 非 ps-ok 拒绝（该处走 install-pc2.ps1）。同版本重复 stage 保留更旧的 prev 备份。
+- Windows 下 CPython execv 表现为子进程接管 + 父进程退出（非同 PID）；以 version 翻转 + 单监听 + updates.log 链为准，不以 PID 不变论。
 
 

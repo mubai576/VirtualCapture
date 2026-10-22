@@ -5,7 +5,8 @@ Single file, zero third-party deps, dual-PC same code (--role sender|receiver).
   record pid; idempotent (kill old first); return session_id.
 - /stop: graceful 2s then kill, keep files for reconcile.
 - /stats: return stats file verbatim + running/uptime; missing → {running:false}.
-- /update: zip atomic replace (staging→rename) + restart self, return new version; {rollback:true}.
+- /update: validate zip, extract to staging mirror, snapshot full-tree prev, no restart; returns staged version.
+- /activate: apply staged (or rollback prev) then in-process execv; no detached processes.
 - /version from version.json else "dev".
 Acceptance: with T-01/T-02 --selftest exes the start/stop/stats file flow still works.
 """
@@ -334,7 +335,7 @@ def run_exec(argv, timeout_s, client):
     return 200, res
 
 
-UPDATE_LOCK = threading.Lock()
+UPDATE_LOCK = threading.RLock()
 UPDATE_MAX_ZIP = 100 * 1024 * 1024
 UPDATE_MAX_FILES = 1000
 UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "version.json"}
@@ -381,7 +382,7 @@ def _update_slots():
     if getattr(sys, "frozen", False):
         m["vc-agent.exe"] = os.path.abspath(sys.executable)
     else:
-        try: m["vc-agent.py"] = os.path.abspath(__file__)
+        try: m["vc-agent.py"] = _agent_script_path()
         except Exception: pass
     m["vc-sender.exe"] = os.path.join(BUILD_DIR, "vc-sender.exe")
     m["vc-receiver.exe"] = os.path.join(BUILD_DIR, "vc-receiver.exe")
@@ -423,63 +424,199 @@ def _live_for_rel(rel, slots):
         return os.path.join(ROOT, rel.replace("/", os.sep))
     return None
 
-def _spawn_helper_and_exit(mirror, newver, action):
-    safe = "".join(c if (c.isalnum() or c in ".-_") else "_" for c in newver) or "update"
-    helper = os.path.join(ROOT, "update_helper-%s.ps1" % safe)
-    if getattr(sys, "frozen", False):
-        exe_path = os.path.abspath(sys.executable)
-        exe_args = sys.argv[1:]
-    else:
-        exe_path = sys.executable
-        exe_args = [os.path.abspath(__file__)] + sys.argv[1:]
-    logf = os.path.join(RUN_DIR, "helper.log")
-    prev = os.path.join(ROOT, "prev", "mirror")
-    L = []
-    L.append("param($PidWait, $Mirror, $RootP, $ExePath, $LogF, $PrevM, $HealthUrl)")
-    L.append("$ErrorActionPreference = 'Stop'")
-    L.append("function Wlog($m) { Add-Content -Path $LogF -Value ((Get-Date -Format o) + ' ' + $m) -Encoding utf8 }")
-    L.append("Wlog \"helper-start wait $PidWait\"")
-    L.append("$t=0; while ($t -lt 120) { $p = Get-Process -Id $PidWait -ErrorAction SilentlyContinue; if (-not $p) { break }; Start-Sleep 1; $t++ }")
-    L.append("Wlog \"copying\"")
-    L.append("robocopy $Mirror $RootP /E /NFL /NDL /NJH /NJS")
-    L.append("Wlog \"starting\"")
-    L.append("Wlog (\"exe=\" + $ExePath + \" argc=\" + $args.Count)" )
-    L.append("$proc = Start-Process -FilePath $ExePath -ArgumentList $args -WindowStyle Hidden -PassThru")
-    L.append("$ok = $false; for ($i=0; $i -lt 30 -and -not $ok; $i++) { Start-Sleep 2; try { $h = Invoke-RestMethod -Uri $HealthUrl -TimeoutSec 5; if ($h.ok) { $ok = $true } } catch { } }")
-    L.append("if ($ok) { Wlog \"healthy\" } else {")
-    L.append("  Wlog \"UNHEALTHY: rolling back\"; Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue")
-    L.append("  if (Test-Path $PrevM) { robocopy $PrevM $RootP /E /NFL /NDL /NJH /NJS; Wlog \"rolled-back\" }")
-    L.append("  else { Wlog \"no-prev: leaving down, manual recovery needed\" }")
-    L.append("  $proc2 = Start-Process -FilePath $ExePath -ArgumentList $args -WindowStyle Hidden -PassThru")
-    L.append("  Wlog \"restarted-after-rollback pid=$($proc2.Id)\"")
-    L.append("}")
-    L.append("Wlog \"done\"")
-    L.append("Remove-Item $PSCommandPath -Force -ErrorAction SilentlyContinue")
-    ps1 = "\r\n".join(L) + "\r\n"
-    with open(helper, "w", encoding="utf-8", newline="") as f:
-        f.write(ps1)
-    health = "http://127.0.0.1:%d/health" % (state.get("port") or 18080)
-    hargs = [str(os.getpid()), mirror, ROOT, exe_path, logf, prev, health] + [str(x) for x in exe_args]
-    flags = 0
-    if os.name == "nt":
-        flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) | getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    import shutil as _sh2
-    _ps = _sh2.which("powershell.exe") or _sh2.which("powershell") or _sh2.which("pwsh") or _sh2.which("pwsh.exe") or "powershell.exe"
-    subprocess.Popen([_ps, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", helper] + hargs,
-                     cwd=ROOT, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
-                     creationflags=flags, close_fds=True)
+
+STAGED = {"version": None, "dir": None}
+
+def _agent_script_path():
     try:
-        with open(os.path.join(RUN_DIR, "updates.log"), "a", encoding="utf-8") as f:
-            f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "action": action, "version": newver, "from": read_version()}) + "\n")
+        _c = os.path.join(ROOT, "agent", "vc-agent.py")
+        if os.path.isfile(_c):
+            return _c
     except Exception:
         pass
-    threading.Timer(1.0, lambda: os._exit(0)).start()
+    try:
+        return os.path.abspath(__file__)
+    except Exception:
+        return ""
 
+def _all_managed_files():
+    _out = []
+    try:
+        for _rel, _live in _update_slots().items():
+            if not _live:
+                continue
+            try:
+                _rp = os.path.realpath(_live)
+            except Exception:
+                continue
+            if not _under_root(_rp):
+                continue
+            _out.append((_rel, _live))
+    except Exception:
+        pass
+    try:
+        _sp = os.path.join(ROOT, "scripts")
+        if os.path.isdir(_sp):
+            for _fn in sorted(os.listdir(_sp)):
+                if _fn.lower().endswith(".ps1"):
+                    _fp = os.path.join(_sp, _fn)
+                    if os.path.isfile(_fp):
+                        _out.append((os.path.join("scripts", _fn), _fp))
+    except Exception:
+        pass
+    return _out
+
+def _full_prev_snapshot():
+    import shutil as _sh
+    _prev = os.path.join(ROOT, "prev", "mirror")
+    if os.path.isdir(_prev):
+        _sh.rmtree(_prev, ignore_errors=True)
+    for _rel, _live in _all_managed_files():
+        if os.path.isfile(_live):
+            _dest = os.path.join(_prev, _rel)
+            _dd = os.path.dirname(_dest)
+            if _dd:
+                os.makedirs(_dd, exist_ok=True)
+            _sh.copy2(_live, _dest)
+    return _prev
+
+def _versioned_exe_name(ver):
+    _safe = "".join(c if c.isalnum() else "_" for c in ver) or "update"
+    return "vc-agent-%s.exe" % _safe
+
+def _gc_versioned_layout():
+    try:
+        _me = os.path.realpath(sys.executable) if getattr(sys, "frozen", False) else ""
+        _keep = set()
+        if _me:
+            _keep.add(_me)
+        try:
+            _vd = json.load(open(os.path.join(ROOT, "version.json"), encoding="utf-8"))
+            _px = (_vd.get("exe", "") or "")
+            if _px:
+                _keep.add(os.path.realpath(os.path.join(ROOT, _px)))
+        except Exception:
+            pass
+        import glob as _gg
+        for _ff in _gg.glob(os.path.join(ROOT, "vc-agent-*.exe")):
+            try:
+                if os.path.realpath(_ff) not in _keep and os.path.isfile(_ff):
+                    os.remove(_ff)
+            except Exception:
+                pass
+        _st = os.path.join(ROOT, "staging")
+        if os.path.isdir(_st):
+            for _e in os.listdir(_st):
+                try:
+                    _p = os.path.join(_st, _e)
+                    if os.path.isdir(_p):
+                        import shutil as _sh2
+                        _sh2.rmtree(_p, ignore_errors=True)
+                    else:
+                        os.remove(_p)
+                except Exception:
+                    pass
+        for _e in os.listdir(ROOT):
+            try:
+                if _e.startswith("update_helper-") and _e.endswith(".ps1"):
+                    os.remove(os.path.join(ROOT, _e))
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+def _apply_staged_to_live(stag, newver):
+    import shutil as _sh
+    _slots = _update_slots()
+    _applied = []
+    for _dp, _dn, _fn in os.walk(stag):
+        for _f in sorted(_fn):
+            _src = os.path.join(_dp, _f)
+            _rel = os.path.relpath(_src, stag).replace(chr(92), "/")
+            if _rel == "vc-agent.exe" and getattr(sys, "frozen", False):
+                _live = os.path.join(ROOT, _versioned_exe_name(newver))
+            else:
+                _live = _live_for_rel(_rel, _slots)
+            if not _live:
+                continue
+            try:
+                if not _under_root(os.path.realpath(_live)):
+                    continue
+            except Exception:
+                continue
+            _dd = os.path.dirname(_live)
+            if _dd:
+                os.makedirs(_dd, exist_ok=True)
+            _sh.copy2(_src, _live)
+            _applied.append(_rel)
+    return _applied
+
+def _do_activate(ver_or_none, is_rollback):
+    with UPDATE_LOCK:
+        if is_rollback:
+            _prev = os.path.join(ROOT, "prev", "mirror")
+            if not os.path.isdir(_prev) or not os.listdir(_prev):
+                return 409, {"error": "no backup"}
+            _target = _prev
+            try:
+                _pvf = os.path.join(_prev, "version.json")
+                _want = json.loads(open(_pvf, encoding="utf-8").read()).get("version", None) if os.path.isfile(_pvf) else None
+            except Exception:
+                _want = None
+        else:
+            if not STAGED.get("version") or not STAGED.get("dir"):
+                return 409, {"error": "nothing staged"}
+            if ver_or_none and ver_or_none != STAGED["version"]:
+                return 409, {"error": "staged version mismatch"}
+            _target = STAGED["dir"]
+            if not os.path.isdir(_target):
+                STAGED["version"] = None; STAGED["dir"] = None
+                return 409, {"error": "staged files gone"}
+            _want = STAGED["version"]
+        _sp = os.path.join(_target, "vc-agent.py")
+        if os.path.isfile(_sp) and not getattr(sys, "frozen", False):
+            try:
+                import py_compile as _pc
+                _pc.compile(_sp, doraise=True)
+            except Exception:
+                return 500, {"error": "staged vc-agent.py does not compile"}
+        kill_slot(state["sender"])
+        kill_slot(state["receiver"])
+        _vn = _want if isinstance(_want, str) and _want else "rollback"
+        _applied = _apply_staged_to_live(_target, _vn)
+        if not _applied:
+            return 500, {"error": "nothing applied"}
+        if getattr(sys, "frozen", False) and isinstance(_want, str) and _want:
+            try:
+                _vf = os.path.join(ROOT, "version.json")
+                _vd = json.loads(open(_vf, encoding="utf-8").read())
+                _vd["exe"] = _versioned_exe_name(_want)
+                open(_vf, "w", encoding="utf-8").write(json.dumps(_vd, indent=1))
+            except Exception:
+                pass
+        try:
+            with open(os.path.join(RUN_DIR, "updates.log"), "a", encoding="utf-8") as _f:
+                _f.write(str((int(time.time()), is_rollback, _want)) + chr(10))
+        except Exception:
+            pass
+        STAGED["version"] = None; STAGED["dir"] = None
+        return 200, {"activated": True, "version": _want, "rollback": is_rollback, "restart": "execv"}
+def _execv_self(new_exe=None):
+    if getattr(sys, "frozen", False):
+        _exe = new_exe or os.path.abspath(sys.executable)
+        os.execv(_exe, [_exe] + sys.argv[1:])
+    else:
+        _py = getattr(sys, "_base_executable", None) or sys.executable
+        _script = _agent_script_path()
+        os.execv(_py, [_py, _script] + sys.argv[1:])
+def handle_activate(body_args):
+    _v = body_args.get("version") if isinstance(body_args, dict) else None
+    return _do_activate(_v if isinstance(_v, str) else None, False)
+def handle_rollback():
+    return _do_activate(None, True)
 def handle_update_binary(body):
     import shutil as _sh, zipfile as _zf
     os.makedirs(RUN_DIR, exist_ok=True)
-    if updater_status() != "ps-ok":
-        return 409, {"error": "updater unavailable: " + updater_status()}
     tmp = os.path.join(RUN_DIR, "update-incoming.zip")
     with open(tmp, "wb") as f:
         f.write(body)
@@ -504,11 +641,11 @@ def handle_update_binary(body):
             live = _live_for_rel(rel, slots)
             if not live or not _under_root(live):
                 continue
-            pairs.append((os.path.relpath(live, ROOT), live, n))
+            pairs.append((rel, live, n))
         if not pairs:
             return 400, {"error": "no applicable files for this layout"}
         pass
-        self_up = [relp for relp, live, n in pairs if relp == "vc-agent.exe" or os.path.basename(relp) == "vc-agent.py"]
+        self_up = [r for r, live, n in pairs if r in ("vc-agent.exe", "vc-agent.py")]
         if not self_up:
             for _sk in ("sender", "receiver"):
                 _pr = state[_sk].get("proc")
@@ -521,13 +658,7 @@ def handle_update_binary(body):
         prev = os.path.join(ROOT, "prev", "mirror")
         # same-version re-apply keeps the older backup (the true rollback target)
         if newver != read_version():
-            if os.path.isdir(prev):
-                _sh.rmtree(prev, ignore_errors=True)
-            for relp, live, n in pairs:
-                if os.path.isfile(live):
-                    dest = os.path.join(prev, relp)
-                    os.makedirs(os.path.dirname(dest) or prev, exist_ok=True)
-                    _sh.copy2(live, dest)
+            _full_prev_snapshot()
         for relp, live, n in pairs:
             dest = os.path.join(stag, relp)
             os.makedirs(os.path.dirname(dest) or stag, exist_ok=True)
@@ -537,9 +668,9 @@ def handle_update_binary(body):
         os.remove(tmp)
     except Exception:
         pass
-    kill_slot(state["sender"])
-    kill_slot(state["receiver"])
     if not self_up:
+        kill_slot(state["sender"])
+        kill_slot(state["receiver"])
         for _rp, _lv, _nn in pairs:
             _dd = os.path.dirname(_lv)
             if _dd:
@@ -555,25 +686,40 @@ def handle_update_binary(body):
                 f.write(json.dumps({"ts": time.strftime("%Y-%m-%dT%H:%M:%S"), "action": "update-live", "version": newver, "from": read_version()}) + "\n")
         except Exception:
             pass
-        return 200, {"updated": True, "version": newver, "restart": "none", "note": "files applied live, agent untouched"}
-    _spawn_helper_and_exit(stag, newver, "update")
-    return 200, {"updated": True, "version": newver, "restart": "self", "note": "agent exiting, helper applies mirror and restarts"}
-
-def handle_rollback():
-    import shutil as _sh
-    prev = os.path.join(ROOT, "prev", "mirror")
-    if not os.path.isdir(prev) or not os.listdir(prev):
-        return 409, {"error": "no backup"}
-    ver = read_version()
+        return 200, {"updated": True, "version": newver, "restart": "none"}
+    STAGED["version"] = newver
+    STAGED["dir"] = stag
     try:
-        pv = os.path.join(prev, "version.json")
-        if os.path.isfile(pv):
-            ver = json.loads(open(pv, encoding="utf-8").read()).get("version", ver)
+        with open(os.path.join(RUN_DIR, "updates.log"), "a", encoding="utf-8") as f:
+            f.write(str(int(time.time())) + " staged " + str(newver) + chr(10))
     except Exception:
         pass
-    _spawn_helper_and_exit(prev, ver if isinstance(ver, str) else "rollback", "rollback")
-    return 200, {"updated": True, "version": ver, "rollback": True, "restart": "self"}
+    return 200, {"staged": True, "version": newver}
 
+
+
+def _respond_activate(handler, code, res):
+    handler._j(res, code)
+    if code != 200 or not isinstance(res, dict) or res.get("restart") != "execv":
+        return
+    try:
+        handler.wfile.flush()
+    except Exception:
+        pass
+    try:
+        _nx = None
+        if getattr(sys, "frozen", False):
+            _rv = res.get("version")
+            _rv = _rv if isinstance(_rv, str) and _rv else "rollback"
+            _nx = os.path.join(ROOT, _versioned_exe_name(_rv))
+        _execv_self(_nx)
+    except Exception as _ex:
+        try:
+            _ef = open(os.path.join(RUN_DIR, "updates.log"), "a", encoding="utf-8")
+            _ef.write("execv failed ")
+            _ef.close()
+        except Exception:
+            pass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -584,7 +730,7 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             anyrun = any((state[k].get("proc") is not None and state[k]["proc"].poll() is None) for k in ("sender", "receiver"))
-            self._j({"ok": True, "version": read_version(), "role": state["role"], "running": anyrun, "updater": updater_status()})
+            self._j({"ok": True, "version": read_version(), "role": state["role"], "running": anyrun, "updater": updater_status(), "pid": os.getpid(), "staged": STAGED.get("version")})
         elif self.path == "/version":
             self._j({"version": read_version()})
         elif self.path == "/adapters":
@@ -670,11 +816,13 @@ class H(BaseHTTPRequestHandler):
                                      self.client_address[0] if self.client_address else "?")
                 self._j(res, code)
         elif self.path == "/update":
-            ctype = (self.headers.get("Content-Type", "") or "").lower()
+            ctype = (self.headers.get('Content-Type', '') or '').lower()
             if isinstance(args, dict) and args.get("rollback"):
-                with UPDATE_LOCK:
-                    code, res = handle_rollback()
-                self._j(res, code)
+                code, res = _do_activate(None, True)
+                _respond_activate(self, code, res)
+
+
+
             elif body[:2] == b"PK" or "zip" in ctype or "octet-stream" in ctype:
                 if len(body) > UPDATE_MAX_ZIP:
                     self._j({"error": "zip too large"}, 413)
@@ -685,6 +833,16 @@ class H(BaseHTTPRequestHandler):
             else:
                 self._j({"updated": False, "version": read_version(),
                          "note": "POST zip bytes (Content-Type: application/zip) or {rollback:true}"}, 400)
+        elif self.path == "/activate":
+            _ab = args if isinstance(args, dict) else {}
+            if _ab.get("rollback"):
+                with UPDATE_LOCK:
+                    code, res = _do_activate(None, True)
+            else:
+                _av = _ab.get("version")
+                with UPDATE_LOCK:
+                    code, res = _do_activate(_av if isinstance(_av, str) else None, False)
+            _respond_activate(self, code, res)
         else:
             self._j({"err": "unknown"}, 404)
     def log_message(self, *a): pass
@@ -698,7 +856,14 @@ if __name__ == "__main__":
     state["port"] = a.port
     print("[agent] role=%s port=%d version=%s root=%s" % (a.role, a.port, read_version(), ROOT), flush=True)
     ThreadingHTTPServer.daemon_threads = True
+    _gc_versioned_layout()
     ThreadingHTTPServer.allow_reuse_address = True
     ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
+
+
+
+
+
+
 
 

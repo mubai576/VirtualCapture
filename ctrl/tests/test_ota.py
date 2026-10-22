@@ -1,0 +1,167 @@
+"""test_ota.py - OTA stage plus activate verification (P3 proposal A)."""
+"""Stage validates without restarting; activate re-execs in place; no detached processes."""
+import json
+import os
+import shutil as _tsh
+import socket
+import subprocess
+import sys
+import tempfile as _ttf
+import time
+import urllib.request
+import urllib.error as _ue
+import zipfile as _tzf
+
+ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+def _free_port():
+    s = socket.socket(); s.bind(("127.0.0.1", 0)); p = s.getsockname()[1]; s.close(); return p
+
+def _wait_health(base, timeout=15):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        try:
+            with urllib.request.urlopen(base + "/health", timeout=3) as r:
+                json.loads(r.read().decode()); return True
+        except Exception:
+            time.sleep(0.5)
+    return False
+
+def _wait_version(base, want, tries=12):
+    for _ in range(tries):
+        time.sleep(2)
+        try:
+            with urllib.request.urlopen(base + "/version", timeout=5) as r:
+                if json.loads(r.read().decode()).get("version", "") == want:
+                    return True
+        except Exception:
+            pass
+    return False
+
+def _post_start(base, path, body):
+    import urllib.error as _e
+    data = json.dumps(body).encode()
+    req = urllib.request.Request(base + path, data=data,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            return r.status, json.loads(r.read().decode())
+    except _e.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode())
+        except Exception:
+            return e.code, {}
+
+def _ota_post_zip(base, path):
+    with open(path, "rb") as f:
+        data = f.read()
+    req = urllib.request.Request(base + "/update", data=data,
+                                    headers={"Content-Type": "application/zip"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            return r.status, json.loads(r.read().decode() or "{}")
+    except _ue.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read().decode() or "{}")
+        except Exception:
+            return e.code, {}
+
+def _ota_health(base):
+    with urllib.request.urlopen(base + "/health", timeout=10) as r:
+        return json.loads(r.read().decode())
+
+def _ota_activate(base, body):
+    code, res = _post_start(base, "/activate", body)
+    assert code == 200, (code, res)
+    assert res.get("restart") == "execv", res
+    return res
+
+def _assert_handover(proc, base, pid0, want):
+    hp = _ota_health(base)
+    assert hp.get("version") == want, hp
+    assert proc.poll() is not None or hp.get("pid") == pid0
+    return hp
+
+
+def _ota_cleanup(proc, troot, extra=()):
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    for _pid in [proc.pid] + [int(x) for x in (extra or [])]:
+        try:
+            import subprocess as _sp3
+            _sp3.run(["taskkill", "/PID", str(_pid), "/F"], capture_output=True, timeout=15)
+        except Exception:
+            pass
+    _tsh.rmtree(troot, ignore_errors=True)
+
+
+def _ota_mkpkg(path, ver, tag):
+    src = os.path.join(ROOT, "agent", "vc-agent.py")
+    with open(src, encoding="utf-8") as f:
+        content = f.read()
+    with _tzf.ZipFile(path, "w", _tzf.ZIP_DEFLATED) as zf:
+        zf.writestr("version.json", json.dumps({"version": ver}))
+        zf.writestr("vc-agent.py", content)
+        zf.writestr("scripts/ok.ps1", tag)
+
+def _ota_spawn(troot, startver):
+    with open(os.path.join(troot, "version.json"), "w", encoding="utf-8") as f:
+        f.write(json.dumps({"version": startver}))
+    os.makedirs(os.path.join(troot, "agent"), exist_ok=True)
+    _tsh.copy2(os.path.join(ROOT, "agent", "vc-agent.py"), os.path.join(troot, "agent", "vc-agent.py"))
+    port = _free_port()
+    agent = os.path.join(ROOT, "agent", "vc-agent.py")
+    proc = subprocess.Popen([sys.executable, agent, "--role", "sender", "--port", str(port), "--root", troot], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    base = "http://127.0.0.1:%d" % port
+    assert _wait_health(base, timeout=15), "agent up"
+    return proc, base, port
+
+def test_update_roundtrip_and_rollback():
+    import pytest as _pt
+    if os.name != "nt":
+        _pt.skip("execv flow is Windows-first")
+    troot = _ttf.mkdtemp(prefix="vc-upd-")
+    proc, base, port = _ota_spawn(troot, "0.2.0")
+    pid0 = proc.pid; seen = {pid0}; cur = pid0
+    try:
+        hp0 = _ota_health(base)
+        assert hp0.get("pid") == proc.pid, (hp0, proc.pid)
+        ver = "0.2.0"
+        for i in range(10):
+            nxt = "9.9.%d" % i
+            zp = os.path.join(troot, "up.zip")
+            _ota_mkpkg(zp, nxt, "r%d" % i)
+            code, res = _ota_post_zip(base, zp)
+            assert code == 200 and res.get("staged") is True and res.get("version") == nxt, (code, res)
+            assert _ota_health(base).get("version") == ver, "stage must not apply"
+            assert _ota_health(base).get("pid") == cur, "stage must not respawn"
+            if i == 0:
+                assert proc.poll() is None, "agent died during stage"
+            pv = os.path.join(troot, "prev", "mirror", "version.json")
+            assert json.loads(open(pv, encoding="utf-8").read()).get("version") == ver, "prev must mirror pre-stage version"
+            t_gap0 = time.time()
+            _ota_activate(base, {"version": nxt})
+            assert _wait_version(base, nxt, tries=45), "activate did not take effect"
+            gap = time.time() - t_gap0
+            assert gap < 180, gap
+            hp = _assert_handover(proc, base, cur, nxt)
+            seen.add(hp.get("pid")); cur = hp.get("pid")
+            assert os.path.isfile(os.path.join(troot, "scripts", "ok.ps1")), "staged files applied"
+            ver = nxt
+        code, res = _post_start(base, "/activate", {"rollback": True})
+        assert code == 200, (code, res)
+        assert _wait_version(base, "9.9.8", tries=45), "rollback did not take effect"
+        hp = _assert_handover(proc, base, pid0, "9.9.8")
+        seen.add(hp.get("pid"))
+        assert os.path.isfile(os.path.join(troot, "run", "updates.log")), "audit trail missing"
+    finally:
+        _ota_cleanup(proc, troot, seen)
