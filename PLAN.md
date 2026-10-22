@@ -15,7 +15,7 @@
 | 调用链止血（原 T-07） | ❌ DONE:`--adapter` 仍可空、无 `/adapters`、全错发送 exit 0、无 live 测试 |
 | 构建/版本管理（原 T-08） | ❌ DONE:无 git、无 docs/build.md、CMake 不回退 thirdparty、`run/` 594 文件 |
 | OTA | 🟡 P3 本地全绿（e01af52：test_ota 10× + run_remote 端到端）；待 PC2 实推；detached helper 已删 |
-| 版本 | 本地 0.3.8 PC2 0.3.7待装；`release/vc-0.3.7.zip` 内 sender 为 send_errors 修复前旧版 |
+| 版本 | 本地 0.3.8 PC2 0.3.8（2026-10-22 晚手工装机 + 同版本热更新实证，冻结版 + exe 指针）；release/vc-0.3.8.zip 已同步最新代码 |
 | 产品链路 | ⬜ 未开始：2K240 实时采集裁 640@240、端到端延迟 <4.16ms、PC2 虚拟采集卡、推理端联调 |
 
 环境：MSVC 19.44（cmake VS 生成器直连，cl 不在 PATH）、python 3.14、Npcap 运行时、
@@ -130,6 +130,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 P2-1 代码：receiver hashlog 加 qpc_ns（D3）；dda selftest 无屏 SKIP（D4）；--batch 默认 69（D5）；
      ctrl 判分按 D1 实现并单测锁定新数字；version.json=0.3.8；按 docs/build.md 打 release/vc-0.3.8.zip。
 P2-2 安装：install-pc2.ps1 手工通道装 PC2（禁止 POST /update），双端 /version 一致。
+进展（2026-10-22 晚）：PC2 已手工装上 0.3.8（冻结版，18080）；同版本热更新实证通过（PID 已换代），双端 /version 一致，P2-2 实质完成；待 P2-3 联调。
 P2-3 联调（scripts/run_T1.ps1 / ctrl/bringup.py，单播 --dst-mac）：T0 → T1 五档 → T2 10min soak；
      每次结束立即 /files 拉回 receiver hashlog 做全量 reconcile（hist S35 教训）。
      用 receiver qpc_ns 定位 ~1s 卡顿（gap_any.py 两端同法），给出 PC2 侧根因假设。
