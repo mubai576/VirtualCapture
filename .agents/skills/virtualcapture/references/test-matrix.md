@@ -36,4 +36,3 @@ Rest unchanged: dropped==0 and hash_mismatch==0 and complete==sent, senderCPU be
 - broadcast dst hangs the sender (~350s, zero errors, alive): suspect switch storm suppression. Default to unicast --dst-mac <peer-MAC> until direct-cable retest. --dst-mac takes colon format.
 - mtu1500 on real NIC is slow-not-lossy (sender 69fps syscall-bound, pps 28k). The 101k-lossy counterexample needs a faster sender first.
 - dda mode (--mode dda): pattern 255 skips pixel verify, hash still reconciled; idle screen reuses last frame; 240Hz redlines do not apply, needs own gates.
-
