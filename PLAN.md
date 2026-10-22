@@ -150,6 +150,7 @@ P2-3 联调（scripts/run_T1.ps1 / ctrl/bringup.py，单播 --dst-mac）：T0 �
 禁止：保留任何依赖"父进程退出后存活"的路径。
 进展（本地，e01af52）：test_update_roundtrip_and_rollback 10×全绿；run_remote --update/--rollback 对临时 agent 端到端 exit 0；待 PC2 实推 0.4.0→回滚→再推。
 进展（冻结模式，本地验证）：dist/vc-agent.exe 冷启动 0.3.8 → stage/activate 到 9.9.98-frozen（版本化 exe + 指针切换，单监听）→ rollback 回 0.3.8；run_remote --update/--rollback 均 exit 0。
+进展（PC2，2026-10-22）：0.3.8 已上线；同版本 stage→activate 实证通过（PID 10316→2528，单监听，updates.log 有链）；注意 prev 快照停在 0.3.5（手工安装不快照），首次回滚将回到 0.3.5 而非 0.3.7，下一次异版本 OTA 后自动纠正；0.4.0 实推待发版。
 ```
 
 ### P4 产品链路（新立项，按 需求文档.md；P4-1 可与 P3 并行）
