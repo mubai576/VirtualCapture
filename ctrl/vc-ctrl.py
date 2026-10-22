@@ -22,8 +22,8 @@ def post(base, path, args=None, timeout=10):
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
-def verdict_t1(sstats, rstats):
-    """T1 linked verdict per test-matrix.md. Returns (pass:bool, reasons:list). Stub data must FAIL, not crash."""
+def verdict_t1(sstats, rstats, steady=None, sender_cadence=None):
+    """T1 verdict D1 drops mismatch complete p99 steady-avg sender-cadence."""
     reasons = []
     try:
         sent = sstats.get("sent_frames", sstats.get("sent", 0)) or 0
@@ -39,10 +39,15 @@ def verdict_t1(sstats, rstats):
             try:
                 if float(p99) >= 8.3: reasons.append("inter_arrival_p99 %.3f >= 8.3ms (2 frames)" % float(p99))
             except Exception: pass
-        avg = rstats.get("inter_arrival_avg_ms", None)
-        if avg is not None:
+        savg = (steady or {}).get("r_avg", None)
+        if savg is not None:
             try:
-                if abs(float(avg) - 4.166) > 0.3: reasons.append("inter_arrival_avg %.3f outside 4.166+-0.3" % float(avg))
+                if abs(float(savg) - 4.166) > 0.3: reasons.append("steady_avg NG");
+            except Exception: pass
+        cad = (sender_cadence or {}).get("cadence_ms", None)
+        if cad is not None:
+            try:
+                if abs(float(cad) - 4.166) > 0.3: reasons.append("sender_cadence NG");
             except Exception: pass
         # no frames at all -> fail (stub case)
         if (sent or 0) == 0 and (comp or 0) == 0:
@@ -157,7 +162,7 @@ def run_case(sender, receiver, seconds=10, pattern="motion", fps=240, mtu=9000, 
         steady_rep = {"s_sent": (steady_s or {}).get("sent_frames"), "s_up": (steady_s or {}).get("uptime_s"), "r_comp": steady_r.get("complete"), "r_avg": steady_r.get("inter_arrival_avg_ms"), "r_p99": steady_r.get("inter_arrival_p99_ms"), "r_up": steady_r.get("uptime_s")}
     else:
         steady_rep = None
-    ok, reasons = verdict_t1(last_s, last_r)
+    ok, reasons = verdict_t1(last_s, last_r, steady_rep, sender_cad)
     if not version_ok:
         ok = False; reasons = ["version-skew"] + reasons
     ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")

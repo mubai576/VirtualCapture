@@ -468,9 +468,19 @@ def test_sender_cadence_ms(tmp_path):
     assert vc_ctrl.sender_cadence_ms(str(tmp_path / "nope.jsonl")) == {"frames": 0, "cadence_ms": None}
     e = tmp_path / "empty.jsonl"; e.write_text("", encoding="utf-8")
     assert vc_ctrl.sender_cadence_ms(str(e))["cadence_ms"] is None
-def test_verdict_gates_frozen_dualnic_numbers():
-    ok, reasons = verdict_t1({"sent_frames": 14400}, {"complete": 14400, "dropped": 0, "hash_mismatch": 0, "inter_arrival_avg_ms": 13.5, "inter_arrival_p99_ms": 5.9})
-    assert ok is False and any("avg" in str(x) for x in reasons)
+def test_verdict_d1_final_avg_ignored():
+    ok, _ = verdict_t1({"sent_frames": 14400}, {"complete": 14400, "dropped": 0, "hash_mismatch": 0, "inter_arrival_avg_ms": 13.5})
+    assert ok is True
+def test_verdict_d1_steady_and_cadence():
+    base_tx = {"sent_frames": 480}
+    base_rx = {"complete": 480, "dropped": 0, "hash_mismatch": 0, "inter_arrival_p99_ms": 5.3}
+    ok, _ = verdict_t1(base_tx, base_rx, {"r_avg": 4.17}, {"cadence_ms": 4.166})
+    assert ok is True
+    ok, rs = verdict_t1(base_tx, base_rx, {"r_avg": 5.0}, {"cadence_ms": 4.166})
+    assert ok is False and any("steady_avg" in r for r in rs)
+    ok, rs = verdict_t1(base_tx, base_rx, {"r_avg": 4.17}, {"cadence_ms": 5.0})
+    assert ok is False and any("sender_cadence" in r for r in rs)
+    assert verdict_t1(base_tx, base_rx, {"r_avg": 4.17}, {"cadence_ms": None})[0] is True
 def test_stub_report_has_steady_keys():
     # P1-1: missing adapter gives 400 without report; steady keys covered by live runs when VC_ADAPTER set.
     rep = _run_stub_case(seconds=2)

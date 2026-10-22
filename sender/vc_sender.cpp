@@ -183,7 +183,7 @@ struct Args {
   std::string adapter="";
   std::string mode="pattern";
   std::string pattern="motion";
-  int fps=240; long long frames=0; long long batch=1;
+  int fps=240; long long frames=0; long long batch=69;
   uint16_t ethertype=0x88B5; int mtu=9000; long long pacing_us=0;
   uint8_t dstmac[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   std::string session="manual", stats="", hashlog="", file="";
@@ -213,7 +213,7 @@ static const char* pat_name(int id){
 
 static void usage(){
   printf("vc-sender.exe --adapter <substr> --mode pattern|file|dda --pattern motion --fps 240\n"
-    "  --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 1 --dst-mac ff:ff:ff:ff:ff:ff\n"
+    "  --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff\n"
     "  --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest]\n");
 }
 

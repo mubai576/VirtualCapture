@@ -11,8 +11,10 @@
 | T4 pacing对照 | `pacing 0/50/200us` | 选 `dropped` vs CPU 最优为默认 |
 | T5 dda摸底 | 无边框 2K→640，240Hz×30s | 只看 `gpu_ms/pps/CPU`，不判 hash |
 
-初版红线（跑 3 轮后收紧入库）：
-`dropped==0(T1), hash_mismatch==0, inter_arrival_avg 4.166±0.3ms, senderCPU<25%, receiverCPU<30%`。
+D1 gates approved 2026-10-22, replacing the avg gate above:
+Rhythm is sender cadence from local sender hashlog qpc span, 4.166+-0.3ms, no cross-clock involved.
+Jitter keeps receiver p99 below 8.3ms. Receiver avg is judged on the steady window only, the final ring contains drain tail.
+Rest unchanged: dropped==0 and hash_mismatch==0 and complete==sent, senderCPU below 25 percent, receiverCPU below 30 percent.
 
 ## 失败分诊
 
@@ -24,13 +26,14 @@
 
 ## 跨机对时/日志
 
-- 日志行：`session_id + frame_id + qpc_ns + event`，JSONL 落盘，ctrl 按 session 拉回合集。
+- Log lines D3: sender and receiver rows both carry qpc_ns; reconcile compares frame_id and hash only. Adjacent-frame gap over 1s flags checker-transient D7, auto by gap_any.py.
 - 控制面 NTP 对时（ms 级够用）；数据面不跑对时协议。
 - 失败自动 `POST /pcap/start` 留证 + `/receiver/report` 打包。
 
 ## Dual-NIC notes 2026-10-21 (thresholds frozen; these are advisories, see docs/plan-history.md S12-S14)
-- verdict avg uses the terminal 120-sample ring: end-drain dominates it. Judge steady state instead: report steady_state (pre-stop sample) and sender_cadence (hashlog qpc span). Gates unchanged.
+- verdict avg uses the terminal 120-sample ring and end-drain dominates it. Steady state and sender_cadence are reported. Gates updated by D1 above.
 - sender ceiling on real NIC is ~200fps (pcap_sendpacket backpressure; loopback does 240). T2 pps baseline ~14000, not 16560. Recalibration is T-10 work, not a quiet edit. Update 2026-10-22: sendqueue batching (--batch 23/69) reaches the 240fps target (docs/plan-history.md S23); ~200fps was the single-packet ceiling.
 - broadcast dst hangs the sender (~350s, zero errors, alive): suspect switch storm suppression. Default to unicast --dst-mac <peer-MAC> until direct-cable retest. --dst-mac takes colon format.
 - mtu1500 on real NIC is slow-not-lossy (sender 69fps syscall-bound, pps 28k). The 101k-lossy counterexample needs a faster sender first.
 - dda mode (--mode dda): pattern 255 skips pixel verify, hash still reconciled; idle screen reuses last frame; 240Hz redlines do not apply, needs own gates.
+

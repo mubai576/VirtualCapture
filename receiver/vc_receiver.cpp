@@ -440,7 +440,7 @@ int main(int argc,char**argv){
             if(done){
               // find fid: last completed is max? use completed_hashes back
               auto bk=R.completed_hashes.back();
-              hashlog << "{\"frame_id\":" << bk.first << ",\"hash\":\"" << bk.second << "\"}\n";
+              hashlog << "{\"frame_id\":" << bk.first << ",\"hash\":\"" << bk.second << "\",\"qpc_ns\":" << now << "}\n";
               if(++hashlog_flushed%8==0) hashlog.flush();
             }
           }

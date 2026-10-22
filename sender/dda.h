@@ -13,7 +13,7 @@
 #include <dxgi1_2.h>
 #endif
 struct DDACap {
-  enum Err { OK=0, E_NODDA=1, E_FULLSCREEN=2, E_FORMAT=3, E_SMALL=4, E_LOST=5, E_TIMEOUT=6, E_INTERNAL=7 };
+  enum Err { OK=0, E_NODDA=1, E_FULLSCREEN=2, E_FORMAT=3, E_SMALL=4, E_LOST=5, E_TIMEOUT=6, E_INTERNAL=7, E_NOOUTPUT=8 };
   Err err_code = E_NODDA;
   std::string err_msg = "uninitialized";
   int out_w = 0, out_h = 0;
@@ -48,7 +48,7 @@ bool DDACap::init(std::string& detail){
   hr = dxgi_dev->GetAdapter(&adapter); dxgi_dev->Release();
   if(FAILED(hr)||!adapter){ shutdown(); err_msg = "no DXGI adapter"; return false; }
   hr = adapter->EnumOutputs(0, &output); adapter->Release();
-  if(FAILED(hr)||!output){ shutdown(); err_msg = "no outputs (headless?)"; return false; }
+  if(FAILED(hr)||!output){ shutdown(); err_code = E_NOOUTPUT; err_msg = "no outputs headless"; return false; }
   DXGI_OUTPUT_DESC od; output->GetDesc(&od); out_w = (int)od.DesktopCoordinates.right - (int)od.DesktopCoordinates.left;
   out_h = (int)od.DesktopCoordinates.bottom - (int)od.DesktopCoordinates.top;
   hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1); output->Release();
@@ -133,7 +133,7 @@ int dda_selftest(){
 #ifdef _WIN32
   DDACap c; std::string detail;
   if(!c.init(detail)){
-    if(c.err_code == DDACap::E_NODDA || c.err_code == DDACap::E_FULLSCREEN){ printf("DDA: SKIP (%s)\n", c.err()); return 2; }
+    if(c.err_code == DDACap::E_NOOUTPUT || c.err_code == DDACap::E_FULLSCREEN){ printf("DDA SKIP ok"); puts(c.err()); return 2; }
     printf("DDA: FAIL (%s)\n", c.err()); return 1;
   }
   std::vector<uint8_t> Y(VC_Y_BYTES), UV(VC_UV_BYTES);

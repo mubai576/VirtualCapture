@@ -34,7 +34,7 @@ PC2=192.168.2.59（agent 手动跑在 PC2 的 Documents\VirtualCapture，exe 在
 ### 1.3 CLI（动词级冻结；dda/batch 为已落地的追加，本次正式纳入）
 ```text
 vc-sender.exe --adapter <子串> --mode pattern|file|dda --pattern motion --fps 240
-  --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 1 --dst-mac ff:ff:ff:ff:ff:ff
+  --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff
   --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest]
 vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
   --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--selftest]
@@ -43,7 +43,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 ### 1.4 文件型 IPC
 - stats ~500ms 原子覆写（tmp→rename）；hashlog 每帧 append 一行。
 - `sender.hash.jsonl`：`{"frame_id":N,"hash":"<16hex>","qpc_ns":T}`
-- `receiver.hash.jsonl`：`{"frame_id":N,"hash":"<16hex>"}`（D3 批准后追加 `qpc_ns`，对账只读 frame_id/hash）
+- receiver hashlog D3 carries qpc_ns; reconcile compares frame_id and hash only.
 - 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 614400B。
 
 ### 1.5 全局禁止
