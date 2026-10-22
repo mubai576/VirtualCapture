@@ -149,6 +149,7 @@ P2-3 联调（scripts/run_T1.ps1 / ctrl/bringup.py，单播 --dst-mac）：T0 �
 验收：test_update_roundtrip_and_rollback 连跑 10 次全绿；PC2 实推 0.4.0→回滚→再推各一次成功。
 禁止：保留任何依赖"父进程退出后存活"的路径。
 进展（本地，e01af52）：test_update_roundtrip_and_rollback 10×全绿；run_remote --update/--rollback 对临时 agent 端到端 exit 0；待 PC2 实推 0.4.0→回滚→再推。
+进展（冻结模式，本地验证）：dist/vc-agent.exe 冷启动 0.3.8 → stage/activate 到 9.9.98-frozen（版本化 exe + 指针切换，单监听）→ rollback 回 0.3.8；run_remote --update/--rollback 均 exit 0。
 ```
 
 ### P4 产品链路（新立项，按 需求文档.md；P4-1 可与 P3 并行）
