@@ -344,3 +344,22 @@ def test_run_remote_cli_update_and_rollback():
         seen.add(_ota_health(base).get('pid'))
     finally:
         _ota_cleanup(proc, base, troot, seen)
+
+def test_stage_rejects_unmappable_self_update():
+    import pytest as _pt
+    if os.name != 'nt':
+        _pt.skip('execv flow is Windows-first')
+    troot = _ttf.mkdtemp(prefix='vc-400-')
+    proc, base, port = _ota_spawn(troot, '0.2.0')
+    seen = {proc.pid}
+    try:
+        zp = os.path.join(troot, 'up.zip')
+        with _tzf.ZipFile(zp, 'w', _tzf.ZIP_DEFLATED) as zf:
+            zf.writestr('version.json', json.dumps({'version': '9.9.99-bad'}))
+            zf.writestr('vc-agent.exe', 'not-a-real-exe')
+        code, res = _ota_post_zip(base, zp)
+        assert code == 400, (code, res)
+        assert _ota_health(base).get('version') == '0.2.0'
+        assert proc.poll() is None, 'agent must survive rejected stage'
+    finally:
+        _ota_cleanup(proc, base, troot, seen)
