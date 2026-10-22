@@ -95,22 +95,9 @@ T5 dda摸底   ：无边框2K桌面裁缩640，240Hz×30s，只看 gpu_ms/pps/CP
 * 控制机与双端用NTP对时（192.168.2.x内已有路由即可，ms级够用）；数据面不跑任何对时协议。
 * 失败自动 `pcap/start` 留证 + `report` 打包（stats+日志+版本+网卡MTU/驱动截图文本）。
 
-## 7. 目录结构（建议现在就按此建）
+## 7. 目录结构
 
-```
-VirtualCapture/
-  需求文档.md
-  自动化测试方案.md        ← 本文件
-  proto/                  ← 包头定义（c/h共用，一个真相源）
-    vc_wire.h             // magic, ethertype, frame_hdr_t, crc
-  sender/                 ← vc-sender (C++)
-  receiver/               ← vc-receiver (C++)
-  agent/                  ← vc-agent.py（双机同代码，--role sender|receiver）
-  ctrl/                   ← vc-ctrl.py + tests/test_matrix.py + report模板
-  ctrl/                   ← vc-ctrl.py + tests/test_matrix.py + tests/test_ota.py（OTA stage/activate 10×往返+回滚） + report模板
-    update.ps1            ← 推版本到双机
-    run_T1.ps1            ← 一键T1示例
-```
+> 2026-10-23：原建议树已落地并演进，现行目录以根目录 `AGENTS.md` 的 Repo map 为准（单一真相源，不在此重复）。
 
 ## 8. TODO（不进MVP，但先占位）
 

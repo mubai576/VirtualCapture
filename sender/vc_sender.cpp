@@ -1,8 +1,8 @@
-// vc_sender.cpp — T-01 sender C++ (PLAN §2). C++17, Npcap wpcap (dynamic load), pattern.h chain.
+// vc_sender.cpp — T-01 sender C++ (PLAN §1). C++17, Npcap wpcap (dynamic load), pattern.h chain.
 // Chain: pattern.h NV12 (default motion) -> FNV-1a64 whole-frame -> payload=mtu-42 split
 //   -> raw eth (dst=--dst-mac, type=--ethertype) -> pcap_sendpacket, QPC fps throttle,
-//   per-packet --pacing-us, stats/hashlog per PLAN §2.3 (atomic tmp+rename, append hashlog).
-// CLI frozen per PLAN §2.2. --selftest runs with no NIC. --list-adapters lists Npcap devs.
+//   per-packet --pacing-us, stats/hashlog per PLAN §1.4 (atomic tmp+rename, append hashlog).
+// CLI frozen per PLAN §1.3. --selftest runs with no NIC. --list-adapters lists Npcap devs.
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>

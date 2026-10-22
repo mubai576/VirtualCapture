@@ -3,10 +3,10 @@
 > 对应 skill：`.agents/skills/virtualcapture/SKILL.md`（给 AI 调用/编排用）。
 > 本文档给人看：从裸机到 `vc-ctrl` 一键测试跑通的完整步骤。
 > SUPERSEDED-NOTE 2026-10-22: pre-implementation plan, kept as archaeology. Current truth lives in the skill:
-> - Topology is shared-NIC now (PLAN S11); S2 dual-NIC/no-IP-data-NIC is void.
+> - Topology is shared-NIC now (docs/history/plan-history.md S11); S2 dual-NIC/no-IP-data-NIC is void.
 > - PC2 single copy lives in Documents (Q4); C:\vc paths are void.
 > - Install via scripts/install-pc2.ps1; peer IPs per skill (PC2=192.168.2.59).
-> - Updates go through the restart-free channel (PLAN S21).
+> - Updates: 0.4.0 stage/activate + execv (`ctrl/run_remote.py --update/--rollback`, see skill references/agent-api.md); first install / pre-0.3.8 agents use the manual channel (docs/runbooks/pc2-cutover.md).
 
 
 ## 1. 前提
@@ -105,5 +105,5 @@ python ctrl\vc-ctrl.py --sender http://192.168.2.100:18080 --receiver http://192
 * [ ] 真双机联调：T0→T1 五档→T2 10min soak（需 PC2=192.168.2.59 在线，直连线到位后补广播 vs 单播 T2 各一次）。
 * [ ] 直连线到位后的最终拓扑确认（当前为同网口方案 192.168.2.x，见 SKILL 拓扑节）。
 
-> 注：本文档中 `C:\vc` 路径为历史写法，PC2 现行为 Documents 手动部署（hist S33，见 docs/plan-history.md S33）：
+> 注：本文档中 `C:\vc` 路径为历史写法，PC2 现行为 Documents 手动部署（hist S33，见 docs/history/plan-history.md S33）：
 > PC1 本地 `D:\Project\REA\VirtualCapture`，PC2 手动跑在 `Documents\VirtualCapture`（exe 在根目录），控制面 http://192.168.2.59:18080。

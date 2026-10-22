@@ -1,5 +1,5 @@
 #pragma once
-// fnv1a.h — FNV-1a 64-bit, PLAN §2.3 frozen.
+// fnv1a.h — FNV-1a 64-bit, PLAN §1.4 frozen.
 // init 14695981039346656037 (0xcbf29ce484222325), prime 1099511628211 (0x100000001b3)
 // per byte: h ^= b; h *= prime. Output lowercase 16 hex, zero-padded.
 #include <stdint.h>

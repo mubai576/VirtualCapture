@@ -15,6 +15,8 @@ cmake --build build --config Release
 NPCAP_SDK 未设时自动回退 不依赖环境变量
 
 ## 自测
+一键：`python scripts/verify.py`（build + 双 selftest + pattern_ref + pytest；`--no-build` 跳过编译，`--live Loopback` 加跑回环 live）。
+产物在 build/Release/（VS 生成器）；release 打包取该目录的 exe。
 build/vc-sender.exe --selftest PASS
 build/vc-receiver.exe --selftest PASS
 P1-1 验收 exit 2 列卡已验证
@@ -25,7 +27,7 @@ python -m PyInstaller --onefile --name vc-agent agent/vc-agent.py
 
 ## release zip
 含 vc-agent.exe vc-sender.exe vc-receiver.exe version.json scripts ps1
-用 Compress-Archive 打 release/vc-0.3.8.zip
+用 Compress-Archive 打 release/vc-<ver>.zip（当前 0.4.0）
 
 ## run 治理策略
 保留所有 report json

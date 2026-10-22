@@ -13,26 +13,25 @@ All paths below are relative to **project root** unless stated otherwise.
 
 PC1 keeps `2K240` normal use; only `640x640@240 NV12` (614400 B/frame, ~1.18 Gbps)
 is sent over a 2.5G direct cable via **raw L2 custom EtherType `0x88B5`** (Npcap,
-NIC keeps its control IP) to PC2 for reassembly. Scope MVP: **streaming validation only**.
-Out of scope (deferred): exclusive-fullscreen hook, virtual capture card on PC2.
+NIC keeps its control IP) to PC2 for reassembly, hash-verified bit-exact, no codec.
+Transport is dual-host validated (T-06 closed 2026-10-22). Current phase P4: capture perf,
+end-to-end latency, PC2 virtual capture card (DShow). Exclusive-fullscreen hook stays out of scope.
 
-Canonical docs: `需求文档.md` (goals/link budget), `自动化测试方案.md` (test system),
-`部署方案.md` (bare-metal to green-T1 steps). Read those before changing design.
+Repo map, commands, rules and multi-AI conventions: **root `AGENTS.md`** (single source; not repeated here).
+Progress and open decisions: `PLAN.md`. Specs: `docs/spec/` (requirements / test-plan / deployment,
+early docs with dated SUPERSEDED notes). This skill holds the domain knowledge + frozen contracts.
 
-## Repo map
+## Contract files
 
 | Path | Truth for |
 |---|---|
 | `proto/vc_wire.h` | **Wire header — frozen.** `vc_pkt_hdr_t` 28 B. `reserved` is now `pattern`. Do not resize without bumping protocol + updating both ends + this skill. |
-| `sender/pattern.h` | Test-source suite (5 patterns, integer-only, seed=`frame_id`). C++/GPU-HLSL/Python bit-exact by construction (no float/sin). |
-| `sender/`, `receiver/` | C++ sender/receiver (`--batch N` sendqueue batching, see `references/wire-protocol.md`; T-01/T-02 done: `--selftest` PASS, file-IPC stats/hashlog per PLAN §1.4). |
-| `agent/vc-agent.py` | Control agent (both PCs, `--role sender\|receiver --port 18080`). T-03 done: launches exe per PLAN §1.3, file-IPC stats/hashlog in `run/`, zero deps. |
-| `ctrl/vc-ctrl.py` | Orchestrator: arm receiver → start sender → poll stats → stop. |
-| `ctrl/pattern_ref.py` | Python mirror of `pattern.h` + self-check (`python ctrl/pattern_ref.py` must PASS). |
-| `ctrl/tests/` | Matrix tests T0–T5 as pytest (`test_matrix.py`, T3 opt-in `--run-t3`; see `references/test-matrix.md`). |
-| `scripts/` | `update.ps1`, `run_T1.ps1`, `check_mtu.ps1` (T-05 done; run with pwsh). |
+| `sender/pattern.h` | Test-source suite (5 patterns, integer-only, seed=`frame_id`). C++/Python bit-exact by construction (no float/sin). Mirror: `ctrl/pattern_ref.py`. |
+| `references/wire-protocol.md` | L2 layout, MTU/pacing math, `--batch` sendqueue semantics. |
+| `references/agent-api.md` | Agent REST contract (/adapters, /files paging, /update stage + /activate). |
+| `references/test-matrix.md` | T0–T5 definitions, D1 gates, triage. |
 
-## Topology (shared-NIC since 2026-10-21: data + control on the same 2.5G port; see docs/plan-history.md S11)
+## Topology (shared-NIC since 2026-10-21: data + control on the same 2.5G port; see docs/history/plan-history.md S11)
 
 - **Data plane**: PC1-PC2 direct 2.5G cable, MTU 9000, EtherType 0x88B5 raw frames via Npcap.
   Raw EtherType and TCP coexist on one NIC, so the NIC keeps its control IP (no IP stripping).
@@ -55,7 +54,7 @@ loss-replay debugging only. Online: 4K-sample spot check; offline: full hash rec
 ## Quickstart for an AI session
 
 ```powershell
-# 0. Sanity: pattern self-check (no hardware needed)
+# 0. Sanity (no hardware): full local gate = python scripts/verify.py ; quick check below
 python ctrl/pattern_ref.py            # expect PASS
 # 0.1 查卡（--adapter 必填，先 GET /adapters 再跑；adapter 空跑必被 agent/ctrl 拒绝）
 # curl http://127.0.0.1:18080/adapters  # -> {text, names[]}，选含 2.5G/Controller 子串
@@ -79,7 +78,7 @@ Full matrix + thresholds: `references/test-matrix.md`.
 3. Never validate with static frames alone; `motion` is the minimum bar for perf claims.
 4. Cross-host QPC timestamps are not comparable; report inter-arrival jitter, not absolute latency.
 5. Version skew fails the run: ctrl must compare `/version` on both agents before T1.
-6. Keep skill + `部署方案.md` in sync with code: if you change topology/API/matrix,
+6. Keep this skill + `AGENTS.md` + PLAN §1 in sync with code: if you change topology/API/matrix,
    update the corresponding `references/` file in the same change.
 
 ## References

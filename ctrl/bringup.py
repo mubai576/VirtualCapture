@@ -1,5 +1,5 @@
 """bringup.py - T-06 dual-host bringup runner: T0 -> T1(x5 patterns) -> T2 soak -> T4 pacing -> T3.
-Writes docs/bringup-<date>.md with verdict tables + auto-triage per references/test-matrix.md.
+Writes docs/bringup/bringup-<date>.md with verdict tables + auto-triage per references/test-matrix.md.
 Usage:
   python ctrl/bringup.py --sender http://192.168.2.100:18080 --receiver http://192.168.2.59:18080 --adapter I226
   python ctrl/bringup.py --sender ... --receiver ... --adapter X --quick        # smoke: T0 + short T1-motion
@@ -165,7 +165,7 @@ def main():
         rows.append(stats_row(rep))
         print("== %s: %s ==" % (name, rep["verdict"]), flush=True)
     date = datetime.datetime.now().strftime("%Y%m%d")
-    out = a.out or os.path.join(ROOT, "docs", "bringup-%s.md" % date)
+    out = a.out or os.path.join(ROOT, "docs", "bringup", "bringup-%s.md" % date)
     os.makedirs(os.path.dirname(out), exist_ok=True)
     render(out, {"date": date, "sender": a.sender, "receiver": a.receiver, "adapter": a.adapter,
                  "sv": (sv or {}).get("version"), "rv": (rv or {}).get("version"), "version_ok": vok}, rows)

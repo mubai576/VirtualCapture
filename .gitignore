@@ -14,4 +14,4 @@ prev/
 *.zip
 *.log
 thirdparty/ninja-win.zip
-
+.tmp-ota-test/

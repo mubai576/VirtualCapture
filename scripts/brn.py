@@ -1,4 +1,8 @@
+"""brn.py - quick dual-host batch probe: arm PC2 receiver via agent, run local sender exe directly.
+Usage: python scripts/brn.py <batch> <frames> <tag>   (writes run/<tag>.* ; PC2 IP/MAC hardcoded below)
+"""
 import json, time, urllib.request, subprocess, os, sys
+os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root: exe/run paths are relative
 R = "http://192.168.2.59:18080"
 print("brn-init")
 def post(base, path, args):
@@ -8,7 +12,7 @@ def post(base, path, args):
 def get(base, path):
     return json.loads(urllib.request.urlopen(base+path, timeout=15).read().decode())
 print("brn-funcs")
-if len(sys.argv) < 4: print("usage: python brn.py <batch> <frames> <tag>"); sys.exit(2)
+if len(sys.argv) < 4: print("usage: python scripts/brn.py <batch> <frames> <tag>"); sys.exit(2)
 batch = sys.argv[1]
 frames = sys.argv[2]
 tag = sys.argv[3]

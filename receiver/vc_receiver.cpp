@@ -1,4 +1,4 @@
-// vc_receiver.cpp — T-02 receiver C++ (PLAN §2). C++17, Npcap wpcap (dynamic load).
+// vc_receiver.cpp — T-02 receiver C++ (PLAN §1). C++17, Npcap wpcap (dynamic load).
 // Chain: pcap_open (snaplen>=9014, promisc, buffer>=128MB) -> ethertype+magic filter
 //   -> per-frame_id reassembly (retain recent 8, incomplete marked dropped on newer completion)
 //   -> whole-frame FNV-1a64 -> hashlog/stats per §2.3.

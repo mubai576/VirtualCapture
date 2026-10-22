@@ -30,7 +30,7 @@ EtherType：`0x88B5`（实验段，无标准冲突，头内另有 magic 双保�
 69 个 9K 包背靠背是 ~620 KB 微突发，直连网卡 Buffer 未必全吃。
 对照 `pacing_us = 0 / 50 / 200` 包间隔，看 `dropped` vs CPU 的 trade-off 再定默认。
 
-## Batch submit (T-10, docs/plan-history.md S23)
+## Batch submit (T-10, docs/history/plan-history.md S23)
 - sender --batch N: N=1 per-packet sendpacket; N>1 accumulates N packets in a sendqueue, one transmit per N, remainder flushed at frame end. N=69 means one full frame per transmit.
 - Dual-host result (2400 motion frames, mtu9000, 0.3.7): batch1 ~205fps, 3 -> 230fps, 23/69 -> 240fps target cadence. Gains converge after 23 (~1/3 frame).
 - Npcap pcap_sendqueue_transmit returns positive on success (not 0): send_errors must test <0 (fixed 2026-10-21 after a !=0 false-positive run).
