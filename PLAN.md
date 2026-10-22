@@ -1,4 +1,4 @@
-# PLAN：VirtualCapture Phase 3（收口 → 双机放行 → 产品链路）
+﻿# PLAN：VirtualCapture Phase 3（收口 → 双机放行 → 产品链路）
 
 > 重写于 2026-10-22。旧版全文（含 T-01~T-10 原卡、§6~§39 流水账、S 编号证据）原样归档于
 > `docs/plan-history.md`，凡引用 "S11/S23/…" 均指该文件，不要改它。
@@ -136,7 +136,8 @@ P2-3 联调（scripts/run_T1.ps1 / ctrl/bringup.py，单播 --dst-mac）：T0 �
      用 receiver qpc_ns 定位 ~1s 卡顿（gap_any.py 两端同法），给出 PC2 侧根因假设。
      直连线：owner 决定短期不考虑，广播 vs 单播 T2 dropped。
 验收：docs/bringup-<日期>.md；T1 五档 + T2 按新判据全绿；全部 receiver hashlog 本地留档；T-06 关闭。
-交付：docs/bringup-20261022.md；T0 + T1 五档 + T2 144000/144000 全绿（rings 判据 bug 修一次、noise 外部 stop 重跑一次）；hashlog 留档（T2 9MB 已用 /files 分页全量拉回并离线对账零错） |
+交付：docs/bringup-20261022.md；T0 + T1 五档 + T2 144000/144000 全绿（rings 判据 bug 修一次、noise 外部 stop 重跑一次） |
+  T-06 关闭备注（owner 2026-10-22 定稿）：/files 实际限制有两层——>4MB 直接 413；<4MB 只返前 256KB（FILES_MAX_BYTES=262144）。T1×5 + T2 的 PC2 hashlog 离线只覆盖头部约 27%（3929–3988/14400）和 0%，判定依据是 PC2 端运行中的全量校验（mm=0）。P2-3 遗留：receiver qpc_ns ~1s 卡顿定位（截断 hashlog 内 max_gap 7.8–14.1ms、>20ms 为 0，T2 全程待分页补查）；T2 发端 203.5ms 间隔一次（按 D7 >1s 才算 transient，不判 fail，batch69 后首次 >20ms，T2 重跑留意）。16:08 T0/T1（report-T0-20261022-160857、report-T1-20261022-160905）系 owner 本人 VC_ADAPTER=Loopback pytest -k live，报告留 run/、session 已进 archive.d。；hashlog 留档（T2 9MB 已用 /files 分页全量拉回并离线对账零错） |
 ```
 
 ### DONE P3 done（2026-10-22 晚，PC2 推→回滚→再推全绿）
