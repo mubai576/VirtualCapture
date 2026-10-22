@@ -165,7 +165,8 @@ def _live_case(case, seconds=2):
         assert _wait_health("http://127.0.0.1:%d" % pr), "receiver agent up"
         rep = run_case("http://127.0.0.1:%d" % ps, "http://127.0.0.1:%d" % pr,
                        seconds=seconds, pattern="motion", fps=240, mtu=9000, pacing_us=0,
-                       case=case, expect_frames=480, adapter=ad)
+        # loopback uses batch 1; batching wedges Npcap loopback capture
+                       case=case, expect_frames=480, adapter=ad, batch=1)
         return rep
     finally:
         for p in (sproc, rproc):

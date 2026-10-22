@@ -129,6 +129,11 @@ def launch(kind, args):
                "--session", sid, "--stats", stats, "--hashlog", hashlog]
         if args.get("file"): cmd += ["--file", str(args["file"])]
         if args.get("loop"): cmd += ["--loop"]
+        _b = args.get("batch", 69)
+        try: _b = int(_b)
+        except Exception: _b = 69
+        if _b < 1: _b = 69
+        cmd += ["--batch", str(_b)]
     else:
         cmd = [exe,
                "--adapter", str(args.get("adapter", "")),

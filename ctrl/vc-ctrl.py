@@ -86,7 +86,7 @@ def sender_cadence_ms(hashlog_path):
     except Exception:
         return {"frames": 0, "cadence_ms": None}
 
-def run_case(sender, receiver, seconds=10, pattern="motion", fps=240, mtu=9000, pacing_us=0, case="T0", expect_frames=0, adapter="", dst_mac="", mode="pattern"):
+def run_case(sender, receiver, seconds=10, pattern="motion", fps=240, mtu=9000, pacing_us=0, case="T0", expect_frames=0, adapter="", dst_mac="", mode="pattern", batch=0):
     os.makedirs(RUN_DIR, exist_ok=True)
     print("== health ==", flush=True)
     sh = get(sender, "/health"); rh = get(receiver, "/health")
@@ -107,6 +107,7 @@ def run_case(sender, receiver, seconds=10, pattern="motion", fps=240, mtu=9000, 
                "ethertype": "0x88B5", "mtu": mtu, "pacing_us": pacing_us}
     if adapter: tx_args["adapter"] = adapter
     if dst_mac: tx_args["dst_mac"] = dst_mac
+    if batch: tx_args["batch"] = batch
     ss = post(sender, "/sender/start", tx_args)
     print("sessions:", ss, rs, flush=True)
     t0 = time.time()
@@ -174,7 +175,7 @@ def run_case(sender, receiver, seconds=10, pattern="motion", fps=240, mtu=9000, 
               "sender_cadence": sender_cad,
               "stop": {"sender": sstop, "receiver": rstop},
               "verdict": "PASS" if ok else "FAIL", "reasons": reasons,
-              "params": {"seconds": seconds, "pattern": pattern, "fps": fps, "mtu": mtu, "pacing_us": pacing_us, "adapter": adapter, "dst_mac": dst_mac}}
+              "params": {"seconds": seconds, "pattern": pattern, "fps": fps, "mtu": mtu, "pacing_us": pacing_us, "adapter": adapter, "dst_mac": dst_mac, "batch": batch}}
     rp = os.path.join(RUN_DIR, "report-%s-%s.json" % (case, ts))
     with open(rp, "w", encoding="utf-8") as f: json.dump(report, f, indent=1)
     print(("PASS" if ok else "FAIL") + ": " + "; ".join(reasons) + " | report=" + rp, flush=True)
@@ -191,12 +192,13 @@ if __name__ == "__main__":
     ap.add_argument("--adapter", default="")
     ap.add_argument("--dst-mac", default="")
     ap.add_argument("--mode", default="pattern")
+    ap.add_argument("--batch", type=int, default=0)
     a = ap.parse_args()
     # P1-1: --adapter 必填（缺省 exit 2，提示先 GET /adapters，不产生报告）
     if not str(a.adapter or "").strip():
         print("missing --adapter; GET /adapters first (e.g. curl http://127.0.0.1:18080/adapters), then pass --adapter <substr>", flush=True)
         print("no report generated (adapter required per PLAN P1-1)", flush=True)
         sys.exit(2)
-    r = run_case(a.sender, a.receiver, a.seconds, a.pattern, a.fps, a.mtu, a.pacing_us, a.case, a.expect_frames, a.adapter, a.dst_mac, a.mode)
+    r = run_case(a.sender, a.receiver, a.seconds, a.pattern, a.fps, a.mtu, a.pacing_us, a.case, a.expect_frames, a.adapter, a.dst_mac, a.mode, a.batch)
     sys.exit(0 if r["verdict"] == "PASS" else 1)
 
