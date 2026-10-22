@@ -15,7 +15,8 @@ PC1 keeps `2K240` normal use; only `640x640@240 NV12` (614400 B/frame, ~1.18 Gbp
 is sent over a 2.5G direct cable via **raw L2 custom EtherType `0x88B5`** (Npcap,
 NIC keeps its control IP) to PC2 for reassembly, hash-verified bit-exact, no codec.
 Transport is dual-host validated (T-06 closed 2026-10-22). Current phase P4: capture perf,
-end-to-end latency, PC2 virtual capture card (DShow). Exclusive-fullscreen hook stays out of scope.
+capture->reassembly latency, PC2 virtual capture card output (DShow). Scope = capture + transport only;
+inference side and exclusive-fullscreen hook are out of scope (PLAN D8).
 
 Repo map, commands, rules and multi-AI conventions: **root `AGENTS.md`** (single source; not repeated here).
 Progress and open decisions: `PLAN.md`. Specs: `docs/spec/` (requirements / test-plan / deployment,

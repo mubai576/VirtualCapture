@@ -16,7 +16,7 @@
 | OTA | ✅ 0.4.0 stage/activate + execv，PC2 推→回滚→再推全绿；/files 分页 |
 | 版本 | PC2 0.4.0（运行中）；本机 version.json 0.4.0，但主 agent 进程仍为旧会话启动（pid 28796，未换代，见 §2 D9） |
 | dda 采集 | 🟡 最小实现 ~10fps；无屏 SKIP |
-| 产品链路 | 🟡 P4-1/2/3 提案已出、owner 已批方向（docs/proposals/），未开工写码；P4-4 未开始 |
+| 产品链路 | 🟡 P4-1/2/3 提案已出、方向已批（docs/proposals/），未开工写码。范围：只管采集与传输，推理不在本项目（D8） |
 
 环境：MSVC 19.44（cmake VS 生成器直连，cl 不在 PATH）、python 3.14、Npcap 运行时、
 `thirdparty/npcap-sdk` + `thirdparty/ninja` 已 vendor。拓扑：同网口方案，PC1=192.168.2.100，
@@ -65,12 +65,12 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 | D5 | `--batch` 默认值 | ✅批：改 69 | P2-1 |
 | D6 | 0.3.7 re-stage | ✅批：作废，并入 0.3.8 | P2-1 |
 | D7 | checker-transient | ✅保留并自动判：发端 hashlog 相邻帧间隔 >1s 由 gap_any.py 判（曾现 1713 帧停住 8.5s，删等于丢证据） | P2-3 |
-| D8 | P4-2 门限口径 | ⏳待批：R(N)=PC2 首包→重组完成，只覆盖重组段，不能证明需求的"采集→推理 Read<4.16ms"。建议门限判全程分段：PC1 段（采集完成→末包发出，PC1 QPC）+ R(N)（PC2 QPC）+ 线传段用 L(N) 上界；R(N) 留作诊断 | P4-2 |
+| D8 | 范围与 P4-2 门限口径 | ✅批（2026-10-23）：本项目只管**采集与传输**，推理不在范围内。延迟口径 = PC1 采集完成 → PC2 重组完成，分段同机 QPC 测：PC1 段（采集完成→末包发出）+ R(N)（PC2 首包→重组完成）+ 线传段用 L(N) 上界；门限判全程 p99，候选 <4.16ms（1 帧），数字随实测分布定。R(N) 单独只作诊断 | P4-2 |
 | D9 | 本机主 agent 换代到 0.4.0 | ⏳待执行：agent 改动已由另一会话提交（d15287d），阻塞解除。注意 2026-10-23 00:10 对该进程 stage 成功但 /activate 无应答且未换代（pid 不变），建议直接手动重启本机 agent（本机，可逆），换代后 /health 应出新 pid | — |
 
 ## 3. 任务卡
 
-派发顺序：`P4-1 × P4-3 并行` → `P4-2（需 D8）` → `P4-4（需 P4-3）`。每卡交付附验收命令完整 stdout；改代码必跑 `python scripts/verify.py`。
+派发顺序：`P4-1 × P4-3 并行` → `P4-2` → `P4-4（需 P4-3）`。每卡交付附验收命令完整 stdout；改代码必跑 `python scripts/verify.py`。
 
 ### 已关闭（原文见 docs/history/phase3-closed-cards.md）
 
@@ -97,10 +97,11 @@ P4-1 采集性能（第一步：gpu_ms 改为 D3D11 timestamp query 真 GPU 时�
      目标 240fps 下 gpu_ms<4ms、不丢采集帧；为 T5 定独立门限写入 test-matrix（需 owner 批）。
      无屏/独占全屏仍须显式报错，不许静默黑帧。
 P4-2 端到端延迟测量：确认包（flags bit1 + 零 payload，28B 不动，实现时 owner 终审）；
-     各段只用同机 QPC，门限口径待 D8。
+     口径按 D8：PC1 采集完成→PC2 重组完成，分段同机 QPC，门限判全程 p99。
 P4-3 PC2 虚拟采集卡：已定 DShow（用户态 source filter），实现
      NV12 640x640、AvgTimePerFrame=41666、只留最新 1 帧、不跟墙钟。
-P4-4 推理端联调：枚举到虚拟设备、逐字节无损（与发端 hash 对账）、FIFO 堆积为 0。
-范围外：独占全屏 Hook、分辨率超 2.5G 链路后的编解码方案（另立项，hist S24）。
+P4-4 虚拟卡出口验收（不含推理）：通用 DShow 客户端（如 ffmpeg -f dshow / GraphEdit）枚举到设备并协商 NV12 640x640@240；
+     出口帧与发端逐字节一致（hash 对账）、FIFO 堆积为 0。推理端接入不在本项目范围（D8）。
+范围外：推理端及其联调（D8）、独占全屏 Hook、分辨率超 2.5G 链路后的编解码方案（另立项，hist S24）。
 owner 批示 2026-10-22：P4-1 不回退 CPU（显式报错）已批，门限数字待测量改对 + 实测分布后再定；P4-2 确认包格式可行，门限指标改为 R(N) 重组段（RTT/2 只做上界交叉验证）；P4-3 DShow 优先（对标 OBS 虚拟机，推理端 AverMedia USB 07CA 系），Win11 MF 降为备选。
 ```
