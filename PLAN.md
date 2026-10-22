@@ -73,7 +73,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 
 ---
 
-### P1-1 调用链止血（原 T-07；碰 sender/、agent/、ctrl/）
+### DONE P1-1 done
 
 ```text
 先读 .agents/skills/virtualcapture/SKILL.md、PLAN §1、docs/plan-history.md §7。
@@ -94,7 +94,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 禁止：改包头；live 测试加 sleep 蒙混；放宽判据。
 ```
 
-### P1-2 可重复构建 + git + 仓库治理（原 T-08；碰根目录、CMake、.gitignore、run/）
+### DONE P1-2 done
 
 ```text
 先读 PLAN §0/§1.2。
@@ -112,7 +112,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 禁止：二进制入 git；删 PASS 报告；删 prev/ staging/ 中正被 agent 使用的目录（只在 PC1 本地归档测试残留）。
 ```
 
-### P1-3 文档同步（原 T-09 余项；只碰 *.md 与 .agents/）
+### DONE P1-3 done
 
 ```text
 1. 部署方案.md §9：scripts 标 DONE（含 install-pc2/set_nic/watchdog），TODO 只留真双机/直连线项；
