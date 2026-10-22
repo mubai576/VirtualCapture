@@ -369,8 +369,6 @@ def read_root_file(rel, offset=0, limit=0):
         return 404, {"error": "not found"}
     try:
         size = os.path.getsize(full)
-        if size > 4 * 1024 * 1024:
-            return 413, {"error": "file too large"}
         with open(full, 'rb') as f:
             f.seek(offset)
             want = limit if limit else FILES_MAX_BYTES

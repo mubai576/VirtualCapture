@@ -20,7 +20,7 @@ Base: `http://<ctrl-ip>:18080`. 全部 JSON. `start` 幂等（先停旧会话）
 | POST | `/pcap/start` | `{seconds}` |
 | POST | `/exec` | `{argv:[...], timeout_s}` (allowlist, see below) | `{exec_id, exit_code, stdout, stderr, timed_out, duration_s}` |
 | GET | `/exec/log?lines=N` | - | `{entries:[{ts, client, argv, exit_code, timed_out, duration_s}]}` | 失败留证抓包（限时，避免 9K 包撑爆盘） |
-| GET | `/files?path=<rel>[&offset=N][&limit=M]` | relative path + byte range | {path, size, offset, truncated, next_offset, content} (under ROOT; files >4MB refused; default head 256KB; limit capped 1MB; bad offset/limit 400; follow next_offset until null) |
+| GET | `/files?path=<rel>[&offset=N][&limit=M]` | relative path + byte range | {path, size, offset, truncated, next_offset, content} (under ROOT; every response capped 1MB; default head 256KB; bad offset/limit 400; follow next_offset until null) |
 
 Impl: `agent/vc-agent.py` single-file zero-dep (same code both PCs; --role is label-only). C++ file IPC (atomic stats rewrite + hashlog append); agent starts/stops/passes through. Also: GET /files reads any file under ROOT with optional paging (0.4.0). Adapter rule (P1-1): `--adapter` 必填；agent 缺 adapter 直接 400 并附本机 adapters 列表，不拉起进程；C++ 空 adapter 按 pcap_findalldevs 顺序逐卡试发（首包成功锁定，全败 exit 2）；显式坏 adapter exit 2 并列卡；live 发送 sent_frames>0 但成功包为 0 则 exit 3。
 
