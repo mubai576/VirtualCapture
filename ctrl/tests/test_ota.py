@@ -267,6 +267,21 @@ def test_frozen_roundtrip_and_rollback():
         import glob as _gg
         assert _gg.glob(os.path.join(troot, 'vc-agent-*.exe')), 'no versioned exe'
         assert json.loads(open(os.path.join(troot, 'version.json'), encoding='utf-8').read()).get('exe', '').startswith('vc-agent-'), 'exe pointer missing'
+        zp2 = os.path.join(troot, 'up2.zip')
+        with _tzf.ZipFile(zp2, 'w', _tzf.ZIP_DEFLATED) as _zf2:
+            _zf2.writestr('version.json', json.dumps({'version': '9.9.97-frozen'}))
+            with open(_exe, 'rb') as _ef2:
+                _zf2.writestr('vc-agent.exe', _ef2.read())
+            _zf2.writestr('scripts/ok.ps1', 'Write-Host fz-ok2')
+        code, res = _ota_post_zip(base, zp2)
+        assert code == 200 and res.get('staged') is True, (code, res)
+        _ota_activate(base, {'version': '9.9.97-frozen'})
+        assert _wait_version(base, '9.9.97-frozen', tries=45), 'same-version frozen re-apply stalled'
+        hp2 = _ota_health(base)
+        assert hp2.get('version') == '9.9.97-frozen'
+        seen.add(hp2.get('pid'))
+        assert hp2.get('pid') != hp.get('pid'), 're-apply must hand over to a fresh file'
+        assert len(_gg.glob(os.path.join(troot, 'vc-agent-*.exe'))) >= 2, 'expected versioned plus unique exe'
         code, res = _post_start(base, '/activate', {'rollback': True})
         assert code == 200, (code, res)
         assert _wait_version(base, '0.3.8', tries=45), 'frozen rollback stalled'

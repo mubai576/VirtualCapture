@@ -541,8 +541,14 @@ def _gc_versioned_layout():
 
 def _apply_staged_to_live(stag, newver):
     import shutil as _sh
+    import time as _tt
     _slots = _update_slots()
     _applied = []
+    _exe_live = None
+    try:
+        _me_img = os.path.realpath(sys.executable) if getattr(sys, "frozen", False) else ""
+    except Exception:
+        _me_img = ""
     for _dp, _dn, _fn in os.walk(stag):
         for _f in sorted(_fn):
             _src = os.path.join(_dp, _f)
@@ -558,12 +564,29 @@ def _apply_staged_to_live(stag, newver):
                     continue
             except Exception:
                 continue
+            try:
+                _is_me = bool(_me_img) and os.path.isfile(_live) and os.path.realpath(_live) == _me_img
+            except Exception:
+                _is_me = False
+            if _is_me:
+                _bd, _bn = os.path.dirname(_live), os.path.basename(_live)
+                _stem, _ext = os.path.splitext(_bn)
+                if not _ext:
+                    _ext = ".exe"
+                _cand = os.path.join(_bd, "%s-%d%s" % (_stem, int(_tt.time()), _ext))
+                _k = 0
+                while os.path.isfile(_cand):
+                    _k += 1
+                    _cand = os.path.join(_bd, "%s-%d-%d%s" % (_stem, int(_tt.time()), _k, _ext))
+                _live = _cand
             _dd = os.path.dirname(_live)
             if _dd:
                 os.makedirs(_dd, exist_ok=True)
             _sh.copy2(_src, _live)
             _applied.append(_rel)
-    return _applied
+            if _rel in ("vc-agent.exe", "vc-agent.py"):
+                _exe_live = _live
+    return _applied, _exe_live
 
 def _do_activate(ver_or_none, is_rollback):
     with UPDATE_LOCK:
@@ -597,14 +620,14 @@ def _do_activate(ver_or_none, is_rollback):
         kill_slot(state["sender"])
         kill_slot(state["receiver"])
         _vn = _want if isinstance(_want, str) and _want else "rollback"
-        _applied = _apply_staged_to_live(_target, _vn)
+        _applied, _exe_live = _apply_staged_to_live(_target, _vn)
         if not _applied:
             return 500, {"error": "nothing applied"}
-        if getattr(sys, "frozen", False) and isinstance(_want, str) and _want:
+        if getattr(sys, "frozen", False) and isinstance(_want, str) and _want and _exe_live:
             try:
                 _vf = os.path.join(ROOT, "version.json")
                 _vd = json.loads(open(_vf, encoding="utf-8").read())
-                _vd["exe"] = _versioned_exe_name(_want)
+                _vd["exe"] = os.path.basename(_exe_live)
                 open(_vf, "w", encoding="utf-8").write(json.dumps(_vd, indent=1))
             except Exception:
                 pass
@@ -614,7 +637,7 @@ def _do_activate(ver_or_none, is_rollback):
         except Exception:
             pass
         STAGED["version"] = None; STAGED["dir"] = None
-        return 200, {"activated": True, "version": _want, "rollback": is_rollback, "restart": "execv"}
+        return 200, {"activated": True, "version": _want, "rollback": is_rollback, "restart": "execv", "exe": (os.path.basename(_exe_live) if _exe_live else None)}
 def _execv_self(new_exe=None):
     if getattr(sys, "frozen", False):
         _exe = new_exe or os.path.abspath(sys.executable)
@@ -725,7 +748,18 @@ def _respond_activate(handler, code, res):
     try:
         _nx = None
         if getattr(sys, "frozen", False):
-            _rv = res.get("version")
+            _en = res.get("exe") if isinstance(res, dict) else None
+            if isinstance(_en, str) and _en and "/" not in _en and chr(92) not in _en and _en.lower().endswith(".exe"):
+                _cand = os.path.realpath(os.path.join(ROOT, _en))
+                try:
+                    _rr = os.path.realpath(ROOT)
+                    _ok = _cand == _rr or _cand.startswith(_rr + os.sep)
+                except Exception:
+                    _ok = False
+                if _ok and os.path.isfile(_cand):
+                    _nx = _cand
+        if _nx is None and getattr(sys, "frozen", False):
+            _rv = res.get("version") if isinstance(res, dict) else None
             _rv = _rv if isinstance(_rv, str) and _rv else "rollback"
             _nx = os.path.join(ROOT, _versioned_exe_name(_rv))
         _execv_self(_nx)
@@ -836,7 +870,10 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/update":
             ctype = (self.headers.get('Content-Type', '') or '').lower()
             if isinstance(args, dict) and args.get("rollback"):
-                code, res = _do_activate(None, True)
+                try:
+                    code, res = _do_activate(None, True)
+                except Exception as _e:
+                    code, res = 500, {"error": "activate failed: %s" % _e}
                 _respond_activate(self, code, res)
 
 
@@ -846,7 +883,10 @@ class H(BaseHTTPRequestHandler):
                     self._j({"error": "zip too large"}, 413)
                 else:
                     with UPDATE_LOCK:
-                        code, res = handle_update_binary(body)
+                        try:
+                            code, res = handle_update_binary(body)
+                        except Exception as _e:
+                            code, res = 500, {"error": "stage failed: %s" % _e}
                     self._j(res, code)
             else:
                 self._j({"updated": False, "version": read_version(),
@@ -855,11 +895,17 @@ class H(BaseHTTPRequestHandler):
             _ab = args if isinstance(args, dict) else {}
             if _ab.get("rollback"):
                 with UPDATE_LOCK:
-                    code, res = _do_activate(None, True)
+                    try:
+                        code, res = _do_activate(None, True)
+                    except Exception as _e:
+                        code, res = 500, {"error": "activate failed: %s" % _e}
             else:
                 _av = _ab.get("version")
                 with UPDATE_LOCK:
-                    code, res = _do_activate(_av if isinstance(_av, str) else None, False)
+                    try:
+                        code, res = _do_activate(_av if isinstance(_av, str) else None, False)
+                    except Exception as _e:
+                        code, res = 500, {"error": "activate failed: %s" % _e}
             _respond_activate(self, code, res)
         else:
             self._j({"err": "unknown"}, 404)
