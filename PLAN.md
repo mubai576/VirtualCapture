@@ -9,13 +9,13 @@
 | 维度 | 状态 |
 |---|---|
 | 传输正确性 | ✅ 双机 T0/T1 五档/T2 10min/T3/T4 全部零丢零错；全史 43 份报告 hash_mismatch=0（hist S36） |
-| 240fps | ✅ 仅当 `--batch ≥23`（hist S23）；默认 batch=1 只有 ~205fps |
+| 240fps | ✅ 仅当 `--batch ≥23`（hist S23）；默认 batch=69 |
 | 延迟抖动 | ✅ p99 全史 <8.3ms（最大 6.99）；❌ 冻结的 avg 门限在真网卡上不可用（drain 尾 + PC2 偶发 ~1s 卡顿，hist S32） |
-| dda 采集 | 🟡 最小实现可用，仅 ~10fps；夜间无屏 selftest FAIL（应 SKIP） |
-| 调用链止血（原 T-07） | ❌ 未做：`--adapter` 仍可空、无 `/adapters`、全错发送 exit 0、无 live 测试 |
-| 构建/版本管理（原 T-08） | ❌ 未做：无 git、无 docs/build.md、CMake 不回退 thirdparty、`run/` 594 文件 |
+| dda 采集 | 🟡 最小实现可用，仅 ~10fps；夜间无屏 selftest SKIP（D4） |
+| 调用链止血（原 T-07） | ❌ DONE:`--adapter` 仍可空、无 `/adapters`、全错发送 exit 0、无 live 测试 |
+| 构建/版本管理（原 T-08） | ❌ DONE:无 git、无 docs/build.md、CMake 不回退 thirdparty、`run/` 594 文件 |
 | OTA | ❌ detached helper 在 PC2 被杀已实证（hist S37）；现只走 install-pc2 手工通道 |
-| 版本 | 本地/PC2 均 0.3.7；`release/vc-0.3.7.zip` 内 sender 为 send_errors 修复前旧版 |
+| 版本 | 本地 0.3.8 PC2 0.3.7待装；`release/vc-0.3.7.zip` 内 sender 为 send_errors 修复前旧版 |
 | 产品链路 | ⬜ 未开始：2K240 实时采集裁 640@240、端到端延迟 <4.16ms、PC2 虚拟采集卡、推理端联调 |
 
 环境：MSVC 19.44（cmake VS 生成器直连，cl 不在 PATH）、python 3.14、Npcap 运行时、
