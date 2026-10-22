@@ -14,7 +14,7 @@
 | dda 采集 | 🟡 最小实现可用，仅 ~10fps；夜间无屏 selftest SKIP（D4） |
 | 调用链止血（原 T-07） | ❌ DONE:`--adapter` 仍可空、无 `/adapters`、全错发送 exit 0、无 live 测试 |
 | 构建/版本管理（原 T-08） | ❌ DONE:无 git、无 docs/build.md、CMake 不回退 thirdparty、`run/` 594 文件 |
-| OTA | ❌ detached helper 在 PC2 被杀已实证（hist S37）；现只走 install-pc2 手工通道 |
+| OTA | 🟡 P3 本地全绿（e01af52：test_ota 10× + run_remote 端到端）；待 PC2 实推；detached helper 已删 |
 | 版本 | 本地 0.3.8 PC2 0.3.7待装；`release/vc-0.3.7.zip` 内 sender 为 send_errors 修复前旧版 |
 | 产品链路 | ⬜ 未开始：2K240 实时采集裁 640@240、端到端延迟 <4.16ms、PC2 虚拟采集卡、推理端联调 |
 
@@ -54,17 +54,17 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 ### 1.6 目录
 `build/` `run/` 均 gitignore；任务只碰自己的目录（sender/ receiver/ agent/ ctrl/ scripts/ docs/）。
 
-## 2. 待决事项（owner 一次拍板，解锁后续）
+## 2. 待决事项（owner 2026-10-22 已拍板，批示见表）
 
 | # | 事项 | 建议 | 解锁 |
 |---|---|---|---|
-| D1 | T-06 判据重定 | 节奏门=发端 cadence 4.166±0.3ms；抖动门=收端 p99<8.3ms 保留；收端 avg 只判稳态窗口 | P2-2 |
-| D2 | OTA 0.4.0 | 批准方案 A（stage/activate 分离 + execv + 版本化 exe + GC + 全树 prev），见 hist S19/S31 | P3 |
-| D3 | receiver hashlog 加 qpc_ns | 批准（vc_receiver.cpp 唯一写点，reconcile 兼容，hist S30） | P2-1 |
-| D4 | dda selftest 无屏 SKIP | 批准（exit 0 + 打印 SKIP；pytest 互锁按 SKIP 通过） | P2-1 |
-| D5 | `--batch` 默认值 | 改 69（实测 240.0fps，零错） | P2-1 |
-| D6 | 0.3.7 re-stage | 作废，并入 0.3.8 | P2-1 |
-| D7 | "checker-transient" | 定义为"发端 hashlog 相邻帧间隔 >1s"，由 gap_any.py 自动判；否则删除此项 | P2-3 |
+| D1 | T-06 判据重定 | ✅批：节奏门=发端 cadence 4.166±0.3ms（PC1 本地 hashlog，不涉跨机时钟）；抖动门=收端 p99<8.3ms 保留；收端 avg 只判稳态窗口 | P2-2 |
+| D2 | OTA 0.4.0 | ✅方案批（stage/activate 分离 + execv + 版本化 exe + GC + 全树 prev）；代码已随 P3 落地 e01af52，PC2 实推待做 | P3 |
+| D3 | receiver hashlog 加 qpc_ns | ✅批：实际写点 vc_receiver.cpp:443，全文件唯一；reconcile 只比 frame_id+hash | P2-1 |
+| D4 | dda selftest 无屏 SKIP | ✅批：有屏仍须 PASS；初始化失败但非无输出仍判 FAIL | P2-1 |
+| D5 | `--batch` 默认值 | ✅批：改 69 | P2-1 |
+| D6 | 0.3.7 re-stage | ✅批：作废，并入 0.3.8 | P2-1 |
+| D7 | checker-transient | ✅保留并自动判：发端 hashlog 相邻帧间隔 >1s 由 gap_any.py 判（曾现 1713 帧停住 8.5s，删等于丢证据） | P2-3 |
 
 ## 3. 任务卡
 
@@ -148,6 +148,7 @@ P2-3 联调（scripts/run_T1.ps1 / ctrl/bringup.py，单播 --dst-mac）：T0 �
 4. update.ps1 / run_remote --update 改为 stage→activate→轮询 /version。
 验收：test_update_roundtrip_and_rollback 连跑 10 次全绿；PC2 实推 0.4.0→回滚→再推各一次成功。
 禁止：保留任何依赖"父进程退出后存活"的路径。
+进展（本地，e01af52）：test_update_roundtrip_and_rollback 10×全绿；run_remote --update/--rollback 对临时 agent 端到端 exit 0；待 PC2 实推 0.4.0→回滚→再推。
 ```
 
 ### P4 产品链路（新立项，按 需求文档.md；P4-1 可与 P3 并行）
