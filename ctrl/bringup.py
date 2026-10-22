@@ -115,6 +115,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sender", default=""); ap.add_argument("--receiver", default="")
     ap.add_argument("--adapter", default="")
+    ap.add_argument("--dst-mac", default="")
+    ap.add_argument("--batch", type=int, default=0)
     ap.add_argument("--quick", action="store_true"); ap.add_argument("--skip-soak", action="store_true")
     ap.add_argument("--dry-run", action="store_true"); ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--out", default="")
@@ -156,7 +158,7 @@ def main():
         return 0
     rows, sv, rv, vok = [], {}, {}, True
     for name, kw in cases:
-        rep = vc_ctrl.run_case(a.sender, a.receiver, adapter=a.adapter, case=name, **kw)
+        rep = vc_ctrl.run_case(a.sender, a.receiver, adapter=a.adapter, dst_mac=a.dst_mac, batch=a.batch, case=name, **kw)
         sv, rv = rep.get("sender_version", {}), rep.get("receiver_version", {})
         vok = vok and rep.get("version_ok", True)
         rep["reconcile"] = local_reconcile(rep)
