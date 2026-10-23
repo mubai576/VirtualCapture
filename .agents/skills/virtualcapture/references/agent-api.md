@@ -12,7 +12,7 @@ Base: `http://<ctrl-ip>:18080`. 全部 JSON. `start` 幂等（先停旧会话）
 | POST | `/activate` | `{version}` 或 `{rollback:true}` | `{activated, version, rollback, restart}`（`restart=execv`，原地接管，无 detached 进程） |
 | POST | `/sender/start` | `{mode, pattern, fps, frames, ethertype, mtu, pacing_us, adapter*, dst_mac, ...}`（*adapter 必填，缺省 400 + adapters 列表，不拉起进程） | `{session_id, args}` |
 | POST | `/sender/stop` | — | `{session_id, stopped}` |
-| GET | `/sender/stats` | — | `{session_id, running, sent_frames, sent_packets, pps, bps, fps_actual, send_errors, pattern, gpu_ms, cpu_pct}` |
+| GET | `/sender/stats` | — | `{session_id, running, sent_frames, sent_packets, pps, bps, fps_actual, send_errors, pattern, gpu_ms, gpu_dispatch_ms, gpu_dispatch_samples, cpu_pct}`（P4-1：gpu_ms=wall-clock；gpu_dispatch_ms=D3D11 timestamp 真 GPU 拷贝时间，0 样本时为 0） |
 | POST | `/receiver/start` | `{adapter*, ethertype, mtu, expect_frames, timeout_s}`（*adapter 必填，缺省 400 + adapters 列表，不拉起进程） | `{session_id, args}` |
 | POST | `/receiver/stop` | — | `{session_id, stopped}` |
 | GET | `/receiver/stats` | — | `{session_id, running, complete, dropped, packets_recv, packets_lost, pps, bps, gaps, hash_mismatch, inter_arrival_avg_ms, inter_arrival_p99_ms}` |

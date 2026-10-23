@@ -44,6 +44,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 - stats ~500ms 原子覆写（tmp→rename）；hashlog 每帧 append 一行。
 - `sender.hash.jsonl`：`{"frame_id":N,"hash":"<16hex>","qpc_ns":T}`
 - receiver hashlog D3 carries qpc_ns; reconcile compares frame_id and hash only.
+- sender stats 新增 `gpu_dispatch_ms`（D3D11 timestamp 包住 CopyResource 的真 GPU 时间均值）+ `gpu_dispatch_samples`（有效样本数）；`gpu_ms` 仍为 capture() wall-clock，待 P4-1 实测分布后按 D10 决定是否切换口径。
 - 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 614400B。
 
 ### 1.5 全局禁止
@@ -66,6 +67,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 | D6 | 0.3.7 re-stage | ✅批：作废，并入 0.3.8 | P2-1 |
 | D7 | checker-transient | ✅保留并自动判：发端 hashlog 相邻帧间隔 >1s 由 gap_any.py 判（曾现 1713 帧停住 8.5s，删等于丢证据） | P2-3 |
 | D8 | 范围与 P4-2 门限口径 | ✅批（2026-10-23）：本项目只管**采集与传输**，推理不在范围内。延迟口径 = PC1 采集完成 → PC2 重组完成，分段同机 QPC 测：PC1 段（采集完成→末包发出）+ R(N)（PC2 首包→重组完成）+ 线传段用 L(N) 上界；门限判全程 p99，候选 <4.16ms（1 帧），数字随实测分布定。R(N) 单独只作诊断 | P4-2 |
+| D10 | P4-1 测量口径与 idle 语义 | ✅批（2026-10-24）：`gpu_ms` 切真 GPU 时间待 PC1 2K240 实测分布后再定，`gpu_dispatch_ms` 先作诊断；dda selftest 连续 5x E_TIMEOUT（2.5s 无新帧）判 SKIP（idle 与故障不可分，live 已容忍超时） | P4-1 |
 | D9 | 本机主 agent 换代到 0.4.0 | ⏳待执行：agent 改动已由另一会话提交（d15287d），阻塞解除。注意 2026-10-23 00:10 对该进程 stage 成功但 /activate 无应答且未换代（pid 不变），建议直接手动重启本机 agent（本机，可逆），换代后 /health 应出新 pid | — |
 
 ## 3. 任务卡
@@ -96,6 +98,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 P4-1 采集性能（第一步：gpu_ms 改为 D3D11 timestamp query 真 GPU 时间，出 2K240 实测分布再定门限）：DDA 2K240 → GPU 居中裁 640 → GPU RGB→NV12（整数矩阵，与 CPU 参考逐字节一致）。
      目标 240fps 下 gpu_ms<4ms、不丢采集帧；为 T5 定独立门限写入 test-matrix（需 owner 批）。
      无屏/独占全屏仍须显式报错，不许静默黑帧。
+     步骤1进展 2026-10-23：`gpu_dispatch_ms` 真 GPU 测量已落地（sender/dda.h timestamp+disjoint + stats 新字段），本机自测 PASS（idle-SKIP，query 创建 ok）；2K240 分布与门限待 PC1 实测（D10）。
 P4-2 端到端延迟测量：确认包（flags bit1 + 零 payload，28B 不动，实现时 owner 终审）；
      口径按 D8：PC1 采集完成→PC2 重组完成，分段同机 QPC，门限判全程 p99。
 P4-3 PC2 虚拟采集卡：已定 DShow（用户态 source filter），实现

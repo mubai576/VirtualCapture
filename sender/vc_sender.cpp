@@ -574,15 +574,17 @@ int main(int argc,char**argv){
 #ifdef _WIN32
       { FILETIME ctc,etc,ktc,utc; ULARGE_INTEGER kk,uu; GetSystemTimeAsFileTime(&ctc); uint64_t wall=((uint64_t)ctc.dwHighDateTime<<32)|ctc.dwLowDateTime; if(GetProcessTimes(GetCurrentProcess(),&ctc,&etc,&ktc,&utc)){ kk.HighPart=ktc.dwHighDateTime; kk.LowPart=ktc.dwLowDateTime; uu.HighPart=utc.dwHighDateTime; uu.LowPart=utc.dwLowDateTime; if(cpu_prev_w!=0&&wall>cpu_prev_w){ uint64_t dw=wall-cpu_prev_w; uint64_t dc=(kk.QuadPart-cpu_prev_k.QuadPart)+(uu.QuadPart-cpu_prev_u.QuadPart); if(dw>0)cpu_pct=(double)dc/(double)dw*100.0; } cpu_prev_k=kk; cpu_prev_u=uu; cpu_prev_w=wall; } }
 #endif
-      char buf[1024];
+      char buf[1152];
       snprintf(buf,sizeof(buf),
         "{\"session_id\":\"%s\",\"running\":true,\"sent_frames\":%llu,\"sent_packets\":%llu,"
         "\"pps\":%.1f,\"bps\":%.1f,\"fps_actual\":%.2f,\"send_errors\":%llu,\"uptime_s\":%.2f,"
-        "\"pattern\":\"%s\",\"fps_target\":%d,\"mtu\":%d,\"ethertype\":\"0x%04x\",\"gpu_ms\":%.3f,\"cpu_pct\":%.1f}",
+        "\"pattern\":\"%s\",\"fps_target\":%d,\"mtu\":%d,\"ethertype\":\"0x%04x\",\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"cpu_pct\":%.1f}",
         a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
         pps,bps,sent_frames/up,(unsigned long long)send_errors,up,
         a.mode=="pattern"?pat_name(pid):(a.mode=="dda"?"dda":"file"),a.fps,a.mtu,a.ethertype,
-        sent_frames>0?gpu_accum_ms/(double)sent_frames:0,cpu_pct);
+        sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
+        dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
+        (unsigned long long)dda_cap.gpu_samples,cpu_pct);
       atomic_write(a.stats,buf);
     }
   }
@@ -591,13 +593,15 @@ int main(int argc,char**argv){
 #ifdef _WIN32
       { FILETIME ctc,etc,ktc,utc; ULARGE_INTEGER kk,uu; GetSystemTimeAsFileTime(&ctc); uint64_t wall=((uint64_t)ctc.dwHighDateTime<<32)|ctc.dwLowDateTime; if(GetProcessTimes(GetCurrentProcess(),&ctc,&etc,&ktc,&utc)){ kk.HighPart=ktc.dwHighDateTime; kk.LowPart=ktc.dwLowDateTime; uu.HighPart=utc.dwHighDateTime; uu.LowPart=utc.dwLowDateTime; if(cpu_prev_w!=0&&wall>cpu_prev_w){ uint64_t dw=wall-cpu_prev_w; uint64_t dc=(kk.QuadPart-cpu_prev_k.QuadPart)+(uu.QuadPart-cpu_prev_u.QuadPart); if(dw>0)cpu_pct_fin=(double)dc/(double)dw*100.0; } } }
 #endif
-    char buf[1024];
+    char buf[1152];
     snprintf(buf,sizeof(buf),
       "{\"session_id\":\"%s\",\"running\":false,\"sent_frames\":%llu,\"sent_packets\":%llu,"
-      "\"pps\":%.1f,\"bps\":%.1f,\"send_errors\":%llu,\"uptime_s\":%.2f,\"gpu_ms\":%.3f,\"cpu_pct\":%.1f}",
+      "\"pps\":%.1f,\"bps\":%.1f,\"send_errors\":%llu,\"uptime_s\":%.2f,\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"cpu_pct\":%.1f}",
       a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
       sent_packets/up,sent_bytes*8/up,(unsigned long long)send_errors,up,
-      sent_frames>0?gpu_accum_ms/(double)sent_frames:0,cpu_pct_fin);
+      sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
+      dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
+      (unsigned long long)dda_cap.gpu_samples,cpu_pct_fin);
     atomic_write(a.stats,buf); }
 #ifdef _WIN32
 #ifdef _WIN32
