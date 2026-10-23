@@ -328,7 +328,9 @@ static void DrawOSD(HDC hdc, const Stats& s, int mode){
     // (video shows through everywhere via alpha)
 
     // ── HERO BAR (top) ───────────────────────────────────────────────────────
-    Panel(hdc,0,0,WIN_W,58,210);
+    // Single panel covering all three sections: hero + detail + graphs
+    // hero: 0-58, detail: 58-240, graphs: 240-408  => total 408px
+    Panel(hdc,0,0,WIN_W,408,220);
 
     // FPS (left, big)
     wchar_t buf[128];
