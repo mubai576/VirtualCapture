@@ -40,7 +40,28 @@ DECLARE_INTERFACE_(IKsControlVC, IUnknown) {
 
 static const GUID IID_ISpecifyPropertyPages_VC =
   {0xb196b28b,0xbab4,0x101a,{0xb6,0x9c,0x00,0xaa,0x00,0x34,0x1d,0x07}};
-// IKsControl {28F54685-06FD-11D2-B27A-00A0C9223196} - already in ks.h via IID_IKsControl
+// IKsPin {B61178D1-A2D9-11CF-9E53-00AA00A216A1}
+// OBS win-dshow uses QI(IKsPin) to classify pin as (video) vs (none).
+// Stub: just respond to QI; all methods return E_NOTIMPL.
+static const GUID IID_IKsPin_VC =
+  {0xb61178d1,0xa2d9,0x11cf,{0x9e,0x53,0x00,0xaa,0x00,0xa2,0x16,0xa1}};
+DECLARE_INTERFACE_(IKsPinVC, IUnknown) {
+    STDMETHOD(QueryInterface)(REFIID,void**) PURE;
+    STDMETHOD_(ULONG,AddRef)() PURE;
+    STDMETHOD_(ULONG,Release)() PURE;
+    STDMETHOD(KsQueryMediums)(void**) PURE;
+    STDMETHOD(KsQueryInterfaces)(void**) PURE;
+    STDMETHOD(KsCreateSinkPinHandle)(ULONG,ULONG) PURE;
+    STDMETHOD(KsGetCurrentCommunication)(void*,void*,void*) PURE;
+    STDMETHOD(KsPropagateAcquire)() PURE;
+    STDMETHOD(KsDeliver)(void*,ULONG) PURE;
+    STDMETHOD(KsMediaSamplesCompleted)(void*) PURE;
+    STDMETHOD_(void*,KsPeekAllocator)(ULONG) PURE;
+    STDMETHOD(KsReceiveAllocator)(void*) PURE;
+    STDMETHOD(KsRenegotiate)() PURE;
+    STDMETHOD(KsPassEventToFilter)(void*) PURE;
+    STDMETHOD(KsSetPinFramingCache)(void*,void*,ULONG) PURE;
+};
 
 static const wchar_t* VCAM_NAME = L"VirtualCapture 640x640 NV12";
 static const wchar_t* VCAM_PIN_ID = L"Out";
@@ -49,7 +70,7 @@ static const wchar_t* VCAM_CLSID_KEY =
 static const wchar_t* VCAM_SHM_DEFAULT = L"Local\\VirtualCaptureVcamFrame";
 static const LONG VCAM_W = 640, VCAM_H = 640;
 static const GUID VCAM_AMPROPSETID_Pin =
-  {0x9b00f101, 0x1567, 0x11d1, {0xb3, 0xa9, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96}};
+  {0x9b00f101, 0x1567, 0x11d1, {0xb3, 0xf1, 0x00, 0xa0, 0x24, 0xcb, 0xed, 0x26}};
 static const GUID VCAM_PIN_CATEGORY_CAPTURE =
   {0xfb6c4281, 0x0353, 0x11d1, {0x90, 0x5f, 0x00, 0x00, 0xc0, 0xcc, 0x16, 0xba}};
 #define VCAM_AMPROPERTY_PIN_CATEGORY 0
@@ -283,7 +304,7 @@ public:
 // ---------- pin ----------
 class CVCamPin : public IPin, public IAMStreamConfig,
                  public IKsPropertySet, public ISpecifyPropertyPages,
-                 public IKsControlVC {
+                 public IKsControlVC, public IKsPinVC {
   friend class CVCamFilter;
   LONG m_cRef = 1;
   CVCamFilter* m_pFilter;  // owning filter, ref'd
@@ -310,6 +331,7 @@ public:
     else if (riid == IID_IKsPropertySet)          *ppv = (IKsPropertySet*)this;
     else if (riid == IID_ISpecifyPropertyPages_VC)*ppv = (ISpecifyPropertyPages*)this;
     else if (riid == IID_IKsControl_VC)           *ppv = (IKsControlVC*)this;
+    else if (riid == IID_IKsPin_VC)               *ppv = (IKsPinVC*)this;
     else { *ppv = nullptr; return E_NOINTERFACE; }
     AddRef(); return S_OK;
   }
@@ -419,6 +441,20 @@ public:
     if (!pPages) return E_POINTER;
     pPages->cElems = 0; pPages->pElems = nullptr; return S_OK;
   }
+
+  // IKsPin: stub — presence is enough; OBS uses QI to classify pin as (video).
+  STDMETHODIMP KsQueryMediums(void** p)           { if(p)*p=nullptr; return E_NOTIMPL; }
+  STDMETHODIMP KsQueryInterfaces(void** p)        { if(p)*p=nullptr; return E_NOTIMPL; }
+  STDMETHODIMP KsCreateSinkPinHandle(ULONG,ULONG) { return E_NOTIMPL; }
+  STDMETHODIMP KsGetCurrentCommunication(void*,void*,void*) { return E_NOTIMPL; }
+  STDMETHODIMP KsPropagateAcquire()               { return E_NOTIMPL; }
+  STDMETHODIMP KsDeliver(void*,ULONG)             { return E_NOTIMPL; }
+  STDMETHODIMP KsMediaSamplesCompleted(void*)     { return E_NOTIMPL; }
+  STDMETHODIMP_(void*) KsPeekAllocator(ULONG)     { return nullptr; }
+  STDMETHODIMP KsReceiveAllocator(void*)          { return E_NOTIMPL; }
+  STDMETHODIMP KsRenegotiate()                    { return E_NOTIMPL; }
+  STDMETHODIMP KsPassEventToFilter(void*)         { return E_NOTIMPL; }
+  STDMETHODIMP KsSetPinFramingCache(void*,void*,ULONG) { return E_NOTIMPL; }
 
   // IKsControl: stub — return STATUS_NOT_SUPPORTED (0xC00000BB).
   // Presence of this interface is enough for clients that QI-check it.
