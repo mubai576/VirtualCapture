@@ -46,6 +46,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 - receiver hashlog D3 carries qpc_ns; reconcile compares frame_id and hash only.
 - receiver `--shm <name>` (P4-3): publish latest complete frame to named file mapping (layout vcam/vcam_shm.h, NOT proto/); stats adds `shm_published`; agent /receiver/start forwards `shm`.
 - sender stats 新增 `gpu_dispatch_ms`（D3D11 timestamp 包住 CopyResource 的真 GPU 时间均值）+ `gpu_dispatch_samples`（有效样本数）；`gpu_ms` 仍为 capture() wall-clock，待 P4-1 实测分布后按 D10 决定是否切换口径。
+- P4-2步骤1（免协议改动）：receiver stats 新增 `rseg_avg_ms/rseg_p50_ms/rseg_p99_ms/rseg_max_ms`（R(N)=首包到达→重组完成，同机QPC）；sender stats 新增 `pc1_seg_avg_ms/pc1_seg_p99_ms/pc1_seg_max_ms`（PC1段=采集/生成完成→末包发出，同机QPC）；确认包（flags bit1）仍待 owner 终审后做步骤2。
 - 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 614400B。
 
 ### 1.5 全局禁止
@@ -102,6 +103,7 @@ P4-1 采集性能（第一步：gpu_ms 改为 D3D11 timestamp query 真 GPU 时�
      无屏/独占全屏仍须显式报错，不许静默黑帧。
      步骤1进展 2026-10-23：`gpu_dispatch_ms` 真 GPU 测量已落地（sender/dda.h timestamp+disjoint + stats 新字段），本机自测 PASS（idle-SKIP，query 创建 ok）；2K240 分布与门限待 PC1 实测（D10）。
 P4-2 端到端延迟测量：确认包（flags bit1 + 零 payload，28B 不动，实现时 owner 终审）；
+     步骤1进展 2026-10-23：R(N) + PC1 段本机分段计时已落地（receiver 首包→重组完成、sender 采集/生成完成→末包发出，同机 QPC，零协议改动，stats 新字段）；确认包与全程 p99 门限待 PC1/PC2 实测分布 + owner 终审（D8）。
      口径按 D8：PC1 采集完成→PC2 重组完成，分段同机 QPC，门限判全程 p99。
 P4-3 PC2 虚拟采集卡：已定 DShow（用户态 source filter），实现
      NV12 640x640、AvgTimePerFrame=41666、只留最新 1 帧、不跟墙钟。

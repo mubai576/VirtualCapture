@@ -9,6 +9,8 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <deque>
+#include <algorithm>
 #include <fstream>
 #include <iostream>
 #include <chrono>
@@ -117,6 +119,13 @@ static uint64_t qpc_ns_now() {
 #else
   return c;
 #endif
+}
+// P4-2步骤1：PC1段=采集/生成完成→末包发出，同机QPC，不跨机比较
+static inline void pc1_stats(const std::deque<uint64_t>&v,double&a,double&p99,double&mx){
+  a=0;p99=0;mx=0; if(v.empty())return;
+  double sum=0; for(auto x:v)sum+=(double)x; a=sum/v.size()/1e6;
+  std::vector<uint64_t> s(v.begin(),v.end()); std::sort(s.begin(),s.end());
+  p99=(double)s[(s.size()*99)/100]/1e6; mx=(double)s.back()/1e6;
 }
 #ifdef _WIN32
 static volatile LONG g_stop = 0;
@@ -481,6 +490,7 @@ int main(int argc,char**argv){
   eth[12]=(uint8_t)(a.ethertype>>8); eth[13]=(uint8_t)(a.ethertype&0xFF);
 
   uint64_t sent_frames=0, sent_packets=0, send_errors=0, sent_bytes=0;
+  std::deque<uint64_t> pc1_ns; // P4-2步骤1：PC1段样本，同机QPC，最新10000帧窗口
   void* sq=nullptr; int sq_n=0;
   uint64_t t_start=qpc_ns_now(), t_last_stats=0;
 #ifdef _WIN32
@@ -517,6 +527,7 @@ int main(int argc,char**argv){
            fileIdx=(fileIdx+1)%fileNFrames; file_played++; }
     uint64_t fh=vc_fnv1a64_two(Y.data(),Y.size(),UV.data(),UV.size());
     char fhx[17]; vc_fnv1a64_hex(fh,fhx);
+    uint64_t t_gen_done=qpc_ns_now(); // 采集/生成+哈希完成（D8 PC1段起点）
     // 拼连续缓冲好切包
     // 免拷贝：先切Y再切UV
     size_t pkts_before = sent_packets; // 防停机半帧
@@ -560,6 +571,8 @@ int main(int argc,char**argv){
 #ifdef _WIN32
     if(sq){ if(d.sendqueue_transmit(h,sq,0)<0) send_errors+=(uint64_t)sq_n; d.sendqueue_destroy(sq); sq=nullptr; sq_n=0; }
 #endif
+    { uint64_t t_last_tx=qpc_ns_now(); // 末包发出（D8 PC1段终点）
+      if(pc1_ns.size()>=10000) pc1_ns.pop_front(); pc1_ns.push_back(t_last_tx>=t_gen_done?t_last_tx-t_gen_done:0); } // 最新10000帧窗口
     hashlog << "{\"frame_id\":" << fid << ",\"hash\":\"" << fhx << "\",\"qpc_ns\":" << f0 << "}\n";
     hashlog.flush();
     sent_frames++;
@@ -572,37 +585,39 @@ int main(int argc,char**argv){
       double up=(now-t_start)/1e9; if(up<0.001)up=0.001;
       double pps=sent_packets/up, bps=sent_bytes*8/up;
       double cpu_pct=0;
+      double pc1_a,pc1_p99,pc1_mx; pc1_stats(pc1_ns,pc1_a,pc1_p99,pc1_mx);
 #ifdef _WIN32
       { FILETIME ctc,etc,ktc,utc; ULARGE_INTEGER kk,uu; GetSystemTimeAsFileTime(&ctc); uint64_t wall=((uint64_t)ctc.dwHighDateTime<<32)|ctc.dwLowDateTime; if(GetProcessTimes(GetCurrentProcess(),&ctc,&etc,&ktc,&utc)){ kk.HighPart=ktc.dwHighDateTime; kk.LowPart=ktc.dwLowDateTime; uu.HighPart=utc.dwHighDateTime; uu.LowPart=utc.dwLowDateTime; if(cpu_prev_w!=0&&wall>cpu_prev_w){ uint64_t dw=wall-cpu_prev_w; uint64_t dc=(kk.QuadPart-cpu_prev_k.QuadPart)+(uu.QuadPart-cpu_prev_u.QuadPart); if(dw>0)cpu_pct=(double)dc/(double)dw*100.0; } cpu_prev_k=kk; cpu_prev_u=uu; cpu_prev_w=wall; } }
 #endif
-      char buf[1152];
+      char buf[2048];
       snprintf(buf,sizeof(buf),
         "{\"session_id\":\"%s\",\"running\":true,\"sent_frames\":%llu,\"sent_packets\":%llu,"
         "\"pps\":%.1f,\"bps\":%.1f,\"fps_actual\":%.2f,\"send_errors\":%llu,\"uptime_s\":%.2f,"
-        "\"pattern\":\"%s\",\"fps_target\":%d,\"mtu\":%d,\"ethertype\":\"0x%04x\",\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"cpu_pct\":%.1f}",
+        "\"pattern\":\"%s\",\"fps_target\":%d,\"mtu\":%d,\"ethertype\":\"0x%04x\",\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"cpu_pct\":%.1f}",
         a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
         pps,bps,sent_frames/up,(unsigned long long)send_errors,up,
         a.mode=="pattern"?pat_name(pid):(a.mode=="dda"?"dda":"file"),a.fps,a.mtu,a.ethertype,
         sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
         dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
-        (unsigned long long)dda_cap.gpu_samples,cpu_pct);
+        (unsigned long long)dda_cap.gpu_samples,pc1_a,pc1_p99,pc1_mx,cpu_pct);
       atomic_write(a.stats,buf);
     }
   }
   { double up=(qpc_ns_now()-t_start)/1e9; if(up<0.001)up=0.001;
       double cpu_pct_fin=0;
+      double pc1_fa,pc1_fp99,pc1_fmx; pc1_stats(pc1_ns,pc1_fa,pc1_fp99,pc1_fmx);
 #ifdef _WIN32
       { FILETIME ctc,etc,ktc,utc; ULARGE_INTEGER kk,uu; GetSystemTimeAsFileTime(&ctc); uint64_t wall=((uint64_t)ctc.dwHighDateTime<<32)|ctc.dwLowDateTime; if(GetProcessTimes(GetCurrentProcess(),&ctc,&etc,&ktc,&utc)){ kk.HighPart=ktc.dwHighDateTime; kk.LowPart=ktc.dwLowDateTime; uu.HighPart=utc.dwHighDateTime; uu.LowPart=utc.dwLowDateTime; if(cpu_prev_w!=0&&wall>cpu_prev_w){ uint64_t dw=wall-cpu_prev_w; uint64_t dc=(kk.QuadPart-cpu_prev_k.QuadPart)+(uu.QuadPart-cpu_prev_u.QuadPart); if(dw>0)cpu_pct_fin=(double)dc/(double)dw*100.0; } } }
 #endif
-    char buf[1152];
+    char buf[2048];
     snprintf(buf,sizeof(buf),
       "{\"session_id\":\"%s\",\"running\":false,\"sent_frames\":%llu,\"sent_packets\":%llu,"
-      "\"pps\":%.1f,\"bps\":%.1f,\"send_errors\":%llu,\"uptime_s\":%.2f,\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"cpu_pct\":%.1f}",
+      "\"pps\":%.1f,\"bps\":%.1f,\"send_errors\":%llu,\"uptime_s\":%.2f,\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"cpu_pct\":%.1f}",
       a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
       sent_packets/up,sent_bytes*8/up,(unsigned long long)send_errors,up,
       sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
       dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
-      (unsigned long long)dda_cap.gpu_samples,cpu_pct_fin);
+      (unsigned long long)dda_cap.gpu_samples,pc1_fa,pc1_fp99,pc1_fmx,cpu_pct_fin);
     atomic_write(a.stats,buf); }
 #ifdef _WIN32
 #ifdef _WIN32

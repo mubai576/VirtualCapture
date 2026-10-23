@@ -149,6 +149,7 @@ public:
   std::map<uint32_t,FrameSlot> slots; // 仅存活帧
   std::deque<uint64_t> arrivals; // 完成到达时间，留120个
   uint64_t last_complete_ns=0;
+  std::deque<uint64_t> rseg_ns; // P4-2步骤1：R(N)=首包到达→重组完成，同机QPC，最新10000帧窗口
   size_t payload_max;
   std::vector<std::pair<uint32_t,std::string>> completed_hashes; // 供hashlog用
   Reassembler(int mtu=9000){ payload_max=(size_t)(mtu-42); }
@@ -209,6 +210,7 @@ public:
       }
       st.complete++;
       uint64_t now=qpc_ns_now();
+      if(rseg_ns.size()>=10000) rseg_ns.pop_front(); rseg_ns.push_back(now>=s.first_ns?now-s.first_ns:0); // 最新10000帧窗口（满了丢最旧）
       if(last_complete_ns!=0&&arrivals.size()<10000){ arrivals.push_back(now-last_complete_ns); if(arrivals.size()>120)arrivals.pop_front(); }
       last_complete_ns=now;
       uint32_t donefid=s.fid;
@@ -228,6 +230,16 @@ public:
     avg_ms=sum/arrivals.size()/1e6;
     std::vector<uint64_t> s(arrivals.begin(),arrivals.end()); std::sort(s.begin(),s.end());
     p99_ms=(double)s[(s.size()*99)/100]/1e6;
+  }
+  void rseg_stats(double&avg_ms,double&p50_ms,double&p99_ms,double&max_ms) const {
+    // P4-2步骤1：R(N)分布，同机QPC，不跨机比较
+    avg_ms=0;p50_ms=0;p99_ms=0;max_ms=0; if(rseg_ns.empty())return;
+    double sum=0; for(auto v:rseg_ns)sum+=(double)v;
+    avg_ms=sum/rseg_ns.size()/1e6;
+    std::vector<uint64_t> s(rseg_ns.begin(),rseg_ns.end()); std::sort(s.begin(),s.end());
+    p50_ms=(double)s[(s.size()*50)/100]/1e6;
+    p99_ms=(double)s[(s.size()*99)/100]/1e6;
+    max_ms=(double)s.back()/1e6;
   }
 };
 
@@ -327,6 +339,8 @@ static int run_selftest(){
   if(R.st.hash_mismatch!=1){printf("FAIL mismatch!=1\n");ok=false;}
   if(R.st.packets_recv!=276){printf("FAIL recv!=276 got %llu\n",(unsigned long long)R.st.packets_recv);ok=false;}
   if(R.st.packets_lost!=2){printf("FAIL lost!=2 got %llu\n",(unsigned long long)R.st.packets_lost);ok=false;}
+  { double ra,rp50,rp99,rmx; R.rseg_stats(ra,rp50,rp99,rmx);
+    if(R.rseg_ns.size()!=R.st.complete){printf("FAIL rseg samples!=complete got %zu\n",R.rseg_ns.size());ok=false;} }
   if(!ok){printf("FAIL: receiver selftest\n");return 1;}
   printf("PASS: receiver selftest\n");
   return 0;
@@ -519,17 +533,19 @@ int main(int argc,char**argv){
       double up=(now-t_start)/1e9; if(up<0.001)up=0.001;
       double pps=R.st.packets_recv/up, bps=R.st.bytes_recv*8/up;
       double avg,p99; R.inter_stats(avg,p99);
+      double rg_a,rg_p50,rg_p99,rg_mx; R.rseg_stats(rg_a,rg_p50,rg_p99,rg_mx);
       char buf[2048];
       snprintf(buf,sizeof(buf),
         "{\"session_id\":\"%s\",\"running\":true,\"complete\":%llu,\"dropped\":%llu,"
         "\"packets_recv\":%llu,\"packets_lost\":%llu,\"pps\":%.1f,\"bps\":%.1f,"
         "\"gaps\":%llu,\"trailing\":%zu,\"hash_mismatch\":%llu,"
-        "\"inter_arrival_avg_ms\":%.3f,\"inter_arrival_p99_ms\":%.3f,\"uptime_s\":%.2f,"
+        "\"inter_arrival_avg_ms\":%.3f,\"inter_arrival_p99_ms\":%.3f,\"rseg_avg_ms\":%.3f,"
+        "\"rseg_p50_ms\":%.3f,\"rseg_p99_ms\":%.3f,\"rseg_max_ms\":%.3f,\"uptime_s\":%.2f,"
         "\"mtu\":%d,\"ethertype\":\"0x%04x\",\"shm_published\":%llu}",
         a.session.c_str(),(unsigned long long)R.st.complete,(unsigned long long)R.st.dropped,
         (unsigned long long)R.st.packets_recv,(unsigned long long)R.st.packets_lost,
         pps,bps,(unsigned long long)R.st.gaps,R.trailing_packets(),
-        (unsigned long long)R.st.hash_mismatch,avg,p99,up,a.mtu,a.ethertype,
+        (unsigned long long)R.st.hash_mismatch,avg,p99,rg_a,rg_p50,rg_p99,rg_mx,up,a.mtu,a.ethertype,
         (unsigned long long)shm_n);
       atomic_write(a.stats,buf);
     }
@@ -541,6 +557,7 @@ int main(int argc,char**argv){
   { double up=(qpc_ns_now()-t_start)/1e9; if(up<0.001)up=0.001;
     double pps=R.st.packets_recv/up, bps=R.st.bytes_recv*8/up;
     double avg,p99; R.inter_stats(avg,p99);
+    double rg_a,rg_p50,rg_p99,rg_mx; R.rseg_stats(rg_a,rg_p50,rg_p99,rg_mx);
 #ifdef _WIN32
     uint64_t shm_n=shm.base?shm.published:0;
 #else
@@ -551,12 +568,13 @@ int main(int argc,char**argv){
       "{\"session_id\":\"%s\",\"running\":false,\"complete\":%llu,\"dropped\":%llu,"
       "\"packets_recv\":%llu,\"packets_lost\":%llu,\"pps\":%.1f,\"bps\":%.1f,"
       "\"gaps\":%llu,\"trailing\":%zu,\"hash_mismatch\":%llu,"
-      "\"inter_arrival_avg_ms\":%.3f,\"inter_arrival_p99_ms\":%.3f,\"uptime_s\":%.2f,"
+      "\"inter_arrival_avg_ms\":%.3f,\"inter_arrival_p99_ms\":%.3f,\"rseg_avg_ms\":%.3f,"
+      "\"rseg_p50_ms\":%.3f,\"rseg_p99_ms\":%.3f,\"rseg_max_ms\":%.3f,\"uptime_s\":%.2f,"
       "\"shm_published\":%llu}",
       a.session.c_str(),(unsigned long long)R.st.complete,(unsigned long long)R.st.dropped,
       (unsigned long long)R.st.packets_recv,(unsigned long long)R.st.packets_lost,
       pps,bps,(unsigned long long)R.st.gaps,R.trailing_packets(),
-      (unsigned long long)R.st.hash_mismatch,avg,p99,up,(unsigned long long)shm_n);
+      (unsigned long long)R.st.hash_mismatch,avg,p99,rg_a,rg_p50,rg_p99,rg_mx,up,(unsigned long long)shm_n);
     atomic_write(a.stats,buf); }
 #ifdef _WIN32
   d.closeh(h);
