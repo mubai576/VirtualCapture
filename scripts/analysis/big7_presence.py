@@ -1,3 +1,4 @@
+# 查大7文件是否齐
 import json, glob, os, urllib.request, urllib.parse
 R = "http://192.168.2.59:18080"
 want = ["checker-20261021-194156", "checker-rerun-20261021-194723", "counter-20261021-194047",

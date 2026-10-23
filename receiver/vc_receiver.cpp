@@ -1,9 +1,9 @@
-// vc_receiver.cpp — T-02 receiver C++ (PLAN §1). C++17, Npcap wpcap (dynamic load).
-// Chain: pcap_open (snaplen>=9014, promisc, buffer>=128MB) -> ethertype+magic filter
-//   -> per-frame_id reassembly (retain recent 8, incomplete marked dropped on newer completion)
-//   -> whole-frame FNV-1a64 -> hashlog/stats per §2.3.
-// Stats include complete/dropped/packets_recv/packets_lost/pps/bps/gaps/trailing,
-// inter_arrival avg/p99 over last 120. CLI per §2.2. --selftest needs no NIC.
+// 收端（T-02，PLAN §1冻结）：收包重组验哈希
+// 链路：抓包过滤→按帧号重组→整帧哈希
+// 近8帧缓存，新帧到则旧残帧记丢
+// 哈希对账落盘按§2.3
+// 统计：完成/丢/包数/pps/bps/间隔
+// 间隔看近120包均值/p99，无网卡可自检
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -30,6 +30,7 @@
 #ifdef _WIN32
 static volatile LONG g_stop = 0;
 static BOOL WINAPI chandler(DWORD e){
+  // 截停止信号
   if(e==CTRL_C_EVENT||e==CTRL_BREAK_EVENT||e==CTRL_CLOSE_EVENT){ InterlockedExchange(&g_stop,1); return TRUE; }
   return FALSE;
 }
@@ -37,6 +38,7 @@ static BOOL WINAPI chandler(DWORD e){
 
 static uint64_t qpc_freq_=0;
 static void qpc_init(){
+  // 初始化计时频率
 #ifdef _WIN32
   LARGE_INTEGER f; QueryPerformanceFrequency(&f); qpc_freq_=(uint64_t)f.QuadPart;
 #else
@@ -44,6 +46,7 @@ static void qpc_init(){
 #endif
 }
 static uint64_t qpc_ns_now(){
+  // 取纳秒戳
 #ifdef _WIN32
   LARGE_INTEGER c; QueryPerformanceCounter(&c); return (uint64_t)c.QuadPart*1000000000ull/qpc_freq_;
 #else
@@ -80,6 +83,7 @@ static void ensure_parent(const std::string&path){
 #endif
 }
 static void atomic_write(const std::string&path,const std::string&data){
+  // 原子写文件
   if(path.empty()) return;
   ensure_parent(path);
   std::string tmp=path+".tmp";
@@ -128,7 +132,7 @@ public:
     }
     auto it=slots.find(h.frame_id);
     if(it==slots.end()){
-      // evict oldest if >=8 active
+      // 超8帧逐出最旧
       if(slots.size()>=8){
         auto old=slots.begin();
         st.dropped++; st.packets_lost+=(old->second.total-old->second.got_n);
@@ -171,7 +175,7 @@ public:
       last_complete_ns=now;
       uint32_t donefid=s.fid;
       slots.erase(it);
-      // older incomplete -> dropped (new-frame-arrival rule)
+      // 旧残帧记丢（新帧到达规则）
       std::vector<uint32_t> todrop;
       for(auto&p:slots) if(p.first<donefid) todrop.push_back(p.first);
       for(uint32_t f:todrop){ auto jt=slots.find(f); if(jt!=slots.end()){ st.dropped++; st.packets_lost+=(jt->second.total-jt->second.got_n); slots.erase(jt);} }
@@ -190,6 +194,7 @@ public:
 };
 
 static int run_selftest(){
+  // 自检：重组/坏包/哈希
   qpc_init();
   printf("[receiver selftest] in-mem 3 frames + loss/dup/badCRC/hashMismatch\n");
   const int MTU=9000; size_t P=(size_t)(MTU-42);
@@ -209,10 +214,10 @@ static int run_selftest(){
   };
   auto feed=[&](uint32_t fid,const std::vector<uint8_t>&f,uint8_t pat,bool skip_one=false,bool corrupt_content=false){
     for(size_t s=0;s<T;s++){
-      if(skip_one&&s==5) continue; // miss one
+      if(skip_one&&s==5) continue; // 漏一个
       size_t off=s*P; size_t cl=(s==T-1)?(VC_FRAME_BYTES-off):P;
       std::vector<uint8_t> chunk(cl); memcpy(chunk.data(),f.data()+off,cl);
-      if(corrupt_content&&s==0){ chunk[0]^=0x01; } // valid CRC over corrupted bytes -> hash mismatch
+      if(corrupt_content&&s==0){ chunk[0]^=0x01; } // CRC对但内容坏→哈希错
       vc_pkt_hdr_t h; memset(&h,0,sizeof(h));
       h.magic=VC_MAGIC; h.frame_id=fid; h.seq=(uint16_t)s; h.total=(uint16_t)T;
       h.qpc_ns=123; h.payload_crc=vc_crc32(chunk.data(),cl); h.payload_len=(uint16_t)cl;
@@ -220,26 +225,26 @@ static int run_selftest(){
       R.on_packet(h,chunk.data());
     }
   };
-  // F0 good motion fid=10
+  // F0好帧fid=10
   auto f0=mkframe(10,4); feed(10,f0,4);
-  // F1 fid=11 with one missing
+  // F1缺一包fid=11
   auto f1=mkframe(11,4); feed(11,f1,4,true,false);
-  // dup: re-feed one packet of F0 (already completed, new slot? F0 slot gone -> creates new incomplete? avoid: dup within active frame instead)
-  // Instead test dup on F2: feed half, dup one, then rest.
+  // 重包：在活跃帧内重喂，避开已完成帧建新槽
+  // 在F2上测重包：喂半帧→重一包→喂完
   auto f2=mkframe(12,4);
-  { // partial F2 with dup
+  { // F2半帧含重包
     for(size_t s=0;s<T;s++){
       size_t off=s*P; size_t cl=(s==T-1)?(VC_FRAME_BYTES-off):P;
       vc_pkt_hdr_t h; memset(&h,0,sizeof(h));
       h.magic=VC_MAGIC; h.frame_id=12; h.seq=(uint16_t)s; h.total=(uint16_t)T;
       h.payload_crc=vc_crc32(f2.data()+off,cl); h.payload_len=(uint16_t)cl; h.pattern=4;
       R.on_packet(h,f2.data()+off);
-      if(s==3){ // dup seq 3
+      if(s==3){ // 重发seq3
         R.on_packet(h,f2.data()+off);
       }
       if(s==10) break;
     }
-    // bad CRC packet (seq 11 with wrong crc)
+    // 坏CRC包（seq11错crc）
     { size_t s=11; size_t off=s*P; size_t cl=P;
       vc_pkt_hdr_t h; memset(&h,0,sizeof(h));
       h.magic=VC_MAGIC; h.frame_id=12; h.seq=(uint16_t)s; h.total=(uint16_t)T;
@@ -247,7 +252,7 @@ static int run_selftest(){
       size_t before=R.st.packets_lost;
       R.on_packet(h,f2.data()+off);
       if(R.st.packets_lost!=before+1){printf("FAIL badCRC not counted\n");return 1;}
-      // now feed correct seq 11
+      // 再喂对的seq11
       h.payload_crc=vc_crc32(f2.data()+off,cl);
       R.on_packet(h,f2.data()+off);
     }
@@ -259,10 +264,10 @@ static int run_selftest(){
       R.on_packet(h,f2.data()+off);
     }
   }
-  // At this point F1 (fid 11) should have been dropped when F2 completed (older incomplete rule).
-  // F3 corrupted content fid=13 -> complete but hash_mismatch
+  // 此时F2完成，旧残F1应已记丢
+  // F3内容坏fid=13→凑齐但哈希错
   auto f3=mkframe(13,4); feed(13,f3,4,false,true);
-  // wrong-magic packet ignored (should not affect counts except no recv increment)
+  // 错魔数包忽略，不计数
   { uint64_t before=R.st.packets_recv;
     vc_pkt_hdr_t h; memset(&h,0,sizeof(h));
     h.magic=0xDEADu; h.frame_id=99; h.seq=0; h.total=69; h.payload_crc=0; h.payload_len=100; h.pattern=4;
@@ -274,10 +279,10 @@ static int run_selftest(){
     (unsigned long long)R.st.complete,(unsigned long long)R.st.dropped,
     (unsigned long long)R.st.packets_recv,(unsigned long long)R.st.packets_lost,
     (unsigned long long)R.st.hash_mismatch);
-  // Expect: complete: F0,F2,F3 =3 ; dropped: F1 =1 ; mismatch: F3 =1
-  // packets_recv: F0 69 + F1 68 + F2 69 +1 dup + F3 69 = 276 (badCRC not counted)
-  // packets_lost: F1 missing 1 + badCRC 1 + F1 dropped remainder? F1 dropped adds (69-68)=1? careful double count:
-  //   skip_one: no packet, no lost yet. badCRC: lost+1. F1 dropped when F2 completes: lost += 69-68=1. total lost=2.
+  // 期望：完成3丢1错1
+  // 收包276=69+68+69+1重+69（坏CRC不计）
+  // 丢包2=漏1+坏CRC1（弃帧余量另计防重）
+  // 漏包暂不计，坏CRC+1，弃帧补1，共2
   bool ok=true;
   if(R.st.complete!=3){printf("FAIL complete!=3\n");ok=false;}
   if(R.st.dropped!=1){printf("FAIL dropped!=1\n");ok=false;}
@@ -422,7 +427,7 @@ int main(int argc,char**argv){
 #endif
     uint64_t now=qpc_ns_now();
     if(a.timeout_s>0&&(long long)((now-t_start)/1000000000ull)>=a.timeout_s) break;
-    if(a.expect_frames>0&&(long long)R.st.complete>=a.expect_frames) break; // 0/-1 = unlimited
+    if(a.expect_frames>0&&(long long)R.st.complete>=a.expect_frames) break; // 0/-1不限帧
 #ifdef _WIN32
     void* pkt_hdr=nullptr; void* pkt_data=nullptr;
     int rc=d.nextex(h,&pkt_hdr,&pkt_data);

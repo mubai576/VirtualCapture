@@ -1,3 +1,4 @@
+# 查PLAN格式
 import re
 lines = open("PLAN.md", encoding="utf-8").read().splitlines()
 heads = {}

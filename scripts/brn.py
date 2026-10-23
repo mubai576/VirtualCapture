@@ -1,6 +1,4 @@
-"""brn.py - quick dual-host batch probe: arm PC2 receiver via agent, run local sender exe directly.
-Usage: python scripts/brn.py <batch> <frames> <tag>   (writes run/<tag>.* ; PC2 IP/MAC hardcoded below)
-"""
+"""双机批探针：备好PC2收端，本地直跑发端；写run/<tag>.*"""
 import json, time, urllib.request, subprocess, os, sys
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root: exe/run paths are relative
 R = "http://192.168.2.59:18080"

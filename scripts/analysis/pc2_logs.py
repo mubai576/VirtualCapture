@@ -1,3 +1,4 @@
+# 看PC2 agent日志
 import json, urllib.request, urllib.parse
 R = "http://192.168.2.59:18080"
 for rel in ("run/updates.log", "run/exec.log", "run/helper.log"):

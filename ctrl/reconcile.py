@@ -1,12 +1,10 @@
-"""reconcile.py - compare sender.hash.jsonl vs receiver.hash.jsonl for a session.
-Usage:
-  python ctrl/reconcile.py --sender run/<sid>.sender.hash.jsonl --receiver run/<sid>.receiver.hash.jsonl
-  python ctrl/reconcile.py --session <sid>   (looks in run/)
-Output: summary JSON to stdout + mismatch frame list. Exit 0 if 0 mismatch and 0 missing, else 1.
-"""
+"""收发哈希对账：比frame_id+hash（qpc只看抖动）
+用法：--sender发端hashlog --receiver收端hashlog，或--session自动找run/下文件
+输出摘要JSON+错帧列表；零错零多余则exit 0。"""
 import argparse, json, os, sys
 
 def load(p):
+    # 读hashlog：帧号→哈希
     d = {}
     if not p or not os.path.exists(p): return d, ["missing-file:" + str(p)]
     errs = []
@@ -22,6 +20,7 @@ def load(p):
     return d, errs
 
 def main():
+    # 入口：对账并输出摘要
     ap = argparse.ArgumentParser()
     ap.add_argument("--sender", default=""); ap.add_argument("--receiver", default="")
     ap.add_argument("--session", default="")

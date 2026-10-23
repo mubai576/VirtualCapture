@@ -1,4 +1,4 @@
-"""fnv1a.py - FNV-1a 64-bit Python reference (PLAN 2.3 frozen)."""
+"""FNV-1a64对照实现（PLAN §1.4冻结）"""
 MASK = 0xFFFFFFFFFFFFFFFF
 INIT = 14695981039346656037
 PRIME = 1099511628211

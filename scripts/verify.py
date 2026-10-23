@@ -1,12 +1,5 @@
-"""verify.py - one-shot local gate for any change (no second PC needed).
-
-Usage (from anywhere):
-  python scripts/verify.py              # build + selftests + pattern_ref + pytest
-  python scripts/verify.py --no-build   # skip cmake build (use existing build/Release exes)
-  python scripts/verify.py --live Loopback   # also run live loopback pytest (VC_ADAPTER=<substr>)
-
-Exit 0 only if every step passes. Steps print PASS/FAIL lines; first failure stops the run.
-"""
+"""本地总闸：改代码必跑（无需第二台）
+默认构建+双自检+对账+pytest；--no-build跳构建，--live加回环"""
 import argparse, os, subprocess, sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

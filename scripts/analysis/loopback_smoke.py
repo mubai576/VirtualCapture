@@ -1,3 +1,4 @@
+# 回环冒烟：本机快速自查
 import os, importlib.util
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 _spec = importlib.util.spec_from_file_location("vc_ctrl", os.path.join(ROOT, "ctrl", "vc-ctrl.py"))

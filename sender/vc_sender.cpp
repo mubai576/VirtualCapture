@@ -1,8 +1,8 @@
-// vc_sender.cpp — T-01 sender C++ (PLAN §1). C++17, Npcap wpcap (dynamic load), pattern.h chain.
-// Chain: pattern.h NV12 (default motion) -> FNV-1a64 whole-frame -> payload=mtu-42 split
-//   -> raw eth (dst=--dst-mac, type=--ethertype) -> pcap_sendpacket, QPC fps throttle,
-//   per-packet --pacing-us, stats/hashlog per PLAN §1.4 (atomic tmp+rename, append hashlog).
-// CLI frozen per PLAN §1.3. --selftest runs with no NIC. --list-adapters lists Npcap devs.
+// 发端（T-01，PLAN §1冻结）：生成NV12发包
+// 链路：NV12→整帧哈希→按mtu-42切包
+// 发raw以太网包，QPC控帧率
+// stats/hashlog按§1.4落盘
+// CLI冻结，无网卡可跑--selftest
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,21 +29,24 @@
 #include "fnv1a.h"
 #include "crc32.h"
 
-// ---------- small-size (64x64) mirror for Python interlock (T-04) ----------
-// Spec (must match ctrl/pattern_ref.py small funcs exactly):
-// W=H=64, sprites S=16, central noise W2=16. Formulas identical to pattern.h
-// with w/h substituted and centers w/2,h/2.
+// 64小图镜像（对账用）
+// 须与pattern_ref.py小图函数一致
+// 宽高64，块16，中央噪声16，公式同pattern.h
+// 宽高代入，中心取半
 namespace small64 {
 static const int W=64,H=64;
 static inline uint64_t sm_splitmix(uint64_t *s){
+  // 小图随机数
   uint64_t z=(*s+=0x9E3779B97F4A7C15ull);
   z=(z^(z>>30))*0xBF58476D1CE4E5B9ull; z=(z^(z>>27))*0x94D049BB133111EBull; return z^(z>>31);
 }
 static inline void gen_counter(uint32_t fid,uint8_t*Y,uint8_t*UV){
+  // 小图烟雾
   for(int y=0;y<H;y++)for(int x=0;x<W;x++)Y[y*W+x]=(uint8_t)(x+y+fid);
   uint8_t v=(uint8_t)(0x80^(fid&0xFF)); for(int i=0;i<W*H/2;i++)UV[i]=v;
 }
 static inline void gen_checker(uint32_t fid,uint8_t*Y,uint8_t*UV){
+  // 小图棋盘
   int ox=fid&7,oy=(fid>>3)&7;
   for(int y=0;y<H;y++)for(int x=0;x<W;x++)Y[y*W+x]=((((x+ox)>>3)+((y+oy)>>3))&1)?255:0;
   for(int y=0;y<H/2;y++)for(int x=0;x<W;x+=2){
@@ -52,6 +55,7 @@ static inline void gen_checker(uint32_t fid,uint8_t*Y,uint8_t*UV){
   }
 }
 static inline void gen_rings(uint32_t fid,uint8_t*Y,uint8_t*UV){
+  // 小图同心环
   int cx=W/2,cy=H/2;
   for(int y=0;y<H;y++){int dy=y-cy;for(int x=0;x<W;x++){int dx=x-cx;uint32_t r2=(uint32_t)(dx*dx+dy*dy);
     Y[y*W+x]=(uint8_t)((r2>>4)+fid*7+((x^y)&15));}}
@@ -70,6 +74,7 @@ static inline void gen_noise(uint32_t fid,uint8_t*Y,uint8_t*UV){
   while(n--)*p++=(uint8_t)sm_splitmix(&s);
 }
 static inline void gen_motion(uint32_t fid,uint8_t*Y,uint8_t*UV){
+  // 小图拟游戏
   for(int y=0;y<H;y++)for(int x=0;x<W;x++)Y[y*W+x]=(uint8_t)(x+fid*3+(y>>2));
   const int S=16;
   for(int k=0;k<4;k++){
@@ -87,6 +92,7 @@ static inline void gen_motion(uint32_t fid,uint8_t*Y,uint8_t*UV){
 
 static uint64_t qpc_freq_ = 0;
 static uint64_t qpc_now_raw() {
+  // 读原始tick
 #ifdef _WIN32
   LARGE_INTEGER c; QueryPerformanceCounter(&c); return (uint64_t)c.QuadPart;
 #else
@@ -95,6 +101,7 @@ static uint64_t qpc_now_raw() {
 #endif
 }
 static void qpc_init() {
+  // 初始化计时频率
 #ifdef _WIN32
   LARGE_INTEGER f; QueryPerformanceFrequency(&f); qpc_freq_=(uint64_t)f.QuadPart;
 #else
@@ -102,6 +109,7 @@ static void qpc_init() {
 #endif
 }
 static uint64_t qpc_ns_now() {
+  // 取纳秒戳
   uint64_t c=qpc_now_raw();
 #ifdef _WIN32
   return c*1000000000ull/qpc_freq_;
@@ -112,17 +120,19 @@ static uint64_t qpc_ns_now() {
 #ifdef _WIN32
 static volatile LONG g_stop = 0;
 static BOOL WINAPI chandler(DWORD e){
+  // 截停止信号
   if(e==CTRL_C_EVENT||e==CTRL_BREAK_EVENT||e==CTRL_CLOSE_EVENT){ InterlockedExchange(&g_stop,1); return TRUE; }
   return FALSE;
 }
 #endif
 
 static void sleep_us(uint64_t us){
+  // 微秒休眠（粗睡+精旋）
   if(us==0) return;
-  uint64_t t0=qpc_ns_now(), want=t0+us*1000ull; // t0 BEFORE sleep: spin only the remainder
+  uint64_t t0=qpc_ns_now(), want=t0+us*1000ull; // 先记t0，休眠后只旋余量
   if(us>=2500){
 #ifdef _WIN32
-    Sleep((DWORD)((us-1500)/1000)); // coarse part, leave ~1.5ms for precise spin
+    Sleep((DWORD)((us-1500)/1000)); // 粗睡，留1.5ms精旋
 #else
     std::this_thread::sleep_for(std::chrono::microseconds(us-1500));
 #endif
@@ -136,7 +146,7 @@ static void sleep_us(uint64_t us){
   }
 }
 
-// ---------- dynamic wpcap ----------
+// 动态加载wpcap
 #ifdef _WIN32
 typedef struct pcap_opaque pcap_t;
 struct DynPcap {
@@ -191,11 +201,13 @@ struct Args {
 };
 
 static bool parse_mac(const std::string&s,uint8_t m[6]){
+  // 解析MAC串
   unsigned v[6];
   if(sscanf(s.c_str(),"%x:%x:%x:%x:%x:%x",&v[0],&v[1],&v[2],&v[3],&v[4],&v[5])!=6) return false;
   for(int i=0;i<6;i++) m[i]=(uint8_t)v[i]; return true;
 }
 static uint16_t parse_et(const std::string&s){
+  // 解析协议号（hex/十进制）
   unsigned v=0;
   if(s.size()>2&&(s[0]==48&&(s[1]==120||s[1]==88))) sscanf(s.c_str(),"%x",&v);
   else if(s.find_first_of("abcdefABCDEF")!=std::string::npos) sscanf(s.c_str(),"%x",&v);
@@ -203,21 +215,25 @@ static uint16_t parse_et(const std::string&s){
   return (uint16_t)v;
 }
 static int pat_id(const std::string&s){
+  // 名转号
   if(s=="counter")return 0; if(s=="checker")return 1; if(s=="rings")return 2;
   if(s=="noise")return 3; if(s=="motion")return 4; return 4;
 }
 static const char* pat_name(int id){
+  // 号转名
   switch(id){case 0:return "counter";case 1:return "checker";case 2:return "rings";
     case 3:return "noise";case 4:return "motion";default:return "motion";}
 }
 
 static void usage(){
+  // 打印用法
   printf("vc-sender.exe --adapter <substr> --mode pattern|file|dda --pattern motion --fps 240\n"
     "  --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff\n"
     "  --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest]\n");
 }
 
 static void ensure_parent(const std::string&path){
+  // 建父目录
   if(path.empty()) return;
   size_t p=path.find_last_of("/\\");
   if(p==std::string::npos) return;
@@ -229,6 +245,7 @@ static void ensure_parent(const std::string&path){
 #endif
 }
 static void atomic_write(const std::string&path,const std::string&data){
+  // 原子写文件（tmp换名）
   if(path.empty()) return;
   ensure_parent(path);
   std::string tmp=path+".tmp";
@@ -241,18 +258,21 @@ static void atomic_write(const std::string&path,const std::string&data){
 }
 
 static void gen_full(int pid,uint32_t fid,uint8_t*Y,uint8_t*UV){
+  // 按号生成全帧
   switch(pid){case 0:vc_gen_counter(fid,Y,UV);break;case 1:vc_gen_checker(fid,Y,UV);break;
     case 2:vc_gen_rings(fid,Y,UV);break;case 3:vc_gen_noise(fid,Y,UV);break;
     default:vc_gen_motion(fid,Y,UV);break;}
 }
 static void gen_small(int pid,uint32_t fid,uint8_t*Y,uint8_t*UV){
+  // 按号生成小图
   switch(pid){case 0:small64::gen_counter(fid,Y,UV);break;case 1:small64::gen_checker(fid,Y,UV);break;
     case 2:small64::gen_rings(fid,Y,UV);break;case 3:small64::gen_noise(fid,Y,UV);break;
     default:small64::gen_motion(fid,Y,UV);break;}
 }
 
-// ---------- selftest ----------
+// 自检
 static int run_selftest(){
+  // 自检：分包/哈希/小图互锁
   qpc_init();
   printf("[sender selftest] patterns x determinism x frag-reassembly\n");
   const int MTU=9000;
@@ -262,7 +282,7 @@ static int run_selftest(){
   printf("frag: mtu=%d payload=%zu total=%zu last=%zu (expect 69/5256)\n",MTU,payload,total,last_len);
   if(total!=69){printf("FAIL total!=69\n");return 1;}
   if(last_len!=5256){printf("FAIL last!=5256 got %zu\n",last_len);return 1;}
-  // mtu1500 reference (doc counter-example)
+  // mtu1500对照（反例）
   { size_t p2=1500-42; size_t t2=(VC_FRAME_BYTES+p2-1)/p2;
     printf("ref1500: payload=%zu total=%zu (expect 422)\n",p2,t2);
     if(t2!=422){printf("FAIL ref1500!=422\n");return 1;} }
@@ -277,19 +297,19 @@ static int run_selftest(){
       uint64_t h1=vc_fnv1a64_two(Y.data(),Y.size(),UV.data(),UV.size());
       uint64_t h2=vc_fnv1a64_two(Y2.data(),Y2.size(),UV2.data(),UV2.size());
       if(h1!=h2){printf("FAIL determinism %s fid=%u\n",pat_name(pid),fid);ok=false;}
-      // frag roundtrip locally
+      // 本地分包往返
       memcpy(frame.data(),Y.data(),VC_Y_BYTES);
       memcpy(frame.data()+VC_Y_BYTES,UV.data(),VC_UV_BYTES);
-      // split + crc + reassemble
+      // 切包+CRC+重组
       std::vector<uint8_t> out(VC_FRAME_BYTES); size_t off=0;
     for(size_t s=0;s<total;s++){
         size_t cl=(s==total-1)?last_len:payload;
         uint32_t c=vc_crc32(frame.data()+off,cl);
-        // verify crc immediately (transport-intact path)
+        // 先验CRC（传输完好路径）
         uint32_t c2=vc_crc32(frame.data()+off,cl);
         if(c!=c2){printf("FAIL crc self %s fid=%u seq=%zu\n",pat_name(pid),fid,s);ok=false;}
         memcpy(out.data()+off,frame.data()+off,cl);
-        // header field sanity
+        // 头字段合法性
         vc_pkt_hdr_t h; memset(&h,0,sizeof(h));
         h.magic=VC_MAGIC; h.frame_id=fid; h.seq=(uint16_t)s; h.total=(uint16_t)total;
         h.payload_crc=c; h.payload_len=(uint16_t)cl; h.pattern=(uint8_t)pid;
@@ -300,7 +320,7 @@ static int run_selftest(){
       if(hr!=h1){printf("FAIL roundtrip %s fid=%u\n",pat_name(pid),fid);ok=false;}
       char hx[17]; vc_fnv1a64_hex(h1,hx);
       printf("VEC full %s %u %s\n",pat_name(pid),fid,hx);
-      // small interlock vectors
+      // 小图互锁向量
       gen_small(pid,fid,sY.data(),sUV.data());
       gen_small(pid,fid,sY2.data(),sUV2.data());
       uint64_t sh1=vc_fnv1a64_two(sY.data(),sY.size(),sUV.data(),sUV.size());
@@ -310,13 +330,13 @@ static int run_selftest(){
       printf("VEC small %s %u %s\n",pat_name(pid),fid,shx);
     }
   }
-  // FNV known vectors (spec): empty==offset basis, single 'a' known? use standard test:
-  // FNV-1a64("") = cbf29ce484222325 ; FNV-1a64("a") = af63dc4c8601ec8c (well-known)
+  // FNV标准向量
+  // 空串=初值，a=af63dc4c8601ec8c
   { uint64_t he=vc_fnv1a64(nullptr,0);
     if(he!=14695981039346656037ull){printf("FAIL fnv empty %016llx\n",(unsigned long long)he);ok=false;}
     const uint8_t a[]={97};
     uint64_t ha=vc_fnv1a64(a,1);
-    // 0xaf63dc4c8601ec8c is the standard FNV-1a 64 for "a"
+    // 上值为标准a向量
     if(ha!=0xaf63dc4c8601ec8cull){printf("FAIL fnv(a) %016llx\n",(unsigned long long)ha);ok=false;} }
   { static const int DW=640, DH=640;
     std::vector<uint8_t> bgra((size_t)DW*DH*4), tY(VC_Y_BYTES), tUV(VC_UV_BYTES);
@@ -336,9 +356,10 @@ static int run_selftest(){
 
 #ifdef _WIN32
 static int run_list_adapters(){
+  // 列网卡
   DynPcap d; if(!d.load()){ fprintf(stderr,"list-adapters: %s\n",d.err.c_str()); return 1; }
   if(!d.findalldevs){ fprintf(stderr,"list-adapters: no pcap_findalldevs\n"); return 1; }
-  // pcap_if minimal layout: next, name, description, addresses, flags
+  // 网卡结构：链首/名/描述/地址/标志
   struct PcapIf { PcapIf* next; char* name; char* description; void* addresses; uint32_t flags; };
   PcapIf* devs=nullptr; char errbuf[256]={0};
   if(d.findalldevs((void**)&devs,errbuf)!=0){ fprintf(stderr,"findalldevs failed: %s\n",errbuf); return 1; }
@@ -399,13 +420,13 @@ int main(int argc,char**argv){
   if(a.batch<1){fprintf(stderr,"bad --batch\n");return 2;}
   if(total>65535){fprintf(stderr,"mtu too small\n");return 2;}
 #ifdef _WIN32
-  timeBeginPeriod(1); // 1ms Sleep granularity, else 240Hz throttle oversleeps to 64Hz
+  timeBeginPeriod(1); // 1ms精度，否则240Hz会睡成64Hz
 #endif
   printf("[sender] session=%s mode=%s pattern=%s fps=%d frames=%lld mtu=%d payload=%zu total=%zu ethertype=0x%04x\n",
     a.session.c_str(),a.mode.c_str(),a.pattern.c_str(),a.fps,(long long)a.frames,
     a.mtu,payload,total,a.ethertype);
 
-  // file mode load
+  // 文件模式读帧
   std::vector<uint8_t> fileFrames;
   size_t fileNFrames=0;
   if(a.mode=="file"){
@@ -421,7 +442,7 @@ int main(int argc,char**argv){
 
 #ifdef _WIN32
   DynPcap d; if(!d.load()){fprintf(stderr,"pcap load: %s\n",d.err.c_str());return 1;}
-  // resolve adapter substring
+  // 按子串找网卡
   struct PcapIf { PcapIf* next; char* name; char* description; void* addresses; uint32_t flags; };
   std::string devName="";
   if(a.adapter.empty()){
@@ -452,7 +473,7 @@ int main(int argc,char**argv){
   DDACap dda_cap; double gpu_accum_ms=0;
   if(a.mode=="dda"){ std::string dd; if(!dda_cap.init(dd)){fprintf(stderr,"dda init failed: %s\n",dda_cap.err());return 1;} printf("[sender] dda output=%s center640\n",dd.c_str()); }
   std::vector<uint8_t> eth(14+28+payload);
-  // eth header
+  // 组以太网头
   memcpy(eth.data(),a.dstmac,6);
   uint8_t srcmac[6]={0x02,0x00,0x00,0x00,0x00,0x01};
   memcpy(eth.data()+6,srcmac,6);
@@ -464,7 +485,7 @@ int main(int argc,char**argv){
 #ifdef _WIN32
   static ULARGE_INTEGER cpu_prev_k, cpu_prev_u; static uint64_t cpu_prev_w=0;
 #endif
-  // truncate hashlog at start
+  // 起始清空hashlog
   { ensure_parent(a.hashlog); std::ofstream f(a.hashlog,std::ios::trunc); }
   std::ofstream hashlog(a.hashlog,std::ios::app|std::ios::binary);
   double frame_interval_s=a.fps>0?1.0/a.fps:0;
@@ -477,7 +498,7 @@ int main(int argc,char**argv){
 #endif
     if(a.frames>0&&(long long)sent_frames>=a.frames) break;
     if(a.mode=="file"&&!a.loop&&file_played>=fileNFrames) break;
-    // fps throttle (skip for first frame)
+    // 帧率节流（首帧跳过）
     if(sent_frames>0&&frame_interval_s>0){
       uint64_t now=qpc_ns_now();
       if(now<next_frame_ns) {
@@ -486,7 +507,7 @@ int main(int argc,char**argv){
       }
     }
     uint64_t f0=qpc_ns_now();
-    // generate
+    // 生成一帧
     uint8_t pat_field=255;
     if(a.mode=="pattern"){ gen_full(pid,fid,Y.data(),UV.data()); pat_field=(uint8_t)pid; }
     else if(a.mode=="dda"){ uint64_t g0=qpc_ns_now(); if(!dda_cap.capture(Y.data(),UV.data())){ if(dda_cap.err_code!=DDACap::E_TIMEOUT){fprintf(stderr,"dda capture failed: %s\n",dda_cap.err());return 1;} } gpu_accum_ms+=(qpc_ns_now()-g0)/1e6; pat_field=255; }
@@ -495,13 +516,13 @@ int main(int argc,char**argv){
            fileIdx=(fileIdx+1)%fileNFrames; file_played++; }
     uint64_t fh=vc_fnv1a64_two(Y.data(),Y.size(),UV.data(),UV.size());
     char fhx[17]; vc_fnv1a64_hex(fh,fhx);
-    // contiguous for slicing
-    // (avoid extra copy: slice Y then UV)
-    size_t pkts_before = sent_packets; // for partial-frame stop guard
+    // 拼连续缓冲好切包
+    // 免拷贝：先切Y再切UV
+    size_t pkts_before = sent_packets; // 防停机半帧
     for(size_t s=0;s<total;s++){
       size_t off=s*payload;
       size_t cl=(s==total-1)?(VC_FRAME_BYTES-off):payload;
-      // copy chunk handling Y/UV boundary
+      // 拷贝分片，处理Y/UV边界
       std::vector<uint8_t> chunk(cl);
       if(off+cl<=VC_Y_BYTES) memcpy(chunk.data(),Y.data()+off,cl);
       else if(off>=VC_Y_BYTES) memcpy(chunk.data(),UV.data()+(off-VC_Y_BYTES),cl);
@@ -516,7 +537,7 @@ int main(int argc,char**argv){
       memcpy(eth.data()+14+sizeof(hdr),chunk.data(),cl);
 #ifdef _WIN32
       int plen=(int)(14+sizeof(hdr)+cl);
-      // NOTE: Npcap sendqueue_transmit returns positive on success, so error tests must use <0 (a !=0 check once faked 165600 errors on a fully-delivered run, 2026-10-21).
+      // 注意：sendqueue成功返回正数，判错须用<0（曾误报16万错）
       if(a.batch<=1){ int rc=d.sendpacket(h,eth.data(),plen); if(rc<0) send_errors++; }
       else {
         if(!sq){ sq=d.sendqueue_alloc(2*1024*1024); if(!sq){fprintf(stderr,"sendqueue_alloc failed\n");return 1;}
@@ -533,7 +554,7 @@ int main(int argc,char**argv){
       if(a.pacing_us>0) sleep_us((uint64_t)a.pacing_us);
     }
 #ifdef _WIN32
-    if(g_stop && sent_packets - pkts_before < total) break; // partial frame on stop: drop, do not log/count
+    if(g_stop && sent_packets - pkts_before < total) break; // 停机半帧丢弃，不记数
 #endif
 #ifdef _WIN32
     if(sq){ if(d.sendqueue_transmit(h,sq,0)<0) send_errors+=(uint64_t)sq_n; d.sendqueue_destroy(sq); sq=nullptr; sq_n=0; }

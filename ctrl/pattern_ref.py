@@ -7,6 +7,7 @@ W = H = 64
 M = 0xFFFFFFFFFFFFFFFF
 
 def splitmix64(s):
+    # 确定性随机数（与C++同算法）
     s = (s + 0x9E3779B97F4A7C15) & M
     z = s
     z = ((z ^ (z >> 30)) * 0xBF58476D1CE4E5B9) & M
@@ -14,6 +15,7 @@ def splitmix64(s):
     return s, (z ^ (z >> 31)) & M
 
 def _fill_prng(seed, n):
+    # 按种子填n字节随机流
     s = seed & M
     out = bytearray(n)
     i = 0
@@ -25,12 +27,14 @@ def _fill_prng(seed, n):
     return bytes(out)
 
 def gen_counter(fid, w=W, h=H):
+    # 烟雾渐变：Y=x+y+fid
     Y = bytes(((x + y + fid) & 0xFF) for y in range(h) for x in range(w))
     v = 0x80 ^ (fid & 0xFF)
     UV = bytes([v]) * (w * h // 2)
     return Y, UV
 
 def gen_checker(fid, w=W, h=H):
+    # 棋盘：逐帧滚1px
     ox = fid & 7; oy = (fid >> 3) & 7
     Y = bytes((255 if ((((x + ox) >> 3) + ((y + oy) >> 3)) & 1) else 0) for y in range(h) for x in range(w))
     uv = bytearray(w * h // 2)
@@ -42,6 +46,7 @@ def gen_checker(fid, w=W, h=H):
     return Y, bytes(uv)
 
 def gen_rings(fid, w=W, h=H):
+    # 同心环：高频运动
     cx, cy = w // 2, h // 2
     Y = bytearray(w * h)
     for y in range(h):
@@ -86,20 +91,25 @@ def gen_motion(fid, w=W, h=H):
     return bytes(Y), bytes(uv)
 
 def gen_noise_y(fid, w=W, h=H):
+    # 取噪声Y分量
     Y, _ = gen_noise(fid, w, h)
     return Y
 
 def gen_counter_y(fid, w=W, h=H):
+    # 取渐变Y分量
     Y, _ = gen_counter(fid, w, h)
     return Y
 
 def frame_hash(data: bytes) -> str:
+    # 整段哈希转hex
     return fnv1a64_hex(data)
 
 def frame_hash_yuv(Y: bytes, UV: bytes) -> str:
+    # Y+UV拼接哈希
     return fnv1a64_hex(Y + UV)
 
 def verify_samples(Y: bytes, UV: bytes, fid: int, pattern: str, n: int = 4096):
+    # 抽点验帧（默认4096点）
     expY, expUV = {"counter": gen_counter, "checker": gen_checker, "rings": gen_rings,
                    "noise": gen_noise, "motion": gen_motion}[pattern](fid)
     step = max(1, len(Y) // n)

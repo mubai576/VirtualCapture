@@ -1,12 +1,13 @@
+// 包载荷CRC32（IEEE多项式），查表法
+// 初值全1，输出异或全1
 #pragma once
-// crc32.h — IEEE CRC32 (poly 0xEDB88320), for vc_pkt_hdr_t.payload_crc.
-// Table-driven, init 0xFFFFFFFF, xorout 0xFFFFFFFF.
 #include <stdint.h>
 #include <stddef.h>
 
 static uint32_t vc_crc32_table[256];
 static int vc_crc32_table_ready = 0;
 
+// 建表：只建一次
 static inline void vc_crc32_init(void) {
   if (vc_crc32_table_ready) return;
   for (uint32_t i = 0; i < 256; i++) {
@@ -17,6 +18,7 @@ static inline void vc_crc32_init(void) {
   vc_crc32_table_ready = 1;
 }
 
+// 算整段CRC
 static inline uint32_t vc_crc32(const uint8_t *data, size_t len) {
   vc_crc32_init();
   uint32_t c = 0xFFFFFFFFu;

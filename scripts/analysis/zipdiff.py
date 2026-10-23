@@ -1,3 +1,4 @@
+# 比两个OTA包差异
 import zipfile, hashlib, os
 z = zipfile.ZipFile("release/vc-0.3.7.zip")
 print("entries:")

@@ -1,12 +1,6 @@
-"""bringup.py - T-06 dual-host bringup runner: T0 -> T1(x5 patterns) -> T2 soak -> T4 pacing -> T3.
-Writes docs/bringup/bringup-<date>.md with verdict tables + auto-triage per references/test-matrix.md.
-Usage:
-  python ctrl/bringup.py --sender http://192.168.2.100:18080 --receiver http://192.168.2.59:18080 --adapter I226
-  python ctrl/bringup.py --sender ... --receiver ... --adapter X --quick        # smoke: T0 + short T1-motion
-  python ctrl/bringup.py --sender ... --receiver ... --adapter X --skip-soak
-  python ctrl/bringup.py --selftest    # offline: render sample doc to temp, no network
-Exit 0 iff all gating cases PASS (T3 is informational only).
-"""
+"""双机联调：T0→T1五源→T2浸泡→T4间隔→T3（只报不卡）
+报告写docs/bringup/bringup-<日期>.md，含判分+自动归因。
+quick只跑冒烟；--selftest离线渲文档样例"""
 import argparse, datetime, json, os, sys, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -35,7 +29,7 @@ CASES_QUICK = [
 ]
 
 def triage(rep):
-    """Map a FAIL report to one of the four test-matrix buckets + next step."""
+    """失败归因：落四类桶+下一步"""
     rs = rep.get("receiver_stats", {}) or {}
     ss = rep.get("sender_stats", {}) or {}
     out = []
@@ -57,7 +51,7 @@ def triage(rep):
     return out
 
 def local_reconcile(rep):
-    """Full hashlog compare when both files are local (loopback); else note for manual transfer."""
+    """本地全量对账；异机需手动传文件"""
     try:
         ssid = (rep.get("sender_session") or {}).get("session_id", "")
         rsid = (rep.get("receiver_session") or {}).get("session_id", "")
@@ -74,6 +68,7 @@ def local_reconcile(rep):
             "note": "hashlogs live on the agents; transfer run/*.hash.jsonl off both hosts for offline reconcile.py"}
 
 def stats_row(rep):
+    # 取一行统计用于制表
     ss = rep.get("sender_stats", {}) or {}
     rs = rep.get("receiver_stats", {}) or {}
     rec = rep.get("reconcile", {}) or {}
@@ -84,6 +79,7 @@ def stats_row(rep):
             "pps": round(rs.get("pps", 0) or 0), "reconcile": rec, "triage": triage(rep)}
 
 def render(path, meta, rows):
+    # 渲染bringup报告
     L = []
     L.append("# Bringup %s" % meta["date"])
     L.append("")
@@ -112,6 +108,7 @@ def render(path, meta, rows):
     return path
 
 def main():
+    # 入口：组装用例集并跑
     ap = argparse.ArgumentParser()
     ap.add_argument("--sender", default=""); ap.add_argument("--receiver", default="")
     ap.add_argument("--adapter", default="")

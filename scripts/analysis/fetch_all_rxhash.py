@@ -1,3 +1,4 @@
+# 拉回PC2全量收端哈希
 import json, urllib.request, urllib.parse
 R = "http://192.168.2.59:18080"
 for tag in ("q1", "q1b", "q3", "q23", "q69", "q3b"):

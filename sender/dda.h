@@ -1,7 +1,7 @@
-// dda.h - T-05/T-10 DDA capture minimal (Windows D3D11 Desktop Duplication).
-// Borderless desktop -> center 640x640 crop -> NV12, integer BT.601, no float anywhere.
-// Contract: NO silent black frames. Every failure sets an explicit err; caller must exit non-zero.
-// Non-Windows: stub (init fails E_NODDA, selftest SKIP).
+// 桌面采集（DDA取屏，居中裁640，整数转NV12）
+// 无边框桌面→居中裁剪→NV12，全程整数无浮点
+// 禁止静默黑帧：失败必置错码，调用方非零退出
+// 非Windows：桩实现，无屏SKIP
 #pragma once
 #include <cstdint>
 #include <cstdio>
@@ -68,6 +68,7 @@ void DDACap::shutdown(){
   if(dev){ dev->Release(); dev = nullptr; }
 #endif
 }
+// BGRX居中裁640转NV12（整数BT.601）
 static inline void dda_bgrx_to_nv12(const uint8_t* base, unsigned pitch, int w, int h, uint8_t* Y, uint8_t* UV){
   int ox = (w - 640) / 2, oy = (h - 640) / 2;
   for(int y = 0; y < 640; y++){

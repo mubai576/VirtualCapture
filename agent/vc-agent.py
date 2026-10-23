@@ -23,7 +23,7 @@ BUILD_DIR = os.path.join(ROOT, "build")
 VERSION_FILE = os.path.join(ROOT, "version.json")
 
 def updater_status():
-    """Pre-flight for the PS restart helper: ps-ok | ps-missing | unchecked."""
+    """重启前检查：ps可用/缺失/未查"""
     if os.name != "nt":
         return "unchecked"
     import shutil as _sh
@@ -47,6 +47,7 @@ def updater_status():
     return "vbs-ok"
 
 def read_version():
+    # 读版本号（version.json缺省dev）
     try:
         with open(VERSION_FILE, "r", encoding="utf-8") as f:
             return json.load(f).get("version", VERSION_DEFAULT)
@@ -58,24 +59,25 @@ state = {"role": None, "port": 18080,
          "receiver": {"session_id": None, "proc": None, "started_at": 0, "stats": "", "hashlog": ""}}
 
 def exe_path(kind):
-    # kind sender|receiver → build/vc-sender.exe / build/vc-receiver.exe ; fallback .exe in root?
+    # 发收两用：找build下exe，兜底根目录
     name = "vc-sender.exe" if kind == "sender" else "vc-receiver.exe"
     p = os.path.join(BUILD_DIR, name)
     if os.path.exists(p): return p
-    # also accept build/Release etc (MSVC multi-config)
+    # 兼容多配置目录
     for cand in [os.path.join(BUILD_DIR, "Release", name), os.path.join(BUILD_DIR, "Debug", name),
                  os.path.join(ROOT, name)]:
         if os.path.exists(cand): return cand
     return p  # return expected path so error message is clear
 
 def kill_slot(slot):
+    # 停槽位进程（优雅2s再杀）
     p = slot.get("proc")
     if p is None: return
     try:
         if p.poll() is None:
             try:
                 if os.name == "nt":
-                    # graceful: CTRL_BREAK to the child process group (exe flushes final stats)
+                    # 优雅停：发CTRL_BREAK让exe刷完统计
                     os.kill(p.pid, signal.CTRL_BREAK_EVENT)
                 else:
                     p.terminate()
@@ -94,6 +96,7 @@ def kill_slot(slot):
     slot["proc"] = None
 
 def launch(kind, args):
+    # 起一端：先停旧，再拉新会话
     slot = state[kind]
     kill_slot(slot)  # idempotent: stop old first
     sid = "s-%s" % uuid.uuid4().hex[:8]
@@ -102,15 +105,15 @@ def launch(kind, args):
     hashlog = os.path.join(RUN_DIR, "%s.%s.hash.jsonl" % (sid, kind))
     exe = exe_path(kind)
     if not os.path.exists(exe):
-        # No binary yet (pre-T01/T02): run a stub long-lived process so ctrl flow still works,
-        # and write stub stats/hashlog files so /stats + reconcile have real files.
-        # Stub mimics C++ file IPC: stats atomic write + hashlog append.
+        # 无二进制时跑桩进程保流程
+        # 写桩统计/哈希供对账
+        # 桩模拟C++落盘：统计覆写+哈希追加
         slot.update(session_id=sid, started_at=time.time(), stats=stats, hashlog=hashlog)
         stub_stats = {"session_id": sid, "running": True, "note": "stub-no-binary",
                       "sent_frames": 0, "complete": 0, "version": read_version()}
         with open(stats, "w", encoding="utf-8") as f: json.dump(stub_stats, f)
         open(hashlog, "w", encoding="utf-8").close()
-        # placeholder sleeper process (python) so running stays true until /stop
+        # 占位睡进程，stop前保持运行态
         skw = {"cwd": ROOT, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL}
         if os.name == "nt":
             skw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -154,7 +157,7 @@ def launch(kind, args):
             skip_next = True; continue
         cmd2.append(c)
     slot.update(session_id=sid, started_at=time.time(), stats=stats, hashlog=hashlog)
-    # truncate outputs
+    # 截断输出防爆
     open(hashlog, "w", encoding="utf-8").close()
     popen_kw = {"cwd": ROOT, "stdout": open(os.path.join(RUN_DIR, sid + "." + kind + ".stdout.log"), "wb"),
                 "stderr": subprocess.STDOUT}
@@ -165,7 +168,7 @@ def launch(kind, args):
     return sid, {"cmd": cmd2, "stats": stats, "hashlog": hashlog, "pid": proc.pid}
 
 def get_adapters():
-    """P1-1: run exe --list-adapters, return (code, {text, names[]}). No process launch."""
+    """列网卡：跑--list-adapters，不起进程"""
     import re
     exe = ""
     for cand in [exe_path("sender"), exe_path("receiver")]:
@@ -182,7 +185,7 @@ def get_adapters():
             nm = m.group(1).strip()
             if nm and nm != "(null)" and nm not in names:
                 names.append(nm)
-        # also accept adapter[...] lines without name= (fallback: whole line)
+        # 兼容无name=的行
         if not names:
             for line in text.splitlines():
                 line=line.strip()
@@ -193,6 +196,7 @@ def get_adapters():
         return 500, {"error": str(e), "text": "", "names": []}
 
 def slot_stats(kind):
+    # 读槽位统计（缺文件则报停止）
     slot = state[kind]
     sid = slot.get("session_id")
     proc = slot.get("proc")
@@ -200,7 +204,7 @@ def slot_stats(kind):
     up = round(time.time() - slot["started_at"], 2) if slot.get("started_at") else 0
     path = slot.get("stats", "")
     if not path or not os.path.exists(path):
-        # also try latest run file for this kind (survive agent restart within same session?)
+        # 兜底读同类最新run文件
         return {"session_id": sid, "running": running, "uptime_s": up}
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -221,6 +225,7 @@ EXEC_OUT_CAP = 131072  # per-stream truncation cap
 EXEC_LOCK = threading.Lock()
 
 def _under_root(path):
+    # 判路径在ROOT内防越界
     try:
         rp = os.path.realpath(path)
         rr = os.path.realpath(ROOT)
@@ -229,7 +234,7 @@ def _under_root(path):
         return False
 
 def _resolve_argv(argv):
-    """Allowlist resolution. Returns (run_argv, denied_reason)."""
+    """白名单解析：返回命令或拒绝原因"""
     if not argv or not isinstance(argv, list) or not all(isinstance(a, str) for a in argv):
         return None, "argv must be a non-empty string list"
     if any(a == "" for a in argv):
@@ -239,7 +244,7 @@ def _resolve_argv(argv):
         return None, "path traversal denied"
     lo = a0.lower()
     base = os.path.basename(a0)
-    # python scripts: only files under ROOT, via local interpreter
+    # py脚本限ROOT内，走本地解释器
     if lo in ("python", "python3", "python.exe"):
         interp = sys.executable
         if getattr(sys, "frozen", False):
@@ -255,7 +260,7 @@ def _resolve_argv(argv):
                 if not _under_root(cand) or not os.path.isfile(cand):
                     return None, "script outside ROOT denied: " + a
         return [interp] + rest, ""
-    # pwsh: only -File scripts under ROOT (no -Command/-EncodedCommand)
+    # pwsh限-File，不接命令串
     if lo in ("pwsh", "powershell", "pwsh.exe", "powershell.exe"):
         if len(argv) < 6 or argv[1] != "-NoProfile" or argv[2] != "-ExecutionPolicy" \
                 or argv[3] != "Bypass" or argv[4] != "-File":
@@ -266,7 +271,7 @@ def _resolve_argv(argv):
             return None, "script outside ROOT/scripts denied"
         exe = "pwsh.exe" if lo.startswith("pwsh") else "powershell.exe"
         return [exe, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", cand] + argv[6:], ""
-    # canned diagnostics
+    # 预置诊断命令
     if lo in ("ipconfig", "ipconfig.exe"):
         if len(argv) > 2 or (len(argv) == 2 and argv[1].lower() != "/all"):
             return None, "ipconfig allows no args or /all only"
@@ -277,7 +282,7 @@ def _resolve_argv(argv):
             return None, "ping denied (-t or too many args)"
         sys32 = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "PING.EXE")
         return [sys32] + argv[1:], ""
-    # files under ROOT: bare name searched in ROOT/build/scripts, abs path must stay under ROOT
+    # 文件限ROOT内，绝对路径防越界
     if os.path.isabs(a0):
         cand = a0
         if not _under_root(cand):
@@ -295,6 +300,7 @@ def _resolve_argv(argv):
     return [cand] + argv[1:], ""
 
 def run_exec(argv, timeout_s, client):
+    # 远控执行：白名单内跑命令
     import uuid as _uuid, time as _time
     run_argv, denied = _resolve_argv(argv)
     if denied:
@@ -354,7 +360,7 @@ def read_root_file(rel, offset=0, limit=0):
         limit = 0
     if limit > 1048576:
         limit = 1048576
-    """Read-only file fetch under ROOT for automation/diagnosis. Returns (code, obj)."""
+    """只读取文件：限ROOT内"""
     if not rel or not isinstance(rel, str):
         return 400, {"error": "path required"}
     nn = rel.replace("\\", "/")
@@ -391,7 +397,7 @@ def read_root_file(rel, offset=0, limit=0):
         return 500, {"error": str(e)}
 
 def _update_slots():
-    """Live absolute paths of managed slots for this runtime."""
+    """本运行时管理槽位绝对路径"""
     m = {}
     if getattr(sys, "frozen", False):
         m["vc-agent.exe"] = os.path.abspath(sys.executable)
@@ -442,6 +448,7 @@ def _live_for_rel(rel, slots):
 STAGED = {"version": None, "dir": None}
 
 def _agent_script_path():
+    # 取agent自身脚本路径
     try:
         _c = os.path.join(ROOT, "agent", "vc-agent.py")
         if os.path.isfile(_c):
@@ -454,6 +461,7 @@ def _agent_script_path():
         return ""
 
 def _all_managed_files():
+    # 列管控文件（OTA范围）
     _out = []
     try:
         for _rel, _live in _update_slots().items():
@@ -481,6 +489,7 @@ def _all_managed_files():
     return _out
 
 def _full_prev_snapshot():
+    # 全量备份prev（回滚用）
     import shutil as _sh
     _prev = os.path.join(ROOT, "prev", "mirror")
     if os.path.isdir(_prev):
@@ -495,10 +504,12 @@ def _full_prev_snapshot():
     return _prev
 
 def _versioned_exe_name(ver):
+    # 版本化exe名
     _safe = "".join(c if c.isalnum() else "_" for c in ver) or "update"
     return "vc-agent-%s.exe" % _safe
 
 def _gc_versioned_layout():
+    # 清旧版本留最新
     try:
         _me = os.path.realpath(sys.executable) if getattr(sys, "frozen", False) else ""
         _keep = set()
@@ -540,6 +551,7 @@ def _gc_versioned_layout():
         pass
 
 def _apply_staged_to_live(stag, newver):
+    # staging搬live
     import shutil as _sh
     import time as _tt
     _slots = _update_slots()
@@ -589,6 +601,7 @@ def _apply_staged_to_live(stag, newver):
     return _applied, _exe_live
 
 def _do_activate(ver_or_none, is_rollback):
+    # 执行切换/回滚
     with UPDATE_LOCK:
         if is_rollback:
             _prev = os.path.join(ROOT, "prev", "mirror")
@@ -639,6 +652,7 @@ def _do_activate(ver_or_none, is_rollback):
         STAGED["version"] = None; STAGED["dir"] = None
         return 200, {"activated": True, "version": _want, "rollback": is_rollback, "restart": "execv", "exe": (os.path.basename(_exe_live) if _exe_live else None)}
 def _execv_self(new_exe=None):
+    # 原地换代（execv）
     if getattr(sys, "frozen", False):
         _exe = new_exe or os.path.abspath(sys.executable)
         os.execv(_exe, [_exe] + sys.argv[1:])
@@ -647,11 +661,14 @@ def _execv_self(new_exe=None):
         _script = _agent_script_path()
         os.execv(_py, [_py, _script] + sys.argv[1:])
 def handle_activate(body_args):
+    # 处理activate请求
     _v = body_args.get("version") if isinstance(body_args, dict) else None
     return _do_activate(_v if isinstance(_v, str) else None, False)
 def handle_rollback():
+    # 处理回滚请求
     return _do_activate(None, True)
 def handle_update_binary(body):
+    # 处理推包（验zip存staging）
     import shutil as _sh, zipfile as _zf
     os.makedirs(RUN_DIR, exist_ok=True)
     tmp = os.path.join(RUN_DIR, "update-incoming.zip")
@@ -695,7 +712,7 @@ def handle_update_binary(body):
         if os.path.isdir(stag):
             _sh.rmtree(stag, ignore_errors=True)
         prev = os.path.join(ROOT, "prev", "mirror")
-        # same-version re-apply keeps the older backup (the true rollback target)
+        # 同版本重打保留旧备，回滚用
         if newver != read_version():
             _full_prev_snapshot()
         for relp, live, n in pairs:
@@ -738,6 +755,7 @@ def handle_update_binary(body):
 
 
 def _respond_activate(handler, code, res):
+    # 回activate应答
     handler._j(res, code)
     if code != 200 or not isinstance(res, dict) or res.get("restart") != "execv":
         return
@@ -791,7 +809,7 @@ class H(BaseHTTPRequestHandler):
         elif self.path == "/receiver/stats":
             self._j(slot_stats("receiver"))
         elif self.path == "/receiver/report":
-            # bundle stats + versions + file existence for ctrl packaging
+            # 打包用统计+版本+文件存在性
             self._j({"version": read_version(), "sender": slot_stats("sender"), "receiver": slot_stats("receiver")})
         elif self.path == '/files' or self.path.startswith('/files?'):
             try:
@@ -848,7 +866,7 @@ class H(BaseHTTPRequestHandler):
             kind = "sender" if self.path.startswith("/sender") else "receiver"
             sid = state[kind].get("session_id")
             kill_slot(state[kind])
-            # mark stats file running:false (keep file for reconcile)
+            # 停后标运行假，留文件对账
             try:
                 p = state[kind].get("stats", "")
                 if p and os.path.exists(p):

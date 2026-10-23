@@ -1,11 +1,6 @@
-"""vc-ctrl.py - orchestrator (T-04 ready): version compare -> arm rx -> start tx -> poll -> stop -> verdict+report.
-Usage (loopback, no 2nd PC):
-  python ctrl/vc-ctrl.py --sender http://127.0.0.1:18081 --receiver http://127.0.0.1:18081 --seconds 10
-Real dual-host T1:
-  python ctrl/vc-ctrl.py --sender http://192.168.2.100:18080 --receiver http://192.168.2.59:18080 --seconds 60 --pattern motion --case T1
-Thresholds per references/test-matrix.md (initial redlines, tighten after 3 rounds).
-Report: run/report-<case>-<timestamp>.json with versions/sessions/stats/verdict.
-"""
+"""编排器：比版本→备收端→发起端→轮询→判分报告
+单机回环：--sender/--receiver同地址；双机T1加--pattern motion。
+门限见test-matrix.md；报告落run/report-<case>-<时间>.json"""
 import argparse, json, time, sys, os, datetime
 import urllib.request
 
@@ -13,17 +8,19 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN_DIR = os.path.join(ROOT, "run")
 
 def get(base, path, timeout=10):
+    # GET取JSON
     with urllib.request.urlopen(base + path, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 def post(base, path, args=None, timeout=10):
+    # POST发JSON
     data = json.dumps(args or {}).encode()
     req = urllib.request.Request(base + path, data=data, headers={"Content-Type": "application/json"}, method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return json.loads(r.read().decode())
 
 def verdict_t1(sstats, rstats, steady=None, sender_cadence=None):
-    """T1 verdict D1 drops mismatch complete p99 steady-avg sender-cadence."""
+    """T1判分：丢包/错哈希/完成数/p99/稳态均值/发端节拍"""
     reasons = []
     try:
         sent = sstats.get("sent_frames", sstats.get("sent", 0)) or 0
@@ -32,7 +29,7 @@ def verdict_t1(sstats, rstats, steady=None, sender_cadence=None):
         mm = rstats.get("hash_mismatch", 0) or 0
         if dropped != 0: reasons.append("dropped=%s != 0" % dropped)
         if mm != 0: reasons.append("hash_mismatch=%s != 0" % mm)
-        # complete==sent (allow receiver file-mode unknown? strict for T1)
+        # 完成须等于发送（T1从严）
         if comp != sent: reasons.append("complete(%s)!=sent(%s)" % (comp, sent))
         _sp99 = (steady or {}).get("r_p99", None)
         p99 = _sp99 if _sp99 is not None else rstats.get("inter_arrival_p99_ms", None)
@@ -50,7 +47,7 @@ def verdict_t1(sstats, rstats, steady=None, sender_cadence=None):
             try:
                 if abs(float(cad) - 4.166) > 0.3: reasons.append("sender_cadence NG");
             except Exception: pass
-        # no frames at all -> fail (stub case)
+        # 零帧判败（桩态）
         if (sent or 0) == 0 and (comp or 0) == 0:
             reasons.append("no frames (stub?)")
     except Exception as e:
@@ -58,6 +55,7 @@ def verdict_t1(sstats, rstats, steady=None, sender_cadence=None):
     return (len(reasons) == 0), reasons
 
 def sender_cadence_ms(hashlog_path):
+    # 发端节拍：相邻帧qpc差均值
     try:
         if not hashlog_path or not os.path.isfile(hashlog_path):
             return {"frames": 0, "cadence_ms": None}
@@ -88,6 +86,7 @@ def sender_cadence_ms(hashlog_path):
         return {"frames": 0, "cadence_ms": None}
 
 def run_case(sender, receiver, seconds=10, pattern="motion", fps=240, mtu=9000, pacing_us=0, case="T0", expect_frames=0, adapter="", dst_mac="", mode="pattern", batch=0):
+    # 跑单用例：备收→发→轮询→判分
     os.makedirs(RUN_DIR, exist_ok=True)
     print("== health ==", flush=True)
     sh = get(sender, "/health"); rh = get(receiver, "/health")
@@ -97,8 +96,8 @@ def run_case(sender, receiver, seconds=10, pattern="motion", fps=240, mtu=9000, 
     version_ok = sv.get("version") == rv.get("version")
     if not version_ok:
         print("FAIL: version skew %s vs %s" % (sv.get("version"), rv.get("version")), flush=True)
-    # frame-count boxing: sender emits exactly `frames` full frames then exits cleanly
-    # (no mid-frame SIGTERM -> no stop-edge partial -> complete==sent exactly).
+    # 定帧数：发满即退，无半帧
+    # 无中帧打断，完成必等于发送
     frames = expect_frames if (expect_frames and expect_frames > 0) else (seconds * fps if (fps and fps > 0) else 0)
     rx_args = {"ethertype": "0x88B5", "mtu": mtu, "verify_hash": True,
                "timeout_s": seconds + 120, "expect_frames": frames}  # generous: pacing/soak stretch sender duration
@@ -195,7 +194,7 @@ if __name__ == "__main__":
     ap.add_argument("--mode", default="pattern")
     ap.add_argument("--batch", type=int, default=0)
     a = ap.parse_args()
-    # P1-1: --adapter 必填（缺省 exit 2，提示先 GET /adapters，不产生报告）
+    # 网卡必填，缺省exit2先查/adapters
     if not str(a.adapter or "").strip():
         print("missing --adapter; GET /adapters first (e.g. curl http://127.0.0.1:18080/adapters), then pass --adapter <substr>", flush=True)
         print("no report generated (adapter required per PLAN P1-1)", flush=True)

@@ -1,3 +1,4 @@
+# 查会话文件是否齐
 import json, glob, os
 files = sorted(glob.glob("run/report-T*-20261021-*.json") ) + sorted(glob.glob("run/report-T*-20261022-*.json"))
 seen = set()

@@ -1,16 +1,10 @@
-"""run_remote.py - POST /exec to a vc-agent (allowlist-bound remote exec for automation).
-Usage:
-  python ctrl/run_remote.py --agent http://192.168.2.59:18080 --timeout 30 -- ipconfig /all
-  python ctrl/run_remote.py --agent http://127.0.0.1:18081 -- python --version
-  python ctrl/run_remote.py --agent http://127.0.0.1:18081 --log --lines 10
-  python ctrl/run_remote.py --agent http://192.168.2.59:18080 --update release/vc-0.4.0.zip
-  python ctrl/run_remote.py --agent http://192.168.2.59:18080 --rollback
-Exit code = remote exit code (None/timed-out -> 1, transport error -> 2, denied -> 3).
-"""
+"""远控执行：POST /exec到agent（白名单限内）
+查日志/跑脚本/推OTA包/回滚；退出码=远端码，超时1传输错2拒绝3"""
 import argparse, json, sys
 import urllib.request, urllib.error
 
 def post(base, argv, timeout):
+    # 发/exec远控命令
     data = json.dumps({"argv": argv, "timeout_s": timeout}).encode()
     req = urllib.request.Request(base + "/exec", data=data,
                                  headers={"Content-Type": "application/json"}, method="POST")
@@ -23,6 +17,7 @@ def post(base, argv, timeout):
 
 
 def poll_version(base, want, timeout=180):
+    # 轮询/version等换代
     import time as _t
     _dead = _t.time() + timeout
     while _t.time() < _dead:
@@ -40,6 +35,7 @@ def poll_version(base, want, timeout=180):
     return 1
 
 def main():
+    # 入口：解析参数并转发
     ap = argparse.ArgumentParser()
     ap.add_argument("--agent", required=True)
     ap.add_argument("--timeout", type=int, default=30)

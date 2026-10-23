@@ -50,7 +50,7 @@ def test_reconcile_unit(tmp_path):
     s, _ = reconcile.load(str(sp)); r, _ = reconcile.load(str(rp))
     mm = sorted([f for f in (set(s) & set(r)) if s[f] != r[f]])
     assert mm == [2], "mismatch detect"
-    # missing-frame case
+    # 缺帧用例
     rp.write_text("{\"frame_id\": 1, \"hash\": \"aaaaaaaaaaaaaaaa\"}\n", encoding="utf-8")
     s, _ = reconcile.load(str(sp)); r, _ = reconcile.load(str(rp))
     assert sorted(set(s) - set(r)) == [2], "missing detect"
@@ -99,7 +99,7 @@ def _post_start(base, path, body):
         except Exception: return e.code, {}
 
 def _run_stub_case(seconds=2, adapter="NoSuchNic-xyz-bad"):
-    # P1-1: stub path now requires explicit bad adapter; missing adapter is 400, bad exe is exit 2.
+    # P1-1桩路径：坏网卡才起桩；缺网卡400，坏exe exit2
     ps = _free_port(); pr = _free_port()
     agent = os.path.join(ROOT, "agent", "vc-agent.py")
     sproc = subprocess.Popen([sys.executable, agent, "--role", "sender", "--port", str(ps)],
@@ -109,7 +109,7 @@ def _run_stub_case(seconds=2, adapter="NoSuchNic-xyz-bad"):
     try:
         assert _wait_health("http://127.0.0.1:%d" % ps), "sender agent up"
         assert _wait_health("http://127.0.0.1:%d" % pr), "receiver agent up"
-        # missing adapter -> 400, no process launched
+        # 缺网卡400，不起进程
         c1, _ = _post_start("http://127.0.0.1:%d" % ps, "/sender/start", {})
         c2, _ = _post_start("http://127.0.0.1:%d" % pr, "/receiver/start", {})
         assert c1 == 400 and c2 == 400, (c1, c2)
@@ -128,7 +128,7 @@ def test_T0_stub_structure_fails_cleanly():
     """P1-1: missing adapter -> 400; bad adapter exe -> exit 2; vc-ctrl missing adapter -> exit 2 no report."""
     rep = _run_stub_case(seconds=2)
     assert rep["verdict"] == "FAIL" and rep["codes"] == (400, 400)
-    # exe bad adapter must exit 2 with card list
+    # 坏网卡exit2并列卡
     exe = os.path.join(ROOT, "build", "vc-sender.exe")
     if os.path.exists(exe):
         out = subprocess.run([exe, "--adapter", "NoSuchNic-xyz-bad", "--frames", "5",
@@ -137,7 +137,7 @@ def test_T0_stub_structure_fails_cleanly():
                              capture_output=True, text=True, timeout=30)
         assert out.returncode == 2, (out.returncode, out.stdout, out.stderr)
         assert "not found" in (out.stderr or "") or "adapter" in (out.stderr or "").lower()
-    # vc-ctrl without --adapter must exit 2 and create no report
+    # 无网卡exit2，不写报告
     import glob as _g
     before = set(_g.glob(os.path.join(ROOT, "run", "report-*.json")))
     out = subprocess.run([sys.executable, os.path.join(ROOT, "ctrl", "vc-ctrl.py"),
@@ -165,7 +165,7 @@ def _live_case(case, seconds=2):
         assert _wait_health("http://127.0.0.1:%d" % pr), "receiver agent up"
         rep = run_case("http://127.0.0.1:%d" % ps, "http://127.0.0.1:%d" % pr,
                        seconds=seconds, pattern="motion", fps=240, mtu=9000, pacing_us=0,
-        # loopback uses batch 1; batching wedges Npcap loopback capture
+        # 回环用batch1，大batch会卡回环抓包
                        case=case, expect_frames=480, adapter=ad, batch=1)
         return rep
     finally:
@@ -212,7 +212,7 @@ def test_T1_live_loopback():
 def test_T3_mtu1500_counterexample(request):
     if not request.config.getoption("--run-t3"):
         import pytest; pytest.skip("T3 default skip (use --run-t3)")
-    # doc expectation: mtu1500 -> ~422 packets/frame, ~101k pps, must drop. Unit-level: frag formula only.
+    # mtu1500必丢：约422包/帧；单测只验分包公式
     payload = 1500 - 42; total = (614400 + payload - 1) // payload
     assert total == 422
     assert total * 240 > 90000, "pps ~101k"
@@ -364,7 +364,7 @@ def test_verdict_d1_steady_and_cadence():
     assert ok is False and any("sender_cadence" in r for r in rs)
     assert verdict_t1(base_tx, base_rx, {"r_avg": 4.17}, {"cadence_ms": None})[0] is True
 def test_verdict_d1_steady_p99_beats_drain_tail():
-    # drain-contaminated terminal ring p99 must not fail a run whose steady window is clean (rings 2026-10-22: full 8.534 vs steady 6.899)
+    # 收尾污染不判败：稳态窗干净即过
     base_tx = {"sent_frames": 14400}
     drain_rx = {"complete": 14400, "dropped": 0, "hash_mismatch": 0, "inter_arrival_p99_ms": 8.534, "inter_arrival_avg_ms": 12.613}
     ok, _ = verdict_t1(base_tx, drain_rx, {"r_avg": 4.158, "r_p99": 6.899}, {"cadence_ms": 4.177})
@@ -375,7 +375,7 @@ def test_verdict_d1_steady_p99_beats_drain_tail():
     assert ok is False
 
 def test_stub_report_has_steady_keys():
-    # P1-1: missing adapter gives 400 without report; steady keys covered by live runs when VC_ADAPTER set.
+    # 缺网卡400无报告；稳态键由live覆盖
     rep = _run_stub_case(seconds=2)
     assert rep["verdict"] == "FAIL" and rep.get("codes") == (400, 400)
 def test_update_no_restart_keeps_pid():

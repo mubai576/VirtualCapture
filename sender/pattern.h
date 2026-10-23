@@ -1,9 +1,9 @@
-// pattern.h — 高复杂度确定性测试源（sender生成，receiver校验，python有镜像实现）
-// 设计约束：
-//  1. 纯整数运算，跨C++/GPU-HLSL/Python三端bit-exact（不用sin/float，HLSL sin各卡有差）。
-//  2. 同一frame_id必出同一帧（seed=frame_id），丢包可重放debug，无需传147MB/s参考帧。
-//  3. 主校验不靠重算：sender记每帧FNV1a64到JSONL，receiver记收到的哈希，ctrl对账；
-//     重算只在log缺失时兜底。
+// 测试源（生成/校验/python镜像三端一致）
+// 约束：纯整数，同帧号必同帧，主校验靠哈希对账
+// 纯整数，三端bit一致，不用浮点
+// 同帧号必同帧，可重放，不传参考帧
+// 主校验靠哈希对账，重算只兜底
+
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -15,14 +15,14 @@
 #define VC_UV_BYTES (640*640/2)
 
 typedef enum : uint8_t {
-  VC_PAT_COUNTER   = 0, // 烟雾测试：低渐变 VC
-  VC_PAT_CHECKER   = 1, // 高频黑白棋盘，逐帧滚1px：专杀NV12 4:2:0色度错位/矩阵错
-  VC_PAT_RINGS     = 2, // 同心环sawtooth+滚动：高频+运动，整数近似zoneplate
-  VC_PAT_NOISE     = 3, // 全帧PRNG噪声：最大熵，专杀隐藏压缩/去重/脏矩形作弊
-  VC_PAT_MOTION    = 4, // 拟游戏：滚动背景+4弹跳块+中央256噪声窗（默认压力源）
+  VC_PAT_COUNTER   = 0, // 烟雾：低渐变
+  VC_PAT_CHECKER   = 1, // 棋盘：滚1px查色度错
+  VC_PAT_RINGS     = 2, // 同心环：高频运动
+  VC_PAT_NOISE     = 3, // 噪声：防压缩作弊
+  VC_PAT_MOTION    = 4, // 拟游戏：默认压力源
 } vc_pattern_t;
 
-// ---- 确定性PRNG：splitmix64，单核~3GB/s，240Hz*0.6MB=147MB/s吃得下 ----
+// 随机数：splitmix64，够240Hz用
 static inline uint64_t vc_splitmix64(uint64_t *s) {
   uint64_t z = (*s += 0x9E3779B97F4A7C15ull);
   z = (z ^ (z >> 30)) * 0xBF58476D1CE4E5B9ull;
@@ -30,7 +30,8 @@ static inline uint64_t vc_splitmix64(uint64_t *s) {
   return z ^ (z >> 31);
 }
 
-// ---- 各pattern生成NV12（Y: VC_Y_BYTES, UV: VC_UV_BYTES interleaved） ----
+// 生成NV12
+// 烟雾渐变帧
 static inline void vc_gen_counter(uint32_t fid, uint8_t *Y, uint8_t *UV) {
   for (int y = 0; y < VC_PH; y++)
     for (int x = 0; x < VC_PW; x++)
@@ -39,6 +40,7 @@ static inline void vc_gen_counter(uint32_t fid, uint8_t *Y, uint8_t *UV) {
   for (size_t i = 0; i < VC_UV_BYTES; i++) UV[i] = v;
 }
 
+// 棋盘滚动帧
 static inline void vc_gen_checker(uint32_t fid, uint8_t *Y, uint8_t *UV) {
   int ox = fid & 7, oy = (fid >> 3) & 7; // 每帧滚，保证DDA脏矩形=全帧
   for (int y = 0; y < VC_PH; y++)
@@ -52,6 +54,7 @@ static inline void vc_gen_checker(uint32_t fid, uint8_t *Y, uint8_t *UV) {
     }
 }
 
+// 同心环帧
 static inline void vc_gen_rings(uint32_t fid, uint8_t *Y, uint8_t *UV) {
   // 环：r2=(x-cx)^2+(y-cy)^2，Y=(r2>>4)+fid*7 锯齿，高频验证下采样混叠是否符合预期
   const int cx = VC_PW/2, cy = VC_PH/2;
@@ -80,12 +83,13 @@ static inline void vc_gen_noise(uint32_t fid, uint8_t *Y, uint8_t *UV) {
   while (n--) *p++ = (uint8_t)vc_splitmix64(&s);
 }
 
+// 拟游戏压力帧
 static inline void vc_gen_motion(uint32_t fid, uint8_t *Y, uint8_t *UV) {
   // 背景：逐帧横滚3px渐变（杀DDA静态优化）+ 4弹跳色块 + 中央256x256噪声窗
   for (int y = 0; y < VC_PH; y++)
     for (int x = 0; x < VC_PW; x++)
       Y[y*VC_PW+x] = (uint8_t)(x + fid * 3 + (y >> 2));
-  // 4 sprites 64x64，位置纯整数弹跳
+  // 4块64弹跳
   const int S = 64;
   for (int k = 0; k < 4; k++) {
     int px = (int)((fid * (5 + k * 2) + k * 173) % (VC_PW - S));

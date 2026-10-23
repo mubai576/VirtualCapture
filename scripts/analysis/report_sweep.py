@@ -1,3 +1,4 @@
+# 扫报告目录汇总判分
 import json, glob, os
 for p in sorted(glob.glob("run/report-*.json")):
     try:

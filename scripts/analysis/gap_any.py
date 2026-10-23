@@ -1,3 +1,4 @@
+# 查任意hashlog帧间隔（>1s判瞬断）
 import json, sys
 for p in sys.argv[1:]:
     qs = []

@@ -1,5 +1,5 @@
-"""test_ota.py - OTA stage plus activate verification (P3 proposal A)."""
-"""Stage validates without restarting; activate re-execs in place; no detached processes."""
+"""OTA升级验证：stage验包不重启，activate原地切换"""
+"""stage只验不重启；activate原地exec；不起孤进程"""
 import json
 import os
 import shutil as _tsh

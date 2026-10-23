@@ -20,7 +20,7 @@ for case, fn, v, sent, comp, pps in rows:
         s, x = r["sender_stats"], r["receiver_stats"]
         ok = (r["verdict"] == v and s["sent_frames"] == sent and x["complete"] == comp
               and abs(round(x.get("pps", s.get("pps", 0))) - pps) <= 1)
-        # table pps: try receiver first, fall back to sender
+        # 表pps：先收端，缺则发端
         if not ok:
             ok = (r["verdict"] == v and s["sent_frames"] == sent and x["complete"] == comp
                   and abs(round(s.get("pps", 0)) - pps) <= 1)
