@@ -207,7 +207,7 @@ struct Args {
   uint16_t ethertype=0x88B5; int mtu=9000; long long pacing_us=0;
   uint8_t dstmac[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   std::string session="manual", stats="", hashlog="", file="";
-  bool loop=false, list_adapters=false, selftest=false;
+  bool loop=false, list_adapters=false, selftest=false, gpu_convert=false;
 };
 
 static bool parse_mac(const std::string&s,uint8_t m[6]){
@@ -239,7 +239,8 @@ static void usage(){
   // 打印用法
   printf("vc-sender.exe --adapter <substr> --mode pattern|file|dda --pattern motion --fps 240\n"
     "  --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff\n"
-    "  --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest]\n");
+    "  --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest]\n"
+    "  [--gpu-convert: DDA走GPU转换，失败显式报错不回退]\n");
 }
 
 static void ensure_parent(const std::string&path){
@@ -359,6 +360,7 @@ static int run_selftest(){
     if(tY[0]!=76||tY[(size_t)640*639+639]!=76){printf("FAIL dda red Y\n");ok=false;}
     printf("DDA: converter unit PASS (white/red exact)\n"); }
   { int ddr=dda_selftest(); if(ddr==1){printf("FAIL dda selftest\n");ok=false;} }
+  { int dgr=dda_gpu_selftest(); if(dgr==1){printf("FAIL dda gpu selftest\n");ok=false;} }
   if(!ok){printf("FAIL: sender selftest\n");return 1;}
   printf("PASS: sender selftest\n");
   return 0;
@@ -408,6 +410,7 @@ int main(int argc,char**argv){
     else if(k=="--loop"){a.loop=true;}
     else if(k=="--list-adapters"){a.list_adapters=true;}
     else if(k=="--selftest"){a.selftest=true;}
+    else if(k=="--gpu-convert"){a.gpu_convert=true;}
     else if(k=="--help"||k=="-h"){usage();return 0;}
     else {fprintf(stderr,"unknown arg %s\n",k.c_str());usage();return 2;}
   }
@@ -482,6 +485,11 @@ int main(int argc,char**argv){
   std::vector<uint8_t> Y(VC_Y_BYTES),UV(VC_UV_BYTES);
   DDACap dda_cap; double gpu_accum_ms=0;
   if(a.mode=="dda"){ std::string dd; if(!dda_cap.init(dd)){fprintf(stderr,"dda init failed: %s\n",dda_cap.err());return 1;} printf("[sender] dda output=%s center640\n",dd.c_str()); }
+#ifdef _WIN32
+  if(a.mode=="dda"&&a.gpu_convert){ std::string gd; if(!dda_cap.start_gpu(gd)){fprintf(stderr,"gpu-convert start failed: %s\n",gd.c_str());return 1;} printf("[sender] gpu-convert on (%s)\n",gd.c_str()); }
+#else
+  if(a.gpu_convert){fprintf(stderr,"--gpu-convert is Windows-only\n");return 2;}
+#endif
   std::vector<uint8_t> eth(14+28+payload);
   // 组以太网头
   memcpy(eth.data(),a.dstmac,6);
@@ -593,13 +601,13 @@ int main(int argc,char**argv){
       snprintf(buf,sizeof(buf),
         "{\"session_id\":\"%s\",\"running\":true,\"sent_frames\":%llu,\"sent_packets\":%llu,"
         "\"pps\":%.1f,\"bps\":%.1f,\"fps_actual\":%.2f,\"send_errors\":%llu,\"uptime_s\":%.2f,"
-        "\"pattern\":\"%s\",\"fps_target\":%d,\"mtu\":%d,\"ethertype\":\"0x%04x\",\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"cpu_pct\":%.1f}",
+        "\"pattern\":\"%s\",\"fps_target\":%d,\"mtu\":%d,\"ethertype\":\"0x%04x\",\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"gpu_convert\":%d,\"cpu_pct\":%.1f}",
         a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
         pps,bps,sent_frames/up,(unsigned long long)send_errors,up,
         a.mode=="pattern"?pat_name(pid):(a.mode=="dda"?"dda":"file"),a.fps,a.mtu,a.ethertype,
         sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
         dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
-        (unsigned long long)dda_cap.gpu_samples,pc1_a,pc1_p99,pc1_mx,cpu_pct);
+        (unsigned long long)dda_cap.gpu_samples,pc1_a,pc1_p99,pc1_mx,(a.gpu_convert?1:0),cpu_pct);
       atomic_write(a.stats,buf);
     }
   }
@@ -612,12 +620,12 @@ int main(int argc,char**argv){
     char buf[2048];
     snprintf(buf,sizeof(buf),
       "{\"session_id\":\"%s\",\"running\":false,\"sent_frames\":%llu,\"sent_packets\":%llu,"
-      "\"pps\":%.1f,\"bps\":%.1f,\"send_errors\":%llu,\"uptime_s\":%.2f,\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"cpu_pct\":%.1f}",
+      "\"pps\":%.1f,\"bps\":%.1f,\"send_errors\":%llu,\"uptime_s\":%.2f,\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"gpu_convert\":%d,\"cpu_pct\":%.1f}",
       a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
       sent_packets/up,sent_bytes*8/up,(unsigned long long)send_errors,up,
       sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
       dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
-      (unsigned long long)dda_cap.gpu_samples,pc1_fa,pc1_fp99,pc1_fmx,cpu_pct_fin);
+      (unsigned long long)dda_cap.gpu_samples,pc1_fa,pc1_fp99,pc1_fmx,(a.gpu_convert?1:0),cpu_pct_fin);
     atomic_write(a.stats,buf); }
 #ifdef _WIN32
 #ifdef _WIN32

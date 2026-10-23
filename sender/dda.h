@@ -8,6 +8,7 @@
 #include <string>
 #include <vector>
 #include "pattern.h"
+#include "dda_gpu.h"
 #ifdef _WIN32
 #include <d3d11.h>
 #include <dxgi1_2.h>
@@ -26,6 +27,9 @@ struct DDACap {
   ID3D11Query* qDisjoint = nullptr;
   ID3D11Query* qStart = nullptr;
   ID3D11Query* qEnd = nullptr;
+  DDAGpu* gpu = nullptr; // P4-1方案A：compute shader转换（--gpu-convert显式开启）
+  bool want_gpu = false;
+  bool start_gpu(std::string& why); // P4-1：init之后调，失败显式错
 #endif
   // P4-1真GPU时间（CopyResource前后打戳，D10切口径前仅诊断）
   // gpu_ms仍是capture耗时，新字段走GPU时钟
@@ -86,12 +90,23 @@ bool DDACap::init(std::string& detail){
   char db[64]; snprintf(db, sizeof(db), "%dx%d", out_w, out_h); detail = db;
   err_code = OK; err_msg = "ok"; return true;
 }
+#ifdef _WIN32
+bool DDACap::start_gpu(std::string& why){
+  if(!dev || !ctx){ why = "gpu-convert before init"; return false; }
+  if(gpu){ want_gpu = true; why = "already started"; return true; }
+  gpu = new DDAGpu();
+  if(!gpu){ why = "out of memory"; return false; }
+  if(!gpu->init(dev, ctx, qDisjoint, qStart, qEnd)){ why = gpu->err(); delete gpu; gpu = nullptr; return false; }
+  want_gpu = true; why = "gpu-convert on (compute shader)"; return true;
+}
+#endif
 void DDACap::shutdown(){
 #ifdef _WIN32
   if(qEnd){ qEnd->Release(); qEnd = nullptr; }
   if(qStart){ qStart->Release(); qStart = nullptr; }
   if(qDisjoint){ qDisjoint->Release(); qDisjoint = nullptr; }
   gpu_qok = false;
+  if(gpu){ gpu->shutdown(); delete gpu; gpu = nullptr; } want_gpu = false;
   if(staging){ staging->Release(); staging = nullptr; }
   stag_w = 0; stag_h = 0;
   if(dup){ dup->Release(); dup = nullptr; }
@@ -135,7 +150,7 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
   int w = (int)d.Width, h = (int)d.Height;
   if(d.Format != DXGI_FORMAT_B8G8R8A8_UNORM){ tex->Release(); dup->ReleaseFrame(); err_code = E_FORMAT; err_msg = "only B8G8R8A8 supported"; return false; }
   if(w < 640 || h < 640){ tex->Release(); dup->ReleaseFrame(); err_code = E_SMALL; err_msg = "desktop smaller than 640"; return false; }
-  if(!staging || stag_w != w || stag_h != h){
+  if(!want_gpu && (!staging || stag_w != w || stag_h != h)){
     if(staging){ staging->Release(); staging = nullptr; }
     D3D11_TEXTURE2D_DESC sd; sd.Width = d.Width; sd.Height = d.Height; sd.MipLevels = 1; sd.ArraySize = 1;
     sd.Format = d.Format; sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0;
@@ -145,6 +160,16 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
     stag_w = w; stag_h = h;
   }
   bool stamped = gpu_qok && qDisjoint && qStart && qEnd;
+  if(want_gpu){
+    // GPU路径：shader直读DDA纹理，失败显式报错，不回退CPU（owner批）
+    if(!gpu){ tex->Release(); dup->ReleaseFrame(); err_code = E_INTERNAL; err_msg = "gpu-convert requested but gpu not started"; return false; }
+    if(stamped){ ctx->Begin(qDisjoint); ctx->End(qStart); }
+    bool gok = gpu->run(tex, w, h);
+    if(stamped){ ctx->End(qEnd); ctx->End(qDisjoint); }
+    tex->Release(); dup->ReleaseFrame();
+    if(!gok){ err_code = E_INTERNAL; err_msg = gpu->err(); return false; }
+    if(!gpu->readback(Y, UV)){ err_code = E_INTERNAL; err_msg = gpu->err(); return false; }
+  } else {
   if(stamped){ ctx->Begin(qDisjoint); ctx->End(qStart); }
   ctx->CopyResource(staging, tex); tex->Release();
   if(stamped){ ctx->End(qEnd); ctx->End(qDisjoint); }
@@ -154,6 +179,7 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
   dda_bgrx_to_nv12((const uint8_t*)mp.pData, (unsigned)mp.RowPitch, w, h, Y, UV);
   ctx->Unmap(staging, 0);
   dup->ReleaseFrame();
+  }
   if(stamped){
 // 限时轮询（约2ms），不占4.16ms帧预算
     D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj; HRESULT gr = S_FALSE;
@@ -187,6 +213,61 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
 #else
 bool DDACap::init(std::string& detail){ (void)detail; shutdown(); err_code = E_NODDA; err_msg = "non-Windows build"; return false; }
 bool DDACap::capture(uint8_t* Y, uint8_t* UV){ (void)Y; (void)UV; err_code = E_NODDA; err_msg = "non-Windows build"; return false; }
+#endif
+#ifdef _WIN32
+int dda_gpu_selftest(){
+  // GPU转换与CPU参考逐字节一致性（合成B8G8R8A8纹理，不依赖真实桌面）
+  ID3D11Device* dev = nullptr; ID3D11DeviceContext* ctx = nullptr;
+  const char* drv = "HARDWARE";
+  HRESULT hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_HARDWARE, NULL, 0, NULL, 0,
+    D3D11_SDK_VERSION, &dev, NULL, &ctx);
+  if(FAILED(hr) || !dev || !ctx){
+    drv = "WARP";
+    hr = D3D11CreateDevice(NULL, D3D_DRIVER_TYPE_WARP, NULL, 0, NULL, 0,
+      D3D11_SDK_VERSION, &dev, NULL, &ctx);
+  }
+  if(FAILED(hr) || !dev || !ctx){ printf("DDA-GPU: SKIP no D3D11 device\n"); return 2; }
+  DDAGpu g;
+  if(!g.init(dev, ctx, nullptr, nullptr, nullptr)){ printf("DDA-GPU: FAIL gpu init (%s)\n", g.err()); if(ctx)ctx->Release(); if(dev)dev->Release(); return 1; }
+  struct Case { int w, h, fill; };
+  const Case cases[] = { {640,640,0}, {640,640,1}, {800,700,2}, {1024,768,3}, {960,800,2} };
+  bool ok = true;
+  for(const auto& c : cases){
+    std::vector<uint8_t> bgra((size_t)c.w*c.h*4);
+    if(c.fill==0){ for(size_t i=0;i<bgra.size();i+=4){ bgra[i]=255; bgra[i+1]=255; bgra[i+2]=255; bgra[i+3]=0; } }
+    else if(c.fill==1){ for(size_t i=0;i<bgra.size();i+=4){ bgra[i]=0; bgra[i+1]=0; bgra[i+2]=255; bgra[i+3]=0; } }
+    else if(c.fill==2){ for(int y=0;y<c.h;y++) for(int x=0;x<c.w;x++){ size_t i=((size_t)y*c.w+x)*4; bgra[i]=(uint8_t)(x+y); bgra[i+1]=(uint8_t)(x*2); bgra[i+2]=(uint8_t)(y*3); bgra[i+3]=0; } }
+    else { uint32_t s=0x12345678u; for(size_t i=0;i<bgra.size();i++){ s=s*1664525u+1013904223u; bgra[i]=(uint8_t)(s>>24); } for(size_t i=3;i<bgra.size();i+=4) bgra[i]=0; }
+    D3D11_TEXTURE2D_DESC td; memset(&td,0,sizeof(td));
+    td.Width=c.w; td.Height=c.h; td.MipLevels=1; td.ArraySize=1;
+    td.Format=DXGI_FORMAT_B8G8R8A8_UNORM; td.SampleDesc.Count=1;
+    td.Usage=D3D11_USAGE_DEFAULT; td.BindFlags=D3D11_BIND_SHADER_RESOURCE;
+    D3D11_SUBRESOURCE_DATA sd; memset(&sd,0,sizeof(sd));
+    sd.pSysMem=bgra.data(); sd.SysMemPitch=(UINT)(c.w*4);
+    ID3D11Texture2D* tex=nullptr;
+    if(FAILED(dev->CreateTexture2D(&td,&sd,&tex))||!tex){ printf("DDA-GPU: FAIL texture %dx%d\n",c.w,c.h); ok=false; continue; }
+    std::vector<uint8_t> eY(VC_Y_BYTES), eUV(VC_UV_BYTES), gY(VC_Y_BYTES), gUV(VC_UV_BYTES);
+    dda_bgrx_to_nv12(bgra.data(), (unsigned)c.w*4u, c.w, c.h, eY.data(), eUV.data());
+    if(!g.run(tex,c.w,c.h)){ printf("DDA-GPU: FAIL run %dx%d (%s)\n",c.w,c.h,g.err()); ok=false; tex->Release(); continue; }
+    if(!g.readback(gY.data(),gUV.data())){ printf("DDA-GPU: FAIL readback %dx%d (%s)\n",c.w,c.h,g.err()); ok=false; tex->Release(); continue; }
+    tex->Release();
+    if(eY!=gY || eUV!=gUV){
+      size_t dy=0; while(dy<eY.size()&&eY[dy]==gY[dy]) dy++;
+      size_t du=0; while(du<eUV.size()&&eUV[du]==gUV[du]) du++;
+      printf("DDA-GPU: FAIL mismatch %dx%d fill=%d Y[%zu] cpu=%d gpu=%d UV[%zu] cpu=%d gpu=%d\n",
+        c.w,c.h,c.fill,dy,dy<eY.size()?eY[dy]:-1,dy<gY.size()?gY[dy]:-1,
+        du,du<eUV.size()?eUV[du]:-1,du<gUV.size()?gUV[du]:-1);
+      ok=false; continue;
+    }
+    printf("DDA-GPU: case %dx%d fill=%d exact (%s)\n", c.w, c.h, c.fill, drv);
+  }
+  g.shutdown(); ctx->Release(); dev->Release();
+  if(!ok){ printf("DDA-GPU: FAIL\n"); return 1; }
+  printf("DDA-GPU: PASS 5 cases bit-exact (%s)\n", drv);
+  return 0;
+}
+#else
+int dda_gpu_selftest(){ printf("DDA-GPU: SKIP (non-Windows build)\n"); return 2; }
 #endif
 int dda_selftest(){
 #ifdef _WIN32

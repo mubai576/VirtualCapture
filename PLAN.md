@@ -35,7 +35,7 @@ PC2=192.168.2.59（agent 手动跑在 PC2 的 Documents\VirtualCapture，exe 在
 ```text
 vc-sender.exe --adapter <子串> --mode pattern|file|dda --pattern motion --fps 240
   --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff
-  --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest]
+  --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest] [--gpu-convert]
 vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
   --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]
 ```
@@ -46,6 +46,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 - receiver hashlog D3 carries qpc_ns; reconcile compares frame_id and hash only.
 - receiver `--shm <name>` (P4-3): publish latest complete frame to named file mapping (layout vcam/vcam_shm.h, NOT proto/); stats adds `shm_published`; agent /receiver/start forwards `shm`.
 - sender stats 新增 `gpu_dispatch_ms`（D3D11 timestamp 包住 CopyResource 的真 GPU 时间均值）+ `gpu_dispatch_samples`（有效样本数）；`gpu_ms` 仍为 capture() wall-clock，待 P4-1 实测分布后按 D10 决定是否切换口径。
+- sender stats 新增 `gpu_convert`（0/1，采集走 CPU 还是 GPU compute shader；GPU 失败显式报错，不静默回退）。
 - P4-2步骤1（免协议改动）：receiver stats 新增 `rseg_avg_ms/rseg_p50_ms/rseg_p99_ms/rseg_max_ms`（R(N)=首包到达→重组完成，同机QPC）；sender stats 新增 `pc1_seg_avg_ms/pc1_seg_p99_ms/pc1_seg_max_ms`（PC1段=采集/生成完成→末包发出，同机QPC）；确认包（flags bit1）仍待 owner 终审后做步骤2。
 - 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 614400B。
 
@@ -102,6 +103,7 @@ P4-1 采集性能（第一步：gpu_ms 改为 D3D11 timestamp query 真 GPU 时�
      目标 240fps 下 gpu_ms<4ms、不丢采集帧；为 T5 定独立门限写入 test-matrix（需 owner 批）。
      无屏/独占全屏仍须显式报错，不许静默黑帧。
      步骤1进展 2026-10-23：`gpu_dispatch_ms` 真 GPU 测量已落地（sender/dda.h timestamp+disjoint + stats 新字段），本机自测 PASS（idle-SKIP，query 创建 ok）；2K240 分布与门限待 PC1 实测（D10）。
+     步骤2进展 2026-10-23：GPU compute shader（居中裁+整数BT.601，直读DDA纹理）已落地（sender/dda_gpu.h），合成纹理 selftest 与 CPU 参考逐字节一致；live 路径经 --gpu-convert 显式开启，失败显式报错不回退；默认仍走 CPU 路径，PC1 2K240 验证后再定默认（待 owner 拍板）。
 P4-2 端到端延迟测量：确认包（flags bit1 + 零 payload，28B 不动，实现时 owner 终审）；
      步骤1进展 2026-10-23：R(N) + PC1 段本机分段计时已落地（receiver 首包→重组完成、sender 采集/生成完成→末包发出，同机 QPC，零协议改动，stats 新字段）；确认包与全程 p99 门限待 PC1/PC2 实测分布 + owner 终审（D8）。
      口径按 D8：PC1 采集完成→PC2 重组完成，分段同机 QPC，门限判全程 p99。

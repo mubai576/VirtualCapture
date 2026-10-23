@@ -5,7 +5,7 @@ add_executable(vc-sender vc_sender.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/long
 target_include_directories(vc-sender PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../proto)
 target_compile_features(vc-sender PRIVATE cxx_std_17)
 if(WIN32)
-  target_link_libraries(vc-sender PRIVATE ws2_32 winmm d3d11 dxgi)
+  target_link_libraries(vc-sender PRIVATE ws2_32 winmm d3d11 dxgi d3dcompiler)
 endif()
 if(MSVC)
   target_compile_options(vc-sender PRIVATE /utf-8)
