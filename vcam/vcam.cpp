@@ -188,9 +188,12 @@ class CVCamFilter : public IBaseFilter, public IAMFilterMiscFlags {
   IFilterGraph* m_pGraph = nullptr;
   IReferenceClock* m_pClock = nullptr;
   CVCamPin* m_pPin = nullptr;
-  HANDLE m_hShmMap = nullptr;     // receiver frame mapping (null = motion fallback)
+  HANDLE m_hShmMap = nullptr;     // receiver frame mapping
   uint8_t* m_shmView = nullptr;
   uint8_t* m_shmStage = nullptr;  // VC_FRAME_BYTES staging (torn-read safe copy)
+  uint8_t* m_lastGoodFrame = nullptr; // D12: last successfully read frame (repeat-on-stall)
+  bool m_hasLastGood = false;     // D12: true after first clean shm read in this session
+  bool m_motionEnable = false;    // D12: explicit bring-up flag; false = stall when no receiver
   HANDLE m_hThread = nullptr;
   HANDLE m_hStop = nullptr;
   IMemInputPin* Input() ;
@@ -423,6 +426,7 @@ CVCamFilter::CVCamFilter() {
   InterlockedIncrement(&g_objs);
   m_pPin = new (std::nothrow) CVCamPin(this);
   m_shmStage = new (std::nothrow) uint8_t[VCAM_FRAME_BYTES];
+  m_lastGoodFrame = new (std::nothrow) uint8_t[VCAM_FRAME_BYTES];  // D12
 }
 void CVCamFilter::ShmEnsureOpen() {
   // called with m_cs held; throttled by design (early-out once mapped)
@@ -451,6 +455,7 @@ CVCamFilter::~CVCamFilter() {
   Deactivate();
   ShmClose();
   if (m_shmStage) { delete[] m_shmStage; m_shmStage = nullptr; }
+  if (m_lastGoodFrame) { delete[] m_lastGoodFrame; m_lastGoodFrame = nullptr; }  // D12
   if (m_pPin) m_pPin->Release();
   if (m_pClock) m_pClock->Release();
   if (m_pGraph) m_pGraph->Release();
@@ -504,6 +509,7 @@ void CVCamFilter::Deactivate() {
   if (th) { WaitForSingleObject(th, 2000); CloseHandle(th); }
   if (ev) CloseHandle(ev);
   ShmClose();  // worker joined: drop receiver mapping (re-resolves on next Run)
+  m_hasLastGood = false;  // D12: reset per-session last-frame state
 }
 STDMETHODIMP CVCamFilter::Stop() {
   Deactivate();
@@ -560,10 +566,12 @@ DWORD CVCamFilter::Worker() {
     HRESULT hr = alloc->GetBuffer(&s, nullptr, nullptr, 0);
     alloc->Release();
     if (FAILED(hr) || !s) { input->Release(); break; }  // decommitted / stopping
-    // P4-3/D11: shm latest frame first. Torn/invalid read with a live mapping
-    // SKIPS the tick (no motion injection in product; D11 approved skip-or-repeat,
-    // skip chosen: no fake bytes downstream, gap flagged by discontinuity).
-    // Motion generator remains ONLY for absent-mapping bring-up (no receiver).
+    // P4-3/D11/D12: shm latest frame first.
+    // D12 three-state policy:
+    //   clean read           → output frame, update last-good cache
+    //   stall/torn + has last-good → repeat last good frame (freeze, no fake bytes)
+    //   no mapping + no last-good + motionEnable=false → stall (no output this tick)
+    //   motionEnable=true (explicit bring-up) → generate motion pattern
     bool filled = false;
     bool haveView = false;
     uint8_t* view = nullptr;
@@ -585,14 +593,27 @@ DWORD CVCamFilter::Worker() {
         filled = (s1 == s2);
       }
     }
-    if (!filled && haveView) {
-      // Torn read while receiver publishes: skip this tick, keep stream clock true.
-      t += VCAM_FRAME_100NS;
-      discont = TRUE;
-      s->Release(); input->Release();
-      continue;
+    // D12: update last-good cache on a clean read
+    if (filled && m_lastGoodFrame) {
+      memcpy(m_lastGoodFrame, m_shmStage, VCAM_FRAME_BYTES);
+      m_hasLastGood = true;
     }
-    if (!filled) vc_gen_motion(fid++, Y, UV);  // absent mapping: bring-up only
+    if (!filled) {
+      if (m_hasLastGood && m_lastGoodFrame) {
+        // Torn read or mapping lost: repeat last good frame (freeze, not fake bytes)
+        memcpy(m_shmStage, m_lastGoodFrame, VCAM_FRAME_BYTES);
+        filled = true;
+        // no discont: repeated frame is a valid continuation, not a gap
+      } else if (m_motionEnable) {
+        vc_gen_motion(fid++, Y, UV);  // explicit bring-up mode: no receiver needed
+      } else {
+        // D12: no mapping, no last-good frame, motion disabled → stall (no output)
+        t += VCAM_FRAME_100NS;
+        discont = TRUE;
+        s->Release(); input->Release();
+        continue;
+      }
+    }
     BYTE* buf = nullptr;
     if (s->GetPointer(&buf) == S_OK && buf) {
       if (filled) memcpy(buf, m_shmStage, VC_FRAME_BYTES);
