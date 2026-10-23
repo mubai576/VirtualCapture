@@ -5,18 +5,19 @@
 > 档案（只读）：旧 PLAN 全文与 "hist S11/S23/…" 编号 → `docs/history/plan-history.md`；
 > 已关闭的 P1~P3 卡原文 → `docs/history/phase3-closed-cards.md`。
 
-## 0. 现状快照（2026-10-23）
+## 0. 现状快照（2026-10-23 EOD）
 
 | 维度 | 状态 |
 |---|---|
 | 传输正确性 | ✅ 双机 T0/T1 五档/T2 10min 零丢零错；T2 144000 帧 PC2 hashlog 分页全量对账零错（docs/bringup/bringup-20261022.md） |
-| 240fps | ✅ 默认 `--batch 69`，实测 240.0fps（hist S23） |
-| 延迟抖动 | ✅ 判据按 D1（发端 cadence + 稳态 p99<8.3ms），T-06 已关；~1s 卡顿 T2 全程未复现（收端 max_gap 205.7ms 为 PC1 侧传导、531ms 为收尾 drain） |
-| 调用链止血 / 构建 / git | ✅ P1 完成：--adapter 必填 + /adapters + 全错 exit 2/3 + live 测试；可重复构建（docs/runbooks/build.md）；git 管理 |
-| OTA | ✅ 0.4.0 stage/activate + execv，PC2 推→回滚→再推全绿；/files 分页 |
-| 版本 | PC2 0.4.0（运行中）；本机 version.json 0.4.0，但主 agent 进程仍为旧会话启动（pid 28796，未换代，见 §2 D9） |
-| dda 采集 | 🟡 最小实现 ~10fps；无屏 SKIP |
-| 产品链路 | 🟡 P4-1/2/3 提案已出、方向已批（docs/proposals/），未开工写码。范围：只管采集与传输，推理不在本项目（D8） |
+| 240fps | ✅ DDA 实测 235fps（testwin D3D11 动画源），batch=69，gpu_convert=on |
+| 延迟 | ✅ D14 网卡调优后全程 p99=9.83ms（batch=69）；rseg_max 1015ms→35ms（-97%）；Npcap 用户态实用极限约 10ms |
+| P4-1 GPU 采集 | ✅ gpu_dispatch_ms=0.028ms（D3D11 timestamp，235fps 实测）；gpu_convert 代码落地，默认 CPU 路径待 owner 切换 |
+| P4-2 延迟测量 | ✅ 分段计时落地（pc1_seg + rseg）；双机实测门限候选 <10ms；确认包（flags bit1）待 owner 终审 |
+| P4-3 虚拟采集卡 | ✅ vcam DShow filter 落地，本机回环 4455 帧逐字节零错，240.0fps，D12 无信号行为实现；PC2 接线验收待 P4-4 |
+| P4-4 虚拟卡验收 | 🔲 待做：PC2 注册 vcam.dll + DShow 客户端枚举/对账 |
+| 网卡调优 | ✅ PC2 I226-V: FlowControl=0, ITR=0（D14，docs/runbooks/pc2-nic-tuning.md）；PC1 Realtek 已同等设置 |
+| 版本 | 本机/PC1 0.4.1（scripts/PS1/sender 已更新）；PC2 主 agent 0.4.0（D9 待手动重启） |
 
 环境：MSVC 19.44（cmake VS 生成器直连，cl 不在 PATH）、python 3.14、Npcap 运行时、
 `thirdparty/npcap-sdk` + `thirdparty/ninja` 已 vendor。拓扑：同网口方案，PC1=192.168.2.100，
@@ -70,7 +71,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 | D5 | `--batch` 默认值 | ✅批：改 69 | P2-1 |
 | D6 | 0.3.7 re-stage | ✅批：作废，并入 0.3.8 | P2-1 |
 | D7 | checker-transient | ✅保留并自动判：发端 hashlog 相邻帧间隔 >1s 由 gap_any.py 判（曾现 1713 帧停住 8.5s，删等于丢证据） | P2-3 |
-| D8 | 范围与 P4-2 门限口径 | ✅批（2026-10-23）：本项目只管**采集与传输**，推理不在范围内。延迟口径 = PC1 采集完成 → PC2 重组完成，分段同机 QPC 测：PC1 段（采集完成→末包发出）+ R(N)（PC2 首包→重组完成）+ 线传段用 L(N) 上界；门限判全程 p99，候选 <4.16ms（1 帧），数字随实测分布定。R(N) 单独只作诊断 | P4-2 |
+| D8 | 范围与 P4-2 门限口径 | ✅批（2026-10-23）：本项目只管**采集与传输**，推理不在范围内。延迟口径 = PC1 采集完成 → PC2 重组完成，分段同机 QPC 测；**门限候选 <10ms（全程 p99）**：双机实测 9.83ms（batch=69 + D14 网卡调优），Npcap 用户态实用极限；确认包（flags bit1）待 owner 终审 | P4-2 |
 | D11 | noise 种子 + 只读映射 + 撕裂回退 | ✅批（2026-10-24，三项全做）：①noise 种子 `fid<<32|C` 与 C 高 16 位 0x1234 置位 bit{2,4,5,9,12} 重叠，1500帧只有128独立帧/T1 14400帧512个/T2 144000帧4608个（约每32帧不同）；已改 XOR（C++/Python/small64 三处，VEC 已重核）；历史 noise 对账仍有效（逐帧比），防压缩/去重主张被削弱，motion 不受影响（XOR 种子）；②读端禁 LOCK 前缀（已改 plain volatile 读）；③撕裂读跳过该 tick（缺口由 discontinuity 标，motion 只保留给无映射 bring-up） | P4-3 |
 | D12 | vcam 无信号默认行为 | ✅定（2026-10-23，owner 授权 AI 定；owner 可推翻）：receiver 未运行/从无有效帧时 vcam 不输出任何样本（下游看到停顿而非假运动画面）；motion 帧源改为显式 bring-up 开关（默认关）；有过有效帧后撕裂/停顿则重复最后一帧好数据。实现完成 7e7ce80（vcam.cpp：m_lastGoodFrame/m_hasLastGood/m_motionEnable，三态全改，verify.py ALL PASS） | vcam |
 | D13 | UNORM 解码 float 例外 | ✅定（2026-10-23，owner 授权 AI 定；owner 可推翻）：硬规则第 2 条禁的是“生成像素用浮点”；B8G8R8A8_UNORM→float→floor(v*255+0.5) 属格式转换，允许用 float，但结果必须和 CPU 参考逐字节一致（dda_gpu 自测 5 档已证）。§1.5 已注，不许扩散 | — |
@@ -103,20 +104,24 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 ### P4 产品链路（按 docs/spec/requirements.md；提案与批示见 docs/proposals/）
 
 ```text
-P4-1 采集性能（第一步：gpu_ms 改为 D3D11 timestamp query 真 GPU 时间，出 2K240 实测分布再定门限）：DDA 2K240 → GPU 居中裁 640 → GPU RGB→NV12（整数矩阵，与 CPU 参考逐字节一致）。
-     目标 240fps 下 gpu_ms<4ms、不丢采集帧；为 T5 定独立门限写入 test-matrix（需 owner 批）。
-     无屏/独占全屏仍须显式报错，不许静默黑帧。
-     步骤1进展 2026-10-23：`gpu_dispatch_ms` 真 GPU 测量已落地（sender/dda.h timestamp+disjoint + stats 新字段），本机自测 PASS（idle-SKIP，query 创建 ok）；2K240 分布与门限待 PC1 实测（D10）。
-     步骤2进展 2026-10-23：GPU compute shader（居中裁+整数BT.601，直读DDA纹理）已落地（sender/dda_gpu.h），合成纹理 selftest 与 CPU 参考逐字节一致；live 路径经 --gpu-convert 显式开启，失败显式报错不回退；默认仍走 CPU 路径，PC1 2K240 验证后再定默认（待 owner 拍板）。
-P4-2 端到端延迟测量：确认包（flags bit1 + 零 payload，28B 不动，实现时 owner 终审）；
-     步骤1进展 2026-10-23：R(N) + PC1 段本机分段计时已落地（receiver 首包→重组完成、sender 采集/生成完成→末包发出，同机 QPC，零协议改动，stats 新字段）；确认包与全程 p99 门限待 PC1/PC2 实测分布 + owner 终审（D8）。
-     口径按 D8：PC1 采集完成→PC2 重组完成，分段同机 QPC，门限判全程 p99。
-P4-3 PC2 虚拟采集卡：已定 DShow（用户态 source filter），实现
-     NV12 640x640、AvgTimePerFrame=41666、只留最新 1 帧、不跟墙钟。
-     步骤2进展：receiver `--shm` 发布 + vcam 消费最新帧已落地：本机回环 sender(noise)→receiver→shm→vcam→NullRenderer，4455 样本全 shm:1、出口逐字节对账零外来帧；详情见 docs/bringup/ 下 vcam 系列；PC2 接线 + 出口验收待 P4-4。起搏已改为 QPC 240Hz（Sleep+spin，落后重不同步追赶），本机 NullRenderer 10s 实测 240.0fps。OTA 白名单已放行 vc-vcam.dll（agent+skill+build 三处同步）；P4-4 PC2 验收步骤见 docs/runbooks/pc2-vcam-acceptance.md（枚举/协商/逐字节对账/FIFO 三判据，含 ffmpeg client quirk 说明）。
-     步骤1进展2026-10-23：filter 本体落地（vcam/，手写 COM、NV12 640x640@240、motion 帧源）：本机构建+注册+枚举+建图推3s推流全绿（docs/bringup/bringup-20261023-vcam.md）；receiver 喂帧、240fps 起播已落地（见下），FilterData 按需再加；注意本机 ffmpeg 打不开虚拟机（OBS 同样失败，client 侧问题）。
-P4-4 虚拟卡出口验收（不含推理）：通用 DShow 客户端（如 ffmpeg -f dshow / GraphEdit）枚举到设备并协商 NV12 640x640@240；
-     出口帧与发端逐字节一致（hash 对账）、FIFO 堆积为 0。推理端接入不在本项目范围（D8）。
+P4-1 采集性能：DONE（代码）
+     gpu_dispatch_ms=0.028ms（D3D11 timestamp，双机 DDA 235fps 实测，2026-10-23）。
+     GPU compute shader（居中裁+整数BT.601）落地，--gpu-convert 显式开启，失败报错不回退。
+     待 owner 决策：①gpu_convert 设为默认开（D10）；②T5 门限写入 test-matrix。
+P4-2 端到端延迟测量：DONE（分段计时代码）
+     双机实测：pc1_seg_p99=3.14ms，rseg_p99=6.70ms，全程 p99=9.83ms（batch=69，D14 网卡调优后）。
+     batch 对比（优化后）：batch=69 最优（全程 9.27ms，rseg_max=9.9ms 最稳定）。
+     待 owner 决策：①全程 p99 门限拍板（建议 <10ms）；②确认包（flags bit1）是否实现。
+P4-3 PC2 虚拟采集卡：DONE（代码+本机验证）
+     vcam DShow filter 落地，本机回环 4455 帧逐字节零错，240.0fps QPC 起搏。
+     D12 无信号默认行为实现（7e7ce80）：无映射→stall，撕裂+有历史帧→repeat-last，正常→输出。
+     OTA 白名单已放行 vc-vcam.dll；验收手册：docs/runbooks/pc2-vcam-acceptance.md。
+P4-4 虚拟卡出口验收（不含推理）：🔲 待做（唯一剩余任务）
+     步骤：① PC2 注册 vc-vcam.dll（regsvr32）
+           ② PC1 sender(DDA) → PC2 receiver(--shm) → vcam → DShow 客户端
+           ③ 三判据：枚举到设备 / 协商 NV12 640x640@240 / 出口 hash 逐字节一致 + FIFO=0
+     前置：PC2 需安装 GraphEdit 或 GraphStudioNext（免费）供枚举/对账用。
+     验收通过即 P4 全部 DONE，项目收口。
 范围外：推理端及其联调（D8）、独占全屏 Hook、分辨率超 2.5G 链路后的编解码方案（另立项，hist S24）。
-owner 批示 2026-10-22：P4-1 不回退 CPU（显式报错）已批，门限数字待测量改对 + 实测分布后再定；P4-2 确认包格式可行，门限指标改为 R(N) 重组段（RTT/2 只做上界交叉验证）；P4-3 DShow 优先（对标 OBS 虚拟机，推理端 AverMedia USB 07CA 系），Win11 MF 降为备选。
+owner 待决：①全程延迟门限 <10ms；②gpu_convert 默认开；③确认包是否实现；④T5 门限数字。
 ```
