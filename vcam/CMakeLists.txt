@@ -10,9 +10,10 @@ endif()
 if(WIN32)
   target_link_libraries(vc-vcam PRIVATE strmiids winmm)
 endif()
-set_target_properties(vc-vcam PROPERTIES RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR})
-add_custom_command(TARGET vc-vcam POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-  $<TARGET_FILE:vc-vcam> ${CMAKE_BINARY_DIR}/vc-vcam.dll)
+set_target_properties(vc-vcam PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY_RELEASE ${CMAKE_BINARY_DIR}/Release
+    RUNTIME_OUTPUT_DIRECTORY_DEBUG   ${CMAKE_BINARY_DIR}/Debug)
+# No post-build copy: use build/Release/vc-vcam.dll directly for registration.
 
 
 
