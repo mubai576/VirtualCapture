@@ -15,7 +15,8 @@
 | P4-1 GPU 采集 | ✅ gpu_dispatch_ms=0.028ms（D3D11 timestamp，235fps 实测）；gpu_convert 代码落地，默认 CPU 路径待 owner 切换 |
 | P4-2 延迟测量 | ✅ 分段计时落地（pc1_seg + rseg）；双机实测门限候选 <10ms；确认包（flags bit1）待 owner 终审 |
 | P4-3 虚拟采集卡 | ✅ vcam DShow filter 落地，本机回环 4455 帧逐字节零错，240.0fps，D12 无信号行为实现；PC2 接线验收待 P4-4 |
-| P4-4 虚拟卡验收 | 🔲 待做：PC2 注册 vcam.dll + DShow 客户端枚举/对账 |
+| P4-4 虚拟卡验收 | ✅ DONE 2026-10-23：三判据全通（J1 枚举/J2 NV12 640x640@240/J3 35069帧零错+SHM hash 27/27一致）；vcam_verify/ + scripts/p4_4_shm_verify.py；docs/bringup/bringup-20261023-p4-4-vcam-acceptance.md |
+| 产品链路 P4 | ✅ P4-1/2/3/4 全部完成 |
 | 网卡调优 | ✅ PC2 I226-V: FlowControl=0, ITR=0（D14，docs/runbooks/pc2-nic-tuning.md）；PC1 Realtek 已同等设置 |
 | 版本 | 本机/PC1 0.4.1（scripts/PS1/sender 已更新）；PC2 主 agent 0.4.0（D9 待手动重启） |
 
@@ -116,12 +117,12 @@ P4-3 PC2 虚拟采集卡：DONE（代码+本机验证）
      vcam DShow filter 落地，本机回环 4455 帧逐字节零错，240.0fps QPC 起搏。
      D12 无信号默认行为实现（7e7ce80）：无映射→stall，撕裂+有历史帧→repeat-last，正常→输出。
      OTA 白名单已放行 vc-vcam.dll；验收手册：docs/runbooks/pc2-vcam-acceptance.md。
-P4-4 虚拟卡出口验收（不含推理）：🔲 待做（唯一剩余任务）
-     步骤：① PC2 注册 vc-vcam.dll（regsvr32）
-           ② PC1 sender(DDA) → PC2 receiver(--shm) → vcam → DShow 客户端
-           ③ 三判据：枚举到设备 / 协商 NV12 640x640@240 / 出口 hash 逐字节一致 + FIFO=0
-     前置：PC2 需安装 GraphEdit 或 GraphStudioNext（免费）供枚举/对账用。
-     验收通过即 P4 全部 DONE，项目收口。
+P4-4 虚拟卡出口验收（不含推理）：DONE 2026-10-23
+     J1 PASS：vc-vcam-verify.exe（vcam_verify/ C++）ICreateDevEnum 枚举到 VirtualCapture 640x640 NV12。
+     J2 PASS：IAMStreamConfig GetFormat = NV12 640x640 AvgTimePerFrame=41666 (240.0fps)。
+     J3 PASS：35069帧 shm_published==complete, dropped=0, hash_mismatch=0；SHM FNV-1a64 采样 27/27 与 receiver hashlog 一致。
+     验收工具：vcam_verify/vc-vcam-verify.exe + scripts/p4_4_shm_verify.py。
+     证据：docs/bringup/bringup-20261023-p4-4-vcam-acceptance.md。
 范围外：推理端及其联调（D8）、独占全屏 Hook、分辨率超 2.5G 链路后的编解码方案（另立项，hist S24）。
 owner 待决：①全程延迟门限 <10ms；②gpu_convert 默认开；③确认包是否实现；④T5 门限数字。
 ```
