@@ -6,6 +6,7 @@
 // Hand-rolled COM: no ATL, no strmbase (not in modern Windows SDK). Links strmiids + winmm.
 #include <windows.h>
 #include <dshow.h>
+// IKsControl and ISpecifyPropertyPages declared inline below (no ATL/strmbase)
 #include <cstring>
 #include <cstdio>
 #include <new>
@@ -23,6 +24,23 @@ DEFINE_GUID(CLSID_VirtualCaptureCam,
 // any strmiids duplicate-definition risk.
 static const GUID VCAM_SUBTYPE_NV12 =
   {0x3231564e, 0x0000, 0x0010, {0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71}};
+
+// ISpecifyPropertyPages already in ocidl.h (via dshow.h)
+// IKsControl {28F54685-06FD-11D2-B27A-00A0C9223196}
+static const GUID IID_IKsControl_VC =
+  {0x28f54685,0x06fd,0x11d2,{0xb2,0x7a,0x00,0xa0,0xc9,0x22,0x31,0x96}};
+DECLARE_INTERFACE_(IKsControlVC, IUnknown) {
+    STDMETHOD(QueryInterface)(REFIID,void**) PURE;
+    STDMETHOD_(ULONG,AddRef)() PURE;
+    STDMETHOD_(ULONG,Release)() PURE;
+    STDMETHOD_(LONG,KsProperty)(void*,ULONG,void*,ULONG,ULONG*) PURE;
+    STDMETHOD_(LONG,KsMethod)(void*,ULONG,void*,ULONG,ULONG*) PURE;
+    STDMETHOD_(LONG,KsEvent)(void*,ULONG,void*,ULONG,ULONG*) PURE;
+};
+
+static const GUID IID_ISpecifyPropertyPages_VC =
+  {0xb196b28b,0xbab4,0x101a,{0xb6,0x9c,0x00,0xaa,0x00,0x34,0x1d,0x07}};
+// IKsControl {28F54685-06FD-11D2-B27A-00A0C9223196} - already in ks.h via IID_IKsControl
 
 static const wchar_t* VCAM_NAME = L"VirtualCapture 640x640 NV12";
 static const wchar_t* VCAM_PIN_ID = L"Out";
@@ -263,7 +281,9 @@ public:
 };
 
 // ---------- pin ----------
-class CVCamPin : public IPin, public IAMStreamConfig, public IKsPropertySet {
+class CVCamPin : public IPin, public IAMStreamConfig,
+                 public IKsPropertySet, public ISpecifyPropertyPages,
+                 public IKsControlVC {
   friend class CVCamFilter;
   LONG m_cRef = 1;
   CVCamFilter* m_pFilter;  // owning filter, ref'd
@@ -286,8 +306,10 @@ public:
   STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
     if (riid == IID_IUnknown || riid == IID_IPin) *ppv = (IPin*)this;
-    else if (riid == IID_IAMStreamConfig) *ppv = (IAMStreamConfig*)this;
-    else if (riid == IID_IKsPropertySet) *ppv = (IKsPropertySet*)this;
+    else if (riid == IID_IAMStreamConfig)         *ppv = (IAMStreamConfig*)this;
+    else if (riid == IID_IKsPropertySet)          *ppv = (IKsPropertySet*)this;
+    else if (riid == IID_ISpecifyPropertyPages_VC)*ppv = (ISpecifyPropertyPages*)this;
+    else if (riid == IID_IKsControl_VC)           *ppv = (IKsControlVC*)this;
     else { *ppv = nullptr; return E_NOINTERFACE; }
     AddRef(); return S_OK;
   }
@@ -392,6 +414,21 @@ public:
     }
     return E_PROP_ID_UNSUPPORTED;
   }
+  // ISpecifyPropertyPages: no property pages (empty CAUUID)
+  STDMETHODIMP GetPages(CAUUID* pPages) {
+    if (!pPages) return E_POINTER;
+    pPages->cElems = 0; pPages->pElems = nullptr; return S_OK;
+  }
+
+  // IKsControl: stub — return STATUS_NOT_SUPPORTED (0xC00000BB).
+  // Presence of this interface is enough for clients that QI-check it.
+  STDMETHODIMP_(LONG) KsProperty(void*,ULONG,void*,ULONG,ULONG* b)
+    { if(b)*b=0; return (LONG)0xC00000BBL; }
+  STDMETHODIMP_(LONG) KsMethod(void*,ULONG,void*,ULONG,ULONG* b)
+    { if(b)*b=0; return (LONG)0xC00000BBL; }
+  STDMETHODIMP_(LONG) KsEvent(void*,ULONG,void*,ULONG,ULONG* b)
+    { if(b)*b=0; return (LONG)0xC00000BBL; }
+
   // GetStreamCaps: 3 entries (30/60/240fps) so clients populate dropdowns
   STDMETHODIMP GetStreamCaps(int i, AM_MEDIA_TYPE** pp, BYTE* caps) {
     if (i < 0 || i >= kNumCaps || !pp || !caps) return E_INVALIDARG;
