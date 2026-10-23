@@ -274,13 +274,6 @@ static COLORREF FpsColor(float fps){
 static void Spark(HDC hdc,int x,int y,int w,int h,
                   const std::deque<float>& dq,float maxv,COLORREF lc,float warn=0){
     if(maxv<=0)maxv=1;
-    if(warn>0&&warn<maxv){
-        int wy=y+h-(int)(warn/maxv*h);
-        HPEN wp=CreatePen(PS_DOT,1,RGB(220,180,40));
-        HPEN op=(HPEN)SelectObject(hdc,wp);
-        MoveToEx(hdc,x,wy,nullptr);LineTo(hdc,x+w,wy);
-        SelectObject(hdc,op);DeleteObject(wp);
-    }
     int n=(int)dq.size();if(n<2)return;
     int start=n>w?n-w:0;
     bool first=true;
@@ -289,9 +282,6 @@ static void Spark(HDC hdc,int x,int y,int w,int h,
         float v=dq[i];if(v<0)v=0;if(v>maxv)v=maxv;
         int px=x+(i-start),py=y+h-(int)(v/maxv*h);
         if(py<y)py=y;if(py>=y+h)py=y+h-1;
-        COLORREF c=(warn>0&&dq[i]>warn)?RGB(255,80,50):lc;
-        SelectObject(hdc,op);DeleteObject(lp);
-        lp=CreatePen(PS_SOLID,2,c);op=(HPEN)SelectObject(hdc,lp);
         if(first){MoveToEx(hdc,px,py,nullptr);first=false;}else LineTo(hdc,px,py);
     }
     SelectObject(hdc,op);DeleteObject(lp);
@@ -421,16 +411,25 @@ static void DrawOSD(HDC hdc, const Stats& s, int mode){
     for(int i=0;i<4;i++){
         int col=i%2, row2=i/2;
         int gx=4+col*GCOL, gy=GY0+row2*GROW;
-        Txt(hdc,gx,gy,graphs[i].label,RGB(210,215,225),g_f_small);
-        Spark(hdc,gx,gy+12,GW2,GH2,*graphs[i].h,graphs[i].maxv,RGB(255,255,255),graphs[i].warn);
+        // label + current value on same line
+        wchar_t title_line[64];
         if(!graphs[i].h->empty()){
             float v=graphs[i].h->back();
-            wchar_t lbl[24];
-            if(i==0) swprintf_s(lbl,L"%.0f",v);
-            else     swprintf_s(lbl,L"%.2f",v);
-            COLORREF vc=(graphs[i].warn>0&&v>graphs[i].warn)?RGB(255,130,60):RGB(255,255,255);
-            Txt(hdc,gx+2,gy+12+GH2-14,lbl,vc,g_f_small);
+            COLORREF vc=(v>graphs[i].warn&&graphs[i].warn>0)?RGB(255,130,60):RGB(255,255,255);
+            if(i==0) swprintf_s(title_line,L"%s   %.0f",graphs[i].label,v);
+            else     swprintf_s(title_line,L"%s   %.2f ms",graphs[i].label,v);
+            Txt(hdc,gx,gy,title_line,RGB(210,215,225),g_f_small);
+            // color-highlight the value part: re-draw just the value portion
+            SIZE sz; SelectObject(hdc,g_f_small);
+            GetTextExtentPoint32W(hdc,graphs[i].label,(int)wcslen(graphs[i].label),&sz);
+            wchar_t valstr[24];
+            if(i==0) swprintf_s(valstr,L"%.0f",v);
+            else     swprintf_s(valstr,L"%.2f ms",v);
+            Txt(hdc,gx+sz.cx+6,gy,valstr,vc,g_f_small);
+        } else {
+            Txt(hdc,gx,gy,graphs[i].label,RGB(210,215,225),g_f_small);
         }
+        Spark(hdc,gx,gy+12,GW2,GH2,*graphs[i].h,graphs[i].maxv,RGB(255,255,255),graphs[i].warn);
     }
 
     // (no ReleaseDC here — caller owns hdc)
