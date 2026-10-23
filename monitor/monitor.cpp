@@ -142,6 +142,11 @@ static void ReadStats(const wchar_t* pat, Stats& s, bool rx) {
         jstr(buf,"session_id",s.rx_sid,sizeof(s.rx_sid));
     } else {
         s.fps=jf(buf,"fps_actual");
+        // fallback: derive from sent_frames / uptime
+        if(s.fps<=0){
+            float frames=jf(buf,"sent_frames"); float up=jf(buf,"uptime_s");
+            if(frames>0&&up>0) s.fps=frames/up;
+        }
         s.pc1_avg=jf(buf,"pc1_seg_avg_ms"); s.pc1_p99=jf(buf,"pc1_seg_p99_ms"); s.pc1_max=jf(buf,"pc1_seg_max_ms");
         s.gpu_ms=jf(buf,"gpu_ms"); s.gpu_dispatch=jf(buf,"gpu_dispatch_ms");
         s.cpu_pct=ji(buf,"cpu_pct"); s.send_err=ji(buf,"send_errors");
@@ -343,7 +348,6 @@ static void DrawOSD(HDC hdc, const Stats& s, int mode){
     Txt(hdc,490,28,buf,RGB(160,170,190),g_f_label);
 
     // ── DETAIL GRID ──────────────────────────────────────────────────────────
-    Panel(hdc,0,60,WIN_W,178,200);
 
     const int LX=8, RX=326, DY=17;
     int ly=64, ry=64;
@@ -395,33 +399,35 @@ static void DrawOSD(HDC hdc, const Stats& s, int mode){
     fmt(vb,L"%.8hs",s.tx_sid);
     row(ry,RX,L"session",vb,RGB(120,130,150));
 
-    // ── GRAPHS (4 side-by-side) ───────────────────────────────────────────────
-    const int GY=244, GH=60, GW=148, GPAD=5;
-    Panel(hdc,0,GY-14,WIN_W,GH+30,200);
+    // ── GRAPHS: 2 rows x 2 cols, white lines, shared bg ─────────────────────
+    // divider
+    {HPEN p=CreatePen(PS_SOLID,1,RGB(90,100,110));HPEN op=(HPEN)SelectObject(hdc,p);
+     MoveToEx(hdc,0,240,nullptr);LineTo(hdc,WIN_W,240);SelectObject(hdc,op);DeleteObject(p);}
 
-    struct GraphDef { const wchar_t* label; std::deque<float>* hist; float maxv; COLORREF lc; float warn; };
     std::deque<float> h_fps,h_rseg,h_pc1,h_full;
     { std::lock_guard<std::mutex> lk(g_smtx); h_fps=g_h_fps;h_rseg=g_h_rseg;h_pc1=g_h_pc1;h_full=g_h_full; }
-    GraphDef graphs[4]={
-        {L"FPS",        &h_fps,  280.f, RGB(80,220,80),  200.f},
-        {L"rseg p99 ms",&h_rseg, 30.f,  RGB(255,200,60), 10.f},
-        {L"pc1 p99 ms", &h_pc1,  10.f,  RGB(160,120,255),5.f},
-        {L"full p99 ms",&h_full, 20.f,  RGB(255,140,80), 10.f},
+
+    struct GDef { const wchar_t* label; std::deque<float>* h; float maxv; float warn; };
+    GDef graphs[4]={
+        {L"FPS (0-280)",        &h_fps,  280.f, 200.f},
+        {L"rseg p99 ms (0-30)", &h_rseg,  30.f,  10.f},
+        {L"pc1 p99 ms (0-10)",  &h_pc1,   10.f,   5.f},
+        {L"full p99 ms (0-20)", &h_full,  20.f,  10.f},
     };
+    const int GW2=(WIN_W/2)-8, GH2=72, GCOL=WIN_W/2;
+    const int GY0=244, GROW=GH2+20;
     for(int i=0;i<4;i++){
-        int gx=i*(GW+GPAD);
-        // label above graph
-        Txt(hdc,gx,GY-12,graphs[i].label,graphs[i].lc,g_f_small);
-        // graph bg
-        RECT gr={gx,GY,gx+GW,GY+GH}; FillRect(hdc,&gr,(HBRUSH)GetStockObject(BLACK_BRUSH));
-        Spark(hdc,gx,GY,GW,GH,*graphs[i].hist,graphs[i].maxv,graphs[i].lc,graphs[i].warn);
-        // current value
-        if(!graphs[i].hist->empty()){
-            float v=graphs[i].hist->back();
-            wchar_t lbl[20];
+        int col=i%2, row2=i/2;
+        int gx=4+col*GCOL, gy=GY0+row2*GROW;
+        Txt(hdc,gx,gy,graphs[i].label,RGB(210,215,225),g_f_small);
+        Spark(hdc,gx,gy+12,GW2,GH2,*graphs[i].h,graphs[i].maxv,RGB(255,255,255),graphs[i].warn);
+        if(!graphs[i].h->empty()){
+            float v=graphs[i].h->back();
+            wchar_t lbl[24];
             if(i==0) swprintf_s(lbl,L"%.0f",v);
-            else     swprintf_s(lbl,L"%.1f",v);
-            Txt(hdc,gx+2,GY+GH-16,lbl,graphs[i].lc,g_f_small);
+            else     swprintf_s(lbl,L"%.2f",v);
+            COLORREF vc=(graphs[i].warn>0&&v>graphs[i].warn)?RGB(255,130,60):RGB(255,255,255);
+            Txt(hdc,gx+2,gy+12+GH2-14,lbl,vc,g_f_small);
         }
     }
 
