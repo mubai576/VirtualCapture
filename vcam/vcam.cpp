@@ -797,26 +797,11 @@ static LONG RegSetStr(HKEY root, const wchar_t* sub, const wchar_t* val, const w
 STDAPI DllRegisterServer() {
   wchar_t path[MAX_PATH];
   if (!GetModuleFileName(g_hMod, path, MAX_PATH)) return SELFREG_E_CLASS;
-  wchar_t clsidKey[128], instKey[256];
+  wchar_t clsidKey[128], instKey[256], srv[160];
   swprintf_s(clsidKey, L"Software\\Classes\\CLSID\\%s", CLSID_STR);
-  swprintf_s(instKey, L"Software\\Classes\\CLSID\\%s\\Instance\\%s", CAT_VIDEO_INPUT, CLSID_STR);
-  if (RegSetStr(HKEY_CURRENT_USER, clsidKey, nullptr, VCAM_NAME) != ERROR_SUCCESS) return SELFREG_E_CLASS;
-  wchar_t srv[160];
-  swprintf_s(srv, L"%s\\InprocServer32", clsidKey);
-  if (RegSetStr(HKEY_CURRENT_USER, srv, nullptr, path) != ERROR_SUCCESS) return SELFREG_E_CLASS;
-  if (RegSetStr(HKEY_CURRENT_USER, srv, L"ThreadingModel", L"Both") != ERROR_SUCCESS) return SELFREG_E_CLASS;
-  if (RegSetStr(HKEY_CURRENT_USER, instKey, L"FriendlyName", VCAM_NAME) != ERROR_SUCCESS) return SELFREG_E_CLASS;
-  if (RegSetStr(HKEY_CURRENT_USER, instKey, L"CLSID", CLSID_STR) != ERROR_SUCCESS) return SELFREG_E_CLASS;
-  HKEY k = nullptr;
-  if (RegCreateKeyEx(HKEY_CURRENT_USER, instKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS)
-    return SELFREG_E_CLASS;
-  DWORD merit = 0x00200000;
-  RegSetValueEx(k, L"Merit", 0, REG_DWORD, (const BYTE*)&merit, sizeof(merit));
-  // FilterData binary blob: version=2, merit=0x200000, 1 output pin, MEDIATYPE_Video + MEDIASUBTYPE_NV12.
-  // Serialized format matches DShow FilterMapper internal representation (offset-based tags).
-  // Verified against OBS Virtual Camera FilterData (same 88-byte layout).
-  // FilterData: 88 bytes, exactly matching OBS Virtual Camera format.
-  // version=2, merit=0x00200000, 1 output pin (MEDIATYPE_Video + MEDIASUBTYPE_NV12).
+  swprintf_s(instKey,  L"Software\\Classes\\CLSID\\%s\\Instance\\%s", CAT_VIDEO_INPUT, CLSID_STR);
+  swprintf_s(srv,      L"%s\\InprocServer32", clsidKey);
+
   static const BYTE kFilterData[88] = {
     0x02,0x00,0x00,0x00,0x00,0x00,0x20,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     0x30,0x70,0x69,0x33,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,
@@ -825,18 +810,36 @@ STDAPI DllRegisterServer() {
     0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71,0x4e,0x56,0x31,0x32,0x00,0x00,0x10,0x00,
     0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71,
   };
-  static_assert(sizeof(kFilterData) == 88, "FilterData must be 88 bytes");
+  static_assert(sizeof(kFilterData)==88,"FilterData");
+  DWORD merit = 0x00200000;
 
-  RegSetValueEx(k, L"FilterData", 0, REG_BINARY, kFilterData, sizeof(kFilterData));
-  RegCloseKey(k);
+  // Helper: write to one hive (HKCU always; HKLM if we have write access)
+  auto WriteHive = [&](HKEY root) -> bool {
+    if (RegSetStr(root, clsidKey, nullptr, VCAM_NAME) != ERROR_SUCCESS) return false;
+    if (RegSetStr(root, srv, nullptr, path)           != ERROR_SUCCESS) return false;
+    if (RegSetStr(root, srv, L"ThreadingModel", L"Both") != ERROR_SUCCESS) return false;
+    if (RegSetStr(root, instKey, L"FriendlyName", VCAM_NAME) != ERROR_SUCCESS) return false;
+    if (RegSetStr(root, instKey, L"CLSID", CLSID_STR)  != ERROR_SUCCESS) return false;
+    HKEY k = nullptr;
+    if (RegCreateKeyEx(root, instKey, 0, nullptr, 0, KEY_WRITE, nullptr, &k, nullptr) != ERROR_SUCCESS) return false;
+    RegSetValueEx(k, L"Merit",      0, REG_DWORD,  (const BYTE*)&merit,      sizeof(merit));
+    RegSetValueEx(k, L"FilterData", 0, REG_BINARY, kFilterData, sizeof(kFilterData));
+    RegCloseKey(k);
+    return true;
+  };
+
+  if (!WriteHive(HKEY_CURRENT_USER)) return SELFREG_E_CLASS;
+  WriteHive(HKEY_LOCAL_MACHINE);  // best-effort (admin); ignore failure
   return S_OK;
 }
 STDAPI DllUnregisterServer() {
   wchar_t clsidKey[128], instKey[256];
   swprintf_s(clsidKey, L"Software\\Classes\\CLSID\\%s", CLSID_STR);
-  swprintf_s(instKey, L"Software\\Classes\\CLSID\\%s\\Instance\\%s", CAT_VIDEO_INPUT, CLSID_STR);
-  RegDeleteTree(HKEY_CURRENT_USER, instKey);
-  RegDeleteTree(HKEY_CURRENT_USER, clsidKey);
+  swprintf_s(instKey,  L"Software\\Classes\\CLSID\\%s\\Instance\\%s", CAT_VIDEO_INPUT, CLSID_STR);
+  RegDeleteTree(HKEY_CURRENT_USER,   instKey);
+  RegDeleteTree(HKEY_CURRENT_USER,   clsidKey);
+  RegDeleteTree(HKEY_LOCAL_MACHINE,  instKey);   // best-effort
+  RegDeleteTree(HKEY_LOCAL_MACHINE,  clsidKey);  // best-effort
   return S_OK;
 }
 BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
