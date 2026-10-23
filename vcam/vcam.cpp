@@ -341,7 +341,19 @@ public:
   STDMETHODIMP BeginFlush() { return S_OK; }
   STDMETHODIMP EndFlush() { return S_OK; }
   STDMETHODIMP NewSegment(REFERENCE_TIME, REFERENCE_TIME, double) { return S_OK; }
-  // IAMStreamConfig
+  // IAMStreamConfig — expose 3 caps entries (30/60/240 fps) so clients
+  // populate their resolution/fps dropdowns instead of showing "no capabilities".
+  // All three use the same 640x640 NV12 format; only AvgTimePerFrame differs.
+  static const int kNumCaps = 3;
+  static constexpr LONGLONG kFrameIntervals[3] = {
+    416666LL,  // ~24fps
+    333333LL,  // 30fps
+    41666LL,   // 240fps
+  };
+  STDMETHODIMP GetNumberOfCapabilities(int* piCount, int* piSize) {
+    if (!piCount || !piSize) return E_POINTER;
+    *piCount = kNumCaps; *piSize = sizeof(VIDEO_STREAM_CONFIG_CAPS); return S_OK;
+  }
   STDMETHODIMP SetFormat(AM_MEDIA_TYPE* p) {
     if (!p) return E_POINTER;
     return VCamTypeMatches(p) ? S_OK : VFW_E_TYPE_NOT_ACCEPTED;
@@ -352,11 +364,6 @@ public:
     if (!t) return E_OUTOFMEMORY;
     *pp = t; return S_OK;
   }
-  STDMETHODIMP GetNumberOfCapabilities(int* piCount, int* piSize) {
-    if (!piCount || !piSize) return E_POINTER;
-    *piCount = 1; *piSize = sizeof(VIDEO_STREAM_CONFIG_CAPS); return S_OK;
-  }
-  // IKsPropertySet: advertise PIN_CATEGORY_CAPTURE so stock clients (ffmpeg
   // dshow, GraphEdit) accept this pin as the capture pin.
   STDMETHODIMP Set(REFGUID, DWORD, LPVOID, DWORD, LPVOID, DWORD) {
     return E_PROP_ID_UNSUPPORTED;
@@ -385,30 +392,35 @@ public:
     }
     return E_PROP_ID_UNSUPPORTED;
   }
+  // GetStreamCaps: 3 entries (30/60/240fps) so clients populate dropdowns
   STDMETHODIMP GetStreamCaps(int i, AM_MEDIA_TYPE** pp, BYTE* caps) {
-    if (i != 0 || !pp || !caps) return E_INVALIDARG;
+    if (i < 0 || i >= kNumCaps || !pp || !caps) return E_INVALIDARG;
     AM_MEDIA_TYPE* t = VCamCreateType();
     if (!t) return E_OUTOFMEMORY;
+    // Override AvgTimePerFrame for each capability entry
+    VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)t->pbFormat;
+    LONGLONG fi = kFrameIntervals[i];
+    vih->AvgTimePerFrame = fi;
+    vih->dwBitRate = (DWORD)(VCAM_FRAME_BYTES * 8LL * (10000000LL / fi));
     VIDEO_STREAM_CONFIG_CAPS* c = (VIDEO_STREAM_CONFIG_CAPS*)caps;
     ZeroMemory(c, sizeof(*c));
-    c->guid = FORMAT_VideoInfo;
-    c->VideoStandard = AnalogVideo_None;
-    c->InputSize.cx = VCAM_W; c->InputSize.cy = VCAM_H;
-    c->MinCroppingSize.cx = VCAM_W; c->MinCroppingSize.cy = VCAM_H;
-    c->MaxCroppingSize.cx = VCAM_W; c->MaxCroppingSize.cy = VCAM_H;
-    c->CropGranularityX = 1; c->CropGranularityY = 1;
-    c->CropAlignX = 1; c->CropAlignY = 1;
-    c->MinOutputSize.cx = VCAM_W; c->MinOutputSize.cy = VCAM_H;
-    c->MaxOutputSize.cx = VCAM_W; c->MaxOutputSize.cy = VCAM_H;
-    c->OutputGranularityX = 1; c->OutputGranularityY = 1;
-    c->StretchTapsX = 0; c->StretchTapsY = 0;
-    c->ShrinkTapsX = 0; c->ShrinkTapsY = 0;
-    c->MinFrameInterval = VCAM_FRAME_100NS; c->MaxFrameInterval = VCAM_FRAME_100NS;
-    c->MinBitsPerSecond = VCAM_FRAME_BYTES * 8 * 240;
-    c->MaxBitsPerSecond = VCAM_FRAME_BYTES * 8 * 240;
+    c->guid                = FORMAT_VideoInfo;
+    c->VideoStandard       = AnalogVideo_None;
+    c->InputSize.cx        = VCAM_W; c->InputSize.cy = VCAM_H;
+    c->MinCroppingSize.cx  = VCAM_W; c->MinCroppingSize.cy = VCAM_H;
+    c->MaxCroppingSize.cx  = VCAM_W; c->MaxCroppingSize.cy = VCAM_H;
+    c->CropGranularityX    = 1; c->CropGranularityY = 1;
+    c->CropAlignX          = 1; c->CropAlignY = 1;
+    c->MinOutputSize.cx    = VCAM_W; c->MinOutputSize.cy = VCAM_H;
+    c->MaxOutputSize.cx    = VCAM_W; c->MaxOutputSize.cy = VCAM_H;
+    c->OutputGranularityX  = 1; c->OutputGranularityY = 1;
+    c->MinFrameInterval    = fi;
+    c->MaxFrameInterval    = fi;
+    c->MinBitsPerSecond    = (LONG)vih->dwBitRate;
+    c->MaxBitsPerSecond    = (LONG)vih->dwBitRate;
     *pp = t; return S_OK;
   }
-};
+}; // end class CVCamPin
 
 STDMETHODIMP CEnumPins::Next(ULONG c, IPin** pp, ULONG* pc) {
   if (!pp) return E_POINTER;
