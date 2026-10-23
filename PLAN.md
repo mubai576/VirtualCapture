@@ -37,13 +37,14 @@ vc-sender.exe --adapter <子串> --mode pattern|file|dda --pattern motion --fps 
   --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff
   --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest]
 vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
-  --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--selftest]
+  --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]
 ```
 
 ### 1.4 文件型 IPC
 - stats ~500ms 原子覆写（tmp→rename）；hashlog 每帧 append 一行。
 - `sender.hash.jsonl`：`{"frame_id":N,"hash":"<16hex>","qpc_ns":T}`
 - receiver hashlog D3 carries qpc_ns; reconcile compares frame_id and hash only.
+- receiver `--shm <name>` (P4-3): publish latest complete frame to named file mapping (layout vcam/vcam_shm.h, NOT proto/); stats adds `shm_published`; agent /receiver/start forwards `shm`.
 - sender stats 新增 `gpu_dispatch_ms`（D3D11 timestamp 包住 CopyResource 的真 GPU 时间均值）+ `gpu_dispatch_samples`（有效样本数）；`gpu_ms` 仍为 capture() wall-clock，待 P4-1 实测分布后按 D10 决定是否切换口径。
 - 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 614400B。
 
@@ -67,6 +68,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 | D6 | 0.3.7 re-stage | ✅批：作废，并入 0.3.8 | P2-1 |
 | D7 | checker-transient | ✅保留并自动判：发端 hashlog 相邻帧间隔 >1s 由 gap_any.py 判（曾现 1713 帧停住 8.5s，删等于丢证据） | P2-3 |
 | D8 | 范围与 P4-2 门限口径 | ✅批（2026-10-23）：本项目只管**采集与传输**，推理不在范围内。延迟口径 = PC1 采集完成 → PC2 重组完成，分段同机 QPC 测：PC1 段（采集完成→末包发出）+ R(N)（PC2 首包→重组完成）+ 线传段用 L(N) 上界；门限判全程 p99，候选 <4.16ms（1 帧），数字随实测分布定。R(N) 单独只作诊断 | P4-2 |
+| D11 | noise 种子 + 只读映射 + 撕裂回退 | ✅批（2026-10-24，三项全做）：①noise 种子 `fid<<32|C` 与 C 高 16 位 0x1234 置位 bit{2,4,5,9,12} 重叠，1500帧只有128独立帧/T1 14400帧512个/T2 144000帧4608个（约每32帧不同）；已改 XOR（C++/Python/small64 三处，VEC 已重核）；历史 noise 对账仍有效（逐帧比），防压缩/去重主张被削弱，motion 不受影响（XOR 种子）；②读端禁 LOCK 前缀（已改 plain volatile 读）；③撕裂读跳过该 tick（缺口由 discontinuity 标，motion 只保留给无映射 bring-up） | P4-3 |
 | D10 | P4-1 测量口径与 idle 语义 | ✅批（2026-10-24）：`gpu_ms` 切真 GPU 时间待 PC1 2K240 实测分布后再定，`gpu_dispatch_ms` 先作诊断；dda selftest 连续 5x E_TIMEOUT（2.5s 无新帧）判 SKIP（idle 与故障不可分，live 已容忍超时） | P4-1 |
 | D9 | 本机主 agent 换代到 0.4.0 | ⏳待执行：agent 改动已由另一会话提交（d15287d），阻塞解除。注意 2026-10-23 00:10 对该进程 stage 成功但 /activate 无应答且未换代（pid 不变），建议直接手动重启本机 agent（本机，可逆），换代后 /health 应出新 pid | — |
 
@@ -103,6 +105,8 @@ P4-2 端到端延迟测量：确认包（flags bit1 + 零 payload，28B 不动�
      口径按 D8：PC1 采集完成→PC2 重组完成，分段同机 QPC，门限判全程 p99。
 P4-3 PC2 虚拟采集卡：已定 DShow（用户态 source filter），实现
      NV12 640x640、AvgTimePerFrame=41666、只留最新 1 帧、不跟墙钟。
+     步骤2进展：receiver `--shm` 发布 + vcam 消费最新帧已落地：本机回环 sender(noise)→receiver→shm→vcam→NullRenderer，4455 样本全 shm:1、出口逐字节对账零外来帧；详情见 docs/bringup/ 下 vcam 系列；PC2 接线 + 出口验收待 P4-4。起搏已改为 QPC 240Hz（Sleep+spin，落后重不同步追赶），本机 NullRenderer 10s 实测 240.0fps。OTA 白名单已放行 vc-vcam.dll（agent+skill+build 三处同步）；P4-4 PC2 验收步骤见 docs/runbooks/pc2-vcam-acceptance.md（枚举/协商/逐字节对账/FIFO 三判据，含 ffmpeg client quirk 说明）。
+     步骤1进展2026-10-23：filter 本体落地（vcam/，手写 COM、NV12 640x640@240、motion 帧源）：本机构建+注册+枚举+建图推3s推流全绿（docs/bringup/bringup-20261023-vcam.md）；receiver 喂帧、240fps 起播已落地（见下），FilterData 按需再加；注意本机 ffmpeg 打不开虚拟机（OBS 同样失败，client 侧问题）。
 P4-4 虚拟卡出口验收（不含推理）：通用 DShow 客户端（如 ffmpeg -f dshow / GraphEdit）枚举到设备并协商 NV12 640x640@240；
      出口帧与发端逐字节一致（hash 对账）、FIFO 堆积为 0。推理端接入不在本项目范围（D8）。
 范围外：推理端及其联调（D8）、独占全屏 Hook、分辨率超 2.5G 链路后的编解码方案（另立项，hist S24）。

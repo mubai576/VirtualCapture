@@ -28,6 +28,7 @@ raw L2 EtherType `0x88B5`（Npcap）发到 PC2 重组，逐帧 FNV-1a64 对账�
 |---|---|---|
 | `proto/vc_wire.h` | 28B 包头，**冻结** | 仅 owner 可改 |
 | `sender/` | `vc-sender.exe`（pattern/file/dda，`--batch`，`pattern.h` 整数测试源，`dda.h` 桌面采集） | C++17 |
+| `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，NV12 640x640@240，motion 帧源） | C++17 |
 | `receiver/` | `vc-receiver.exe`（重组、hash、stats、hashlog 带 qpc_ns） | C++17 |
 | `agent/vc-agent.py` | 双机控制 agent（REST :18080，/exec 白名单，/files 分页，stage/activate OTA） | 单文件零依赖 |
 | `ctrl/` | `vc-ctrl.py` 编排判分、`bringup.py` 联调报告、`reconcile.py` 对账、`run_remote.py` 远控/OTA、`pattern_ref.py` Python 镜像 | |

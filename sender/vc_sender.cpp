@@ -65,7 +65,8 @@ static inline void gen_rings(uint32_t fid,uint8_t*Y,uint8_t*UV){
   }
 }
 static inline void gen_noise(uint32_t fid,uint8_t*Y,uint8_t*UV){
-  uint64_t s=((uint64_t)fid<<32)|0x123456789ABCull;
+  // 小图噪声
+  uint64_t s=((uint64_t)fid<<32)^0x123456789ABCull; // D11: XOR，见 pattern.h
   uint8_t*p=Y;size_t n=W*H;
   while(n>=8){uint64_t r=sm_splitmix(&s);memcpy(p,&r,8);p+=8;n-=8;}
   while(n--)*p++=(uint8_t)sm_splitmix(&s);

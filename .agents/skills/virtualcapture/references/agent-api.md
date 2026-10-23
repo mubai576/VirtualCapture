@@ -13,9 +13,9 @@ Base: `http://<ctrl-ip>:18080`. 全部 JSON. `start` 幂等（先停旧会话）
 | POST | `/sender/start` | `{mode, pattern, fps, frames, ethertype, mtu, pacing_us, adapter*, dst_mac, ...}`（*adapter 必填，缺省 400 + adapters 列表，不拉起进程） | `{session_id, args}` |
 | POST | `/sender/stop` | — | `{session_id, stopped}` |
 | GET | `/sender/stats` | — | `{session_id, running, sent_frames, sent_packets, pps, bps, fps_actual, send_errors, pattern, gpu_ms, gpu_dispatch_ms, gpu_dispatch_samples, cpu_pct}`（P4-1：gpu_ms=wall-clock；gpu_dispatch_ms=D3D11 timestamp 真 GPU 拷贝时间，0 样本时为 0） |
-| POST | `/receiver/start` | `{adapter*, ethertype, mtu, expect_frames, timeout_s}`（*adapter 必填，缺省 400 + adapters 列表，不拉起进程） | `{session_id, args}` |
+| POST | `/receiver/start` | `{adapter*, ethertype, mtu, expect_frames, timeout_s, shm}`（*adapter 必填，缺省 400 + adapters 列表，不拉起进程） | `{session_id, args}` |
 | POST | `/receiver/stop` | — | `{session_id, stopped}` |
-| GET | `/receiver/stats` | — | `{session_id, running, complete, dropped, packets_recv, packets_lost, pps, bps, gaps, hash_mismatch, inter_arrival_avg_ms, inter_arrival_p99_ms}` |
+| GET | `/receiver/stats` | — | `{session_id, running, complete, dropped, packets_recv, packets_lost, pps, bps, gaps, hash_mismatch, inter_arrival_avg_ms, inter_arrival_p99_ms, shm_published}` |
 | GET | `/receiver/report` | -- | {version, sender, receiver} (both-side stats snapshot) |
 | POST | `/pcap/start` | `{seconds}` |
 | POST | `/exec` | `{argv:[...], timeout_s}` (allowlist, see below) | `{exec_id, exit_code, stdout, stderr, timed_out, duration_s}` |
@@ -41,7 +41,7 @@ Impl: `agent/vc-agent.py` single-file zero-dep (same code both PCs; --role is la
 - `POST /activate {version}`（缺省用已 stage 版本）或 `{rollback:true}`（用 prev）：拷贝适用条目到 live 位 →
   应答 `{activated, version, rollback, restart}`（`restart=execv`）→ 原地 `os.execv` 接管（同 argv；冻结模式切 `version.json` exe 指针到版本化 exe 并 GC 旧版）。
 - 交接期 `health/version` 短暂不可达，轮询确认；`run/updates.log` 记录每次 stage/apply/rollback。
-- Zip allowlist：顶层 `vc-agent.exe|vc-agent.py|vc-sender.exe|vc-receiver.exe|version.json` 加 `scripts/*.ps1`；`version.json` 必带；zip-slip（`..`/absolute）400。
+- Zip allowlist：顶层 `vc-agent.exe|vc-agent.py|vc-sender.exe|vc-receiver.exe|vc-vcam.dll|version.json` 加 `scripts/*.ps1`；`version.json` 必带；zip-slip（`..`/absolute）400。
 - stage 包不含自更新条目时（只换 sender/receiver exe）直接 live 应用并返回 `{updated, version, restart:none}`（先停 sender/receiver 会话）。
 - 自更新条目（`vc-agent.exe|vc-agent.py`）若落不到 ROOT 下，整包 400 拒绝（不静默跳过）；冻结模式 ROOT 默认为 exe 所在目录，生产布局不受影响。
 - 回滚用 `prev/mirror` 走同一 activate 路径；空备份 → 409；stage 版本不符 → 409；staged agent.py 编译失败 → 500；中途失败一律 500 JSON（不断连接），轮询 `/version` 为准。

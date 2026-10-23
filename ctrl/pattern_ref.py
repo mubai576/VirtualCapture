@@ -63,12 +63,14 @@ def gen_rings(fid, w=W, h=H):
     return bytes(Y), bytes(uv)
 
 def gen_noise(fid, w=W, h=H):
-    seed = ((fid << 32) | 0x123456789ABC) & M
+    # 全帧噪声：最大熵
+    seed = ((fid << 32) ^ 0x123456789ABC) & M  # D11: XOR（与 motion 一致）
     n = w * h + w * h // 2
     raw = _fill_prng(seed, n)
     return raw[:w*h], raw[w*h:]
 
 def gen_motion(fid, w=W, h=H):
+    # 拟游戏：背景+弹跳块+中央噪声
     Y = bytearray(((x + fid * 3 + (y >> 2)) & 0xFF) for y in range(h) for x in range(w))
     S = 16
     for k in range(4):

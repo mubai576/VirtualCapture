@@ -73,8 +73,10 @@ static inline void vc_gen_rings(uint32_t fid, uint8_t *Y, uint8_t *UV) {
     }
 }
 
+// 全帧噪声
 static inline void vc_gen_noise(uint32_t fid, uint8_t *Y, uint8_t *UV) {
-  uint64_t s = ((uint64_t)fid << 32) | 0x123456789ABCull;
+  // D11: seed 用 XOR（与 motion 一致）；`|` 会被常量高 16 位 0x1234 吞掉 fid bit{2,4,5,9,12}。
+  uint64_t s = ((uint64_t)fid << 32) ^ 0x123456789ABCull;
   uint8_t *p = Y; size_t n = VC_Y_BYTES;
   while (n >= 8) { uint64_t r = vc_splitmix64(&s); memcpy(p, &r, 8); p += 8; n -= 8; }
   while (n--) *p++ = (uint8_t)vc_splitmix64(&s);

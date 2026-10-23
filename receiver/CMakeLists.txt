@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 # receiver/CMakeLists.txt — T-02 + P1-2. Same Npcap policy as sender.
 add_executable(vc-receiver vc_receiver.cpp ${CMAKE_CURRENT_SOURCE_DIR}/../cmake/longpath.manifest)
-target_include_directories(vc-receiver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../proto ${CMAKE_CURRENT_SOURCE_DIR}/../sender)
+target_include_directories(vc-receiver PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE_CURRENT_SOURCE_DIR}/../proto ${CMAKE_CURRENT_SOURCE_DIR}/../sender ${CMAKE_CURRENT_SOURCE_DIR}/../vcam)
 target_compile_features(vc-receiver PRIVATE cxx_std_17)
 if(WIN32)
   target_link_libraries(vc-receiver PRIVATE ws2_32)

@@ -1,15 +1,7 @@
-"""vc-agent.py — T-03 control agent (PLAN §2.3, agent-api.md frozen).
-Single file, zero third-party deps, dual-PC same code (--role sender|receiver).
-- /sender|receiver/start: assemble CLI per PLAN §2.2, cwd=project root,
-  stats/hashlog → run/<session>.sender|receiver.stats.json + .hash.jsonl,
-  record pid; idempotent (kill old first); return session_id.
-- /stop: graceful 2s then kill, keep files for reconcile.
-- /stats: return stats file verbatim + running/uptime; missing → {running:false}.
-- /update: validate zip, extract to staging mirror, snapshot full-tree prev, no restart; returns staged version.
-- /activate: apply staged (or rollback prev) then in-process execv; no detached processes.
-- /version from version.json else "dev".
-Acceptance: with T-01/T-02 --selftest exes the start/stop/stats file flow still works.
-"""
+"""双机控制agent（T-03，接口冻结）
+单文件零依赖，双机同一份代码。
+启停查：组CLI→记pid→幂等启停；stats/hashlog落run/。
+升级：验zip→staging→快照prev→execv切换，不起孤进程。"""
 import argparse, time, uuid, json, os, sys, signal, subprocess, shutil, zipfile, threading
 
 VERSION_DEFAULT = "dev"
@@ -148,7 +140,10 @@ def launch(kind, args):
         _ef = args.get("expect_frames", args.get("expect-frames", None))
         if _ef is not None and int(_ef) > 0:
             cmd += ["--expect-frames", str(_ef)]
-    # filter empty --adapter value (exe treats missing as auto)
+        _shm = args.get("shm", None)
+        if _shm:
+            cmd += ["--shm", str(_shm)]
+    # 过滤空网卡参数
     cmd2 = []
     skip_next = False
     for i, c in enumerate(cmd):
@@ -344,11 +339,12 @@ def run_exec(argv, timeout_s, client):
 UPDATE_LOCK = threading.RLock()
 UPDATE_MAX_ZIP = 100 * 1024 * 1024
 UPDATE_MAX_FILES = 1000
-UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "version.json"}
+UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "version.json"}
 
 
 FILES_MAX_BYTES = 262144
 def read_root_file(rel, offset=0, limit=0):
+    # 读ROOT文件分页（供拉日志）
     try:
         offset = int(offset or 0)
         limit = int(limit or 0)
@@ -406,10 +402,12 @@ def _update_slots():
         except Exception: pass
     m["vc-sender.exe"] = os.path.join(BUILD_DIR, "vc-sender.exe")
     m["vc-receiver.exe"] = os.path.join(BUILD_DIR, "vc-receiver.exe")
+    m["vc-vcam.dll"] = os.path.join(BUILD_DIR, "vc-vcam.dll")
     m["version.json"] = VERSION_FILE
     return m
 
 def _safe_zip_entries(zf):
+    # 验zip条目防越界
     items, total = [], 0
     names = zf.namelist()
     if len(names) > UPDATE_MAX_FILES:
@@ -438,7 +436,8 @@ def _safe_zip_entries(zf):
     return items, ""
 
 def _live_for_rel(rel, slots):
-    if rel in ("vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "version.json"):
+    # 判运行文件绝对路径
+    if rel in ("vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "version.json"):
         return slots.get(rel)
     if rel.startswith("scripts/"):
         return os.path.join(ROOT, rel.replace("/", os.sep))

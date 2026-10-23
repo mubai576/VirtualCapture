@@ -26,7 +26,7 @@ python -m PyInstaller --onefile --name vc-agent agent/vc-agent.py
 产物 dist/vc-agent.exe
 
 ## release zip
-含 vc-agent.exe vc-sender.exe vc-receiver.exe version.json scripts ps1
+含 vc-agent.exe vc-sender.exe vc-receiver.exe version.json scripts ps1 vc-vcam.dll（P4-3）
 用 Compress-Archive 打 release/vc-<ver>.zip（当前 0.4.0）
 
 ## run 治理策略

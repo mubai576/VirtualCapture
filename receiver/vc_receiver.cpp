@@ -23,6 +23,7 @@
 #include <time.h>
 #endif
 #include "../proto/vc_wire.h"
+#include "../vcam/vcam_shm.h"
 #include "pattern.h"
 #include "fnv1a.h"
 #include "crc32.h"
@@ -60,9 +61,11 @@ struct Args{
   uint16_t ethertype=0x88B5; int mtu=9000;
   std::string session="manual", stats="", hashlog="";
   long long timeout_s=0; long long expect_frames=-1;
+  std::string shm="";  // P4-3: publish latest complete frame to named file mapping ("" = off)
   bool selftest=false;
 };
 static uint16_t parse_et(const std::string&s){
+  // 解析协议号
   unsigned v=0;
   if(s.size()>2&&(s[0]==48&&(s[1]==120||s[1]==88))) sscanf(s.c_str(),"%x",&v);
   else if(s.find_first_of("abcdefABCDEF")!=std::string::npos) sscanf(s.c_str(),"%x",&v);
@@ -70,10 +73,12 @@ static uint16_t parse_et(const std::string&s){
   return (uint16_t)v;
 }
 static void usage(){
+  // 打印用法
   printf("vc-receiver.exe --adapter <substr> --ethertype 0x88B5 --mtu 9000\n"
-    "  --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--selftest]\n");
+    "  --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]\n");
 }
 static void ensure_parent(const std::string&path){
+  // 建父目录
   if(path.empty()) return;
   size_t p=path.find_last_of("/\\");
   if(p==std::string::npos) return;
@@ -95,13 +100,44 @@ static void atomic_write(const std::string&path,const std::string&data){
 #endif
 }
 
-// ---------- reassembler (testable, no pcap dependency) ----------
+// 重组器（可单测，不依赖抓包）
 struct ReasmStats{
   uint64_t complete=0, dropped=0, packets_recv=0, packets_lost=0;
   uint64_t hash_mismatch=0, gaps=0;
   uint64_t bytes_recv=0;
   uint64_t max_seen_fid=0; bool have_seen=false;
 };
+#ifdef _WIN32
+// P4-3: latest-1-frame publisher (named file mapping, layout = vcam/vcam_shm.h).
+struct ShmPub{
+  HANDLE hMap=nullptr; uint8_t* base=nullptr; uint64_t published=0;
+  bool open(const std::string& name){
+    close();
+    hMap=CreateFileMappingA(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,
+                            (DWORD)VC_SHM_SIZE,name.c_str());
+    if(!hMap||hMap==INVALID_HANDLE_VALUE){ hMap=nullptr; return false; }
+    base=(uint8_t*)MapViewOfFile(hMap,FILE_MAP_WRITE,0,0,VC_SHM_SIZE);
+    if(!base){ CloseHandle(hMap); hMap=nullptr; return false; }
+    vc_shm_hdr_t* h=(vc_shm_hdr_t*)base;
+    h->magic=VC_SHM_MAGIC; h->seq=0; h->frame_id=0; h->hash=0; h->size=(uint32_t)VC_FRAME_BYTES;
+    return true;
+  }
+  void publish(uint32_t fid,uint64_t fh,const uint8_t* frame){
+    if(!base) return;
+    vc_shm_hdr_t* h=(vc_shm_hdr_t*)base;
+    InterlockedIncrement((volatile LONG*)&h->seq);  // odd = writing
+    h->frame_id=fid; h->hash=fh; h->size=(uint32_t)VC_FRAME_BYTES;
+    memcpy(base+sizeof(vc_shm_hdr_t),frame,VC_FRAME_BYTES);
+    InterlockedIncrement((volatile LONG*)&h->seq);  // even = ready
+    published++;
+  }
+  void close(){
+    if(base){ UnmapViewOfFile(base); base=nullptr; }
+    if(hMap){ CloseHandle(hMap); hMap=nullptr; }
+  }
+  ~ShmPub(){ close(); }
+};
+#endif
 struct FrameSlot{
   uint32_t fid=0; uint16_t total=0, got_n=0;
   std::vector<uint8_t> data; std::vector<char> got;
@@ -110,21 +146,22 @@ struct FrameSlot{
 class Reassembler{
 public:
   ReasmStats st;
-  std::map<uint32_t,FrameSlot> slots; // active only
-  std::deque<uint64_t> arrivals; // complete arrival ns, cap 120
+  std::map<uint32_t,FrameSlot> slots; // 仅存活帧
+  std::deque<uint64_t> arrivals; // 完成到达时间，留120个
   uint64_t last_complete_ns=0;
   size_t payload_max;
-  std::vector<std::pair<uint32_t,std::string>> completed_hashes; // for hashlog
+  std::vector<std::pair<uint32_t,std::string>> completed_hashes; // 供hashlog用
   Reassembler(int mtu=9000){ payload_max=(size_t)(mtu-42); }
-  // returns true if frame completed by this packet
-  bool on_packet(const vc_pkt_hdr_t&h,const uint8_t*payload,std::string*out_hash=nullptr){
+  // 本包凑齐整帧则真
+  bool on_packet(const vc_pkt_hdr_t&h,const uint8_t*payload,std::string*out_hash=nullptr,
+               std::vector<uint8_t>*out_frame=nullptr){
     if(h.magic!=VC_MAGIC) return false;
     if(h.total==0||h.seq>=h.total||h.payload_len==0) { st.packets_lost++; return false; }
     if(h.payload_len>((h.seq==(uint16_t)(h.total-1))?payload_max+1:payload_max+1)) { st.packets_lost++; return false; }
     uint32_t c=vc_crc32(payload,h.payload_len);
     if(c!=h.payload_crc){ st.packets_lost++; return false; }
     st.packets_recv++; st.bytes_recv+=14+28+h.payload_len;
-    // fid gap detection
+    // 帧号断档检测
     if(!st.have_seen){ st.have_seen=true; st.max_seen_fid=h.frame_id; }
     else if(h.frame_id>st.max_seen_fid){
       if(h.frame_id>st.max_seen_fid+1) st.gaps+=(h.frame_id-st.max_seen_fid-1);
@@ -144,19 +181,20 @@ public:
       it=slots.emplace(h.frame_id,std::move(s)).first;
     }
     FrameSlot&s=it->second;
-    if(h.total!=s.total){ st.packets_lost++; return false; } // total mismatch -> treat lost
-    if(s.got[h.seq]) return false; // dup: counted in packets_recv already
+    if(h.total!=s.total){ st.packets_lost++; return false; } // 总包数对不上记丢
+    if(s.got[h.seq]) return false; // 重包：已计入收包数
     size_t off=(size_t)h.seq*payload_max;
     if(off+h.payload_len>VC_FRAME_BYTES){ st.packets_lost++; return false; }
     memcpy(s.data.data()+off,payload,h.payload_len);
     s.got[h.seq]=1; s.got_n++;
     if(s.got_n==s.total){
-      // complete
+      // 凑齐
+      if(out_frame) *out_frame=s.data;
       uint64_t fh=vc_fnv1a64(s.data.data(),s.data.size());
       char hx[17]; vc_fnv1a64_hex(fh,hx);
       completed_hashes.emplace_back(s.fid,hx);
       if(out_hash) *out_hash=hx;
-      // pattern verify (only known 0..4)
+      // 验测试源编号0..4
       if(s.pattern<=4){
         std::vector<uint8_t> eY(VC_Y_BYTES),eUV(VC_UV_BYTES);
         switch(s.pattern){
@@ -340,6 +378,7 @@ int main(int argc,char**argv){
     else if(k=="--hashlog"){need(a.hashlog);}
     else if(k=="--timeout-s"){a.timeout_s=atoll(argv[++i]);}
     else if(k=="--expect-frames"){a.expect_frames=atoll(argv[++i]);}
+    else if(k=="--shm"){need(a.shm);}
     else if(k=="--selftest"){a.selftest=true;}
     else if(k=="--help"||k=="-h"){usage();return 0;}
     else {fprintf(stderr,"unknown arg %s\n",k.c_str());usage();return 2;}
@@ -419,6 +458,15 @@ int main(int argc,char**argv){
   Reassembler R(a.mtu);
   { ensure_parent(a.hashlog); std::ofstream f(a.hashlog,std::ios::trunc); }
   std::ofstream hashlog(a.hashlog,std::ios::app|std::ios::binary);
+#ifdef _WIN32
+  ShmPub shm;
+  if(!a.shm.empty()){
+    if(!shm.open(a.shm)){ fprintf(stderr,"shm open failed: %s\n",a.shm.c_str()); return 1; }
+    printf("[receiver] shm publish -> %s (%zu bytes)\n",a.shm.c_str(),(size_t)VC_SHM_SIZE);
+  }
+#else
+  if(!a.shm.empty()){ fprintf(stderr,"--shm is Windows-only in this build\n"); return 1; }
+#endif
   uint64_t t_start=qpc_ns_now(), t_last_stats=0;
   size_t hashlog_flushed=0;
   for(;;){
@@ -440,11 +488,17 @@ int main(int argc,char**argv){
           uint8_t* pl=eth+14+sizeof(hdr);
           size_t avail=ph->caplen-(14+sizeof(hdr));
           if(hdr.payload_len<=avail){
-            std::string hx;
-            bool done=R.on_packet(hdr,pl,&hx);
+            std::string hx; std::vector<uint8_t> frame;
+            bool done=R.on_packet(hdr,pl,&hx,a.shm.empty()?nullptr:&frame);
             if(done){
-              // find fid: last completed is max? use completed_hashes back
+              // 取末完成帧号写hash
               auto bk=R.completed_hashes.back();
+#ifdef _WIN32
+              if(shm.base&&!frame.empty()){
+                uint64_t fh=0; sscanf(bk.second.c_str(),"%llx",&fh);
+                shm.publish(bk.first,fh,frame.data());
+              }
+#endif
               hashlog << "{\"frame_id\":" << bk.first << ",\"hash\":\"" << bk.second << "\",\"qpc_ns\":" << now << "}\n";
               if(++hashlog_flushed%8==0) hashlog.flush();
             }
@@ -452,11 +506,16 @@ int main(int argc,char**argv){
         }
       }
     } else if(rc==0){
-      // timeout: still update stats
+      // 超时仍刷统计
     }
 #endif
     if(now-t_last_stats>500*1000000ull){
       t_last_stats=now; hashlog.flush();
+#ifdef _WIN32
+      uint64_t shm_n=shm.base?shm.published:0;
+#else
+      uint64_t shm_n=0;
+#endif
       double up=(now-t_start)/1e9; if(up<0.001)up=0.001;
       double pps=R.st.packets_recv/up, bps=R.st.bytes_recv*8/up;
       double avg,p99; R.inter_stats(avg,p99);
@@ -466,31 +525,38 @@ int main(int argc,char**argv){
         "\"packets_recv\":%llu,\"packets_lost\":%llu,\"pps\":%.1f,\"bps\":%.1f,"
         "\"gaps\":%llu,\"trailing\":%zu,\"hash_mismatch\":%llu,"
         "\"inter_arrival_avg_ms\":%.3f,\"inter_arrival_p99_ms\":%.3f,\"uptime_s\":%.2f,"
-        "\"mtu\":%d,\"ethertype\":\"0x%04x\"}",
+        "\"mtu\":%d,\"ethertype\":\"0x%04x\",\"shm_published\":%llu}",
         a.session.c_str(),(unsigned long long)R.st.complete,(unsigned long long)R.st.dropped,
         (unsigned long long)R.st.packets_recv,(unsigned long long)R.st.packets_lost,
         pps,bps,(unsigned long long)R.st.gaps,R.trailing_packets(),
-        (unsigned long long)R.st.hash_mismatch,avg,p99,up,a.mtu,a.ethertype);
+        (unsigned long long)R.st.hash_mismatch,avg,p99,up,a.mtu,a.ethertype,
+        (unsigned long long)shm_n);
       atomic_write(a.stats,buf);
     }
   }
   hashlog.flush();
-  // trailing incomplete frames are dropped at shutdown for exact accounting
+  // 收尾残帧记丢，保证账实相符
   for(auto &p : R.slots){ R.st.dropped++; if(p.second.total>p.second.got_n) R.st.packets_lost+=(p.second.total-p.second.got_n); }
   R.slots.clear();
   { double up=(qpc_ns_now()-t_start)/1e9; if(up<0.001)up=0.001;
     double pps=R.st.packets_recv/up, bps=R.st.bytes_recv*8/up;
     double avg,p99; R.inter_stats(avg,p99);
+#ifdef _WIN32
+    uint64_t shm_n=shm.base?shm.published:0;
+#else
+    uint64_t shm_n=0;
+#endif
     char buf[2048];
     snprintf(buf,sizeof(buf),
       "{\"session_id\":\"%s\",\"running\":false,\"complete\":%llu,\"dropped\":%llu,"
       "\"packets_recv\":%llu,\"packets_lost\":%llu,\"pps\":%.1f,\"bps\":%.1f,"
       "\"gaps\":%llu,\"trailing\":%zu,\"hash_mismatch\":%llu,"
-      "\"inter_arrival_avg_ms\":%.3f,\"inter_arrival_p99_ms\":%.3f,\"uptime_s\":%.2f}",
+      "\"inter_arrival_avg_ms\":%.3f,\"inter_arrival_p99_ms\":%.3f,\"uptime_s\":%.2f,"
+      "\"shm_published\":%llu}",
       a.session.c_str(),(unsigned long long)R.st.complete,(unsigned long long)R.st.dropped,
       (unsigned long long)R.st.packets_recv,(unsigned long long)R.st.packets_lost,
       pps,bps,(unsigned long long)R.st.gaps,R.trailing_packets(),
-      (unsigned long long)R.st.hash_mismatch,avg,p99,up);
+      (unsigned long long)R.st.hash_mismatch,avg,p99,up,(unsigned long long)shm_n);
     atomic_write(a.stats,buf); }
 #ifdef _WIN32
   d.closeh(h);
