@@ -339,7 +339,7 @@ def run_exec(argv, timeout_s, client):
 UPDATE_LOCK = threading.RLock()
 UPDATE_MAX_ZIP = 100 * 1024 * 1024
 UPDATE_MAX_FILES = 1000
-UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "version.json"}
+UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "vc-testwin.exe", "version.json"}
 
 
 FILES_MAX_BYTES = 262144
@@ -403,6 +403,7 @@ def _update_slots():
     m["vc-sender.exe"] = os.path.join(BUILD_DIR, "vc-sender.exe")
     m["vc-receiver.exe"] = os.path.join(BUILD_DIR, "vc-receiver.exe")
     m["vc-vcam.dll"] = os.path.join(BUILD_DIR, "vc-vcam.dll")
+    m["vc-testwin.exe"] = os.path.join(BUILD_DIR, "vc-testwin.exe")
     m["version.json"] = VERSION_FILE
     return m
 
@@ -437,7 +438,7 @@ def _safe_zip_entries(zf):
 
 def _live_for_rel(rel, slots):
     # 判运行文件绝对路径
-    if rel in ("vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "version.json"):
+    if rel in ("vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "vc-testwin.exe", "version.json"):
         return slots.get(rel)
     if rel.startswith("scripts/"):
         return os.path.join(ROOT, rel.replace("/", os.sep))
