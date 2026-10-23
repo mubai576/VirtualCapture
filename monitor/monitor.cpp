@@ -178,9 +178,10 @@ static bool CompileShader(const char* src,const char* ep,const char* model,ID3DB
 static bool InitD3D(HWND hw){
     DXGI_SWAP_CHAIN_DESC sd={};
     sd.BufferCount=2;sd.BufferDesc.Width=WIN_W;sd.BufferDesc.Height=WIN_H;
-    sd.BufferDesc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;sd.BufferDesc.RefreshRate={0,1};
+    sd.BufferDesc.Format=DXGI_FORMAT_B8G8R8A8_UNORM;sd.BufferDesc.RefreshRate={0,1};
     sd.BufferUsage=DXGI_USAGE_RENDER_TARGET_OUTPUT;sd.OutputWindow=hw;
     sd.SampleDesc.Count=1;sd.Windowed=TRUE;sd.SwapEffect=DXGI_SWAP_EFFECT_DISCARD;
+    sd.Flags=DXGI_SWAP_CHAIN_FLAG_GDI_COMPATIBLE;
     D3D_FEATURE_LEVEL fl;
     if(FAILED(D3D11CreateDeviceAndSwapChain(nullptr,D3D_DRIVER_TYPE_HARDWARE,nullptr,0,nullptr,0,D3D11_SDK_VERSION,&sd,&g_sc,&g_dev,&fl,&g_ctx)))return false;
     ID3D11Texture2D* bb=nullptr; g_sc->GetBuffer(0,IID_PPV_ARGS(&bb));
@@ -232,24 +233,22 @@ static void InitFonts(){
 
 // ── OSD drawing primitives ────────────────────────────────────────────────────
 
-// Semi-transparent black pill/rect
-static void AlphaRect(HDC dst,int x,int y,int w,int h,BYTE alpha=210){
-    HDC mem=CreateCompatibleDC(dst);
-    HBITMAP bmp=CreateCompatibleBitmap(dst,w,h);
+// YouTube-style panel: RGB(50,59,67) solid fill via AlphaBlend
+static void Panel(HDC hdc,int x,int y,int w,int h,BYTE alpha=230){
+    HDC mem=CreateCompatibleDC(hdc);
+    HBITMAP bmp=CreateCompatibleBitmap(hdc,w,h);
     HBITMAP old=(HBITMAP)SelectObject(mem,bmp);
-    RECT r={0,0,w,h}; FillRect(mem,&r,(HBRUSH)GetStockObject(BLACK_BRUSH));
+    HBRUSH br=CreateSolidBrush(RGB(50,59,67));
+    RECT r={0,0,w,h}; FillRect(mem,&r,br); DeleteObject(br);
     BLENDFUNCTION bf={AC_SRC_OVER,0,alpha,0};
-    AlphaBlend(dst,x,y,w,h,mem,0,0,w,h,bf);
+    AlphaBlend(hdc,x,y,w,h,mem,0,0,w,h,bf);
     SelectObject(mem,old);DeleteObject(bmp);DeleteDC(mem);
 }
 
-// Text with drop shadow (shadow offset dx,dy) — YouTube style
-static void ShadowText(HDC hdc,int x,int y,const wchar_t* text,COLORREF fg,HFONT fnt,int sdx=2,int sdy=2){
+// White text, no shadow needed on dark panel
+static void Txt(HDC hdc,int x,int y,const wchar_t* text,COLORREF fg,HFONT fnt){
     SelectObject(hdc,fnt); SetBkMode(hdc,TRANSPARENT);
-    SetTextColor(hdc,RGB(0,0,0));
-    TextOutW(hdc,x+sdx,y+sdy,text,(int)wcslen(text));
-    SetTextColor(hdc,fg);
-    TextOutW(hdc,x,y,text,(int)wcslen(text));
+    SetTextColor(hdc,fg); TextOutW(hdc,x,y,text,(int)wcslen(text));
 }
 
 // Colored value helper
@@ -294,9 +293,8 @@ static void Spark(HDC hdc,int x,int y,int w,int h,
 }
 
 // ── DrawOSD ───────────────────────────────────────────────────────────────────
-static void DrawOSD(HWND hwnd,const Stats& s,int mode){
-    if(mode==0)return;
-    HDC hdc=GetDC(hwnd);if(!hdc)return;
+// DrawOSD — takes pre-acquired HDC (DXGI surface DC)
+static void DrawOSD(HDC hdc, const Stats& s, int mode){
 
     bool live=s.rx_run&&g_has_signal.load();
     bool err =s.mismatch>0||s.dropped>0;
@@ -304,17 +302,17 @@ static void DrawOSD(HWND hwnd,const Stats& s,int mode){
 
     // ── MINI: 2-line top bar ─────────────────────────────────────────────────
     if(mode==1){
-        AlphaRect(hdc,0,0,WIN_W,52,190);
+        Panel(hdc,0,0,WIN_W,52,190);
         wchar_t buf[128];
         // Line 1: FPS  p99  status
         swprintf_s(buf,L"%.0f fps   p99 %.1f ms   %s",
                    s.fps, fp, live?L"\u25cf LIVE":L"\u25cb IDLE");
-        ShadowText(hdc,10,6,buf,FpsColor(s.fps),g_f_val);
+        Txt(hdc,10,6,buf,FpsColor(s.fps),g_f_val);
         // Line 2: detail
         swprintf_s(buf,L"rseg %.1f ms   pc1 %.1f ms   ok %d   drop %d   miss %d",
                    s.rseg_p99,s.pc1_p99,s.complete,s.dropped,s.mismatch);
-        ShadowText(hdc,10,28,buf,RGB(200,210,230),g_f_label);
-        ReleaseDC(hwnd,hdc);return;
+        Txt(hdc,10,28,buf,RGB(200,210,230),g_f_label);
+        return;
     }
 
     // ── FULL OSD ─────────────────────────────────────────────────────────────
@@ -325,35 +323,35 @@ static void DrawOSD(HWND hwnd,const Stats& s,int mode){
     // (video shows through everywhere via alpha)
 
     // ── HERO BAR (top) ───────────────────────────────────────────────────────
-    AlphaRect(hdc,0,0,WIN_W,58,210);
+    Panel(hdc,0,0,WIN_W,58,210);
 
     // FPS (left, big)
     wchar_t buf[128];
     swprintf_s(buf,L"%.0f fps",s.fps);
-    ShadowText(hdc,8,4,buf,FpsColor(s.fps),g_f_hero);
+    Txt(hdc,8,4,buf,FpsColor(s.fps),g_f_hero);
 
     // full-path p99 (center)
     COLORREF fp_c=RampColor(fp,8,15);
     swprintf_s(buf,L"p99 %.1f ms",fp);
-    ShadowText(hdc,240,4,buf,fp_c,g_f_hero);
+    Txt(hdc,240,4,buf,fp_c,g_f_hero);
 
     // status dot + rfps (right)
     COLORREF st_c=err?RGB(255,70,50):(live?RGB(80,230,80):RGB(255,200,50));
     swprintf_s(buf,L"%s  rfps %.0f",live?L"\u25cf LIVE":L"\u25cb",s.rfps);
-    ShadowText(hdc,490,4,buf,st_c,g_f_val);
+    Txt(hdc,490,4,buf,st_c,g_f_val);
     swprintf_s(buf,L"uptime %.0fs",s.uptime_rx);
-    ShadowText(hdc,490,28,buf,RGB(160,170,190),g_f_label);
+    Txt(hdc,490,28,buf,RGB(160,170,190),g_f_label);
 
     // ── DETAIL GRID ──────────────────────────────────────────────────────────
-    AlphaRect(hdc,0,60,WIN_W,178,200);
+    Panel(hdc,0,60,WIN_W,178,200);
 
     const int LX=8, RX=326, DY=17;
     int ly=64, ry=64;
 
     // helper lambdas
     auto row=[&](int& cy,int col,const wchar_t* label,const wchar_t* val,COLORREF vc){
-        ShadowText(hdc,col,     cy,label,RGB(160,170,200),g_f_label,1,1);
-        ShadowText(hdc,col+150, cy,val,  vc,               g_f_val,  1,1);
+        Txt(hdc,col,     cy,label,RGB(160,170,200),g_f_label);
+        Txt(hdc,col+150, cy,val,  vc,               g_f_val);
         cy+=DY;
     };
     auto fmt=[](wchar_t* b,const wchar_t* fmt,...){
@@ -362,7 +360,7 @@ static void DrawOSD(HWND hwnd,const Stats& s,int mode){
     wchar_t vb[64];
 
     // section header
-    ShadowText(hdc,LX,ly,L"Receiver",RGB(120,170,255),g_f_val,1,1); ly+=DY+2;
+    Txt(hdc,LX,ly,L"Receiver",RGB(120,170,255),g_f_val); ly+=DY+2;
     fmt(vb,L"%.1f / %.1f / %.1f ms",s.rseg_avg,s.rseg_p50,s.rseg_p99);
     row(ly,LX,L"rseg avg/p50/p99",vb,RampColor(s.rseg_p99,6,12));
     fmt(vb,L"%.1f ms",s.rseg_max);
@@ -381,7 +379,7 @@ static void DrawOSD(HWND hwnd,const Stats& s,int mode){
     fmt(vb,L"%.8hs",s.rx_sid);
     row(ly,LX,L"session",vb,RGB(120,130,150));
 
-    ShadowText(hdc,RX,ry,L"Sender",RGB(120,170,255),g_f_val,1,1); ry+=DY+2;
+    Txt(hdc,RX,ry,L"Sender",RGB(120,170,255),g_f_val); ry+=DY+2;
     fmt(vb,L"%.1f fps   cpu %d%%",s.fps,s.cpu_pct);
     row(ry,RX,L"fps / cpu",vb,FpsColor(s.fps));
     fmt(vb,L"%.2f / %.2f / %.2f ms",s.pc1_avg,s.pc1_p99,s.pc1_max);
@@ -399,7 +397,7 @@ static void DrawOSD(HWND hwnd,const Stats& s,int mode){
 
     // ── GRAPHS (4 side-by-side) ───────────────────────────────────────────────
     const int GY=244, GH=60, GW=148, GPAD=5;
-    AlphaRect(hdc,0,GY-14,WIN_W,GH+30,200);
+    Panel(hdc,0,GY-14,WIN_W,GH+30,200);
 
     struct GraphDef { const wchar_t* label; std::deque<float>* hist; float maxv; COLORREF lc; float warn; };
     std::deque<float> h_fps,h_rseg,h_pc1,h_full;
@@ -413,7 +411,7 @@ static void DrawOSD(HWND hwnd,const Stats& s,int mode){
     for(int i=0;i<4;i++){
         int gx=i*(GW+GPAD);
         // label above graph
-        ShadowText(hdc,gx,GY-12,graphs[i].label,graphs[i].lc,g_f_small,1,1);
+        Txt(hdc,gx,GY-12,graphs[i].label,graphs[i].lc,g_f_small);
         // graph bg
         RECT gr={gx,GY,gx+GW,GY+GH}; FillRect(hdc,&gr,(HBRUSH)GetStockObject(BLACK_BRUSH));
         Spark(hdc,gx,GY,GW,GH,*graphs[i].hist,graphs[i].maxv,graphs[i].lc,graphs[i].warn);
@@ -423,11 +421,11 @@ static void DrawOSD(HWND hwnd,const Stats& s,int mode){
             wchar_t lbl[20];
             if(i==0) swprintf_s(lbl,L"%.0f",v);
             else     swprintf_s(lbl,L"%.1f",v);
-            ShadowText(hdc,gx+2,GY+GH-16,lbl,graphs[i].lc,g_f_small,1,1);
+            Txt(hdc,gx+2,GY+GH-16,lbl,graphs[i].lc,g_f_small);
         }
     }
 
-    ReleaseDC(hwnd,hdc);
+    // (no ReleaseDC here — caller owns hdc)
 }
 
 // ── Render ────────────────────────────────────────────────────────────────────
@@ -466,12 +464,24 @@ static void Render(bool valid){
     g_ctx->PSSetConstantBuffers(0,1,&g_cb);
     g_ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
     g_ctx->Draw(4,0);
-    g_sc->Present(0,0);
+
+    // OSD: draw on DXGI back-buffer surface DC BEFORE Present
     int mode=g_osd_mode.load();
-    if(mode>0&&g_hwnd){
-        Stats s2;{std::lock_guard<std::mutex> lk(g_smtx);s2=g_stats;}
-        DrawOSD(g_hwnd,s2,mode);
+    if(mode>0){
+        IDXGISurface1* pSurf=nullptr;
+        if(SUCCEEDED(g_sc->GetBuffer(0,__uuidof(IDXGISurface1),(void**)&pSurf))){
+            HDC hdc=nullptr;
+            if(SUCCEEDED(pSurf->GetDC(FALSE,&hdc))){
+                Stats s2;{std::lock_guard<std::mutex> lk(g_smtx);s2=g_stats;}
+                DrawOSD(hdc,s2,mode);
+                pSurf->ReleaseDC(nullptr);
+            }
+            pSurf->Release();
+        }
     }
+
+    g_sc->Present(0,0);
+    // (no post-Present GDI needed)
 }
 
 // ── WndProc ───────────────────────────────────────────────────────────────────
