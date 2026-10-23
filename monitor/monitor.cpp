@@ -28,7 +28,7 @@
 static const int    VCAM_W      = 640;
 static const int    VCAM_H      = 640;
 static const int    WIN_W       = 640;
-static const int    WIN_H       = 700;   // 640 video + 60px status bar at bottom
+static const int    WIN_H       = 640;   // pure video, no status bar
 static const UINT   FRAME_BYTES = 614400;
 static const UINT   HDR_SIZE    = 24;
 static const UINT32 SHM_MAGIC   = 0x5643414Du;
@@ -53,7 +53,7 @@ void VS(uint id:SV_VertexID, out float4 pos:SV_Position, out float2 uv:TEXCOORD)
 }
 )HLSL";
 
-// NV12 → RGB.  Video fills top VCAM_H px; bottom bar = dark.
+// NV12 → RGB.  Video fills entire window.
 static const char* kPS = R"HLSL(
 Texture2D<float>  TexY  : register(t0);
 Texture2D<float2> TexUV : register(t1);
@@ -65,10 +65,8 @@ cbuffer CB : register(b0) {
 float4 PS(float4 pos:SV_Position, float2 uv:TEXCOORD):SV_Target {
     // Status dot top-left 18x18
     if (pos.x>=4&&pos.x<22&&pos.y>=4&&pos.y<22) return sig_color;
-    // Bottom status bar
-    if (pos.y >= vid_h) return float4(0.06f,0.06f,0.08f,1.0f);
     // NV12 → RGB (BT.601 limited range)
-    float2 vuv = float2(pos.x/640.0f, pos.y/vid_h);
+    float2 vuv = float2(pos.x/640.0f, pos.y/640.0f);
     float Y   = TexY .Sample(Smp, vuv).r;
     float2 UV = TexUV.Sample(Smp, vuv).rg;
     float Cb=UV.r-0.5f, Cr=UV.g-0.5f;
@@ -342,7 +340,7 @@ static void DrawOSD(HWND hwnd, const Stats& s, int mode){
 
     // ── Mini OSD: compact 3-line overlay (top-left) ──────────────────────────
     if(mode==1){
-        AlphaRect(hdc, 2, 24, 380, 56, RGB(0,0,0), 110);
+        AlphaRect(hdc, 2, 24, 380, 56, RGB(0,0,0), 204);
         int cy=27;
         COLORREF fps_c=(s.fps>=230)?RGB(100,230,100):(s.fps>=180)?RGB(255,200,60):RGB(255,80,60);
         fps_c=(s.fps>=230)?RGB(100,230,100):(s.fps>=180)?RGB(255,200,60):RGB(255,80,60);
@@ -368,8 +366,8 @@ static void DrawOSD(HWND hwnd, const Stats& s, int mode){
     int L=COL1, R=COL2;
 
     // Background panels
-    AlphaRect(hdc, 2, 24, 636, 194, RGB(0,0,0), 120);  // stats area
-    AlphaRect(hdc, 2, 226, 636, 172, RGB(0,0,0), 120); // graphs area (bottom of video)
+    AlphaRect(hdc, 2, 24, 636, 194, RGB(0,0,0), 204);  // stats area
+    AlphaRect(hdc, 2, 226, 636, 172, RGB(0,0,0), 204); // graphs area
 
     // ── Left: Receiver ────────────────────────────────────────────────────────
     int cy=27;
@@ -429,7 +427,7 @@ static void DrawOSD(HWND hwnd, const Stats& s, int mode){
     // full path summary (big)
     cy=175;
     COLORREF fp_c=(full_p99<10)?RGB(100,240,100):(full_p99<15)?RGB(255,200,60):RGB(255,80,60);
-    AlphaRect(hdc, 2, cy-2, 636, 23, RGB(0,0,0), 80);
+    AlphaRect(hdc, 2, cy-2, 636, 23, RGB(0,0,0), 204);
     OsdLine(hdc,6,cy,22,fp_c,g_fnt_bd,
         L" Full-path p99: %.2f ms  (pc1: %.2f + rseg: %.2f)   rfps: %.0f",
         full_p99, s.pc1_p99, s.rseg_p99, s.rfps);
@@ -483,19 +481,6 @@ static void DrawOSD(HWND hwnd, const Stats& s, int mode){
         DrawSparkline(hdc,gx,ly,GW,GH,h,20.f,RGB(255,140,80),10.f);
         wchar_t vl[24]; swprintf_s(vl,L"%.2fms",h.empty()?0.f:h.back());
         SetTextColor(hdc,RGB(255,140,80)); TextOutW(hdc,gx+GW+2,ly+GH/2-6,vl,(int)wcslen(vl));
-    }
-
-    // ── Bottom status bar (y=640..700) ────────────────────────────────────────
-    {
-        int cy2=644;
-        // left: key stats
-        OsdLine(hdc,6,cy2,14,RGB(160,200,255),g_fnt_sm,
-            L"  fps %.0f  rseg_p99 %.1fms  full_p99 %.1fms  bw %.3fG  ok %d  drop %d  miss %d",
-            s.fps, s.rseg_p99, full_p99, s.bps/1e9f,
-            s.complete, s.dropped, s.mismatch);
-        OsdLine(hdc,6,cy2,14,RGB(120,130,160),g_fnt_sm,
-            L"  shm %d  gaps %d  rfps %.0f  gpu_disp %.3fms  RClick=OSD  O=cycle  ESC=quit",
-            s.shm_pub, s.gaps, s.rfps, s.gpu_dispatch);
     }
 
     ReleaseDC(hwnd,hdc);
@@ -580,15 +565,8 @@ static LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         case IDM_QUIT:     PostQuitMessage(0);   return 0;
         }
         break;
-    case WM_TIMER:{
-        Stats s; { std::lock_guard<std::mutex> lk(g_smtx); s=g_stats; }
-        float fp=s.pc1_p99+s.rseg_p99;
-        wchar_t t[200];
-        swprintf_s(t,L"vc-monitor  fps:%.0f  p99:%.1fms  rseg:%.1fms  drop:%d  miss:%d  rfps:%.0f",
-            s.fps,fp,s.rseg_p99,s.dropped,s.mismatch,g_rfps.load());
-        SetWindowTextW(hw,t);
+    case WM_TIMER:
         return 0;
-    }
     }
     return DefWindowProcW(hw,msg,wp,lp);
 }
@@ -617,7 +595,7 @@ int WINAPI WinMain(HINSTANCE hi,HINSTANCE,LPSTR,int){
         MessageBoxW(nullptr,e,L"Error",MB_OK); return 1;
     }
     RECT r={0,0,WIN_W,WIN_H}; AdjustWindowRect(&r,WS_OVERLAPPEDWINDOW,FALSE);
-    g_hwnd=CreateWindowExW(0,L"VCMonitor",L"vc-monitor [starting...]",
+    g_hwnd=CreateWindowExW(0,L"VCMonitor",L"vc-monitor",
         WS_OVERLAPPEDWINDOW,CW_USEDEFAULT,CW_USEDEFAULT,r.right-r.left,r.bottom-r.top,
         nullptr,nullptr,hi,nullptr);
     if(!g_hwnd){
