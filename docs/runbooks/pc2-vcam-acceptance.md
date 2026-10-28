@@ -12,7 +12,7 @@
 1. OTA 推包 → `/activate` → 轮询 `/version` 确认翻转（参考 scripts/update.ps1）。
 2. PC2 注册虚拟卡（与稍后跑 DShow 客户端**同一用户**执行，HKCU 注册）：
    `regsvr32 <ROOT>\vc-vcam.dll`（注销用 `/u`）。
-3. 枚举确认：GraphStudioNext/GraphEdit 能看到 "VirtualCapture 640x640 NV12"；
+3. 枚举确认：GraphStudioNext/GraphEdit 能看到 "VirtualCapture"（ffmpeg `-list_devices` 显示 `(video)`）；
    pin 协商确认为 NV12 640x640、AvgTimePerFrame=41666。
    注意：本机 WinGet 版 ffmpeg 打不开虚拟机（对 OBS 同样失败，client 侧 quirk），
    **不用该 ffmpeg 版本判流**；用 GraphStudioNext 或 SampleGrabber 式 client。

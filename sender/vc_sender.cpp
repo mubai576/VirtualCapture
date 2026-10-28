@@ -115,11 +115,29 @@ static uint64_t qpc_ns_now() {
   // 取纳秒戳
   uint64_t c=qpc_now_raw();
 #ifdef _WIN32
-  return c*1000000000ull/qpc_freq_;
+  return (c/qpc_freq_)*1000000000ull+(c%qpc_freq_)*1000000000ull/qpc_freq_;  // 无 c*1e9 溢出
 #else
   return c;
 #endif
 }
+static uint64_t qpc_to_ns_raw(uint64_t c){
+#ifdef _WIN32
+  return (c/qpc_freq_)*1000000000ull+(c%qpc_freq_)*1000000000ull/qpc_freq_;
+#else
+  return c;
+#endif
+}
+#ifdef _WIN32
+// 发送线程提优先级（MMCSS "Capture"，失败退回 TIME_CRITICAL），压 p99/max 尾部
+static void sender_boost_thread(){
+  typedef HANDLE (WINAPI *avset_fn)(LPCSTR,LPDWORD);
+  HMODULE av=LoadLibraryA("avrt.dll"); DWORD task=0; bool mm=false;
+  if(av){ avset_fn f=(avset_fn)GetProcAddress(av,"AvSetMmThreadCharacteristicsA"); if(f&&f("Capture",&task)) mm=true; }
+  if(!mm) SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_TIME_CRITICAL);
+  SetPriorityClass(GetCurrentProcess(),HIGH_PRIORITY_CLASS);
+  printf("[sender] tx thread priority: %s\n",mm?"MMCSS Capture":"TIME_CRITICAL");
+}
+#endif
 // P4-2步骤1：PC1段=采集/生成完成→末包发出，同机QPC，不跨机比较
 static inline void pc1_stats(const std::deque<uint64_t>&v,double&a,double&p99,double&mx){
   a=0;p99=0;mx=0; if(v.empty())return;
@@ -359,6 +377,12 @@ static int run_selftest(){
     dda_bgrx_to_nv12(bgra.data(), (unsigned)DW*4u, DW, DH, tY.data(), tUV.data());
     if(tY[0]!=76||tY[(size_t)640*639+639]!=76){printf("FAIL dda red Y\n");ok=false;}
     printf("DDA: converter unit PASS (white/red exact)\n"); }
+  { // slice-by-8 CRC 与逐字节参考逐位一致（含标准向量 "123456789"=cbf43926 与各种长度/对齐）
+    const uint8_t v[]={'1','2','3','4','5','6','7','8','9'};
+    if(vc_crc32(v,9)!=0xCBF43926u){printf("FAIL crc32 std vector %08x\n",vc_crc32(v,9));ok=false;}
+    std::vector<uint8_t> buf(9100); uint32_t sd=0x9e3779b9u; for(auto&b:buf){ sd=sd*1664525u+1013904223u; b=(uint8_t)(sd>>24); }
+    int bad=0; for(size_t off=0;off<8;off++) for(size_t len: {0,1,7,8,9,63,5256,8958,9000}) if(vc_crc32(buf.data()+off,len)!=vc_crc32_ref(buf.data()+off,len)) bad++;
+    if(bad){printf("FAIL crc32 slice8 != ref (%d cases)\n",bad);ok=false;} else printf("crc32: slice-by-8 == bytewise ref (72 cases)\n"); }
   { int ddr=dda_selftest(); if(ddr==1){printf("FAIL dda selftest\n");ok=false;} }
   { int dgr=dda_gpu_selftest(); if(dgr==1){printf("FAIL dda gpu selftest\n");ok=false;} }
   if(!ok){printf("FAIL: sender selftest\n");return 1;}
@@ -499,6 +523,13 @@ int main(int argc,char**argv){
 
   uint64_t sent_frames=0, sent_packets=0, send_errors=0, sent_bytes=0;
   std::deque<uint64_t> pc1_ns; // P4-2步骤1：PC1段样本，同机QPC，最新10000帧窗口
+  std::deque<uint64_t> cap_lag_ns; // dda：LastPresentTime -> 转换完成，同机QPC
+#ifdef _WIN32
+  // sendqueue 复用：重置 len，免每批 2MB alloc/free（结构见 npcap pcap.h pcap_send_queue）
+  struct SqHdr{ unsigned maxlen, len; char* buffer; };
+  auto sq_reset=[](void* q){ ((SqHdr*)q)->len=0; };
+  sender_boost_thread();
+#endif
   void* sq=nullptr; int sq_n=0;
   uint64_t t_start=qpc_ns_now(), t_last_stats=0;
 #ifdef _WIN32
@@ -517,8 +548,8 @@ int main(int argc,char**argv){
 #endif
     if(a.frames>0&&(long long)sent_frames>=a.frames) break;
     if(a.mode=="file"&&!a.loop&&file_played>=fileNFrames) break;
-    // 帧率节流（首帧跳过）
-    if(sent_frames>0&&frame_interval_s>0){
+    // 帧率节流（首帧跳过）。dda 由 AcquireNextFrame 自身节拍（新帧一出即取，免睡眠相位延迟）
+    if(sent_frames>0&&frame_interval_s>0&&a.mode!="dda"){
       uint64_t now=qpc_ns_now();
       if(now<next_frame_ns) {
         uint64_t wait_us=(next_frame_ns-now)/1000ull;
@@ -529,32 +560,33 @@ int main(int argc,char**argv){
     // 生成一帧
     uint8_t pat_field=255;
     if(a.mode=="pattern"){ gen_full(pid,fid,Y.data(),UV.data()); pat_field=(uint8_t)pid; }
-    else if(a.mode=="dda"){ uint64_t g0=qpc_ns_now(); if(!dda_cap.capture(Y.data(),UV.data())){ if(dda_cap.err_code!=DDACap::E_TIMEOUT){fprintf(stderr,"dda capture failed: %s\n",dda_cap.err());return 1;} } gpu_accum_ms+=(qpc_ns_now()-g0)/1e6; pat_field=255; }
+    else if(a.mode=="dda"){ uint64_t g0=qpc_ns_now(); if(!dda_cap.capture(Y.data(),UV.data())){ if(dda_cap.err_code!=DDACap::E_TIMEOUT){fprintf(stderr,"dda capture failed: %s\n",dda_cap.err());return 1;} }
+      else if(dda_cap.last_present_qpc){ // 采集滞后 = DWM present -> 转换完成（同机 QPC）
+        uint64_t pn=qpc_to_ns_raw(dda_cap.last_present_qpc), dn=qpc_ns_now();
+        if(cap_lag_ns.size()>=10000) cap_lag_ns.pop_front(); cap_lag_ns.push_back(dn>=pn?dn-pn:0); }
+      gpu_accum_ms+=(qpc_ns_now()-g0)/1e6; pat_field=255; }
     else { memcpy(Y.data(),fileFrames.data()+fileIdx*VC_FRAME_BYTES,VC_Y_BYTES);
            memcpy(UV.data(),fileFrames.data()+fileIdx*VC_FRAME_BYTES+VC_Y_BYTES,VC_UV_BYTES);
            fileIdx=(fileIdx+1)%fileNFrames; file_played++; }
-    uint64_t fh=vc_fnv1a64_two(Y.data(),Y.size(),UV.data(),UV.size());
-    char fhx[17]; vc_fnv1a64_hex(fh,fhx);
-    uint64_t t_gen_done=qpc_ns_now(); // 采集/生成+哈希完成（D8 PC1段起点）
+    uint64_t t_gen_done=qpc_ns_now(); // 采集/生成完成（D8 PC1段起点；整帧哈希已移到末包之后）
     // 拼连续缓冲好切包
     // 免拷贝：先切Y再切UV
     size_t pkts_before = sent_packets; // 防停机半帧
     for(size_t s=0;s<total;s++){
       size_t off=s*payload;
       size_t cl=(s==total-1)?(VC_FRAME_BYTES-off):payload;
-      // 拷贝分片，处理Y/UV边界
-      std::vector<uint8_t> chunk(cl);
-      if(off+cl<=VC_Y_BYTES) memcpy(chunk.data(),Y.data()+off,cl);
-      else if(off>=VC_Y_BYTES) memcpy(chunk.data(),UV.data()+(off-VC_Y_BYTES),cl);
-      else { size_t nY=VC_Y_BYTES-off; memcpy(chunk.data(),Y.data()+off,nY);
-             memcpy(chunk.data()+nY,UV.data(),cl-nY); }
-      uint32_t crc=vc_crc32(chunk.data(),cl);
+      // 载荷直接拷进以太帧缓冲（零分配、单次拷贝），处理Y/UV边界
+      uint8_t* pl=eth.data()+14+sizeof(vc_pkt_hdr_t);
+      if(off+cl<=VC_Y_BYTES) memcpy(pl,Y.data()+off,cl);
+      else if(off>=VC_Y_BYTES) memcpy(pl,UV.data()+(off-VC_Y_BYTES),cl);
+      else { size_t nY=VC_Y_BYTES-off; memcpy(pl,Y.data()+off,nY);
+             memcpy(pl+nY,UV.data(),cl-nY); }
+      uint32_t crc=vc_crc32(pl,cl);
       vc_pkt_hdr_t hdr; memset(&hdr,0,sizeof(hdr));
       hdr.magic=VC_MAGIC; hdr.frame_id=fid; hdr.seq=(uint16_t)s; hdr.total=(uint16_t)total;
       hdr.qpc_ns=f0; hdr.payload_crc=crc; hdr.payload_len=(uint16_t)cl;
       hdr.flags=(fid==0?1:0); hdr.pattern=pat_field;
       memcpy(eth.data()+14,&hdr,sizeof(hdr));
-      memcpy(eth.data()+14+sizeof(hdr),chunk.data(),cl);
 #ifdef _WIN32
       int plen=(int)(14+sizeof(hdr)+cl);
       // 注意：sendqueue成功返回正数，判错须用<0（曾误报16万错）
@@ -564,7 +596,7 @@ int main(int argc,char**argv){
           if(!d.sendqueue_queue||!d.sendqueue_transmit||!d.sendqueue_destroy){fprintf(stderr,"wpcap missing sendqueue exports\n");return 1;} sq_n=0; }
         PcapHdr ph; memset(&ph,0,sizeof(ph)); ph.caplen=(unsigned)plen; ph.len=(unsigned)plen;
         if(d.sendqueue_queue(sq,(const void*)&ph,eth.data())!=0){ send_errors++; }
-        else if(++sq_n>=a.batch){ if(d.sendqueue_transmit(h,sq,0)<0) send_errors+=(uint64_t)sq_n; d.sendqueue_destroy(sq); sq=nullptr; sq_n=0; }
+        else if(++sq_n>=a.batch){ if(d.sendqueue_transmit(h,sq,0)<0) send_errors+=(uint64_t)sq_n; sq_reset(sq); sq_n=0; }
       }
 #endif
       sent_packets++; sent_bytes+=14+sizeof(hdr)+cl;
@@ -577,12 +609,15 @@ int main(int argc,char**argv){
     if(g_stop && sent_packets - pkts_before < total) break; // 停机半帧丢弃，不记数
 #endif
 #ifdef _WIN32
-    if(sq){ if(d.sendqueue_transmit(h,sq,0)<0) send_errors+=(uint64_t)sq_n; d.sendqueue_destroy(sq); sq=nullptr; sq_n=0; }
+    if(sq&&sq_n>0){ if(d.sendqueue_transmit(h,sq,0)<0) send_errors+=(uint64_t)sq_n; sq_reset(sq); sq_n=0; }
 #endif
     { uint64_t t_last_tx=qpc_ns_now(); // 末包发出（D8 PC1段终点）
       if(pc1_ns.size()>=10000) pc1_ns.pop_front(); pc1_ns.push_back(t_last_tx>=t_gen_done?t_last_tx-t_gen_done:0); } // 最新10000帧窗口
+    // 整帧哈希在末包之后算（只用于对账，不在延迟关键路径上；Y/UV 下一轮才会被覆盖）
+    uint64_t fh=vc_fnv1a64_two(Y.data(),Y.size(),UV.data(),UV.size());
+    char fhx[17]; vc_fnv1a64_hex(fh,fhx);
     hashlog << "{\"frame_id\":" << fid << ",\"hash\":\"" << fhx << "\",\"qpc_ns\":" << f0 << "}\n";
-    hashlog.flush();
+    if((sent_frames&7)==7) hashlog.flush();
     sent_frames++;
     fid++;
     if(frame_interval_s>0) next_frame_ns=f0+(uint64_t)(frame_interval_s*1e9);
@@ -594,6 +629,7 @@ int main(int argc,char**argv){
       double pps=sent_packets/up, bps=sent_bytes*8/up;
       double cpu_pct=0;
       double pc1_a,pc1_p99,pc1_mx; pc1_stats(pc1_ns,pc1_a,pc1_p99,pc1_mx);
+      double cl_a,cl_p99,cl_mx; pc1_stats(cap_lag_ns,cl_a,cl_p99,cl_mx);
 #ifdef _WIN32
       { FILETIME ctc,etc,ktc,utc; ULARGE_INTEGER kk,uu; GetSystemTimeAsFileTime(&ctc); uint64_t wall=((uint64_t)ctc.dwHighDateTime<<32)|ctc.dwLowDateTime; if(GetProcessTimes(GetCurrentProcess(),&ctc,&etc,&ktc,&utc)){ kk.HighPart=ktc.dwHighDateTime; kk.LowPart=ktc.dwLowDateTime; uu.HighPart=utc.dwHighDateTime; uu.LowPart=utc.dwLowDateTime; if(cpu_prev_w!=0&&wall>cpu_prev_w){ uint64_t dw=wall-cpu_prev_w; uint64_t dc=(kk.QuadPart-cpu_prev_k.QuadPart)+(uu.QuadPart-cpu_prev_u.QuadPart); if(dw>0)cpu_pct=(double)dc/(double)dw*100.0; } cpu_prev_k=kk; cpu_prev_u=uu; cpu_prev_w=wall; } }
 #endif
@@ -601,35 +637,36 @@ int main(int argc,char**argv){
       snprintf(buf,sizeof(buf),
         "{\"session_id\":\"%s\",\"running\":true,\"sent_frames\":%llu,\"sent_packets\":%llu,"
         "\"pps\":%.1f,\"bps\":%.1f,\"fps_actual\":%.2f,\"send_errors\":%llu,\"uptime_s\":%.2f,"
-        "\"pattern\":\"%s\",\"fps_target\":%d,\"mtu\":%d,\"ethertype\":\"0x%04x\",\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"gpu_convert\":%d,\"cpu_pct\":%.1f}",
+        "\"pattern\":\"%s\",\"fps_target\":%d,\"mtu\":%d,\"ethertype\":\"0x%04x\",\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"gpu_convert\":%d,\"cpu_pct\":%.1f,\"cap_lag_avg_ms\":%.3f,\"cap_lag_p99_ms\":%.3f,\"cap_lag_max_ms\":%.3f}",
         a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
         pps,bps,sent_frames/up,(unsigned long long)send_errors,up,
         a.mode=="pattern"?pat_name(pid):(a.mode=="dda"?"dda":"file"),a.fps,a.mtu,a.ethertype,
         sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
         dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
-        (unsigned long long)dda_cap.gpu_samples,pc1_a,pc1_p99,pc1_mx,(a.gpu_convert?1:0),cpu_pct);
+        (unsigned long long)dda_cap.gpu_samples,pc1_a,pc1_p99,pc1_mx,(a.gpu_convert?1:0),cpu_pct,cl_a,cl_p99,cl_mx);
       atomic_write(a.stats,buf);
     }
   }
   { double up=(qpc_ns_now()-t_start)/1e9; if(up<0.001)up=0.001;
       double cpu_pct_fin=0;
       double pc1_fa,pc1_fp99,pc1_fmx; pc1_stats(pc1_ns,pc1_fa,pc1_fp99,pc1_fmx);
+      double cl_fa,cl_fp99,cl_fmx; pc1_stats(cap_lag_ns,cl_fa,cl_fp99,cl_fmx);
 #ifdef _WIN32
       { FILETIME ctc,etc,ktc,utc; ULARGE_INTEGER kk,uu; GetSystemTimeAsFileTime(&ctc); uint64_t wall=((uint64_t)ctc.dwHighDateTime<<32)|ctc.dwLowDateTime; if(GetProcessTimes(GetCurrentProcess(),&ctc,&etc,&ktc,&utc)){ kk.HighPart=ktc.dwHighDateTime; kk.LowPart=ktc.dwLowDateTime; uu.HighPart=utc.dwHighDateTime; uu.LowPart=utc.dwLowDateTime; if(cpu_prev_w!=0&&wall>cpu_prev_w){ uint64_t dw=wall-cpu_prev_w; uint64_t dc=(kk.QuadPart-cpu_prev_k.QuadPart)+(uu.QuadPart-cpu_prev_u.QuadPart); if(dw>0)cpu_pct_fin=(double)dc/(double)dw*100.0; } } }
 #endif
     char buf[2048];
     snprintf(buf,sizeof(buf),
       "{\"session_id\":\"%s\",\"running\":false,\"sent_frames\":%llu,\"sent_packets\":%llu,"
-      "\"pps\":%.1f,\"bps\":%.1f,\"send_errors\":%llu,\"uptime_s\":%.2f,\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"gpu_convert\":%d,\"cpu_pct\":%.1f}",
+      "\"pps\":%.1f,\"bps\":%.1f,\"send_errors\":%llu,\"uptime_s\":%.2f,\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"gpu_convert\":%d,\"cpu_pct\":%.1f,\"cap_lag_avg_ms\":%.3f,\"cap_lag_p99_ms\":%.3f,\"cap_lag_max_ms\":%.3f}",
       a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
       sent_packets/up,sent_bytes*8/up,(unsigned long long)send_errors,up,
       sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
       dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
-      (unsigned long long)dda_cap.gpu_samples,pc1_fa,pc1_fp99,pc1_fmx,(a.gpu_convert?1:0),cpu_pct_fin);
+      (unsigned long long)dda_cap.gpu_samples,pc1_fa,pc1_fp99,pc1_fmx,(a.gpu_convert?1:0),cpu_pct_fin,cl_fa,cl_fp99,cl_fmx);
     atomic_write(a.stats,buf); }
 #ifdef _WIN32
 #ifdef _WIN32
-  if(sq){d.sendqueue_destroy(sq);sq=nullptr;}
+  if(sq){d.sendqueue_destroy(sq);sq=nullptr;}  // 只在退出时销毁一次
 #endif
   d.closeh(h);
   timeEndPeriod(1);

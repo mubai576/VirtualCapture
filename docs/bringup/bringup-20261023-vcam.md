@@ -27,6 +27,9 @@
   改为 `VC_Y_BYTES/VC_UV_BYTES` 精确平面（tracer 定位到 memcpy 行）。
 
 ## 给 P4-4 的 client 结论（重要）
+> 2026-10-25 更正：下述“ffmpeg quirk”为误判。ffmpeg 用的是 SDK 标准 AMPROPSETID_Pin（`...B3F1-00AA003761C5`），
+> 是 vcam.cpp 自己把 GUID 尾写错；已修，ffmpeg 现可枚举 `(video)` 并开流 239fps。见 docs/runbooks/vcam.md。
+
 - 本机 ffmpeg（WinGet 版）`list_options`/开流对**自家实现和 OBS Virtual Camera 同样报
   `Could not find output pin`**：ffmpeg 用 property set `{9B00F101-1567-11D1-B3F1-...}`（非标准
   AMPROPSETID_Pin 的 B3A9 尾）查 pin category，两家都不匹配。属该 ffmpeg 构建的 client 侧 quirk，

@@ -36,6 +36,7 @@ struct DDACap {
   double gpu_accum_ms = 0;
   uint64_t gpu_samples = 0;
   double last_gpu_ms = 0;
+  uint64_t last_present_qpc = 0; // DXGI_OUTDUPL_FRAME_INFO.LastPresentTime (raw QPC ticks, same machine)
   bool gpu_qok = false;
   std::string gpu_qmsg = "uninitialized";
   const char* err() const { return err_msg.c_str(); }
@@ -143,6 +144,7 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
   if(hr == DXGI_ERROR_WAIT_TIMEOUT){ err_code = E_TIMEOUT; err_msg = "AcquireNextFrame timeout (output idle?)"; return false; }
   if(hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL){ err_code = E_LOST; err_msg = "output lost (mode change?)"; return false; }
   if(FAILED(hr) || !res){ err_code = E_INTERNAL; err_msg = "AcquireNextFrame failed"; return false; }
+  last_present_qpc = (uint64_t)info.LastPresentTime.QuadPart;  // 0 = pointer-only update
   ID3D11Texture2D* tex = nullptr;
   hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex); res->Release();
   if(FAILED(hr) || !tex){ dup->ReleaseFrame(); err_code = E_INTERNAL; err_msg = "frame is not a 2D texture"; return false; }
@@ -150,9 +152,10 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
   int w = (int)d.Width, h = (int)d.Height;
   if(d.Format != DXGI_FORMAT_B8G8R8A8_UNORM){ tex->Release(); dup->ReleaseFrame(); err_code = E_FORMAT; err_msg = "only B8G8R8A8 supported"; return false; }
   if(w < 640 || h < 640){ tex->Release(); dup->ReleaseFrame(); err_code = E_SMALL; err_msg = "desktop smaller than 640"; return false; }
+  // latency: only the centred 640x640 is copied (was full-desktop CopyResource, ~9x the bytes)
   if(!want_gpu && (!staging || stag_w != w || stag_h != h)){
     if(staging){ staging->Release(); staging = nullptr; }
-    D3D11_TEXTURE2D_DESC sd; sd.Width = d.Width; sd.Height = d.Height; sd.MipLevels = 1; sd.ArraySize = 1;
+    D3D11_TEXTURE2D_DESC sd; sd.Width = 640; sd.Height = 640; sd.MipLevels = 1; sd.ArraySize = 1;
     sd.Format = d.Format; sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0;
     sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
     hr = dev->CreateTexture2D(&sd, NULL, &staging);
@@ -171,12 +174,15 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
     if(!gpu->readback(Y, UV)){ err_code = E_INTERNAL; err_msg = gpu->err(); return false; }
   } else {
   if(stamped){ ctx->Begin(qDisjoint); ctx->End(qStart); }
-  ctx->CopyResource(staging, tex); tex->Release();
+  { D3D11_BOX box; box.left = (UINT)((w - 640) / 2); box.top = (UINT)((h - 640) / 2); box.front = 0;
+    box.right = box.left + 640; box.bottom = box.top + 640; box.back = 1;
+    ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, 0, &box); }
+  tex->Release();
   if(stamped){ ctx->End(qEnd); ctx->End(qDisjoint); }
   D3D11_MAPPED_SUBRESOURCE mp;
   hr = ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mp);
   if(FAILED(hr)){ dup->ReleaseFrame(); err_code = E_INTERNAL; err_msg = "staging map failed"; return false; }
-  dda_bgrx_to_nv12((const uint8_t*)mp.pData, (unsigned)mp.RowPitch, w, h, Y, UV);
+  dda_bgrx_to_nv12((const uint8_t*)mp.pData, (unsigned)mp.RowPitch, 640, 640, Y, UV);  // staging is already the crop
   ctx->Unmap(staging, 0);
   dup->ReleaseFrame();
   }

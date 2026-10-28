@@ -28,18 +28,21 @@ static const int    VCAM_H      = 640;
 static const int    WIN_W       = 640;
 static const int    WIN_H       = 640;
 static const UINT   FRAME_BYTES = 614400;
-static const UINT   HDR_SIZE    = 24;
-static const UINT32 SHM_MAGIC   = 0x5643414Du;
+static const UINT   SHM_SLOTS   = 12;            // vcam_shm.h VC_SHM_SLOTS
+static const UINT   SHM_DATA_OFF= 4096;          // vcam_shm.h VC_SHM_DATA_OFF
+static const UINT32 SHM_MAGIC   = 0x32414356u;   // "VCA2" (v2)
 static const char*  SHM_NAME    = "Local\\VirtualCaptureVcamFrame";
 static const int    HIST_N      = 120;
 
 enum { IDM_OSD_FULL=1001, IDM_OSD_MINI, IDM_OSD_OFF, IDM_QUIT };
 static wchar_t g_run_dir[MAX_PATH];
 
-// ── SHM ───────────────────────────────────────────────────────────────────────
+// ── SHM (layout v2, mirrors vcam/vcam_shm.h) ─────────────────────────────────
 #pragma pack(push,1)
-struct ShmHdr { uint32_t magic; int32_t seq; uint32_t frame_id; uint64_t hash; uint32_t size; };
+struct ShmHdr  { uint32_t magic,version,slots,frame_bytes,data_off; int32_t latest_slot,latest_seq; uint32_t writer_pid; uint8_t r[32]; };
+struct ShmSlot { int32_t seq; uint32_t frame_id; uint64_t qpc_first_ns,qpc_pub_ns,hash; uint32_t hash_fid; uint8_t r[28]; };
 #pragma pack(pop)
+static_assert(sizeof(ShmHdr)==64&&sizeof(ShmSlot)==64,"shm v2 layout");
 static HANDLE  g_hMap  = nullptr;
 static void*   g_pView = nullptr;
 static uint8_t g_frame_buf[FRAME_BYTES];
@@ -47,11 +50,19 @@ static uint8_t g_frame_buf[FRAME_BYTES];
 struct FrameInfo { uint32_t fid; uint64_t hash; bool valid; };
 static FrameInfo ReadSHMFrame() {
     if (!g_pView) return {0,0,false};
-    ShmHdr h1; memcpy(&h1,g_pView,HDR_SIZE);
-    if (h1.magic!=SHM_MAGIC||(h1.seq&1)||h1.size!=FRAME_BYTES) return {h1.frame_id,h1.hash,false};
-    memcpy(g_frame_buf,(uint8_t*)g_pView+HDR_SIZE,FRAME_BYTES);
-    ShmHdr h2; memcpy(&h2,g_pView,HDR_SIZE);
-    return {h1.frame_id,h1.hash,h1.seq==h2.seq};
+    const uint8_t* b=(const uint8_t*)g_pView;
+    const ShmHdr* h=(const ShmHdr*)b;
+    if (h->magic!=SHM_MAGIC||h->version!=2||h->slots!=SHM_SLOTS||h->frame_bytes!=FRAME_BYTES) return {0,0,false};
+    int32_t i=*(volatile const int32_t*)&h->latest_slot;
+    if (i<0||i>=(int32_t)SHM_SLOTS) return {0,0,false};
+    const ShmSlot* sl=(const ShmSlot*)(b+64+64*i);
+    int32_t s1=*(volatile const int32_t*)&sl->seq;
+    if (s1&1) return {sl->frame_id,0,false};
+    uint32_t fid=sl->frame_id;
+    MemoryBarrier();
+    memcpy(g_frame_buf,b+SHM_DATA_OFF+(size_t)i*FRAME_BYTES,FRAME_BYTES);
+    MemoryBarrier();
+    return {fid,0,s1==*(volatile const int32_t*)&sl->seq};
 }
 
 // ── HLSL ──────────────────────────────────────────────────────────────────────
@@ -126,6 +137,13 @@ static void ReadStats(const wchar_t* pat, Stats& s, bool rx) {
     WIN32_FIND_DATAW best=fd;
     while(FindNextFileW(hf,&fd)) if(CompareFileTime(&fd.ftLastWriteTime,&best.ftLastWriteTime)>0) best=fd;
     FindClose(hf);
+    // Stale guard: stats are rewritten every ~500ms while the process runs. A file older
+    // than 3s belongs to a dead session (e.g. sender actually runs on the other PC) and
+    // must not be shown as live numbers next to a different receiver session.
+    { FILETIME now; GetSystemTimeAsFileTime(&now);
+      ULONGLONG n=((ULONGLONG)now.dwHighDateTime<<32)|now.dwLowDateTime;
+      ULONGLONG w=((ULONGLONG)best.ftLastWriteTime.dwHighDateTime<<32)|best.ftLastWriteTime.dwLowDateTime;
+      if(n>w && n-w>30000000ULL) return; }
     wchar_t path[MAX_PATH]; swprintf_s(path,L"%s\\%s",g_run_dir,best.cFileName);
     HANDLE h=CreateFileW(path,GENERIC_READ,FILE_SHARE_READ|FILE_SHARE_WRITE,nullptr,OPEN_EXISTING,0,nullptr);
     if(h==INVALID_HANDLE_VALUE)return;
@@ -538,7 +556,7 @@ int WINAPI WinMain(HINSTANCE hi,HINSTANCE,LPSTR,int){
     }
     if(!found)swprintf_s(g_run_dir,L"%s\\run",exe);
     g_hMap=OpenFileMappingA(FILE_MAP_READ,FALSE,SHM_NAME);
-    if(g_hMap)g_pView=MapViewOfFile(g_hMap,FILE_MAP_READ,0,0,HDR_SIZE+FRAME_BYTES);
+    if(g_hMap)g_pView=MapViewOfFile(g_hMap,FILE_MAP_READ,0,0,(SIZE_T)SHM_DATA_OFF+(SIZE_T)SHM_SLOTS*FRAME_BYTES);
     WNDCLASSEXW wc={sizeof(wc)};
     wc.style=CS_HREDRAW|CS_VREDRAW;wc.lpfnWndProc=WndProc;wc.hInstance=hi;
     wc.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(32512));wc.lpszClassName=L"VCMonitor";

@@ -46,7 +46,11 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 - stats ~500ms 原子覆写（tmp→rename）；hashlog 每帧 append 一行。
 - `sender.hash.jsonl`：`{"frame_id":N,"hash":"<16hex>","qpc_ns":T}`
 - receiver hashlog D3 carries qpc_ns; reconcile compares frame_id and hash only.
+- vcam DShow 设备契约（2026-10-25）：FriendlyName `VirtualCapture`，pin `Capture`（PIN_CATEGORY_CAPTURE），仿 GC573 枚举为 `(video)`；HKCU CLSID 键下可选 REG_SZ `FrameMap`、REG_DWORD `Motion`=1（D12 显式 bring-up）。
 - receiver `--shm <name>` (P4-3): publish latest complete frame to named file mapping (layout vcam/vcam_shm.h, NOT proto/); stats adds `shm_published`; agent /receiver/start forwards `shm`.
+- **shm v2（D15，2026-10-28）**：`vcam/vcam_shm.h` 为唯一布局（magic `VCA2`，12 槽 ring，数据区 4096 起）；receiver 原地重组进空闲槽，发布=翻槽 seq + 置命名事件 `<name>.evt0/.evt1`（manual-reset 交替），整帧哈希在发布后由哈希线程写入（`hash_fid==frame_id` 才有效）；vcam 事件驱动（新帧立即交付，静默 1.5 帧后才重复上一帧，D12 不变）。v1 读端遇 v2 映射判"无信号"，不崩。Python 镜像 `scripts/vc_shm.py`，monitor 内联镜像。
+- vcam→receiver 回写环 `<name>.vcam`（`vc_vstat_*`，仅测量）：receiver stats 新增 `vseg_avg_ms/vseg_p50_ms/vseg_p99_ms/vseg_max_ms`（receiver 发布→vcam 交付下游，同机 QPC，不含重复帧）、`vcam_delivered`、`vcam_repeats`、`hash_queue_max`；sender stats 新增 `cap_lag_avg_ms/cap_lag_p99_ms/cap_lag_max_ms`（dda：DXGI LastPresentTime→转换完成，同机 QPC）。
+- receiver hashlog `qpc_ns` = 重组完成时刻（原为当次循环起点，差 <1 包）；sender PC1 段不再含整帧哈希（哈希移到末包之后）。dda 模式不再按 `--fps` 睡眠节流，由 AcquireNextFrame 节拍。
 - sender stats 新增 `gpu_dispatch_ms`（D3D11 timestamp 包住 CopyResource 的真 GPU 时间均值）+ `gpu_dispatch_samples`（有效样本数）；`gpu_ms` 仍为 capture() wall-clock，待 P4-1 实测分布后按 D10 决定是否切换口径。
 - sender stats 新增 `gpu_convert`（0/1，采集走 CPU 还是 GPU compute shader；GPU 失败显式报错，不静默回退）。
 - P4-2步骤1（免协议改动）：receiver stats 新增 `rseg_avg_ms/rseg_p50_ms/rseg_p99_ms/rseg_max_ms`（R(N)=首包到达→重组完成，同机QPC）；sender stats 新增 `pc1_seg_avg_ms/pc1_seg_p99_ms/pc1_seg_max_ms`（PC1段=采集/生成完成→末包发出，同机QPC）；确认包（flags bit1）仍待 owner 终审后做步骤2。
@@ -78,6 +82,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 | D13 | UNORM 解码 float 例外 | ✅定（2026-10-23，owner 授权 AI 定；owner 可推翻）：硬规则第 2 条禁的是“生成像素用浮点”；B8G8R8A8_UNORM→float→floor(v*255+0.5) 属格式转换，允许用 float，但结果必须和 CPU 参考逐字节一致（dda_gpu 自测 5 档已证）。§1.5 已注，不许扩散 | — |
 | D10 | P4-1 测量口径与 idle 语义 | ✅批（2026-10-24）：`gpu_ms` 切真 GPU 时间待 PC1 2K240 实测分布后再定，`gpu_dispatch_ms` 先作诊断；dda selftest 连续 5x E_TIMEOUT（2.5s 无新帧）判 SKIP（idle 与故障不可分，live 已容忍超时） | P4-1 |
 | D14 | PC2 网卡调优（I226-V） | ✅执行（2026-10-23，AI 操作，owner 可回滚）：FlowControl=0、ITR=0、EEE=0、InterruptModeration=0；实测 rseg_max 1015ms→35ms（-97%），rseg_p99 8.3ms→6.7ms（-19%），全程 p99 12ms→9.8ms；步骤见 docs/runbooks/pc2-nic-tuning.md；回滚命令见同文件 | P4-2 |
+| D15 | 端到端延迟优化 1+2 组（含 shm v2 IPC 变更） | ✅批（2026-10-28，owner"1 2 一起优化"）：见 §1.4 shm v2 条；本机回环 motion/240/batch1 实测 pc1_seg 1.03→0.37ms、rseg 2.34→0.39ms、vcam 出口 vseg avg 0.03ms（旧轮询理论 +2.1ms）；双机（PC2 发→PC1 收+vcam，motion/240/batch69）rseg p99 6.70→2.05ms、max 35→2.26ms，vseg p99 0.08ms，7200 帧对账零错；证据 docs/bringup/bringup-20261028-latency-opt.md。PC2 已推 0.4.2（发版号 AI 暂定，owner 可改）；v1/v2 不互通，下游须重开 | ✅已部署 |
 | D9 | 本机主 agent 换代到 0.4.0 | ⏳待执行：agent 改动已由另一会话提交（d15287d），阻塞解除。注意 2026-10-23 00:10 对该进程 stage 成功但 /activate 无应答且未换代（pid 不变），建议直接手动重启本机 agent（本机，可逆），换代后 /health 应出新 pid | — |
 
 ## 3. 任务卡
@@ -118,7 +123,7 @@ P4-3 PC2 虚拟采集卡：DONE（代码+本机验证）
      D12 无信号默认行为实现（7e7ce80）：无映射→stall，撕裂+有历史帧→repeat-last，正常→输出。
      OTA 白名单已放行 vc-vcam.dll；验收手册：docs/runbooks/pc2-vcam-acceptance.md。
 P4-4 虚拟卡出口验收（不含推理）：DONE 2026-10-23
-     J1 PASS：vc-vcam-verify.exe（vcam_verify/ C++）ICreateDevEnum 枚举到 VirtualCapture 640x640 NV12。
+     J1 PASS：vc-vcam-verify.exe（vcam_verify/ C++）ICreateDevEnum 枚举到 VirtualCapture 640x640 NV12（2026-10-25 改名为 `VirtualCapture`，见 docs/runbooks/vcam.md）。
      J2 PASS：IAMStreamConfig GetFormat = NV12 640x640 AvgTimePerFrame=41666 (240.0fps)。
      J3 PASS：35069帧 shm_published==complete, dropped=0, hash_mismatch=0；SHM FNV-1a64 采样 27/27 与 receiver hashlog 一致。
      验收工具：vcam_verify/vc-vcam-verify.exe + scripts/p4_4_shm_verify.py。

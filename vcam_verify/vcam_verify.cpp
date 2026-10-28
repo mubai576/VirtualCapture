@@ -59,7 +59,7 @@ int main() {
         printf("  device: %s\n", narrow.c_str());
 
         if (name.find(L"VirtualCapture") != std::wstring::npos) {
-            printf("  J1 PASS: found 'VirtualCapture 640x640 NV12'\n");
+            printf("  J1 PASS: found 'VirtualCapture'\n");
             j1_pass = true;
 
             // Bind to filter

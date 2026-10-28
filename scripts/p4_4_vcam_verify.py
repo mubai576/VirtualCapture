@@ -1,7 +1,7 @@
 """
 P4-4 vcam 出口验收脚本 (纯 ctypes, 无第三方依赖)
 判据:
-  J1. DShow 枚举到 "VirtualCapture 640x640 NV12"
+  J1. DShow 枚举到 "VirtualCapture"
   J2. IAMStreamConfig GetFormat → NV12 640x640 AvgTimePerFrame=41666
   J3. SHM 读帧 hash 与 receiver hashlog 一致; FIFO=0 (dropped=0)
 """
@@ -170,7 +170,7 @@ def check_j1_j2():
         print("  device: %r" % friendly_name)
         if "VirtualCapture" in friendly_name:
             found_j1 = True
-            print("  J1 PASS: found 'VirtualCapture 640x640 NV12'")
+            print("  J1 PASS: found 'VirtualCapture'")
 
             # BindToObject → IBaseFilter
             pFilter = ctypes.c_void_p()
@@ -303,19 +303,13 @@ def check_j1_j2():
 def check_j3(rx_session_id, num_samples=20, interval_ms=100):
     print("\n[J3] SHM hash 对账 + FIFO 检查")
 
-    # Open SHM
-    SHM_NAME = "Local\\VirtualCaptureVcamFrame"
-    hMap = kernel32.OpenFileMappingA(FILE_MAP_READ, False, SHM_NAME.encode())
-    if not hMap:
-        err = kernel32.GetLastError()
-        print("  FAIL OpenFileMapping error=%d (receiver 未运行或 --shm 未透传)" % err)
-        return False
-
-    SHM_SIZE = 24 + FRAME_BYTES  # sizeof(vc_shm_hdr_t)=20 padded to 24 + 614400
-    pView = kernel32.MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, SHM_SIZE)
-    if not pView:
-        print("  FAIL MapViewOfFile")
-        kernel32.CloseHandle(hMap)
+    # Open SHM (layout v2, scripts/vc_shm.py mirrors vcam/vcam_shm.h)
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from vc_shm import ShmReader
+    try:
+        rd = ShmReader()
+    except OSError as e:
+        print("  FAIL %s" % e)
         return False
 
     # Load receiver hashlog
@@ -330,56 +324,30 @@ def check_j3(rx_session_id, num_samples=20, interval_ms=100):
                 except: pass
     print("  receiver hashlog entries: %d" % len(rx_hashes))
 
-    # Sample frames from SHM
     ok_count = 0; fail_count = 0; torn_count = 0
-    SHM_MAGIC = 0x5643414D
-    HDR_FMT = '<IiIQI'  # magic(u32) seq(i32) frame_id(u32) hash(u64) size(u32) = 24B
-    HDR_SIZE = struct.calcsize(HDR_FMT)  # =24
-
     for _ in range(num_samples):
         time.sleep(interval_ms / 1000.0)
-        # Torn-read: seq must be even and stable
-        buf = (ctypes.c_ubyte * SHM_SIZE)()
-        ctypes.memmove(buf, pView, SHM_SIZE)
-        raw = bytes(buf)
-        try:
-            magic, seq1, frame_id, stored_hash, size = struct.unpack_from(HDR_FMT, raw, 0)
-        except: continue
-        if magic != SHM_MAGIC:
-            print("  WARN bad magic 0x%08X (receiver not writing?)" % magic)
-            continue
-        if seq1 & 1:
-            torn_count += 1
-            continue  # writing in progress
-        if size != FRAME_BYTES:
-            continue
-        # Re-read seq to confirm not torn
-        tail_bytes = ctypes.string_at(pView, HDR_SIZE)
-        _, seq2 = struct.unpack_from('<Ii', tail_bytes, 0)
-        if seq1 != seq2:
+        r = rd.read_latest()
+        if r is None:
             torn_count += 1
             continue
-
-        frame_data = raw[HDR_SIZE : HDR_SIZE + FRAME_BYTES]
+        frame_id, stored_hash, frame_data = r
         computed = fnv1a64(frame_data)
-
-        if computed != stored_hash:
-            print("  WARN fid=%d shm header hash != recomputed (SHM corruption?)" % frame_id)
+        if stored_hash is not None and computed != stored_hash:
+            print("  WARN fid=%d shm slot hash != recomputed (SHM corruption?)" % frame_id)
             fail_count += 1
             continue
-
         if frame_id in rx_hashes:
-            if rx_hashes[frame_id] == stored_hash:
+            if rx_hashes[frame_id] == computed:
                 ok_count += 1
             else:
-                print("  MISMATCH fid=%d shm=0x%016x rx=0x%016x" % (frame_id, stored_hash, rx_hashes[frame_id]))
+                print("  MISMATCH fid=%d shm=0x%016x rx=0x%016x" % (frame_id, computed, rx_hashes[frame_id]))
                 fail_count += 1
         else:
-            # Frame not in receiver hashlog yet (lag) — recomputed hash is self-consistent
+            # not yet in receiver hashlog (hash thread lag): self-consistent
             ok_count += 1
 
-    kernel32.UnmapViewOfFile(pView)
-    kernel32.CloseHandle(hMap)
+    rd.close()
 
     print("  SHM samples: ok=%d fail=%d torn=%d" % (ok_count, fail_count, torn_count))
 

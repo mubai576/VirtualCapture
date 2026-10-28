@@ -1,71 +1,19 @@
 """J3: SHM hash 对账 + FIFO 检查（纯 ctypes mmap，无 COM）"""
 import ctypes, ctypes.wintypes as wt, struct, time, json, os, sys
 
-kernel32 = ctypes.windll.kernel32
-# 设置正确的 64-bit 返回类型
-kernel32.OpenFileMappingA.restype  = ctypes.c_void_p
-kernel32.OpenFileMappingA.argtypes = [wt.DWORD, wt.BOOL, ctypes.c_char_p]
-kernel32.MapViewOfFile.restype     = ctypes.c_void_p
-kernel32.MapViewOfFile.argtypes    = [ctypes.c_void_p, wt.DWORD,
-                                       wt.DWORD, wt.DWORD, ctypes.c_size_t]
-kernel32.UnmapViewOfFile.restype   = wt.BOOL
-kernel32.UnmapViewOfFile.argtypes  = [ctypes.c_void_p]
-kernel32.CloseHandle.restype       = wt.BOOL
-kernel32.CloseHandle.argtypes      = [ctypes.c_void_p]
-kernel32.RtlCopyMemory             = kernel32.RtlMoveMemory
-kernel32.RtlMoveMemory.restype     = None
-kernel32.RtlMoveMemory.argtypes    = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t]
-
-FILE_MAP_READ = 0x4
-SHM_NAME      = b"Local\\VirtualCaptureVcamFrame"
-FRAME_BYTES   = 614400
-HDR_SIZE      = 24      # sizeof(vc_shm_hdr_t) with natural alignment: 4+4+4+8+4 = 24
-SHM_TOTAL     = HDR_SIZE + FRAME_BYTES   # 614424
-SHM_MAGIC     = 0x5643414D
-FNV_OFFSET    = 14695981039346656037
-FNV_PRIME     = 1099511628211
-
-def fnv1a64(data: bytes) -> int:
-    h = FNV_OFFSET
-    for b in data:
-        h ^= b
-        h = (h * FNV_PRIME) & 0xFFFFFFFFFFFFFFFF
-    return h
-
-def read_shm_frame(pView: int) -> tuple:
-    """Returns (frame_id, stored_hash, frame_bytes) or None if torn/bad."""
-    # Read header
-    hdr_buf = (ctypes.c_char * HDR_SIZE)()
-    kernel32.RtlMoveMemory(hdr_buf, pView, HDR_SIZE)
-    magic, seq1, frame_id, stored_hash, size = struct.unpack_from('<IiIQI', hdr_buf)
-    if magic != SHM_MAGIC or (seq1 & 1) or size != FRAME_BYTES:
-        return None  # torn or bad magic
-    # Read frame payload
-    frame_buf = (ctypes.c_char * FRAME_BYTES)()
-    kernel32.RtlMoveMemory(frame_buf, pView + HDR_SIZE, FRAME_BYTES)
-    # Re-read seq to confirm not torn
-    hdr2 = (ctypes.c_char * 8)()
-    kernel32.RtlMoveMemory(hdr2, pView, 8)
-    _, seq2 = struct.unpack_from('<Ii', hdr2)
-    if seq1 != seq2:
-        return None
-    return frame_id, stored_hash, bytes(frame_buf)
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from vc_shm import ShmReader, fnv1a64, SHM_NAME, SHM_SIZE  # layout v2 mirror of vcam/vcam_shm.h
 
 def main():
     rx_session = sys.argv[1] if len(sys.argv) > 1 else "s-0144d793"
     run_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "run")
 
-    # Open SHM
-    hMap = kernel32.OpenFileMappingA(FILE_MAP_READ, False, SHM_NAME)
-    if not hMap:
-        print("FAIL: OpenFileMapping error=%d (receiver not running?)" % ctypes.GetLastError())
+    try:
+        rd = ShmReader(SHM_NAME)
+    except OSError as e:
+        print("FAIL: %s" % e)
         return False
-    pView = kernel32.MapViewOfFile(hMap, FILE_MAP_READ, 0, 0, SHM_TOTAL)
-    if not pView:
-        print("FAIL: MapViewOfFile error=%d" % ctypes.GetLastError())
-        kernel32.CloseHandle(hMap)
-        return False
-    print("SHM mapped at 0x%016X (%d bytes)" % (pView, SHM_TOTAL))
+    print("SHM v2 mapped (%d bytes)" % SHM_SIZE)
 
     # Load receiver hashlog
     rx_hashes = {}
@@ -87,27 +35,26 @@ def main():
     print("Sampling %d frames @ 120ms intervals..." % N)
     for _ in range(N):
         time.sleep(0.12)
-        result = read_shm_frame(pView)
+        result = rd.read_latest()
         if result is None:
             torn += 1
             continue
         frame_id, stored_hash, frame_data = result
         computed = fnv1a64(frame_data)
-        if computed != stored_hash:
+        if stored_hash is not None and computed != stored_hash:
             print("  CORRUPT fid=%d: computed=%016x stored=%016x" % (frame_id, computed, stored_hash))
             fail += 1
             continue
         if frame_id in rx_hashes:
-            if rx_hashes[frame_id] == stored_hash:
+            if rx_hashes[frame_id] == computed:
                 ok += 1
             else:
-                print("  MISMATCH fid=%d shm=%016x rx=%016x" % (frame_id, stored_hash, rx_hashes[frame_id]))
+                print("  MISMATCH fid=%d shm=%016x rx=%016x" % (frame_id, computed, rx_hashes[frame_id]))
                 fail += 1
         else:
-            ok += 1  # hash self-consistent, just not yet indexed in hashlog
+            ok += 1  # self-consistent (or slot hash pending), not yet in hashlog
 
-    kernel32.UnmapViewOfFile(pView)
-    kernel32.CloseHandle(hMap)
+    rd.close()
     print("SHM samples: ok=%d fail=%d torn=%d" % (ok, fail, torn))
 
     # FIFO check via receiver stats

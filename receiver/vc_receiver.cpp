@@ -17,6 +17,11 @@
 #include <algorithm>
 #include <cinttypes>
 #include <cctype>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <chrono>
+#include <condition_variable>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -49,7 +54,7 @@ static void qpc_init(){
 static uint64_t qpc_ns_now(){
   // 取纳秒戳
 #ifdef _WIN32
-  LARGE_INTEGER c; QueryPerformanceCounter(&c); return (uint64_t)c.QuadPart*1000000000ull/qpc_freq_;
+  LARGE_INTEGER c; QueryPerformanceCounter(&c); return vc_qpc_to_ns((uint64_t)c.QuadPart,qpc_freq_); // 无 c*1e9 溢出
 #else
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts);
   return (uint64_t)ts.tv_sec*1000000000ull+(uint64_t)ts.tv_nsec;
@@ -103,46 +108,126 @@ static void atomic_write(const std::string&path,const std::string&data){
 // 重组器（可单测，不依赖抓包）
 struct ReasmStats{
   uint64_t complete=0, dropped=0, packets_recv=0, packets_lost=0;
-  uint64_t hash_mismatch=0, gaps=0;
+  std::atomic<uint64_t> hash_mismatch{0};   // live: written by the hash thread
+  uint64_t gaps=0;
   uint64_t bytes_recv=0;
   uint64_t max_seen_fid=0; bool have_seen=false;
 };
+// 整帧哈希 + 测试源比对（live 模式在哈希线程，selftest 内联）
+static bool rx_verify(const uint8_t* f,uint32_t fid,uint8_t pattern,uint64_t& fh,
+                      std::vector<uint8_t>& eY,std::vector<uint8_t>& eUV){
+  fh=vc_fnv1a64(f,VC_FRAME_BYTES);
+  if(pattern>4) return true;
+  eY.resize(VC_Y_BYTES); eUV.resize(VC_UV_BYTES);
+  switch(pattern){
+    case 0:vc_gen_counter(fid,eY.data(),eUV.data());break;
+    case 1:vc_gen_checker(fid,eY.data(),eUV.data());break;
+    case 2:vc_gen_rings(fid,eY.data(),eUV.data());break;
+    case 3:vc_gen_noise(fid,eY.data(),eUV.data());break;
+    default:vc_gen_motion(fid,eY.data(),eUV.data());break;
+  }
+  return vc_fnv1a64_two(eY.data(),eY.size(),eUV.data(),eUV.size())==fh;
+}
+// 帧缓冲池。--shm 时缓冲就是 shm v2 槽（原地重组，发布=翻 seq+置事件，零整帧拷贝）；
+// 无 --shm 时是私有缓冲，生命周期相同。状态：filling(主线程) -> latest -> hashing(哈希线程) -> free。
+struct FramePool{
+  uint8_t* shm=nullptr;
 #ifdef _WIN32
-// P4-3: latest-1-frame publisher (named file mapping, layout = vcam/vcam_shm.h).
-struct ShmPub{
-  HANDLE hMap=nullptr; uint8_t* base=nullptr; uint64_t published=0;
-  bool open(const std::string& name){
-    close();
-    hMap=CreateFileMappingA(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,
-                            (DWORD)VC_SHM_SIZE,name.c_str());
-    if(!hMap||hMap==INVALID_HANDLE_VALUE){ hMap=nullptr; return false; }
-    base=(uint8_t*)MapViewOfFile(hMap,FILE_MAP_WRITE,0,0,VC_SHM_SIZE);
-    if(!base){ CloseHandle(hMap); hMap=nullptr; return false; }
-    vc_shm_hdr_t* h=(vc_shm_hdr_t*)base;
-    h->magic=VC_SHM_MAGIC; h->seq=0; h->frame_id=0; h->hash=0; h->size=(uint32_t)VC_FRAME_BYTES;
+  HANDLE hMap=nullptr; HANDLE evt[2]={nullptr,nullptr};
+#endif
+  static const int N=(int)VC_SHM_SLOTS;
+  std::vector<std::vector<uint8_t>> own;
+  bool filling[N]={}; uint64_t last_use[N]={}; int latest=-1; uint64_t tick=0, published=0;
+  std::mutex mu; std::condition_variable cv; bool hashing[N]={};   // hashing 受 mu 保护
+  FramePool(){ own.resize(N); }
+  uint8_t* data(int i){ if(shm) return vc_shm_data(shm,(uint32_t)i); if(own[i].empty()) own[i].resize(VC_FRAME_BYTES); return own[i].data(); }
+#ifdef _WIN32
+  bool open_shm(const std::string& name){
+    hMap=CreateFileMappingA(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,(DWORD)VC_SHM_SIZE,name.c_str());
+    if(!hMap) return false;
+    shm=(uint8_t*)MapViewOfFile(hMap,FILE_MAP_WRITE,0,0,VC_SHM_SIZE);
+    if(!shm){ CloseHandle(hMap); hMap=nullptr; return false; }  // 例如旧 v1（更小）映射仍被占用
+    for(int k=0;k<2;k++){
+      std::string en=name+".evt"+std::to_string(k);
+      evt[k]=CreateEventA(nullptr,TRUE,FALSE,en.c_str());
+      if(!evt[k]) return false;
+      ResetEvent(evt[k]);
+    }
+    vc_shm_hdr_t* h=(vc_shm_hdr_t*)shm;
+    h->magic=0; MemoryBarrier();
+    h->version=VC_SHM_VERSION; h->slots=VC_SHM_SLOTS; h->frame_bytes=(uint32_t)VC_FRAME_BYTES;
+    h->data_off=VC_SHM_DATA_OFF; h->latest_slot=-1; h->writer_pid=GetCurrentProcessId();
+    for(uint32_t i=0;i<VC_SHM_SLOTS;i++){ vc_shm_slot_t* sl=vc_shm_slot(shm,i); sl->seq|=1; sl->hash_fid=VC_SHM_HASH_NONE; }
+    MemoryBarrier(); h->magic=VC_SHM_MAGIC;
     return true;
   }
-  void publish(uint32_t fid,uint64_t fh,const uint8_t* frame){
-    if(!base) return;
-    vc_shm_hdr_t* h=(vc_shm_hdr_t*)base;
-    InterlockedIncrement((volatile LONG*)&h->seq);  // odd = writing
-    h->frame_id=fid; h->hash=fh; h->size=(uint32_t)VC_FRAME_BYTES;
-    memcpy(base+sizeof(vc_shm_hdr_t),frame,VC_FRAME_BYTES);
-    InterlockedIncrement((volatile LONG*)&h->seq);  // even = ready
-    published++;
-  }
-  void close(){
-    if(base){ UnmapViewOfFile(base); base=nullptr; }
+  void close_shm(){
+    if(shm){ UnmapViewOfFile(shm); shm=nullptr; }
     if(hMap){ CloseHandle(hMap); hMap=nullptr; }
+    for(auto& e:evt) if(e){ CloseHandle(e); e=nullptr; }
   }
-  ~ShmPub(){ close(); }
-};
+  ~FramePool(){ close_shm(); }
 #endif
+  int pick_locked(){
+    int best=-1;
+    for(int i=0;i<N;i++){
+      if(filling[i]||hashing[i]||i==latest) continue;
+      if(best<0||last_use[i]<last_use[best]) best=i;
+    }
+    return best;
+  }
+  int acquire(){
+    int i=-1;
+    { std::unique_lock<std::mutex> lk(mu);
+      i=pick_locked();
+      if(i<0) cv.wait_for(lk,std::chrono::milliseconds(100),[&]{ return (i=pick_locked())>=0; });
+      if(i<0) return -1;
+      filling[i]=true; }
+#ifdef _WIN32
+    if(shm){
+      vc_shm_slot_t* sl=vc_shm_slot(shm,(uint32_t)i);
+      // 偶->奇（填充中）；已是奇（弃帧残留）则 +2，值变化仍为奇
+      InterlockedExchangeAdd((volatile LONG*)&sl->seq,(sl->seq&1)?2:1);
+      sl->hash_fid=VC_SHM_HASH_NONE;
+    }
+#endif
+    return i;
+  }
+  void abandon(int i){ if(i>=0) filling[i]=false; }   // shm seq 保持奇数：读端永远不会接受
+  void publish(int i,uint32_t fid,uint64_t first_ns,uint64_t pub_ns){
+    filling[i]=false;
+    { std::lock_guard<std::mutex> lk(mu); hashing[i]=true; latest=i; }
+    last_use[i]=++tick;
+#ifdef _WIN32
+    if(shm){
+      vc_shm_hdr_t* h=(vc_shm_hdr_t*)shm; vc_shm_slot_t* sl=vc_shm_slot(shm,(uint32_t)i);
+      sl->frame_id=fid; sl->qpc_first_ns=first_ns; sl->qpc_pub_ns=pub_ns;
+      InterlockedIncrement((volatile LONG*)&sl->seq);            // 奇->偶：就绪（全屏障）
+      InterlockedExchange((volatile LONG*)&h->latest_slot,i);
+      LONG n=InterlockedIncrement((volatile LONG*)&h->latest_seq);
+      ResetEvent(evt[(n+1)&1]); SetEvent(evt[n&1]);
+      published++;
+    }
+#else
+    (void)fid;(void)first_ns;(void)pub_ns;
+#endif
+  }
+  void hashed(int i,uint32_t fid,uint64_t fh){
+#ifdef _WIN32
+    if(shm){ vc_shm_slot_t* sl=vc_shm_slot(shm,(uint32_t)i); sl->hash=fh; MemoryBarrier(); sl->hash_fid=fid; }
+#else
+    (void)fid;(void)fh;
+#endif
+    { std::lock_guard<std::mutex> lk(mu); hashing[i]=false; }
+    cv.notify_all();
+  }
+};
 struct FrameSlot{
   uint32_t fid=0; uint16_t total=0, got_n=0;
-  std::vector<uint8_t> data; std::vector<char> got;
+  int buf=-1; std::vector<char> got;
   uint64_t first_ns=0; uint8_t pattern=255; bool active=false;
 };
+struct DoneFrame{ int buf=-1; uint32_t fid=0; uint8_t pattern=255; uint64_t first_ns=0, done_ns=0; };
 class Reassembler{
 public:
   ReasmStats st;
@@ -151,11 +236,17 @@ public:
   uint64_t last_complete_ns=0;
   std::deque<uint64_t> rseg_ns; // P4-2步骤1：R(N)=首包到达→重组完成，同机QPC，最新10000帧窗口
   size_t payload_max;
-  std::vector<std::pair<uint32_t,std::string>> completed_hashes; // 供hashlog用
-  Reassembler(int mtu=9000){ payload_max=(size_t)(mtu-42); }
-  // 本包凑齐整帧则真
-  bool on_packet(const vc_pkt_hdr_t&h,const uint8_t*payload,std::string*out_hash=nullptr,
-               std::vector<uint8_t>*out_frame=nullptr){
+  FramePool own_pool;
+  FramePool* pool;
+  bool inline_verify=true;   // selftest：完成即哈希/比对/释放；live：调用方发布 + 哈希线程异步
+  std::vector<uint8_t> vY,vUV;
+  Reassembler(int mtu=9000,FramePool* p=nullptr){ payload_max=(size_t)(mtu-42); pool=p?p:&own_pool; }
+  void drop_slot(std::map<uint32_t,FrameSlot>::iterator it){
+    st.dropped++; st.packets_lost+=(it->second.total-it->second.got_n);
+    pool->abandon(it->second.buf); slots.erase(it);
+  }
+  // 本包凑齐整帧则真（live 模式下 out 给出待发布缓冲）
+  bool on_packet(const vc_pkt_hdr_t&h,const uint8_t*payload,DoneFrame*out=nullptr){
     if(h.magic!=VC_MAGIC) return false;
     if(h.total==0||h.seq>=h.total||h.payload_len==0) { st.packets_lost++; return false; }
     if(h.payload_len>((h.seq==(uint16_t)(h.total-1))?payload_max+1:payload_max+1)) { st.packets_lost++; return false; }
@@ -171,13 +262,11 @@ public:
     auto it=slots.find(h.frame_id);
     if(it==slots.end()){
       // 超8帧逐出最旧
-      if(slots.size()>=8){
-        auto old=slots.begin();
-        st.dropped++; st.packets_lost+=(old->second.total-old->second.got_n);
-        slots.erase(old);
-      }
-      FrameSlot s; s.fid=h.frame_id; s.total=h.total; s.got_n=0;
-      s.data.assign(VC_FRAME_BYTES,0); s.got.assign(h.total,0);
+      if(slots.size()>=8) drop_slot(slots.begin());
+      int b=pool->acquire();
+      if(b<0){ st.packets_lost++; return false; }   // 池耗尽（哈希线程卡住>100ms）
+      FrameSlot s; s.fid=h.frame_id; s.total=h.total; s.got_n=0; s.buf=b;
+      s.got.assign(h.total,0);   // 不清零缓冲：只有每字节都到齐才会发布
       s.first_ns=qpc_ns_now(); s.pattern=h.pattern; s.active=true;
       it=slots.emplace(h.frame_id,std::move(s)).first;
     }
@@ -186,30 +275,19 @@ public:
     if(s.got[h.seq]) return false; // 重包：已计入收包数
     size_t off=(size_t)h.seq*payload_max;
     if(off+h.payload_len>VC_FRAME_BYTES){ st.packets_lost++; return false; }
-    memcpy(s.data.data()+off,payload,h.payload_len);
+    memcpy(pool->data(s.buf)+off,payload,h.payload_len);
     s.got[h.seq]=1; s.got_n++;
     if(s.got_n==s.total){
       // 凑齐
-      if(out_frame) *out_frame=s.data;
-      uint64_t fh=vc_fnv1a64(s.data.data(),s.data.size());
-      char hx[17]; vc_fnv1a64_hex(fh,hx);
-      completed_hashes.emplace_back(s.fid,hx);
-      if(out_hash) *out_hash=hx;
-      // 验测试源编号0..4
-      if(s.pattern<=4){
-        std::vector<uint8_t> eY(VC_Y_BYTES),eUV(VC_UV_BYTES);
-        switch(s.pattern){
-          case 0:vc_gen_counter(s.fid,eY.data(),eUV.data());break;
-          case 1:vc_gen_checker(s.fid,eY.data(),eUV.data());break;
-          case 2:vc_gen_rings(s.fid,eY.data(),eUV.data());break;
-          case 3:vc_gen_noise(s.fid,eY.data(),eUV.data());break;
-          default:vc_gen_motion(s.fid,eY.data(),eUV.data());break;
-        }
-        uint64_t eh=vc_fnv1a64_two(eY.data(),eY.size(),eUV.data(),eUV.size());
-        if(eh!=fh) st.hash_mismatch++;
+      uint64_t now=qpc_ns_now();
+      if(inline_verify||!out){
+        uint64_t fh=0;
+        if(!rx_verify(pool->data(s.buf),s.fid,s.pattern,fh,vY,vUV)) st.hash_mismatch++;
+        pool->abandon(s.buf);
+      } else {
+        out->buf=s.buf; out->fid=s.fid; out->pattern=s.pattern; out->first_ns=s.first_ns; out->done_ns=now;
       }
       st.complete++;
-      uint64_t now=qpc_ns_now();
       if(rseg_ns.size()>=10000) rseg_ns.pop_front(); rseg_ns.push_back(now>=s.first_ns?now-s.first_ns:0); // 最新10000帧窗口（满了丢最旧）
       if(last_complete_ns!=0&&arrivals.size()<10000){ arrivals.push_back(now-last_complete_ns); if(arrivals.size()>120)arrivals.pop_front(); }
       last_complete_ns=now;
@@ -218,7 +296,7 @@ public:
       // 旧残帧记丢（新帧到达规则）
       std::vector<uint32_t> todrop;
       for(auto&p:slots) if(p.first<donefid) todrop.push_back(p.first);
-      for(uint32_t f:todrop){ auto jt=slots.find(f); if(jt!=slots.end()){ st.dropped++; st.packets_lost+=(jt->second.total-jt->second.got_n); slots.erase(jt);} }
+      for(uint32_t f:todrop){ auto jt=slots.find(f); if(jt!=slots.end()) drop_slot(jt); }
       return true;
     }
     return false;
@@ -328,7 +406,7 @@ static int run_selftest(){
   printf("result complete=%llu dropped=%llu recv=%llu lost=%llu mismatch=%llu\n",
     (unsigned long long)R.st.complete,(unsigned long long)R.st.dropped,
     (unsigned long long)R.st.packets_recv,(unsigned long long)R.st.packets_lost,
-    (unsigned long long)R.st.hash_mismatch);
+    (unsigned long long)R.st.hash_mismatch.load());
   // 期望：完成3丢1错1
   // 收包276=69+68+69+1重+69（坏CRC不计）
   // 丢包2=漏1+坏CRC1（弃帧余量另计防重）
@@ -376,7 +454,63 @@ struct DynPcapRx{
   }
 };
 struct PcapHdr{ uint32_t ts_sec,ts_usec,caplen,len; };
+// 收包线程提优先级（MMCSS "Capture"，失败退回 TIME_CRITICAL），压 p99/max 尾部
+static void rx_boost_thread(){
+  typedef HANDLE (WINAPI *avset_fn)(LPCSTR,LPDWORD);
+  HMODULE av=LoadLibraryA("avrt.dll"); DWORD task=0; bool mm=false;
+  if(av){ avset_fn f=(avset_fn)GetProcAddress(av,"AvSetMmThreadCharacteristicsA"); if(f&&f("Capture",&task)) mm=true; }
+  if(!mm) SetThreadPriority(GetCurrentThread(),THREAD_PRIORITY_TIME_CRITICAL);
+  SetPriorityClass(GetCurrentProcess(),HIGH_PRIORITY_CLASS);
+  printf("[receiver] rx thread priority: %s\n",mm?"MMCSS Capture":"TIME_CRITICAL");
+}
 #endif
+// vcam -> receiver 回写环（vseg = receiver 发布 -> vcam 交付下游，同机 QPC）
+struct VstatReader{
+  std::string name; uint64_t next=0; std::deque<uint64_t> v; uint64_t repeats=0, n_total=0;
+#ifdef _WIN32
+  HANDLE hm=nullptr; uint8_t* base=nullptr;
+  void poll(){
+    if(name.empty()) return;
+    if(!base){
+      hm=OpenFileMappingA(FILE_MAP_READ,FALSE,name.c_str()); if(!hm) return;
+      base=(uint8_t*)MapViewOfFile(hm,FILE_MAP_READ,0,0,VC_VSTAT_SIZE);
+      if(!base){ CloseHandle(hm); hm=nullptr; return; }
+      vc_vstat_hdr_t* h=(vc_vstat_hdr_t*)base; next=(uint64_t)(uint32_t)h->widx;  // 只统计本次 attach 之后
+    }
+    vc_vstat_hdr_t* h=(vc_vstat_hdr_t*)base;
+    if(h->magic!=VC_VSTAT_MAGIC) return;
+    uint64_t w=(uint64_t)(uint32_t)*(volatile LONG*)&h->widx;
+    if(w<next) next=w;                       // vcam 重建映射
+    if(w-next>VC_VSTAT_CAP) next=w-VC_VSTAT_CAP;
+    vc_vstat_entry_t* r=(vc_vstat_entry_t*)(base+sizeof(vc_vstat_hdr_t));
+    for(;next<w;next++){
+      volatile vc_vstat_entry_t* e=&r[next%VC_VSTAT_CAP];
+      if(e->n!=(uint32_t)(next+1)) continue;
+      uint64_t pub=e->pub_ns, del=e->deliver_ns; uint32_t fl=e->flags;
+      if(e->n!=(uint32_t)(next+1)) continue;
+      n_total++;
+      if(fl&VC_VSTAT_FLAG_REPEAT){ repeats++; continue; }
+      if(v.size()>=10000) v.pop_front(); v.push_back(del>=pub?del-pub:0);
+    }
+  }
+  ~VstatReader(){ if(base) UnmapViewOfFile(base); if(hm) CloseHandle(hm); }
+#else
+  void poll(){}
+#endif
+};
+static std::string vseg_json(const VstatReader& vs,unsigned long long hq_max){
+  double a=0,p50=0,p99=0,mx=0;
+  if(!vs.v.empty()){
+    double sum=0; for(auto x:vs.v) sum+=(double)x; a=sum/vs.v.size()/1e6;
+    std::vector<uint64_t> s(vs.v.begin(),vs.v.end()); std::sort(s.begin(),s.end());
+    p50=s[s.size()*50/100]/1e6; p99=s[s.size()*99/100]/1e6; mx=s.back()/1e6;
+  }
+  char b[320];
+  snprintf(b,sizeof(b),"\"vseg_avg_ms\":%.3f,\"vseg_p50_ms\":%.3f,\"vseg_p99_ms\":%.3f,\"vseg_max_ms\":%.3f,"
+    "\"vcam_delivered\":%llu,\"vcam_repeats\":%llu,\"hash_queue_max\":%llu",
+    a,p50,p99,mx,(unsigned long long)vs.n_total,(unsigned long long)vs.repeats,hq_max);
+  return b;
+}
 
 int main(int argc,char**argv){
   qpc_init();
@@ -461,28 +595,54 @@ int main(int argc,char**argv){
       return 2;
     }
     if(d.freealldevs)d.freealldevs(devs);
-    h=d.openlive(devName.c_str(),9014+256,1,1000,errbuf);
+    h=d.openlive(devName.c_str(),9014+256,1,1,errbuf);  // to_ms=1: bound tail wait (see mintocopy note)
     if(!h){fprintf(stderr,"pcap_open_live failed: %s\n",errbuf);return 2;}
   }
   if(d.setbuff) d.setbuff(h,128*1024*1024);
-  if(d.setmintocopy) d.setmintocopy(h,16*1024);
+  // mintocopy=0: deliver immediately. With 16KB the tail packets of a frame sat in the
+  // kernel buffer until the NEXT frame pushed them out, so at low source fps (idle dda)
+  // rseg ~= inter-frame gap (p99 ~400ms). Npcap still batches whatever is queued.
+  if(d.setmintocopy) d.setmintocopy(h,0);
 #else
   fprintf(stderr,"live capture only on Windows/Npcap\n"); return 1;
 #endif
-  Reassembler R(a.mtu);
+  FramePool pool;
+  Reassembler R(a.mtu,&pool);
+  R.inline_verify=false;   // 哈希/比对/hashlog 移出关键路径（哈希线程）
   { ensure_parent(a.hashlog); std::ofstream f(a.hashlog,std::ios::trunc); }
   std::ofstream hashlog(a.hashlog,std::ios::app|std::ios::binary);
 #ifdef _WIN32
-  ShmPub shm;
+  VstatReader vst;
   if(!a.shm.empty()){
-    if(!shm.open(a.shm)){ fprintf(stderr,"shm open failed: %s\n",a.shm.c_str()); return 1; }
-    printf("[receiver] shm publish -> %s (%zu bytes)\n",a.shm.c_str(),(size_t)VC_SHM_SIZE);
+    if(!pool.open_shm(a.shm)){ fprintf(stderr,"shm open failed: %s (err=%lu; old v1 mapping still held by a reader?)\n",a.shm.c_str(),GetLastError()); return 1; }
+    printf("[receiver] shm v2 publish -> %s (%zu bytes, %u slots, events %s.evt0/1)\n",a.shm.c_str(),(size_t)VC_SHM_SIZE,(unsigned)VC_SHM_SLOTS,a.shm.c_str());
+    vst.name=a.shm+".vcam";
   }
+  rx_boost_thread();
 #else
   if(!a.shm.empty()){ fprintf(stderr,"--shm is Windows-only in this build\n"); return 1; }
 #endif
+  // 哈希线程：FIFO 消费已发布帧 -> 哈希 -> 比对 -> 写 slot.hash / hashlog -> 释放槽
+  std::mutex hq_mu; std::condition_variable hq_cv; std::deque<DoneFrame> hq; bool hq_stop=false;
+  std::thread hasher([&]{
+    std::vector<uint8_t> eY,eUV; size_t nflush=0;
+    for(;;){
+      DoneFrame f;
+      { std::unique_lock<std::mutex> lk(hq_mu);
+        hq_cv.wait(lk,[&]{ return hq_stop||!hq.empty(); });
+        if(hq.empty()) break;
+        f=hq.front(); hq.pop_front(); }
+      uint64_t fh=0;
+      if(!rx_verify(pool.data(f.buf),f.fid,f.pattern,fh,eY,eUV)) R.st.hash_mismatch++;
+      pool.hashed(f.buf,f.fid,fh);
+      char hx[17]; vc_fnv1a64_hex(fh,hx);
+      hashlog << "{\"frame_id\":" << f.fid << ",\"hash\":\"" << hx << "\",\"qpc_ns\":" << f.done_ns << "}\n";
+      if(++nflush%8==0) hashlog.flush();
+    }
+    hashlog.flush();
+  });
+  std::atomic<uint64_t> hq_max{0};
   uint64_t t_start=qpc_ns_now(), t_last_stats=0;
-  size_t hashlog_flushed=0;
   for(;;){
 #ifdef _WIN32
     if(g_stop) break;
@@ -502,19 +662,11 @@ int main(int argc,char**argv){
           uint8_t* pl=eth+14+sizeof(hdr);
           size_t avail=ph->caplen-(14+sizeof(hdr));
           if(hdr.payload_len<=avail){
-            std::string hx; std::vector<uint8_t> frame;
-            bool done=R.on_packet(hdr,pl,&hx,a.shm.empty()?nullptr:&frame);
-            if(done){
-              // 取末完成帧号写hash
-              auto bk=R.completed_hashes.back();
-#ifdef _WIN32
-              if(shm.base&&!frame.empty()){
-                uint64_t fh=0; sscanf(bk.second.c_str(),"%llx",&fh);
-                shm.publish(bk.first,fh,frame.data());
-              }
-#endif
-              hashlog << "{\"frame_id\":" << bk.first << ",\"hash\":\"" << bk.second << "\",\"qpc_ns\":" << now << "}\n";
-              if(++hashlog_flushed%8==0) hashlog.flush();
+            DoneFrame df;
+            if(R.on_packet(hdr,pl,&df)&&df.buf>=0){
+              pool.publish(df.buf,df.fid,df.first_ns,qpc_ns_now());   // 先发布（vcam 被事件唤醒）
+              { std::lock_guard<std::mutex> lk(hq_mu); hq.push_back(df); if(hq.size()>hq_max) hq_max=hq.size(); }
+              hq_cv.notify_one();
             }
           }
         }
@@ -524,11 +676,10 @@ int main(int argc,char**argv){
     }
 #endif
     if(now-t_last_stats>500*1000000ull){
-      t_last_stats=now; hashlog.flush();
+      t_last_stats=now;
+      uint64_t shm_n=pool.shm?pool.published:0;
 #ifdef _WIN32
-      uint64_t shm_n=shm.base?shm.published:0;
-#else
-      uint64_t shm_n=0;
+      vst.poll();
 #endif
       double up=(now-t_start)/1e9; if(up<0.001)up=0.001;
       double pps=R.st.packets_recv/up, bps=R.st.bytes_recv*8/up;
@@ -541,27 +692,26 @@ int main(int argc,char**argv){
         "\"gaps\":%llu,\"trailing\":%zu,\"hash_mismatch\":%llu,"
         "\"inter_arrival_avg_ms\":%.3f,\"inter_arrival_p99_ms\":%.3f,\"rseg_avg_ms\":%.3f,"
         "\"rseg_p50_ms\":%.3f,\"rseg_p99_ms\":%.3f,\"rseg_max_ms\":%.3f,\"uptime_s\":%.2f,"
-        "\"mtu\":%d,\"ethertype\":\"0x%04x\",\"shm_published\":%llu}",
+        "\"mtu\":%d,\"ethertype\":\"0x%04x\",\"shm_published\":%llu,%s}",
         a.session.c_str(),(unsigned long long)R.st.complete,(unsigned long long)R.st.dropped,
         (unsigned long long)R.st.packets_recv,(unsigned long long)R.st.packets_lost,
         pps,bps,(unsigned long long)R.st.gaps,R.trailing_packets(),
-        (unsigned long long)R.st.hash_mismatch,avg,p99,rg_a,rg_p50,rg_p99,rg_mx,up,a.mtu,a.ethertype,
-        (unsigned long long)shm_n);
+        (unsigned long long)R.st.hash_mismatch.load(),avg,p99,rg_a,rg_p50,rg_p99,rg_mx,up,a.mtu,a.ethertype,
+        (unsigned long long)shm_n,vseg_json(vst,(unsigned long long)hq_max.load()).c_str());
       atomic_write(a.stats,buf);
     }
   }
-  hashlog.flush();
+  { std::lock_guard<std::mutex> lk(hq_mu); hq_stop=true; }
+  hq_cv.notify_all(); hasher.join();   // 收尾前哈希全部落盘，mismatch 计数完整
   // 收尾残帧记丢，保证账实相符
-  for(auto &p : R.slots){ R.st.dropped++; if(p.second.total>p.second.got_n) R.st.packets_lost+=(p.second.total-p.second.got_n); }
-  R.slots.clear();
+  while(!R.slots.empty()) R.drop_slot(R.slots.begin());
   { double up=(qpc_ns_now()-t_start)/1e9; if(up<0.001)up=0.001;
     double pps=R.st.packets_recv/up, bps=R.st.bytes_recv*8/up;
     double avg,p99; R.inter_stats(avg,p99);
     double rg_a,rg_p50,rg_p99,rg_mx; R.rseg_stats(rg_a,rg_p50,rg_p99,rg_mx);
+    uint64_t shm_n=pool.shm?pool.published:0;
 #ifdef _WIN32
-    uint64_t shm_n=shm.base?shm.published:0;
-#else
-    uint64_t shm_n=0;
+    vst.poll();
 #endif
     char buf[2048];
     snprintf(buf,sizeof(buf),
@@ -570,18 +720,18 @@ int main(int argc,char**argv){
       "\"gaps\":%llu,\"trailing\":%zu,\"hash_mismatch\":%llu,"
       "\"inter_arrival_avg_ms\":%.3f,\"inter_arrival_p99_ms\":%.3f,\"rseg_avg_ms\":%.3f,"
       "\"rseg_p50_ms\":%.3f,\"rseg_p99_ms\":%.3f,\"rseg_max_ms\":%.3f,\"uptime_s\":%.2f,"
-      "\"shm_published\":%llu}",
+      "\"shm_published\":%llu,%s}",
       a.session.c_str(),(unsigned long long)R.st.complete,(unsigned long long)R.st.dropped,
       (unsigned long long)R.st.packets_recv,(unsigned long long)R.st.packets_lost,
       pps,bps,(unsigned long long)R.st.gaps,R.trailing_packets(),
-      (unsigned long long)R.st.hash_mismatch,avg,p99,rg_a,rg_p50,rg_p99,rg_mx,up,(unsigned long long)shm_n);
+      (unsigned long long)R.st.hash_mismatch.load(),avg,p99,rg_a,rg_p50,rg_p99,rg_mx,up,(unsigned long long)shm_n,vseg_json(vst,(unsigned long long)hq_max.load()).c_str());
     atomic_write(a.stats,buf); }
 #ifdef _WIN32
   d.closeh(h);
 #endif
   printf("[receiver] done complete=%llu dropped=%llu mismatch=%llu\n",
     (unsigned long long)R.st.complete,(unsigned long long)R.st.dropped,
-    (unsigned long long)R.st.hash_mismatch);
+    (unsigned long long)R.st.hash_mismatch.load());
   return 0;
 }
 

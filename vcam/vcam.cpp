@@ -63,14 +63,19 @@ DECLARE_INTERFACE_(IKsPinVC, IUnknown) {
     STDMETHOD(KsSetPinFramingCache)(void*,void*,ULONG) PURE;
 };
 
-static const wchar_t* VCAM_NAME = L"VirtualCapture 640x640 NV12";
-static const wchar_t* VCAM_PIN_ID = L"Out";
+// FriendlyName shown by DShow clients (OBS/ffmpeg/GraphEdit), styled after the
+// hardware card "AVerMedia HD Capture GC573 1" whose single output pin is "Capture".
+static const wchar_t* VCAM_NAME = L"VirtualCapture";
+static const wchar_t* VCAM_PIN_ID = L"Capture";
 static const wchar_t* VCAM_CLSID_KEY =
   L"Software\\Classes\\CLSID\\{B84C7E21-4A5F-4E2B-9C11-5A3D7F01229A}";
 static const wchar_t* VCAM_SHM_DEFAULT = L"Local\\VirtualCaptureVcamFrame";
 static const LONG VCAM_W = 640, VCAM_H = 640;
 static const GUID VCAM_AMPROPSETID_Pin =
-  {0x9b00f101, 0x1567, 0x11d1, {0xb3, 0xf1, 0x00, 0xa0, 0x24, 0xcb, 0xed, 0x26}};
+  // AMPROPSETID_Pin per SDK shared/uuids.h. The tail was previously mistyped
+  // (00a024cbed26), so every client's pin-category query failed and ffmpeg/OBS
+  // classified the device as "(none)" / "Could not find output pin".
+  {0x9b00f101, 0x1567, 0x11d1, {0xb3, 0xf1, 0x00, 0xaa, 0x00, 0x37, 0x61, 0xc5}};
 static const GUID VCAM_PIN_CATEGORY_CAPTURE =
   {0xfb6c4281, 0x0353, 0x11d1, {0x90, 0x5f, 0x00, 0x00, 0xc0, 0xcc, 0x16, 0xba}};
 #define VCAM_AMPROPERTY_PIN_CATEGORY 0
@@ -229,7 +234,11 @@ class CVCamFilter : public IBaseFilter, public IAMFilterMiscFlags {
   CVCamPin* m_pPin = nullptr;
   HANDLE m_hShmMap = nullptr;     // receiver frame mapping
   uint8_t* m_shmView = nullptr;
-  uint8_t* m_shmStage = nullptr;  // VC_FRAME_BYTES staging (torn-read safe copy)
+  HANDLE m_hEvt[2] = { nullptr, nullptr };  // shm v2 publish events (<name>.evt0/1)
+  HANDLE m_hVstatMap = nullptr;   // vcam -> receiver latency feedback ring (<name>.vcam)
+  uint8_t* m_vstat = nullptr;
+  REFERENCE_TIME m_tStart = 0;    // Run(tStart): stream time base for sample timestamps
+  void VstatPush(uint32_t fid, uint64_t pub, uint64_t del, uint32_t flags);
   uint8_t* m_lastGoodFrame = nullptr; // D12: last successfully read frame (repeat-on-stall)
   bool m_hasLastGood = false;     // D12: true after first clean shm read in this session
   bool m_motionEnable = false;    // D12: explicit bring-up flag; false = stall when no receiver
@@ -510,36 +519,59 @@ CVCamFilter::CVCamFilter() {
   InitializeCriticalSection(&m_cs);
   InterlockedIncrement(&g_objs);
   m_pPin = new (std::nothrow) CVCamPin(this);
-  m_shmStage = new (std::nothrow) uint8_t[VCAM_FRAME_BYTES];
   m_lastGoodFrame = new (std::nothrow) uint8_t[VCAM_FRAME_BYTES];  // D12
 }
 void CVCamFilter::ShmEnsureOpen() {
-  // called with m_cs held; throttled by design (early-out once mapped)
+  // called with m_cs held; early-out once mapped and valid
   if (m_shmView) return;
-  if (!m_hShmMap) {
-    std::wstring name = VCAM_SHM_DEFAULT;
-    HKEY k = nullptr;
-    if (RegOpenKeyEx(HKEY_CURRENT_USER, VCAM_CLSID_KEY, 0, KEY_READ, &k) == ERROR_SUCCESS) {
-      wchar_t v[260]; DWORD cb = sizeof(v), tp = 0;
-      if (RegQueryValueEx(k, L"FrameMap", nullptr, &tp, (BYTE*)v, &cb) == ERROR_SUCCESS && tp == REG_SZ)
-        name = v;
-      RegCloseKey(k);
-    }
-    m_hShmMap = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
-    if (!m_hShmMap) return;  // receiver not publishing (yet): motion fallback
+  std::wstring name = VCAM_SHM_DEFAULT;
+  HKEY k = nullptr;
+  if (RegOpenKeyEx(HKEY_CURRENT_USER, VCAM_CLSID_KEY, 0, KEY_READ, &k) == ERROR_SUCCESS) {
+    wchar_t v[260]; DWORD cb = sizeof(v), tp = 0;
+    if (RegQueryValueEx(k, L"FrameMap", nullptr, &tp, (BYTE*)v, &cb) == ERROR_SUCCESS && tp == REG_SZ)
+      name = v;
+    // D12 explicit bring-up switch: REG_DWORD Motion=1 -> motion frames when no receiver feed
+    DWORD mv = 0; cb = sizeof(mv);
+    if (RegQueryValueEx(k, L"Motion", nullptr, &tp, (BYTE*)&mv, &cb) == ERROR_SUCCESS && tp == REG_DWORD)
+      m_motionEnable = (mv != 0);
+    RegCloseKey(k);
   }
+  if (!m_hShmMap) {
+    m_hShmMap = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
+    if (!m_hShmMap) return;  // receiver not publishing (yet)
+  }
+  // a v1 (single-slot, smaller) mapping fails here -> treated as "no feed", retried next tick
   m_shmView = (uint8_t*)MapViewOfFile(m_hShmMap, FILE_MAP_READ, 0, 0, VC_SHM_SIZE);
-  if (!m_shmView) { CloseHandle(m_hShmMap); m_hShmMap = nullptr; }
+  vc_shm_hdr_t* h = (vc_shm_hdr_t*)m_shmView;
+  if (!m_shmView || h->magic != VC_SHM_MAGIC || h->version != VC_SHM_VERSION ||
+      h->slots != VC_SHM_SLOTS || h->frame_bytes != (uint32_t)VC_FRAME_BYTES || h->data_off != VC_SHM_DATA_OFF) {
+    ShmClose(); return;
+  }
+  for (int i = 0; i < 2; i++) {
+    std::wstring en = name + (i ? L".evt1" : L".evt0");
+    m_hEvt[i] = OpenEventW(SYNCHRONIZE, FALSE, en.c_str());
+  }
+  if (!m_vstat) {
+    std::wstring vn = name + L".vcam";
+    m_hVstatMap = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, (DWORD)VC_VSTAT_SIZE, vn.c_str());
+    if (m_hVstatMap) m_vstat = (uint8_t*)MapViewOfFile(m_hVstatMap, FILE_MAP_WRITE, 0, 0, VC_VSTAT_SIZE);
+    if (m_vstat) {
+      vc_vstat_hdr_t* vh = (vc_vstat_hdr_t*)m_vstat;
+      if (vh->magic != VC_VSTAT_MAGIC) { vh->cap = VC_VSTAT_CAP; MemoryBarrier(); vh->magic = VC_VSTAT_MAGIC; }
+    } else if (m_hVstatMap) { CloseHandle(m_hVstatMap); m_hVstatMap = nullptr; }
+  }
 }
 void CVCamFilter::ShmClose() {
-  // called from Deactivate (worker joined) or dtor: no lock needed
+  // called with the worker joined, from the worker (m_cs held), or dtor
   if (m_shmView) { UnmapViewOfFile(m_shmView); m_shmView = nullptr; }
   if (m_hShmMap) { CloseHandle(m_hShmMap); m_hShmMap = nullptr; }
+  for (auto& e : m_hEvt) if (e) { CloseHandle(e); e = nullptr; }
+  if (m_vstat) { UnmapViewOfFile(m_vstat); m_vstat = nullptr; }
+  if (m_hVstatMap) { CloseHandle(m_hVstatMap); m_hVstatMap = nullptr; }
 }
 CVCamFilter::~CVCamFilter() {
   Deactivate();
   ShmClose();
-  if (m_shmStage) { delete[] m_shmStage; m_shmStage = nullptr; }
   if (m_lastGoodFrame) { delete[] m_lastGoodFrame; m_lastGoodFrame = nullptr; }  // D12
   if (m_pPin) m_pPin->Release();
   if (m_pClock) m_pClock->Release();
@@ -605,115 +637,161 @@ STDMETHODIMP CVCamFilter::Pause() {
   if (FAILED(hr)) return hr;
   Lock(); m_state = State_Paused; Unlock(); return S_OK;
 }
-STDMETHODIMP CVCamFilter::Run(REFERENCE_TIME) {
+STDMETHODIMP CVCamFilter::Run(REFERENCE_TIME tStart) {
   HRESULT hr = Activate();
   if (FAILED(hr)) return hr;
-  Lock(); m_state = State_Running; Unlock(); return S_OK;
+  Lock(); m_tStart = tStart; m_state = State_Running; Unlock(); return S_OK;
 }
-// 240Hz frame cadence (QPC): coarse Sleep + spin tail, stop-responsive, no catch-up burst.
+// 240Hz pacing only for the no-feed path; with a receiver feed the worker is event-driven.
 static uint64_t VCamQpcFreq() {
   LARGE_INTEGER f; QueryPerformanceFrequency(&f); return (uint64_t)f.QuadPart;
 }
 static uint64_t VCamQpcNs(uint64_t freq) {
   LARGE_INTEGER c; QueryPerformanceCounter(&c);
-  return (uint64_t)c.QuadPart * 1000000000ull / freq;
+  return vc_qpc_to_ns((uint64_t)c.QuadPart, freq);  // same clock/conversion as receiver qpc_pub_ns
+}
+// Stable latest publish -> (slot, seq) token. Read-only view: plain aligned loads only (D11).
+static bool VCamPeek(uint8_t* view, uint32_t& slot, LONG& seq) {
+  vc_shm_hdr_t* h = (vc_shm_hdr_t*)view;
+  if (h->magic != VC_SHM_MAGIC) return false;
+  LONG i = *(volatile LONG*)&h->latest_slot;
+  if (i < 0 || i >= (LONG)VC_SHM_SLOTS) return false;
+  LONG s = *(volatile LONG*)&vc_shm_slot(view, (uint32_t)i)->seq;
+  if (s & 1) return false;
+  slot = (uint32_t)i; seq = s; return true;
+}
+// Seqlock copy of one slot straight into dst; false = torn (writer reused the slot meanwhile).
+static bool VCamCopySlot(uint8_t* view, uint32_t slot, LONG seq, uint8_t* dst, uint32_t& fid, uint64_t& pub) {
+  vc_shm_slot_t* sl = vc_shm_slot(view, slot);
+  fid = *(volatile uint32_t*)&sl->frame_id; pub = *(volatile uint64_t*)&sl->qpc_pub_ns;
+  MemoryBarrier();
+  memcpy(dst, vc_shm_data(view, slot), VC_FRAME_BYTES);
+  MemoryBarrier();
+  return *(volatile LONG*)&sl->seq == seq;
+}
+void CVCamFilter::VstatPush(uint32_t fid, uint64_t pub, uint64_t del, uint32_t flags) {
+  if (!m_vstat) return;
+  vc_vstat_hdr_t* h = (vc_vstat_hdr_t*)m_vstat;
+  LONG k = InterlockedIncrement((volatile LONG*)&h->widx) - 1;
+  vc_vstat_entry_t* e = (vc_vstat_entry_t*)(m_vstat + sizeof(vc_vstat_hdr_t)) + ((uint32_t)k % VC_VSTAT_CAP);
+  e->n = 0; MemoryBarrier();
+  e->frame_id = fid; e->pub_ns = pub; e->deliver_ns = del; e->flags = flags;
+  MemoryBarrier(); e->n = (uint32_t)k + 1;
 }
 DWORD CVCamFilter::Worker() {
-  static uint8_t Y[VC_Y_BYTES], UV[VC_UV_BYTES];  // exact NV12 planes, never sizeof-guessed
+  static uint8_t Y[VC_Y_BYTES], UV[VC_UV_BYTES];  // motion bring-up planes
   uint32_t fid = 0;
-  LONGLONG t = 0;
+  LONGLONG tcount = 0, lastStart = -1;
   BOOL discont = TRUE;
   const uint64_t freq = VCamQpcFreq();
+  const uint64_t FRAME_NS = 4166666ULL, FIRST_REPEAT_NS = 6250000ULL;  // repeat only after 1.5 frames of silence
   timeBeginPeriod(1);
-  uint64_t next_ns = VCamQpcNs(freq);
+  // MMCSS on our own worker thread only (never touch the host process priority class)
+  typedef HANDLE (WINAPI *avset_fn)(LPCWSTR, LPDWORD);
+  typedef BOOL (WINAPI *avrev_fn)(HANDLE);
+  HMODULE av = LoadLibraryW(L"avrt.dll"); HANDLE mm = nullptr; DWORD task = 0;
+  if (av) { avset_fn f = (avset_fn)GetProcAddress(av, "AvSetMmThreadCharacteristicsW"); if (f) mm = f(L"Capture", &task); }
+  if (!mm) SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+  uint64_t next_ns = VCamQpcNs(freq);   // deadline for a repeat / motion / no-feed tick
+  uint64_t lastTok = ~0ULL;              // (slot<<32)|seq of the last delivered publish
+  uint32_t lastFid = 0; uint64_t lastPub = 0;
   for (;;) {
-    next_ns += 4166666ULL;  // 240Hz
-    bool stopReq = false;
-    for (;;) {
-      if (WaitForSingleObject(m_hStop, 0) == WAIT_OBJECT_0) { stopReq = true; break; }
-      uint64_t now = VCamQpcNs(freq);
-      if (now >= next_ns) break;
-      uint64_t rem_us = (next_ns - now) / 1000ULL;
-      if (rem_us > 2500) { if (WaitForSingleObject(m_hStop, 2) == WAIT_OBJECT_0) { stopReq = true; break; } }
-      else if (rem_us > 100) Sleep(1);
-      else SwitchToThread();  // spin tail
+    if (WaitForSingleObject(m_hStop, 0) == WAIT_OBJECT_0) break;
+    Lock(); ShmEnsureOpen(); uint8_t* view = m_shmView; HANDLE ev0 = m_hEvt[0], ev1 = m_hEvt[1]; Unlock();
+    uint32_t slot = 0; LONG seq = 0; bool fresh = false;
+    if (view) {
+      // event-driven: deliver a new publish immediately, else sleep until publish or repeat deadline
+      LONG ls = *(volatile LONG*)&((vc_shm_hdr_t*)view)->latest_seq;
+      fresh = VCamPeek(view, slot, seq) && ((((uint64_t)slot) << 32) | (uint32_t)seq) != lastTok;
+      if (!fresh) {
+        uint64_t now = VCamQpcNs(freq);
+        if (now < next_ns) {
+          DWORD ms = (DWORD)((next_ns - now + 999999ULL) / 1000000ULL);
+          HANDLE ev = (ls & 1) ? ev0 : ev1;    // evt[(ls+1)&1] = the NEXT publish
+          HANDLE hs[2] = { m_hStop, ev };
+          if (!ev && ms > 1) ms = 1;            // no events (should not happen): 1ms poll
+          DWORD w = WaitForMultipleObjects(ev ? 2 : 1, hs, FALSE, ms);
+          if (w == WAIT_OBJECT_0) break;
+          fresh = VCamPeek(view, slot, seq) && ((((uint64_t)slot) << 32) | (uint32_t)seq) != lastTok;
+          if (!fresh && VCamQpcNs(freq) < next_ns) continue;
+        }
+      }
+    } else {
+      // no receiver mapping: 240Hz cadence (D12 stall / last-good repeat / explicit motion)
+      bool stopReq = false;
+      for (;;) {
+        uint64_t now = VCamQpcNs(freq);
+        if (now >= next_ns) break;
+        uint64_t rem_us = (next_ns - now) / 1000ULL;
+        if (WaitForSingleObject(m_hStop, rem_us > 2500 ? 2 : (rem_us > 1100 ? 1 : 0)) == WAIT_OBJECT_0) { stopReq = true; break; }
+        if (rem_us <= 1100) SwitchToThread();
+      }
+      if (stopReq) break;
     }
-    if (stopReq) break;
-    if (VCamQpcNs(freq) > next_ns + 20000000ULL) next_ns = VCamQpcNs(freq);  // >20ms behind: resync
-    IMemInputPin* input = nullptr;
-    IMemAllocator* alloc = nullptr;
+    // D12 policy: fresh frame > repeat last good (freeze) > explicit motion > stall (no output)
+    if (!fresh && !m_hasLastGood && !m_motionEnable) {
+      tcount += VCAM_FRAME_100NS; discont = TRUE;
+      next_ns += FRAME_NS; { uint64_t n = VCamQpcNs(freq); if (n > next_ns + 20000000ULL) next_ns = n; }
+      continue;
+    }
+    IMemInputPin* input = nullptr; IMemAllocator* alloc = nullptr; IReferenceClock* clk = nullptr;
+    FILTER_STATE st = State_Stopped; REFERENCE_TIME t0 = 0;
     Lock();
     if (m_pPin && m_pPin->m_pInput) { input = m_pPin->m_pInput; input->AddRef(); }
     if (m_pPin && m_pPin->m_pAlloc) { alloc = m_pPin->m_pAlloc; alloc->AddRef(); }
+    if (m_pClock) { clk = m_pClock; clk->AddRef(); }
+    st = m_state; t0 = m_tStart;
     Unlock();
-    if (!input || !alloc) { if (input) input->Release(); if (alloc) alloc->Release(); break; }
+    if (!input || !alloc) { if (input) input->Release(); if (alloc) alloc->Release(); if (clk) clk->Release(); break; }
     IMediaSample* s = nullptr;
     HRESULT hr = alloc->GetBuffer(&s, nullptr, nullptr, 0);
     alloc->Release();
-    if (FAILED(hr) || !s) { input->Release(); break; }  // decommitted / stopping
-    // P4-3/D11/D12: shm latest frame first.
-    // D12 three-state policy:
-    //   clean read           → output frame, update last-good cache
-    //   stall/torn + has last-good → repeat last good frame (freeze, no fake bytes)
-    //   no mapping + no last-good + motionEnable=false → stall (no output this tick)
-    //   motionEnable=true (explicit bring-up) → generate motion pattern
-    bool filled = false;
-    bool haveView = false;
-    uint8_t* view = nullptr;
-    Lock();
-    ShmEnsureOpen();
-    view = m_shmView;
-    Unlock();
-    haveView = (view != nullptr);
-    if (view && m_shmStage) {
-      // NOTE: view is mapped READ-ONLY: never issue LOCK-prefixed RMW here
-      // (InterlockedOr writes back -> AV on read-only page). Aligned 32-bit
-      // plain reads are atomic on x86/x64; writer side keeps Interlocked ops.
-      vc_shm_hdr_t* sh = (vc_shm_hdr_t*)view;
-      volatile LONG* pseq = (volatile LONG*)&sh->seq;
-      LONG s1 = *pseq;
-      if (!(s1 & 1) && sh->magic == VC_SHM_MAGIC && sh->size == (uint32_t)VC_FRAME_BYTES) {
-        memcpy(m_shmStage, view + sizeof(vc_shm_hdr_t), VC_FRAME_BYTES);
-        LONG s2 = *pseq;
-        filled = (s1 == s2);
-      }
-    }
-    // D12: update last-good cache on a clean read
-    if (filled && m_lastGoodFrame) {
-      memcpy(m_lastGoodFrame, m_shmStage, VCAM_FRAME_BYTES);
-      m_hasLastGood = true;
-    }
-    if (!filled) {
-      if (m_hasLastGood && m_lastGoodFrame) {
-        // Torn read or mapping lost: repeat last good frame (freeze, not fake bytes)
-        memcpy(m_shmStage, m_lastGoodFrame, VCAM_FRAME_BYTES);
-        filled = true;
-        // no discont: repeated frame is a valid continuation, not a gap
-      } else if (m_motionEnable) {
-        vc_gen_motion(fid++, Y, UV);  // explicit bring-up mode: no receiver needed
-      } else {
-        // D12: no mapping, no last-good frame, motion disabled → stall (no output)
-        t += VCAM_FRAME_100NS;
-        discont = TRUE;
-        s->Release(); input->Release();
-        continue;
-      }
-    }
+    if (FAILED(hr) || !s) { input->Release(); if (clk) clk->Release(); break; }  // decommitted / stopping
     BYTE* buf = nullptr;
-    if (s->GetPointer(&buf) == S_OK && buf) {
-      if (filled) memcpy(buf, m_shmStage, VC_FRAME_BYTES);
-      else { memcpy(buf, Y, VC_Y_BYTES); memcpy(buf + VC_Y_BYTES, UV, VC_UV_BYTES); }
+    if (s->GetPointer(&buf) != S_OK) buf = nullptr;
+    uint32_t outFid = 0; uint64_t outPub = 0, flags = 0;
+    bool ok = false;
+    if (fresh && buf) {
+      ok = VCamCopySlot(view, slot, seq, buf, outFid, outPub);   // shm -> sample, single copy
+      if (ok) { lastTok = (((uint64_t)slot) << 32) | (uint32_t)seq; }
+    }
+    if (!ok && buf) {
+      if (m_hasLastGood && m_lastGoodFrame) {
+        memcpy(buf, m_lastGoodFrame, VCAM_FRAME_BYTES);           // freeze: repeat, not fake bytes
+        outFid = lastFid; outPub = lastPub; flags = VC_VSTAT_FLAG_REPEAT;
+      } else if (m_motionEnable) {
+        vc_gen_motion(fid++, Y, UV);
+        memcpy(buf, Y, VC_Y_BYTES); memcpy(buf + VC_Y_BYTES, UV, VC_UV_BYTES);
+        flags = VC_VSTAT_FLAG_REPEAT;  // not a receiver frame: excluded from vseg
+      }
     }
     s->SetActualDataLength(VCAM_FRAME_BYTES);
-    LONGLONG t1 = t + VCAM_FRAME_100NS;
-    s->SetTime(&t, &t1);
+    // timestamps on the graph clock (stream time = now - tStart); counter fallback when paused / no clock
+    REFERENCE_TIME ts = tcount;
+    if (clk && st == State_Running) { REFERENCE_TIME now = 0; if (SUCCEEDED(clk->GetTime(&now))) ts = now - t0; }
+    if (clk) clk->Release();
+    if (ts <= lastStart) ts = lastStart + 1;
+    REFERENCE_TIME te = ts + VCAM_FRAME_100NS;
+    s->SetTime(&ts, &te);
     s->SetSyncPoint(TRUE);
     if (discont) { s->SetDiscontinuity(TRUE); discont = FALSE; }
-    t = t1;
+    lastStart = ts; tcount = te;
+    uint64_t del = VCamQpcNs(freq);
     hr = input->Receive(s);
     s->Release(); input->Release();
+    VstatPush(outFid, outPub, del, (uint32_t)flags);
+    // off the latency path: refresh the freeze cache from the slot (seqlock-checked)
+    if (ok && m_lastGoodFrame) {
+      uint32_t f2 = 0; uint64_t p2 = 0;
+      if (VCamCopySlot(view, slot, seq, m_lastGoodFrame, f2, p2)) { m_hasLastGood = true; lastFid = f2; lastPub = p2; }
+    }
+    uint64_t n = VCamQpcNs(freq);
+    if (ok) next_ns = n + FIRST_REPEAT_NS;
+    else { next_ns += FRAME_NS; if (n > next_ns + 20000000ULL) next_ns = n; }  // no catch-up burst
     if (FAILED(hr)) break;
   }
+  if (mm && av) { avrev_fn r = (avrev_fn)GetProcAddress(av, "AvRevertMmThreadCharacteristics"); if (r) r(mm); }
+  if (av) FreeLibrary(av);
   timeEndPeriod(1);
   return 0;
 }
@@ -748,7 +826,7 @@ STDMETHODIMP CVCamPin::Connect(IPin* pPeer, const AM_MEDIA_TYPE* pmt) {
                           IID_IMemAllocator, (void**)&alloc);
   }
   if (SUCCEEDED(hr) && alloc) {
-    ALLOCATOR_PROPERTIES req = { 3, (long)VCAM_FRAME_BYTES, 1, 0 }, act = { 0 };
+    ALLOCATOR_PROPERTIES req = { 2, (long)VCAM_FRAME_BYTES, 1, 0 }  /* 2: bound downstream queueing to 1 frame */, act = { 0 };
     hr = alloc->SetProperties(&req, &act);
     if (SUCCEEDED(hr) && act.cbBuffer < VCAM_FRAME_BYTES) hr = VFW_E_SIZENOTSET;
     if (SUCCEEDED(hr)) hr = input->NotifyAllocator(alloc, FALSE);
@@ -838,15 +916,17 @@ STDAPI DllRegisterServer() {
   swprintf_s(instKey,  L"Software\\Classes\\CLSID\\%s\\Instance\\%s", CAT_VIDEO_INPUT, CLSID_STR);
   swprintf_s(srv,      L"%s\\InprocServer32", clsidKey);
 
-  static const BYTE kFilterData[88] = {
+  // REGFILTER2 v2 blob: 1 output pin, 1 media type (vids/NV12), category = PIN_CATEGORY_CAPTURE.
+  static const BYTE kFilterData[104] = {
     0x02,0x00,0x00,0x00,0x00,0x00,0x20,0x00,0x01,0x00,0x00,0x00,0x00,0x00,0x00,0x00,
     0x30,0x70,0x69,0x33,0x08,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x01,0x00,0x00,0x00,
-    0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x30,0x74,0x79,0x33,0x00,0x00,0x00,0x00,
+    0x00,0x00,0x00,0x00,0x58,0x00,0x00,0x00,0x30,0x74,0x79,0x33,0x00,0x00,0x00,0x00,
     0x38,0x00,0x00,0x00,0x48,0x00,0x00,0x00,0x76,0x69,0x64,0x73,0x00,0x00,0x10,0x00,
     0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71,0x4e,0x56,0x31,0x32,0x00,0x00,0x10,0x00,
     0x80,0x00,0x00,0xaa,0x00,0x38,0x9b,0x71,
+    0x81,0x42,0x6c,0xfb,0x53,0x03,0xd1,0x11,0x90,0x5f,0x00,0x00,0xc0,0xcc,0x16,0xba,
   };
-  static_assert(sizeof(kFilterData)==88,"FilterData");
+  static_assert(sizeof(kFilterData)==104,"FilterData");
   DWORD merit = 0x00200000;
 
   // Helper: write to one hive (HKCU always; HKLM if we have write access)
