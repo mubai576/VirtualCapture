@@ -28,9 +28,11 @@ early docs with dated SUPERSEDED notes). This skill holds the domain knowledge +
 |---|---|
 | `proto/vc_wire.h` | **Wire header — frozen.** `vc_pkt_hdr_t` 28 B. `reserved` is now `pattern`. Do not resize without bumping protocol + updating both ends + this skill. |
 | `sender/pattern.h` | Test-source suite (5 patterns, integer-only, seed=`frame_id`). C++/Python bit-exact by construction (no float/sin). Mirror: `ctrl/pattern_ref.py`. |
+| `common/crc32.h`, `common/fnv1a.h` | Shared transport checksums; sender and receiver link the `vc-common` header-only target. Algorithms and vectors are unchanged. |
 | `references/wire-protocol.md` | L2 layout, MTU/pacing math, `--batch` sendqueue semantics. |
 | `references/agent-api.md` | Agent REST contract (/adapters, /files paging, /update stage + /activate). |
 | `references/test-matrix.md` | T0–T5 definitions, D1 gates, triage. |
+| `references/packaging.md` | One-command portable package, contents, output replacement and verification. |
 
 ## Topology (shared-NIC since 2026-10-21: data + control on the same 2.5G port; see docs/history/plan-history.md S11)
 
@@ -87,5 +89,6 @@ Full matrix + thresholds: `references/test-matrix.md`.
 - `references/agent-api.md` — control-agent REST contract (frozen endpoints).
 - `references/wire-protocol.md` — L2 frame layout, header fields, MTU/pacing math.
 - `references/test-matrix.md` — T0–T5 definitions, pass thresholds, failure triage.
+- `references/packaging.md` — build/package entry point and portable directory layout.
 
 

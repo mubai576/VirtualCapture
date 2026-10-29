@@ -1,7 +1,7 @@
 #pragma once
 // vcam_shm.h -- receiver -> vcam frame handoff, layout v2 (2026-10-28, latency work).
 // Canonical layout; every reader/writer includes or mirrors this file (NOT proto/: proto/ is owner-frozen).
-// Mirrors: monitor/monitor.cpp, scripts/p4_4_shm_verify.py, scripts/p4_4_vcam_verify.py.
+// Mirrors: tools/monitor/monitor.cpp, scripts/p4_4_shm_verify.py, scripts/p4_4_vcam_verify.py.
 //
 // v2 = multi-slot ring + in-place reassembly + event wake (replaces v1 single-slot copy + polling).
 //   [0,64)                      vc_shm_hdr_t

@@ -15,7 +15,7 @@
 | P4-1 GPU 采集 | ✅ gpu_dispatch_ms=0.028ms（D3D11 timestamp，235fps 实测）；gpu_convert 代码落地，默认 CPU 路径待 owner 切换 |
 | P4-2 延迟测量 | ✅ 分段计时落地（pc1_seg + rseg）；双机实测门限候选 <10ms；确认包（flags bit1）待 owner 终审 |
 | P4-3 虚拟采集卡 | ✅ vcam DShow filter 落地，本机回环 4455 帧逐字节零错，240.0fps，D12 无信号行为实现；PC2 接线验收待 P4-4 |
-| P4-4 虚拟卡验收 | ✅ DONE 2026-10-23：三判据全通（J1 枚举/J2 NV12 640x640@240/J3 35069帧零错+SHM hash 27/27一致）；vcam_verify/ + scripts/p4_4_shm_verify.py；docs/bringup/bringup-20261023-p4-4-vcam-acceptance.md |
+| P4-4 虚拟卡验收 | ✅ DONE 2026-10-23：三判据全通（J1 枚举/J2 NV12 640x640@240/J3 35069帧零错+SHM hash 27/27一致）；tools/vcam_verify/ + scripts/p4_4_shm_verify.py；docs/bringup/bringup-20261023-p4-4-vcam-acceptance.md |
 | 产品链路 P4 | ✅ P4-1/2/3/4 全部完成 |
 | 网卡调优 | ✅ PC2 I226-V: FlowControl=0, ITR=0（D14，docs/runbooks/pc2-nic-tuning.md）；PC1 Realtek 已同等设置 |
 | 版本 | 本机/PC1 0.4.1（scripts/PS1/sender 已更新）；PC2 主 agent 0.4.0（D9 待手动重启） |
@@ -31,7 +31,8 @@ PC2=192.168.2.59（agent 手动跑在 PC2 的 Documents\VirtualCapture，exe 在
   `total = ceil(614400/payload)`。proto/ 归 owner 锁定。
 
 ### 1.2 构建
-- 根 `CMakeLists.txt` 编排 `sender/` `receiver/`，MSVC 优先；产物 `build/vc-sender.exe` `build/vc-receiver.exe`。
+- 根 `CMakeLists.txt` 编排 `common/`、`sender/`、`receiver/`、`vcam/` 与 `tools/`，MSVC 优先；统一规则在 `cmake/`。默认 `-B build` 下发收端入口仍为 `build/vc-sender.exe`、`build/vc-receiver.exe`；各目标路径见 `docs/runbooks/build.md`。
+- 一键便携包：`python scripts/package.py [--allow-dirty] [--output <目录>]`；默认 `dist/VirtualCapture/`，包含 7 个原生目标、冻结 agent（含 GUI）、MSVC 运行库、脚本和文档。生成文件 SHA-256 与源码来源清单；成功才替换，旧成品整目录归档。契约见 skill `references/packaging.md`。
 
 ### 1.3 CLI（动词级冻结；dda/batch 为已落地的追加，本次正式纳入）
 ```text
@@ -54,6 +55,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 - sender stats 新增 `gpu_dispatch_ms`（D3D11 timestamp 包住 CopyResource 的真 GPU 时间均值）+ `gpu_dispatch_samples`（有效样本数）；`gpu_ms` 仍为 capture() wall-clock，待 P4-1 实测分布后按 D10 决定是否切换口径。
 - sender stats 新增 `gpu_convert`（0/1，采集走 CPU 还是 GPU compute shader；GPU 失败显式报错，不静默回退）。
 - P4-2步骤1（免协议改动）：receiver stats 新增 `rseg_avg_ms/rseg_p50_ms/rseg_p99_ms/rseg_max_ms`（R(N)=首包到达→重组完成，同机QPC）；sender stats 新增 `pc1_seg_avg_ms/pc1_seg_p99_ms/pc1_seg_max_ms`（PC1段=采集/生成完成→末包发出，同机QPC）；确认包（flags bit1）仍待 owner 终审后做步骤2。
+- P5 GUI（D16）：agent 新增 `/ui`、`/config`（ROOT/vc-config.json）、`/vcam/status|register`、`/product/{start,stop,status}`、`/product/local/{start,stop}`；`/sender/start` 可选 `gpu_convert`。详见 agent-api.md。
 - 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 614400B。
 
 ### 1.5 全局禁止
@@ -63,7 +65,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 注：UNORM 解码允许 float（B8G8R8A8_UNORM→float→floor(v*255+0.5) 属格式转换，非像素生成；结果必须和 CPU 参考逐字节一致，dda_gpu 自测已证）；不许拿它当先例去别处用 float。
 
 ### 1.6 目录
-以 `AGENTS.md` Repo map 为准；产物与运行数据全部 gitignore；任务只碰自己的目录。
+以 `AGENTS.md` Repo map 为准；产物与运行数据全部 gitignore；任务只碰自己的目录。共享 CRC32/FNV 统一在 `common/`，原生辅助工具源码归 `tools/`；`proto/vc_wire.h`、`sender/pattern.h`、`vcam/vcam_shm.h` 的契约位置保留。
 
 ## 2. 决策记录与待决事项
 
@@ -83,6 +85,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 | D10 | P4-1 测量口径与 idle 语义 | ✅批（2026-10-24）：`gpu_ms` 切真 GPU 时间待 PC1 2K240 实测分布后再定，`gpu_dispatch_ms` 先作诊断；dda selftest 连续 5x E_TIMEOUT（2.5s 无新帧）判 SKIP（idle 与故障不可分，live 已容忍超时） | P4-1 |
 | D14 | PC2 网卡调优（I226-V） | ✅执行（2026-10-23，AI 操作，owner 可回滚）：FlowControl=0、ITR=0、EEE=0、InterruptModeration=0；实测 rseg_max 1015ms→35ms（-97%），rseg_p99 8.3ms→6.7ms（-19%），全程 p99 12ms→9.8ms；步骤见 docs/runbooks/pc2-nic-tuning.md；回滚命令见同文件 | P4-2 |
 | D15 | 端到端延迟优化 1+2 组（含 shm v2 IPC 变更） | ✅批（2026-10-28，owner"1 2 一起优化"）：见 §1.4 shm v2 条；本机回环 motion/240/batch1 实测 pc1_seg 1.03→0.37ms、rseg 2.34→0.39ms、vcam 出口 vseg avg 0.03ms（旧轮询理论 +2.1ms）；双机（PC2 发→PC1 收+vcam，motion/240/batch69）rseg p99 6.70→2.05ms、max 35→2.26ms，vseg p99 0.08ms，7200 帧对账零错；证据 docs/bringup/bringup-20261028-latency-opt.md。PC2 已推 0.4.2（发版号 AI 暂定，owner 可改）；v1/v2 不互通，下游须重开 | ✅已部署 |
+| D16 | P5 GUI 整合方案 | ✅批 A（2026-10-29，owner）：agent 内置 Web UI；首批 G0 统一配置 + G1 仪表 + G2 一键开播已落地（agent/vc-agent.py、ctrl/tests/test_gui.py，操作见 docs/runbooks/gui.md）。未定：WebView2 外壳、访问控制，按默认（两台都可开控制台、无鉴权）先行 | P5 G3/G4 |
 | D9 | 本机主 agent 换代到 0.4.0 | ⏳待执行：agent 改动已由另一会话提交（d15287d），阻塞解除。注意 2026-10-23 00:10 对该进程 stage 成功但 /activate 无应答且未换代（pid 不变），建议直接手动重启本机 agent（本机，可逆），换代后 /health 应出新 pid | — |
 
 ## 3. 任务卡
@@ -107,6 +110,14 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 - PC2：role 标签仍为 sender（仅显示）；计划任务/watchdog 是否覆盖 Documents 部署未核实。
 - 直连线：owner 决定短期不考虑；线到后补 广播 vs 单播 T2。
 
+### S1 项目结构整理 — DONE（2026-10-29）
+
+`common/` 合并重复校验头、`tools/` 收纳原生辅助工具、`cmake/` 统一规则；verify ALL PASS（28 passed / 3 skipped）+ 独立目录干净构建通过。证据：`docs/proposals/project-structure-20261029.md`。
+
+### S2 一键编译打包 — DONE（2026-10-29）
+
+`python scripts/package.py --allow-dirty` 实际生成 `dist/VirtualCapture/`（含当前 GUI）；verify ALL PASS（42 passed / 3 skipped）+ 成品隔离冒烟/PowerShell 5.1 检查/79 项载荷哈希通过。证据：`docs/proposals/packaging-20261029.md`。
+
 ### P4 产品链路（按 docs/spec/requirements.md；提案与批示见 docs/proposals/）
 
 ```text
@@ -123,10 +134,10 @@ P4-3 PC2 虚拟采集卡：DONE（代码+本机验证）
      D12 无信号默认行为实现（7e7ce80）：无映射→stall，撕裂+有历史帧→repeat-last，正常→输出。
      OTA 白名单已放行 vc-vcam.dll；验收手册：docs/runbooks/pc2-vcam-acceptance.md。
 P4-4 虚拟卡出口验收（不含推理）：DONE 2026-10-23
-     J1 PASS：vc-vcam-verify.exe（vcam_verify/ C++）ICreateDevEnum 枚举到 VirtualCapture 640x640 NV12（2026-10-25 改名为 `VirtualCapture`，见 docs/runbooks/vcam.md）。
+     J1 PASS：vc-vcam-verify.exe（tools/vcam_verify/ C++）ICreateDevEnum 枚举到 VirtualCapture 640x640 NV12（2026-10-25 改名为 `VirtualCapture`，见 docs/runbooks/vcam.md）。
      J2 PASS：IAMStreamConfig GetFormat = NV12 640x640 AvgTimePerFrame=41666 (240.0fps)。
      J3 PASS：35069帧 shm_published==complete, dropped=0, hash_mismatch=0；SHM FNV-1a64 采样 27/27 与 receiver hashlog 一致。
-     验收工具：vcam_verify/vc-vcam-verify.exe + scripts/p4_4_shm_verify.py。
+     验收工具：build/vcam_verify/Release/vc-vcam-verify.exe + scripts/p4_4_shm_verify.py。
      证据：docs/bringup/bringup-20261023-p4-4-vcam-acceptance.md。
 范围外：推理端及其联调（D8）、独占全屏 Hook、分辨率超 2.5G 链路后的编解码方案（另立项，hist S24）。
 owner 待决：①全程延迟门限 <10ms；②gpu_convert 默认开；③确认包是否实现；④T5 门限数字。

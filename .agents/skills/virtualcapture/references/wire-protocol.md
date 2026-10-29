@@ -1,6 +1,7 @@
 # Wire protocol（L2 数据面）
 
 真相源：`proto/vc_wire.h`，本文件是解读版，改协议先改头文件再同步这里。
+校验实现统一在 `common/crc32.h`（包载荷）与 `common/fnv1a.h`（整帧）；发收端共用，算法、向量与包头不变。
 
 ## 一帧的账
 

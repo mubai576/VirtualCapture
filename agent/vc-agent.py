@@ -125,6 +125,7 @@ def launch(kind, args):
                "--session", sid, "--stats", stats, "--hashlog", hashlog]
         if args.get("file"): cmd += ["--file", str(args["file"])]
         if args.get("loop"): cmd += ["--loop"]
+        if args.get("gpu_convert") is True: cmd += ["--gpu-convert"]  # P5：产品模式 dda 默认走 GPU
         _b = args.get("batch", 69)
         try: _b = int(_b)
         except Exception: _b = 69
@@ -788,6 +789,340 @@ def _respond_activate(handler, code, res):
             _ef.close()
         except Exception:
             pass
+# ===================== P5 GUI（D16 方案 A）=====================
+# 统一配置 vc-config.json + 产品模式一键开播/停播 + vcam 注册 + 内置 Web UI（/ui）。
+# 只复用本 agent 已有能力（launch/kill_slot/slot_stats）与对端 agent 的固定端点；无通用反代、不新增数据面逻辑。
+import re as _re, urllib.request as _ureq, urllib.error as _uerr
+CONFIG_NAME = "vc-config.json"
+CONFIG_DEFAULT = {
+    "role": "",          # capture | receive | ""（未设）
+    "peer_url": "",      # 对端 agent，例 http://192.168.2.100:18080
+    "adapter": "",       # 本机 2.5G 网卡子串（--adapter）
+    "capture": {"mode": "dda", "pattern": "motion", "gpu_convert": True, "fps": 240, "batch": 69,
+                "mtu": 9000, "dst_mac": "ff:ff:ff:ff:ff:ff"},
+    "receive": {"shm": "Local\\VirtualCaptureVcamFrame", "mtu": 9000, "vcam_autoregister": True},
+}
+CONFIG_LOCK = threading.Lock()
+VCAM_CLSID = "{B84C7E21-4A5F-4E2B-9C11-5A3D7F01229A}"
+
+def _config_path():
+    return os.path.join(ROOT, CONFIG_NAME)
+
+def _merge(base, over):
+    # 只接受已知键（未知键丢弃），子对象逐键合并
+    out = json.loads(json.dumps(base))
+    for k, v in (over or {}).items():
+        if k not in out: continue
+        if isinstance(out[k], dict):
+            if isinstance(v, dict): out[k].update({kk: vv for kk, vv in v.items() if kk in out[k]})
+        else:
+            out[k] = v
+    return out
+
+def load_config():
+    try:
+        with open(_config_path(), "r", encoding="utf-8") as f: d = json.load(f)
+        if isinstance(d, dict): return _merge(CONFIG_DEFAULT, d)
+    except Exception: pass
+    return _merge(CONFIG_DEFAULT, {})
+
+def _is_int(v, lo, hi):
+    return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+
+def validate_config(c):
+    """返回错误列表（空=合法）。配置会拼进子进程参数，白名单式校验。"""
+    e = []
+    cp, rv = c["capture"], c["receive"]
+    if c["role"] not in ("", "capture", "receive"): e.append("role must be capture|receive|''")
+    if not isinstance(c["peer_url"], str) or (c["peer_url"] and not _re.fullmatch(r"http://[A-Za-z0-9.\-]{1,64}:\d{1,5}", c["peer_url"])):
+        e.append("peer_url must be http://host:port")
+    if not isinstance(c["adapter"], str) or not _re.fullmatch(r"[A-Za-z0-9 _.()\-]{0,64}", c["adapter"]):
+        e.append("adapter: up to 64 chars of [A-Za-z0-9 _.()-]")
+    if cp.get("mode") not in ("dda", "pattern"): e.append("capture.mode must be dda|pattern")
+    if cp.get("pattern") not in ("counter", "checker", "rings", "noise", "motion"): e.append("capture.pattern invalid")
+    if not _is_int(cp.get("fps"), 1, 1000): e.append("capture.fps 1..1000")
+    if not _is_int(cp.get("batch"), 1, 1000): e.append("capture.batch 1..1000")
+    if not _is_int(cp.get("mtu"), 1500, 9000): e.append("capture.mtu 1500..9000")
+    if not _is_int(rv.get("mtu"), 1500, 9000): e.append("receive.mtu 1500..9000")
+    if not isinstance(cp.get("gpu_convert"), bool): e.append("capture.gpu_convert must be bool")
+    if not isinstance(cp.get("dst_mac"), str) or not _re.fullmatch(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", cp["dst_mac"]):
+        e.append("capture.dst_mac must be aa:bb:cc:dd:ee:ff")
+    if not isinstance(rv.get("shm"), str) or not _re.fullmatch(r"(Local|Global)\\[A-Za-z0-9_.\-]{1,64}", rv["shm"]):
+        e.append("receive.shm must be Local\\<name>")
+    if not isinstance(rv.get("vcam_autoregister"), bool): e.append("receive.vcam_autoregister must be bool")
+    return e
+
+def save_config(patch):
+    with CONFIG_LOCK:
+        c = _merge(load_config(), patch if isinstance(patch, dict) else {})
+        err = validate_config(c)
+        if err: return 400, {"error": "invalid config", "details": err}
+        tmp = _config_path() + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f: json.dump(c, f, indent=2, ensure_ascii=False)
+        os.replace(tmp, _config_path())
+        return 200, {"saved": True, "config": c}
+
+# ---- vcam 注册（HKCU，与运行 DShow 客户端的用户相同） ----
+def _vcam_dll():
+    for p in (os.path.join(BUILD_DIR, "vc-vcam.dll"), os.path.join(BUILD_DIR, "Release", "vc-vcam.dll"),
+              os.path.join(ROOT, "vc-vcam.dll")):
+        if os.path.isfile(p): return p
+    return ""
+
+def vcam_status():
+    dll, reg = _vcam_dll(), ""
+    if os.name == "nt":
+        try:
+            import winreg as _wr
+            with _wr.OpenKey(_wr.HKEY_CURRENT_USER, r"Software\Classes\CLSID\%s\InprocServer32" % VCAM_CLSID) as k:
+                reg = _wr.QueryValueEx(k, "")[0]
+        except Exception:
+            reg = ""
+    match = bool(dll and reg and os.path.normcase(os.path.abspath(reg)) == os.path.normcase(os.path.abspath(dll)))
+    return {"dll": dll, "registered": reg, "match": match}
+
+def vcam_register():
+    dll = _vcam_dll()
+    if not dll: return 404, {"error": "vc-vcam.dll not found under ROOT/build"}
+    if os.name != "nt": return 400, {"error": "windows only"}
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "regsvr32.exe")
+    r = subprocess.run([exe, "/s", dll], timeout=30)
+    st = vcam_status(); st["exit_code"] = r.returncode
+    return (200 if r.returncode == 0 and st["match"] else 500), st
+
+# ---- 对端调用（只用固定路径，不做通用反代） ----
+def peer_call(path, body=None, timeout=3.0, url=None):
+    url = url if url is not None else load_config()["peer_url"]
+    if not url: return 0, {"error": "peer_url not configured"}
+    data = None if body is None else json.dumps(body).encode()
+    req = _ureq.Request(url + path, data=data, method="GET" if body is None else "POST",
+                        headers={"Content-Type": "application/json"})
+    try:
+        with _ureq.urlopen(req, timeout=timeout) as r:
+            return r.status, json.loads(r.read() or b"{}")
+    except _uerr.HTTPError as he:
+        try: return he.code, json.loads(he.read() or b"{}")
+        except Exception: return he.code, {"error": "peer http %d" % he.code}
+    except Exception as ex:
+        return 0, {"error": "peer unreachable: %s" % ex}
+
+def _stop_kind(kind):
+    # 同 /sender|receiver/stop：停进程并把 stats 标 running=false
+    kill_slot(state[kind])
+    try:
+        p = state[kind].get("stats", "")
+        if p and os.path.exists(p):
+            with open(p, "r", encoding="utf-8") as f: d = json.load(f)
+            if isinstance(d, dict):
+                d["running"] = False
+                with open(p + ".tmp", "w", encoding="utf-8") as f: json.dump(d, f)
+                os.replace(p + ".tmp", p)
+    except Exception: pass
+
+# ---- 产品模式：本机一侧 ----
+def product_local_start():
+    c = load_config(); role = c["role"]
+    if role not in ("capture", "receive"): return 409, {"error": "local role not set (config.role)"}
+    if not c["adapter"]: return 409, {"error": "local adapter not set (config.adapter)"}
+    if role == "receive":
+        rv = c["receive"]; out = {"role": role}
+        if rv["vcam_autoregister"] and not vcam_status()["match"]:
+            vc, out["vcam"] = vcam_register()
+            if vc != 200: return 500, dict(out, error="vcam register failed")
+        else:
+            out["vcam"] = vcam_status()
+        sid, info = launch("receiver", {"adapter": c["adapter"], "mtu": rv["mtu"], "shm": rv["shm"], "timeout_s": 0})
+        out.update(session_id=sid, args=info)
+        return 200, out
+    cp = c["capture"]
+    sid, info = launch("sender", {"adapter": c["adapter"], "mode": cp["mode"], "pattern": cp["pattern"],
+                                  "fps": cp["fps"], "frames": 0, "mtu": cp["mtu"], "batch": cp["batch"],
+                                  "dst_mac": cp["dst_mac"], "gpu_convert": cp["gpu_convert"]})
+    return 200, {"role": role, "session_id": sid, "args": info}
+
+def product_local_stop():
+    role = load_config()["role"]
+    kinds = {"capture": ("sender",), "receive": ("receiver",)}.get(role, ("sender", "receiver"))
+    out = {}
+    for k in kinds:
+        out[k] = state[k].get("session_id"); _stop_kind(k)
+    return 200, {"role": role, "stopped": out}
+
+# ---- 产品模式：编排（任一台都可发起） ----
+def _side_call(side, local_role, op):
+    if side == local_role:
+        return product_local_start() if op == "start" else product_local_stop()
+    return peer_call("/product/local/" + op, {}, timeout=45)
+
+def product_start():
+    c = load_config(); me = c["role"]
+    if me not in ("capture", "receive"): return 409, {"ok": False, "error": "local role not set (config.role)"}
+    pc, pcfg = peer_call("/config")
+    if pc != 200: return 502, {"ok": False, "error": "peer config: %s" % pcfg.get("error", pc)}
+    want = "receive" if me == "capture" else "capture"
+    if pcfg.get("role") != want:
+        return 409, {"ok": False, "error": "peer role is %r, need %r" % (pcfg.get("role"), want)}
+    steps = []
+    code, r = _side_call("receive", me, "start"); steps.append({"side": "receive", "code": code, "result": r})
+    if code != 200: return 502, {"ok": False, "steps": steps}
+    time.sleep(0.5)  # 收端先就绪，避免首帧丢
+    code, r = _side_call("capture", me, "start"); steps.append({"side": "capture", "code": code, "result": r})
+    if code != 200:
+        sc, sr = _side_call("receive", me, "stop"); steps.append({"side": "receive", "code": sc, "result": sr, "rollback": True})
+        return 502, {"ok": False, "steps": steps}
+    return 200, {"ok": True, "steps": steps}
+
+def product_stop():
+    me = load_config()["role"]
+    if me not in ("capture", "receive"): return 409, {"ok": False, "error": "local role not set (config.role)"}
+    steps = []
+    for side in ("capture", "receive"):  # 先停发端
+        code, r = _side_call(side, me, "stop"); steps.append({"side": side, "code": code, "result": r})
+    return 200, {"ok": all(s["code"] == 200 for s in steps), "steps": steps}
+
+def _local_summary():
+    c = load_config()
+    return {"online": True, "config": c, "version": read_version(),
+            "sender": slot_stats("sender"), "receiver": slot_stats("receiver"),
+            "vcam": vcam_status() if c["role"] == "receive" else None}
+
+def product_status():
+    out = {"ts": time.time(), "local": _local_summary(), "peer": None}
+    url = out["local"]["config"]["peer_url"]
+    if url:
+        code, h = peer_call("/health", timeout=1.0, url=url)
+        if code != 200:
+            out["peer"] = {"online": False, "url": url, "error": h.get("error", code)}
+        else:
+            p = {"online": True, "url": url, "version": h.get("version")}
+            for k, path in (("config", "/config"), ("sender", "/sender/stats"), ("receiver", "/receiver/stats"), ("vcam", "/vcam/status")):
+                cc, d = peer_call(path, timeout=1.5, url=url)
+                p[k] = d if cc == 200 else None
+            out["peer"] = p
+    return out
+
+def _p5_get(h):
+    p = h.path.split("?")[0]
+    if p in ("/", "/ui", "/ui/"):
+        b = UI_HTML.encode("utf-8")
+        h.send_response(200); h.send_header("Content-Type", "text/html; charset=utf-8")
+        h.send_header("Cache-Control", "no-store"); h.send_header("Content-Length", str(len(b)))
+        h.end_headers(); h.wfile.write(b); return True
+    if p == "/config": h._j(load_config()); return True
+    if p == "/vcam/status": h._j(vcam_status()); return True
+    if p == "/product/status": h._j(product_status()); return True
+    return False
+
+def _p5_post(h, args):
+    routes = {"/config": lambda: save_config(args),
+              "/vcam/register": vcam_register,
+              "/product/start": product_start, "/product/stop": product_stop,
+              "/product/local/start": product_local_start, "/product/local/stop": product_local_stop}
+    fn = routes.get(h.path.split("?")[0])
+    if not fn: return False
+    try:
+        code, res = fn()
+    except Exception as ex:
+        code, res = 500, {"error": "%s: %s" % (type(ex).__name__, ex)}
+    h._j(res, code); return True
+
+UI_HTML = r'''<!doctype html>
+<html lang="zh"><head><meta charset="utf-8"><title>VirtualCapture 控制台</title>
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style>
+:root{--bg:#111418;--card:#1b2027;--fg:#e6e9ee;--mut:#8b95a3;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--acc:#58a6ff}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 "Segoe UI","Microsoft YaHei",sans-serif}
+header{display:flex;align-items:center;gap:16px;padding:12px 20px;border-bottom:1px solid #262c35}
+h1{font-size:18px;margin:0}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px;padding:14px 20px}
+.card{background:var(--card);border-radius:8px;padding:14px 16px}.card h2{font-size:14px;margin:0 0 10px;color:var(--mut);font-weight:600}
+.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--mut)}
+.on{background:var(--ok)}.off{background:var(--bad)}.big{font-size:26px;font-weight:700}
+table{width:100%;border-collapse:collapse}td,th{padding:3px 6px;text-align:right}td:first-child,th:first-child{text-align:left;color:var(--mut)}
+th{color:var(--mut);font-weight:500;border-bottom:1px solid #2a313b}
+button{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 18px;font-size:14px;cursor:pointer}
+button.stop{background:#b62324}button.sec{background:#30363d}button:disabled{opacity:.5;cursor:default}
+input,select{background:#0d1117;color:var(--fg);border:1px solid #30363d;border-radius:4px;padding:4px 6px;width:100%}
+.grid2{display:grid;grid-template-columns:130px 1fr;gap:6px 10px;align-items:center}
+.mut{color:var(--mut)}.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}
+canvas{width:100%;height:120px;background:#0d1117;border-radius:4px}#msg{white-space:pre-wrap;font-family:Consolas,monospace;font-size:12px;max-height:160px;overflow:auto}
+.wide{grid-column:1/-1}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
+</style></head><body>
+<header><h1>VirtualCapture 控制台</h1><span id="state" class="mut">连接中…</span>
+<span style="flex:1"></span><button id="bStart">开播</button><button id="bStop" class="stop">停播</button></header>
+<main>
+<section class="card"><h2>采集机（发端）</h2><div id="mCap"></div></section>
+<section class="card"><h2>接收机（收端 + 虚拟采集卡）</h2><div id="mRx"></div></section>
+<section class="card"><h2>链路指标</h2><table id="tM"></table></section>
+<section class="card"><h2>延迟 p99（ms，近 60s）<span class="mut" style="float:right"><span style="color:#58a6ff">■</span> 发端 <span style="color:#3fb950">■</span> 重组 <span style="color:#d29922">■</span> vcam</span></h2><canvas id="cv" width="600" height="120"></canvas></section>
+<section class="card"><h2>本机配置 <span id="cfgWho" class="mut"></span></h2>
+<div class="grid2">
+<label>角色</label><select id="c_role"><option value="">未设</option><option value="capture">采集机（发）</option><option value="receive">接收机（收）</option></select>
+<label>对端 agent</label><input id="c_peer_url" placeholder="http://192.168.2.100:18080">
+<label>本机网卡子串</label><input id="c_adapter" placeholder="I226 / Realtek">
+<label class="cap">采集模式</label><select class="cap" id="c_mode"><option>dda</option><option>pattern</option></select>
+<label class="cap">测试源</label><select class="cap" id="c_pattern"><option>motion</option><option>noise</option><option>rings</option><option>checker</option><option>counter</option></select>
+<label class="cap">GPU 转换</label><select class="cap" id="c_gpu"><option value="1">开</option><option value="0">关</option></select>
+<label class="cap">fps / batch</label><div class="cap row"><input id="c_fps" style="width:80px"><input id="c_batch" style="width:80px"></div>
+<label class="cap">目标 MAC</label><input class="cap" id="c_dst" placeholder="接收机网卡 MAC">
+<label class="rcv">共享内存名</label><input class="rcv" id="c_shm">
+<label class="rcv">自动注册 vcam</label><select class="rcv" id="c_auto"><option value="1">是</option><option value="0">否</option></select>
+</div><div class="row" style="margin-top:10px"><button class="sec" id="bSave">保存</button><button class="sec" id="bReg">注册虚拟采集卡</button><a id="peerLink" class="mut" target="_blank"></a></div></section>
+<section class="card"><h2>操作记录</h2><div id="msg" class="mut"></div></section>
+</main>
+<script>
+const $=id=>document.getElementById(id);const H=[];let prev=null,cfgLoaded=false,busy=false;
+const f=(v,d=2)=>v==null||isNaN(v)?'–':(+v).toFixed(d);
+function log(t,cls){const e=$('msg');e.innerHTML=`<div class="${cls||''}">${new Date().toLocaleTimeString()} ${t.replace(/</g,'&lt;')}</div>`+e.innerHTML}
+async function api(p,b){const r=await fetch(p,b===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let j={};try{j=await r.json()}catch(e){}return [r.status,j]}
+function sides(s){const L=s.local,P=s.peer||{};const lr=L.config.role;
+ const cap=lr==='capture'?L:(P.config&&P.config.role==='capture'?P:null);const rx=lr==='receive'?L:(P.config&&P.config.role==='receive'?P:null);return {cap,rx}}
+function machine(m,kind){if(!m)return '<span class="mut">未配置（检查两端 role / peer_url）</span>';
+ if(m.online===false)return `<span class="dot off"></span>离线 <span class="mut">${m.url||''} ${m.error||''}</span>`;
+ const st=kind==='cap'?m.sender:m.receiver;const run=st&&st.running;let x=`<div><span class="dot ${run?'on':''}"></span>${run?'运行中':'已停止'} <span class="mut">v${m.version||'?'} · ${m.url||'本机'} · 网卡 ${m.config?m.config.adapter||'未设':'?'}</span></div>`;
+ if(kind==='rx'&&m.vcam)x+=`<div>虚拟采集卡：${m.vcam.match?'<span class="ok">已注册</span>':'<span class="warn">未注册/路径不符</span>'} <span class="mut">${m.vcam.registered||''}</span></div>`;
+ if(st&&st.session_id)x+=`<div class="mut">会话 ${st.session_id} · ${f(st.uptime_s,0)}s</div>`;return x}
+function rate(cur,key,p,dt){return p&&cur&&dt>0&&cur[key]!=null&&p[key]!=null?(cur[key]-p[key])/dt:null}
+function render(s){const {cap,rx}=sides(s);$('mCap').innerHTML=machine(cap,'cap');$('mRx').innerHTML=machine(rx,'rx');
+ const tx=cap&&cap.sender||{},r=rx&&rx.receiver||{};const dt=prev?s.ts-prev.ts:0;
+ const ftx=rate(tx,'sent_frames',prev&&prev.tx,dt),frx=rate(r,'complete',prev&&prev.rx,dt);prev={ts:s.ts,tx,rx:r};
+ const bad=(r.dropped||0)+(r.hash_mismatch||0);
+ $('tM').innerHTML=`<tr><th></th><th>值</th><th></th><th>值</th></tr>
+ <tr><td>发端 fps</td><td class="big">${f(ftx,0)}</td><td>收端 fps</td><td class="big">${f(frx,0)}</td></tr>
+ <tr><td>带宽</td><td>${f((tx.bps||r.bps||0)/1e9,2)} Gbps</td><td>完成帧</td><td>${r.complete??'–'}</td></tr>
+ <tr><td>丢帧 / 哈希错</td><td class="${bad?'bad':'ok'}">${r.dropped??'–'} / ${r.hash_mismatch??'–'}</td><td>丢包 / 断档</td><td>${r.packets_lost??'–'} / ${r.gaps??'–'}</td></tr>
+ <tr><td>发端段 avg/p99</td><td>${f(tx.pc1_seg_avg_ms)} / ${f(tx.pc1_seg_p99_ms)}</td><td>采集滞后 p99</td><td>${f(tx.cap_lag_p99_ms)}</td></tr>
+ <tr><td>重组 avg/p99/max</td><td>${f(r.rseg_avg_ms)} / ${f(r.rseg_p99_ms)} / ${f(r.rseg_max_ms)}</td><td>vcam avg/p99</td><td>${f(r.vseg_avg_ms,3)} / ${f(r.vseg_p99_ms,3)}</td></tr>
+ <tr><td>发端 CPU</td><td>${f(tx.cpu_pct,1)}%</td><td>vcam 交付 / 重复</td><td>${r.vcam_delivered??'–'} / ${r.vcam_repeats??'–'}</td></tr>`;
+ H.push([tx.pc1_seg_p99_ms,r.rseg_p99_ms,r.vseg_p99_ms]);if(H.length>60)H.shift();draw();
+ $('state').innerHTML=s.peer&&s.peer.online?'<span class="ok">两端在线</span>':'<span class="warn">对端未连接</span>';
+ if(!cfgLoaded){fillCfg(s.local.config);cfgLoaded=true}
+ const pu=s.local.config.peer_url;$('peerLink').textContent=pu?'打开对端控制台 ↗':'';$('peerLink').href=pu?pu+'/ui':'#'}
+function draw(){const c=$('cv'),g=c.getContext('2d');c.width=c.clientWidth;const W=c.width,Hh=c.height;g.clearRect(0,0,W,Hh);
+ let mx=1;H.forEach(r=>r.forEach(v=>{if(v>mx)mx=v}));mx=Math.ceil(mx);g.fillStyle='#8b95a3';g.font='11px sans-serif';g.fillText(mx+' ms',4,12);
+ ['#58a6ff','#3fb950','#d29922'].forEach((col,i)=>{g.strokeStyle=col;g.lineWidth=1.5;g.beginPath();let st=false;
+  H.forEach((r,k)=>{const v=r[i];if(v==null)return;const x=W*k/59,y=Hh-4-(Hh-18)*v/mx;st?g.lineTo(x,y):g.moveTo(x,y);st=true});g.stroke()})}
+function fillCfg(c){$('c_role').value=c.role;$('c_peer_url').value=c.peer_url;$('c_adapter').value=c.adapter;
+ $('c_mode').value=c.capture.mode;$('c_pattern').value=c.capture.pattern;$('c_gpu').value=c.capture.gpu_convert?'1':'0';
+ $('c_fps').value=c.capture.fps;$('c_batch').value=c.capture.batch;$('c_dst').value=c.capture.dst_mac;
+ $('c_shm').value=c.receive.shm;$('c_auto').value=c.receive.vcam_autoregister?'1':'0';roleVis()}
+function roleVis(){const r=$('c_role').value;document.querySelectorAll('.cap').forEach(e=>e.style.display=r==='capture'?'':'none');
+ document.querySelectorAll('.rcv').forEach(e=>e.style.display=r==='receive'?'':'none');$('bReg').style.display=r==='receive'?'':'none'}
+$('c_role').onchange=roleVis;
+$('bSave').onclick=async()=>{const b={role:$('c_role').value,peer_url:$('c_peer_url').value.trim(),adapter:$('c_adapter').value.trim(),
+ capture:{mode:$('c_mode').value,pattern:$('c_pattern').value,gpu_convert:$('c_gpu').value==='1',fps:parseInt($('c_fps').value),batch:parseInt($('c_batch').value),dst_mac:$('c_dst').value.trim()},
+ receive:{shm:$('c_shm').value.trim(),vcam_autoregister:$('c_auto').value==='1'}};
+ const [c,j]=await api('/config',b);c===200?log('配置已保存','ok'):log('保存失败：'+(j.details||[j.error]).join('；'),'bad')};
+async function act(p,name){if(busy)return;busy=true;$('bStart').disabled=$('bStop').disabled=true;log(name+'…');
+ try{const [c,j]=await api(p,{});const steps=(j.steps||[]).map(s=>`${s.side}${s.rollback?'(回滚)':''}:${s.code}${s.result&&s.result.error?' '+s.result.error:''}`).join('，');
+  log(`${name}${j.ok?'成功':'失败'}${j.error?'：'+j.error:''} ${steps}`,j.ok?'ok':'bad')}catch(e){log(name+'异常：'+e,'bad')}
+ busy=false;$('bStart').disabled=$('bStop').disabled=false}
+$('bStart').onclick=()=>act('/product/start','开播');$('bStop').onclick=()=>act('/product/stop','停播');
+$('bReg').onclick=async()=>{const [c,j]=await api('/vcam/register',{});log(c===200?'虚拟采集卡已注册：'+j.dll:'注册失败：'+(j.error||JSON.stringify(j)),c===200?'ok':'bad')};
+async function tick(){try{const [c,s]=await api('/product/status');if(c===200)render(s)}catch(e){$('state').innerHTML='<span class="bad">本机 agent 无响应</span>'}setTimeout(tick,1000)}
+tick();
+</script></body></html>
+'''
+
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 class H(BaseHTTPRequestHandler):
@@ -796,6 +1131,7 @@ class H(BaseHTTPRequestHandler):
         self.send_response(code); self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(b))); self.end_headers(); self.wfile.write(b)
     def do_GET(self):
+        if _p5_get(self): return
         if self.path == "/health":
             anyrun = any((state[k].get("proc") is not None and state[k]["proc"].poll() is None) for k in ("sender", "receiver"))
             self._j({"ok": True, "version": read_version(), "role": state["role"], "running": anyrun, "updater": updater_status(), "pid": os.getpid(), "staged": STAGED.get("version")})
@@ -846,6 +1182,7 @@ class H(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length", 0)); body = self.rfile.read(n) if n else b"{}"
         try: args = json.loads(body or b"{}")
         except Exception: args = {}
+        if _p5_post(self, args if isinstance(args, dict) else {}): return
         if self.path == "/sender/start":
             _a = (args if isinstance(args, dict) else {})
             if not str(_a.get("adapter", "")).strip():

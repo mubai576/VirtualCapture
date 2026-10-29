@@ -16,6 +16,7 @@ raw L2 EtherType `0x88B5`（Npcap）发到 PC2 重组，逐帧 FNV-1a64 对账�
 | 了解当前进度、领任务 | `PLAN.md`（§0 现状、§2 决策、§3 任务卡） |
 | 改协议/发收端/测试源/agent API | `.agents/skills/virtualcapture/SKILL.md` + 其 `references/`（契约） |
 | 构建、打包、发版 | `docs/runbooks/build.md` |
+| 找开发工具、诊断脚本 | `docs/runbooks/development-tools.md` |
 | 部署/切换 PC2 | `docs/runbooks/pc2-cutover.md`，背景 `docs/spec/deployment.md` |
 | 理解需求与链路预算 | `docs/spec/requirements.md` |
 | 查某个历史结论（"hist S23" 之类） | `docs/history/plan-history.md`（只读档案，不改） |
@@ -26,15 +27,20 @@ raw L2 EtherType `0x88B5`（Npcap）发到 PC2 重组，逐帧 FNV-1a64 对账�
 
 | 路径 | 内容 | 归属/规则 |
 |---|---|---|
+| `CMakeLists.txt` + `cmake/` | 根构建编排、统一编译/输出规则、Npcap SDK 查找、long-path manifest | 从根目录配置；产物跟随 `-B` |
+| `common/` | 发收端共用 CRC32 / FNV-1a64 头文件（`vc-common` CMake target） | 算法只保留一份 |
 | `proto/vc_wire.h` | 28B 包头，**冻结** | 仅 owner 可改 |
 | `sender/` | `vc-sender.exe`（pattern/file/dda，`--batch`，`pattern.h` 整数测试源，`dda.h` 桌面采集） | C++17 |
 | `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，NV12 640x640@240，motion 帧源） | C++17 |
 | `receiver/` | `vc-receiver.exe`（重组、hash、stats、hashlog 带 qpc_ns） | C++17 |
+| `tools/` | `monitor/` 预览与诊断、`testwin/` DDA 动画源、`vcam_verify/` DShow 枚举/格式验收 | C++17；随根 CMake 一起构建，现有产物路径保留 |
 | `agent/vc-agent.py` | 双机控制 agent（REST :18080，/exec 白名单，/files 分页，stage/activate OTA） | 单文件零依赖 |
-| `ctrl/` | `vc-ctrl.py` 编排判分、`bringup.py` 联调报告、`reconcile.py` 对账、`run_remote.py` 远控/OTA、`pattern_ref.py` Python 镜像 | |
-| `ctrl/tests/` | pytest：`test_matrix.py`（向量/判据/live）、`test_ota.py`（OTA 往返） | |
-| `scripts/` | 运维：`verify.py`（本地总闸）、`brn.py`（双机 batch 探针）、`*.ps1`（装机/网卡/更新/watchdog） | |
+| `ctrl/` | `vc-ctrl.py` 编排判分、`bringup.py` 联调报告、`reconcile.py` 对账、`run_remote.py` 远控/OTA、`vc-monitor-tui.py` 文本仪表、`pattern_ref.py` Python 镜像 | |
+| `ctrl/tests/` | pytest：matrix（向量/判据/live）、OTA、GUI、package（打包保护/回滚/路径） | |
+| `scripts/` | `package.py`（一键编译验证打包）、`verify.py`（本地总闸）、`brn.py`（双机 batch 探针）、`*.ps1`（装机/网卡/更新/watchdog） | |
 | `scripts/analysis/` | 一次性取证脚本（gap/对账/审计），可复用但非主流程 | |
+| `version.json` + `packaging/` | 版本元数据、`vc-agent.spec` 打包配置、成品启动入口 | 发版操作见 build runbook |
+| `.agents/skills/virtualcapture/` | 项目技能与 wire/API/test-matrix 契约 | 与代码同步维护 |
 | `docs/` | `spec/` 需求与早期方案、`runbooks/` 操作手册、`bringup/` 联调记录、`proposals/` 设计提案、`history/` 档案 | 只放 md |
 | `thirdparty/` | vendored npcap-sdk、ninja | 不改 |
 | `build/` `dist/` `run/` `release/` `staging/` `prev/` `archive/` | 产物 / 运行数据 / OTA 机关 / 归档 | 全部 gitignore；`staging/` `prev/` 是 live OTA 机关，不手删 |
@@ -42,6 +48,8 @@ raw L2 EtherType `0x88B5`（Npcap）发到 PC2 重组，逐帧 FNV-1a64 对账�
 ## 常用命令
 
 ```powershell
+python scripts/package.py              # 编译 + 验证 + 全量便携目录 → dist/VirtualCapture
+# 已确认包含当前未提交改动时：python scripts/package.py --allow-dirty
 python scripts/verify.py                 # 改完任何代码必跑：build + 双 selftest + pattern_ref + pytest
 python scripts/verify.py --no-build --live Loopback   # 加跑本机回环 live 用例
 curl http://127.0.0.1:18080/adapters     # 查卡；--adapter 必填

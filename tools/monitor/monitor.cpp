@@ -1,4 +1,4 @@
-// monitor/monitor.cpp — vc-monitor.exe
+// tools/monitor/monitor.cpp — vc-monitor.exe
 // D3D11 NV12 preview + GDI OSD overlay.
 // OSD style: YouTube-inspired — large bold numbers, drop-shadow text, minimal bg.
 // Right-click: Full / Mini / Off.  O=cycle.  ESC=quit.

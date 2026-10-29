@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   install-pc2.ps1 — PC2(零环境)现场安装: Npcap检查 -> 文件落盘 -> 计划任务自启 -> 防火墙 -> /health验证。
 .DESCRIPTION
@@ -14,7 +14,7 @@
 .PARAMETER InstallDir
   安装目录, 默认 C:\vc。
 .PARAMETER PackageDir
-  发布包解压目录, 默认本脚本所在目录。
+  发布包根目录, 默认 scripts 的上一级目录。
 .PARAMETER ControlSubnet
   控制面放行网段, 默认 192.168.2.0/24。
 .PARAMETER TaskName
@@ -28,7 +28,7 @@ param(
   [Parameter(Mandatory = $true)][ValidateSet("sender", "receiver")][string]$Role,
   [int]$Port = 18080,
   [string]$InstallDir = "C:\vc",
-  [string]$PackageDir = (Split-Path $PSCommandPath -Parent),
+  [string]$PackageDir = (Split-Path $PSScriptRoot -Parent),
   [string]$ControlSubnet = "192.168.2.0/24",
   [string]$TaskName = "vc-agent"
 )
@@ -51,13 +51,22 @@ if ($PSCmdlet.ShouldProcess($InstallDir, "拷贝文件")) {
   New-Item -ItemType Directory -Path $InstallDir -Force | Out-Null
   New-Item -ItemType Directory -Path (Join-Path $InstallDir "build") -Force | Out-Null
   New-Item -ItemType Directory -Path (Join-Path $InstallDir "run") -Force | Out-Null
-  Copy-Item (Join-Path $PackageDir "vc-agent.exe") $InstallDir -Force
+  # Include every product/tool binary and the app-local MSVC runtime.
+  Get-ChildItem -LiteralPath $PackageDir -File | Where-Object {
+    $_.Extension -in @('.exe', '.dll', '.cmd') -or $_.Name -in @('README.md', 'package-manifest.json')
+  } | ForEach-Object { Copy-Item -LiteralPath $_.FullName -Destination $InstallDir -Force }
   Copy-Item (Join-Path $PackageDir "version.json") $InstallDir -Force
   Copy-Item (Join-Path $PackageDir "vc-sender.exe") (Join-Path $InstallDir "build") -Force
   Copy-Item (Join-Path $PackageDir "vc-receiver.exe") (Join-Path $InstallDir "build") -Force
   if (Test-Path (Join-Path $PackageDir "scripts")) {
     New-Item -ItemType Directory -Path (Join-Path $InstallDir "scripts") -Force | Out-Null
     Copy-Item (Join-Path $PackageDir "scripts/*") (Join-Path $InstallDir "scripts") -Force
+  }
+  foreach ($support in @('ctrl', 'docs')) {
+    if (Test-Path -LiteralPath (Join-Path $PackageDir $support)) {
+      New-Item -ItemType Directory -Path (Join-Path $InstallDir $support) -Force | Out-Null
+      Copy-Item -Path (Join-Path $PackageDir "$support/*") -Destination (Join-Path $InstallDir $support) -Recurse -Force
+    }
   }
   Write-Host "[install] 文件落盘完成。"
 }

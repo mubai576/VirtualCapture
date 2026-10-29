@@ -1,6 +1,8 @@
 """双机批探针：备好PC2收端，本地直跑发端；写run/<tag>.*"""
 import json, time, urllib.request, subprocess, os, sys
 os.chdir(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # repo root: exe/run paths are relative
+sys.path.insert(0, os.path.abspath("ctrl"))
+from runtime_paths import find_binary
 R = "http://192.168.2.59:18080"
 print("brn-init")
 def post(base, path, args):
@@ -16,7 +18,7 @@ frames = sys.argv[2]
 tag = sys.argv[3]
 rs = post(R, "/receiver/start", {"adapter": "Controller", "ethertype": "0x88B5", "mtu": 9000, "timeout_s": 120, "expect_frames": int(frames)})
 print("rx-armed", rs.get("session_id"))
-subprocess.run(["build/vc-sender.exe", "--adapter", "Controller", "--mode", "pattern", "--pattern", "motion", "--fps", "240", "--frames", frames, "--ethertype", "0x88B5", "--mtu", "9000", "--pacing-us", "0", "--dst-mac", "00:E2:69:A9:F0:0A", "--batch", batch, "--session", tag, "--stats", "run/" + tag + ".sender.stats.json", "--hashlog", "run/" + tag + ".sender.hash.jsonl"], check=False)
+subprocess.run([find_binary("vc-sender.exe"), "--adapter", "Controller", "--mode", "pattern", "--pattern", "motion", "--fps", "240", "--frames", frames, "--ethertype", "0x88B5", "--mtu", "9000", "--pacing-us", "0", "--dst-mac", "00:E2:69:A9:F0:0A", "--batch", batch, "--session", tag, "--stats", "run/" + tag + ".sender.stats.json", "--hashlog", "run/" + tag + ".sender.hash.jsonl"], check=False)
 time.sleep(3)
 try:
     post(R, "/receiver/stop", {})

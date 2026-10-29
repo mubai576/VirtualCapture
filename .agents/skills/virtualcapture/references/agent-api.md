@@ -24,6 +24,21 @@ Base: `http://<ctrl-ip>:18080`. 全部 JSON. `start` 幂等（先停旧会话）
 
 Impl: `agent/vc-agent.py` single-file zero-dep (same code both PCs; --role is label-only). C++ file IPC (atomic stats rewrite + hashlog append); agent starts/stops/passes through. Also: GET /files reads any file under ROOT with optional paging (0.4.0). Adapter rule (P1-1): `--adapter` 必填；agent 缺 adapter 直接 400 并附本机 adapters 列表，不拉起进程；C++ 空 adapter 按 pcap_findalldevs 顺序逐卡试发（首包成功锁定，全败 exit 2）；显式坏 adapter exit 2 并列卡；live 发送 sent_frames>0 但成功包为 0 则 exit 3。
 
+## P5 GUI 端点（D16，自 0.5.0）
+| 方法 | 路径 | 请求 | 返回 |
+|---|---|---|---|
+| GET | `/` `/ui` | — | 内置单页控制台（HTML，no-store） |
+| GET | `/config` | — | `{role, peer_url, adapter, capture{mode,pattern,gpu_convert,fps,batch,mtu,dst_mac}, receive{shm,mtu,vcam_autoregister}}`（ROOT/vc-config.json，缺省值见 agent） |
+| POST | `/config` | 部分字段（未知键丢弃，子对象逐键合并） | `{saved, config}`；校验失败 400 `{error, details[]}`（白名单式：role、`http://host:port`、网卡子串字符集、MAC、`Local\<name>`、数值范围） |
+| GET | `/vcam/status` | — | `{dll, registered, match}`（HKCU InprocServer32 是否指向本机 ROOT 下 dll） |
+| POST | `/vcam/register` | — | regsvr32 /s 本机 dll；200 需 exit=0 且 match |
+| POST | `/product/local/start` `/product/local/stop` | — | 按本机 `config.role` 起/停本机一侧：receive = receiver(`--shm`，timeout 0，按需自动注册 vcam)；capture = sender(frames 0，dda 可带 `--gpu-convert`) |
+| POST | `/product/start` | — | 任一台发起：校验对端 role 互补 → 收端先起 → 0.5s → 发端起；发端失败回滚收端。`{ok, steps[{side,code,result,rollback?}]}` |
+| POST | `/product/stop` | — | 先停发端再停收端，`{ok, steps}` |
+| GET | `/product/status` | — | `{ts, local{online,config,version,sender,receiver,vcam}, peer{online,url,version,config,sender,receiver,vcam}|null}`；对端只调固定 GET 端点（无通用反代） |
+- `/sender/start` 新增可选 `gpu_convert:true` → `--gpu-convert`。
+- 访问控制同既有端点（无鉴权，直连网段内使用）；对端调用只走 `peer_url` + 固定路径。
+
 ## /exec policy (added 0.2.0, allowlist-bound, NOT a general shell)
 
 - `python` only runs script files under agent ROOT (no `-c`); frozen exe falls back to PATH python.

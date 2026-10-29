@@ -1,8 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-
-
+from pathlib import Path
+project_root = Path(SPECPATH).parent
 a = Analysis(
-    ['agent/vc-agent.py'],
+    [str(project_root / 'agent' / 'vc-agent.py')],
     pathex=[],
     binaries=[],
     datas=[],

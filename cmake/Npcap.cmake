@@ -1,0 +1,18 @@
+include_guard(GLOBAL)
+
+# Share SDK discovery between sender and receiver; wpcap remains dynamically loaded.
+add_library(vc-npcap INTERFACE)
+if(DEFINED ENV{NPCAP_SDK} AND EXISTS "$ENV{NPCAP_SDK}/Include/pcap.h")
+  set(_vc_npcap_include "$ENV{NPCAP_SDK}/Include")
+  message(STATUS "Npcap: using NPCAP_SDK from env $ENV{NPCAP_SDK}")
+elseif(EXISTS "${PROJECT_SOURCE_DIR}/thirdparty/npcap-sdk/Include/pcap.h")
+  set(_vc_npcap_include "${PROJECT_SOURCE_DIR}/thirdparty/npcap-sdk/Include")
+  message(STATUS "Npcap: using fallback ${PROJECT_SOURCE_DIR}/thirdparty/npcap-sdk")
+else()
+  message(STATUS "Npcap: SDK not found (env + fallback missing), dynamic-load-only build (selftest OK)")
+endif()
+if(DEFINED _vc_npcap_include)
+  target_include_directories(vc-npcap INTERFACE "${_vc_npcap_include}")
+  target_compile_definitions(vc-npcap INTERFACE HAVE_NPCAP_SDK=1)
+endif()
+unset(_vc_npcap_include)

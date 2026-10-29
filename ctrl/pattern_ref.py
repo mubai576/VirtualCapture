@@ -144,7 +144,8 @@ if __name__ == "__main__":
             assert Y1 == Y2 and UV1 == UV2, "small determinism %s fid=%d" % (p, fid)
             print("PY small %s %d %s" % (p, fid, frame_hash_yuv(Y1, UV1)))
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    exe = os.path.join(root, "build", "vc-sender.exe")
+    from runtime_paths import find_binary
+    exe = find_binary("vc-sender.exe", root)
     if os.path.exists(exe):
         try:
             out = subprocess.run([exe, "--selftest"], capture_output=True, text=True, timeout=60)
@@ -166,5 +167,5 @@ if __name__ == "__main__":
         except Exception as e:
             print("WARN interlock skipped: %s" % e)
     else:
-        print("interlock: build/vc-sender.exe missing, skipped (vectors printed above for T-01)")
+        print("interlock: vc-sender.exe missing, skipped (vectors printed above for T-01)")
     print("PASS: complexity tiers ok, determinism ok")

@@ -5,7 +5,8 @@ param(
     [string]$Session = "btest69"
 )
 $root  = Split-Path -Parent $PSScriptRoot
-$exe   = Join-Path $root "build\vc-sender.exe"
+. (Join-Path $PSScriptRoot 'runtime-paths.ps1')
+$exe = Get-VcBinaryPath 'vc-sender.exe'
 $run   = Join-Path $root "run"
 New-Item -ItemType Directory -Force -Path $run | Out-Null
 

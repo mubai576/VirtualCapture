@@ -9,6 +9,7 @@ vc-monitor-tui.py — VirtualCapture 控制台监控 + 启停控制
 import argparse, json, os, sys, time, threading, subprocess
 import urllib.request, urllib.error
 from datetime import datetime
+from runtime_paths import find_binary
 
 try:
     from rich.console import Console
@@ -25,7 +26,7 @@ except ImportError:
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 RUN_DIR = os.path.join(ROOT, "run")
-MONITOR_EXE = os.path.join(ROOT, "build", "Release", "vc-monitor.exe")
+MONITOR_EXE = find_binary("vc-monitor.exe", ROOT)
 
 # ── HTTP helpers ──────────────────────────────────────────────────────────────
 def http_get(url, timeout=3):
