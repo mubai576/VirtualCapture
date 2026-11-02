@@ -13,6 +13,7 @@ def agent(tmp_path, monkeypatch):
     spec.loader.exec_module(module)
     module.ROOT = str(tmp_path)
     module.state["role"] = "host"
+    monkeypatch.setattr(module, "stream_native_errors", lambda kind: [])
     executable = tmp_path / "fake.exe"
     executable.touch()
     monkeypatch.setattr(module, "exe_path", lambda kind: str(executable))
@@ -96,9 +97,10 @@ def test_capture_failure_rolls_back_and_stop_survives_offline_peer(agent, lifecy
     calls = []
     def peer(path, body=None, **kwargs):
         calls.append((path, body))
-        if path == "/health": return 200, {"product_revision": 2, "product_role": "capture"}
+        if path == "/health": return 200, {"product_revision": 2, "product_role": "capture", "stream_revision": 2}
         if path == "/config": return 200, {"role": "capture"}
         if path == "/version": return 200, {"version": agent.read_version()}
+        if path == "/stream/capabilities": return 200, {"revision": 2, "native": {"variable_resolution": True, "dda_fps_limit": True}}
         return 0, {"error": "peer unreachable"}
     monkeypatch.setattr(agent, "peer_call", peer)
     monkeypatch.setattr(agent, "get_adapters", lambda: (200, {"items": []}))
@@ -117,12 +119,31 @@ def test_capture_failure_rolls_back_and_stop_survives_offline_peer(agent, lifecy
 def test_capture_worker_uses_control_route_without_saved_config(agent, lifecycle, monkeypatch):
     agent.state["role"] = "capture"
     monkeypatch.setattr(agent, "_choose_capture_adapter", lambda ip: (200, {"name": "Realtek"}))
-    code, result = agent.product_local_start({"auto_adapter": True, "capture": {"mode": "pattern", "batch": 17}}, "192.168.2.100")
+    code, result = agent.product_local_start({"auto_adapter": True, "capture": {"mode": "pattern", "batch": 17}, "stream": agent.stream_session(agent.load_config()["capture"])}, "192.168.2.100")
     assert code == 200
     assert lifecycle[0][0:2] == ("launch", "sender")
     assert lifecycle[0][2]["adapter"] == "Realtek" and lifecycle[0][2]["batch"] == 17
     assert "register" not in lifecycle
     assert agent.product_start()[0] == 403
+
+
+@pytest.mark.parametrize("echo", [None, {"revision": 1}])
+def test_capture_success_without_exact_session_echo_rolls_back(agent, lifecycle, monkeypatch, echo):
+    calls = []
+    def peer(path, body=None, **kwargs):
+        calls.append(path)
+        if path == "/health": return 200, {"product_revision": 2, "product_role": "capture", "stream_revision": 2}
+        if path == "/config": return 200, {"role": "capture"}
+        if path == "/version": return 200, {"version": agent.read_version()}
+        if path == "/stream/capabilities": return 200, {"revision": 2, "native": {"variable_resolution": True, "dda_fps_limit": True}}
+        return 200, {"stream": echo}
+    monkeypatch.setattr(agent, "peer_call", peer)
+    monkeypatch.setattr(agent, "get_adapters", lambda: (200, {"items": []}))
+    code, result = agent.product_start()
+    assert code == 502 and not result["ok"]
+    assert calls[-1] == "/product/local/stop"
+    assert lifecycle[-2:] == [("stop", "receiver"), "unregister"]
+    assert result["steps"][1]["code"] == 409
 
 
 def test_capture_worker_does_not_serve_ui(agent):
@@ -180,7 +201,7 @@ def test_native_startup_exit_is_failure_with_diagnostics(agent, lifecycle, monke
         agent.state[kind].update(proc=FailedProcess(), stdout=str(log), session_id="failed")
         return "failed", {"cmd": ["vc-sender.exe"]}
     monkeypatch.setattr(agent, "launch", launch)
-    code, result = agent.product_local_start()
+    code, result = agent.product_local_start({"stream": agent.stream_session(agent.load_config()["capture"])})
     assert code == 500 and "adapter missing" in result["error"]
     assert result["diagnostics"]["exit_code"] == 2
     assert result["diagnostics"]["stdout"] == "native.stdout.log"

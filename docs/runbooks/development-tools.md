@@ -11,6 +11,8 @@
 | 本地完整验证 | `python scripts/verify.py` |
 | GUI 前端状态逻辑 | `python -m pytest ctrl/tests/test_gui_client.py -q`；需要开发机有 Node.js，无 npm 依赖，agent 运行不需要 Node.js |
 | 主机/后台与虚拟卡生命周期 | `python -m pytest ctrl/tests/test_gui_host.py -q`；使用进程与注册替身，不操作真实注册表 |
+| P6 Raw尺寸/发送上限/真实DShow | `python scripts/p6_raw_verify.py`；`--dda`需变化桌面，私有映射，不注册 |
+| P6 产品控制端到原生链路 | `python scripts/p6_product_verify.py`；隔离ROOT/随机HTTP端口，注册替身，其余实际执行 |
 | 本机回环 live | `python scripts/verify.py --no-build --live Loopback` |
 | 查看构建产物时间 | `python scripts/check_bins.py` |
 | Python 测试源自检 | `python ctrl/pattern_ref.py` |
@@ -27,6 +29,8 @@
 | SHM NV12 预览、OSD | `tools/monitor/monitor.cpp` | `vc-monitor` |
 | D3D11 诊断 | `tools/monitor/diag.cpp` | `vc-monitor-diag` |
 | DDA 高帧率动画源 | `tools/testwin/testwin.cpp` | `vc-testwin` |
+| MF 实际编解码回环（仅开发） | `tools/codec_probe/roundtrip.cpp`、`common/mf_codec.h` | `vc-codec-roundtrip`；显式后端，命令与限制见 `../proposals/codec-backend-20261103.md` |
+| MF 编解码候选（仅开发） | `tools/codec_probe/codec_probe.cpp` | `vc-codec-probe`；候选与类型协商不是实际编解码 |
 | DShow 枚举 / NV12 格式验收 | `tools/vcam_verify/vcam_verify.cpp` | `vc-vcam-verify` |
 
 这三个源码目录于 2026-10-29 从根目录迁入 `tools/`；历史报告中的旧源码路径保留原文。
@@ -44,7 +48,7 @@
 | batch 探针 | `scripts/brn.py`、`scripts/batch_test.ps1` |
 | 动画窗口辅助 | `scripts/start_testwin.ps1`、`scripts/fetch_testwin.ps1`、`scripts/test_anim.py` |
 | 虚拟卡注册 / 出口验收 | `scripts/vcam_register.ps1`、`scripts/p4_4_shm_verify.py`、`scripts/p4_4_vcam_verify.py`；见 `pc2-vcam-acceptance.md` |
-| SHM v2 Python 镜像 | `scripts/vc_shm.py`，布局真相源仍是 `vcam/vcam_shm.h` |
+| SHM v3 Python 镜像（读端兼容固定v2） | `scripts/vc_shm.py`，布局真相源仍是 `vcam/vcam_shm.h` |
 | 状态 / 历史自检结果 | `scripts/read_pc1_stats.py`、`scripts/list_run.ps1`、`scripts/check_selftest3.py` |
 | 历史取证与报告分析 | `scripts/analysis/` |
 

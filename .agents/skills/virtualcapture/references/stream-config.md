@@ -1,66 +1,59 @@
-# P6 配置、预算与能力边界（D19，2026-11-02）
+# P6 配置、会话与能力契约（D19；P6-2，2026-11-03）
 
-## 已实现与未实现
+## 当前实现边界
 
-本契约的 `revision=1` 是控制面扩展，不是新数据面协议。当前原生程序、28B 包头、SHM v2、
-DShow 都未改，仍只运行 `640×640 NV12 / 居中 1:1 裁切 / raw`。H.264/H.265 与可变分辨率
-已获 owner 开发授权，但本阶段仅支持配置草案与预算；保存不意味着能启动。
+开发版 `stream_revision=2`：Raw NV12 可变尺寸、crop/fit/fill/stretch、发送帧率上限、SHM v3 与动态 DShow 已接通。
+稳定部署仍为封存的固定 640 管线，不自动更新。H.264/H.265 仍只可保存草案，不可启动；开发工具的 MFT 候选不等于后端已接通。
 
-- 预设：416×416、640×640、1280×720、1920×1080、2560×1440；自定义宽高均为 2..8192 的偶数整数。
-- 旧配置合并默认值后仍为 640×640、240fps、crop、raw；保留 GPU 转换、batch、MTU 等隐藏值。
-- `capture` 追加 `width,height,transform,codec,bitrate_mbps,max_bitrate_mbps`。
-- `transform`: `crop` 居中 1:1 裁切；`fit` 保全画面等比缩放加黑边；`fill` 等比铺满后裁切；`stretch` 拉伸。
-- `codec`: `raw|h264|hevc`；后两项未接入后端。目标/最大码率为整数 Mbps，范围 1..10000，最大不得低于目标。
-- `transport.headroom_pct`: 0..50 的整数，默认 20；只影响预算，不改变历史性能判据。
-- 帧率沿用 1..1000 整数的配置范围，不能据此宣称硬件达到该帧率。DDA 尚不按目标帧率硬限速。
+- 预设：416×416、640×640、1280×720、1920×1080、2560×1440；默认保留 **640×640@240 / crop / raw**。
+- 自定义：偶数宽高 2..8192，整数 fps 1..1000；单帧包数不得超过 uint16。范围是软件参数校验，不是显存/吞吐/硬件认证。
+- `capture`：`width,height,fps,transform,codec,bitrate_mbps,max_bitrate_mbps`，其余 GPU/batch/MTU 等隐藏值保留。
+- `codec=raw|h264|hevc`；码率整数 1..10000 Mbps，max>=target。Raw 不压缩、不静默切编码或降尺寸/帧率。
+- `transport.headroom_pct`：0..50，默认20，仅预算建议，不修改历史验收门限。
 
-## API
+## 变换与限速
+
+源为当前 DDA 默认输出，传输/虚拟卡尺寸与源桌面分辨率分离。不修改显示设置；旋转输出暂拒绝，不提供屏幕选择。
+
+- crop：居中 1:1，源必须不小于目标；偏移 `(source-output)/2` 下取整，保持历史 640 裁切逐字节结果。
+- stretch：源整幅映射至目标整幅。
+- fit：按宽高比选择较小缩放，活动宽/高下取到偶数且至少2；活动区域的居中偏移向下对齐偶数；黑边为 full-range Y=0/UV=128。
+- fill：按宽高比选择源内裁切矩形，裁切宽/高下取偶数且至少2；源居中偏移向下对齐偶数，再铺满目标。
+- 所有重采样：整数最近邻 `src=offset+floor(local*source_extent/dest_extent)`；2×2 输出 RGB 均值后沿用整数 BT.601。
+  精确公式唯一实现在 `common/stream.h`，GPU shader 同构；仅 UNORM 解码沿用 D13 狭窄浮点例外。
+- 帧率上限约束**每帧开始分包发送**的同机 QPC 间隔，至少 `ceil(1e9/fps)` ns，不补发赶进度。
+  采集前等待至接近下个发送槽（减去上次转换成本，最多半帧）；DDA 合并中间 presents，只有一个当前帧，不排 FIFO。
+  转换完成后另有最终发送闸，不能将阻塞的 AcquireNextFrame 起点当成实际发送时间。
+- DDA timeout、pointer-only、同一 LastPresentTime 不发送，不递增 frame_id，不重放零帧或旧帧制造 FPS。
+  `source_skipped` 包括 DXGI 合并帧和无图像更新；它不是收端丢包计数。fps 是上限，不保证源/设备达到该值。
+- sender hashlog 保留 `qpc_ns`（采集/生成开始），追加 `send_qpc_ns`（开始分包发送）；两者不跨机相减。
+  stats 双端追加 `width,height,frame_bytes,fps_limit,codec`，sender 另有 `transform,source_skipped`。
+
+## 能力与预算 API
 
 ### GET /stream/capabilities
 
-两种产品角色均可调用，返回：
+`{revision:2,presets[],native,hardware,adapter,adapter_error?}`。
+`native` 含 `codecs,transforms,variable_resolution,dda_fps_limit,shm_version:3,errors[]`。
+不能只凭 agent 版本断言原生支持：实际 sender/receiver `--capabilities` 和 DLL 的导出能力必须匹配。
+DLL 由隔离 verifier 进程探测，不在 agent 内长时间加载；探测失败不回退旧二进制。结果按绝对路径/mtime/size 缓存。
 
-```json
-{
-  "revision": 1,
-  "presets": [{"width": 416, "height": 416}],
-  "native": {"codecs": ["raw"], "width": 640, "height": 640,
-             "transforms": ["crop"], "variable_resolution": false, "dda_fps_limit": false},
-  "hardware": {"encoder": "unprobed", "decoder": "unprobed"},
-  "adapter": null
-}
-```
-
-示例省略其余四档预设。采集后台按该 HTTP 请求来源 IP 的控制路由精确选择网卡，填充 `adapter`；
-失败保留 null 并附 `adapter_error`。主机没有自动选择另一张卡。能力描述是当前软件实现边界，
-不是 GPU、原生二进制或分辨率/帧率组合的实机能力认证。`/health` 另加 `stream_revision=1`，
-现有 `product_revision=2` 不变。
-
-`/adapters.items[]` 和上述 `adapter` 新增 `receive_link_bps`、`transmit_link_bps`：
-Windows `Get-NetAdapter` 的数值速率（bit/s），不是解析本地化的 `LinkSpeed` 文本。缺失/0 不假定为 2.5G。
-同时附 `hardware_interface`、`virtual`；虚拟/非硬件网卡的标称速率不当作物理链路容量。
+capture 按 HTTP 来源控制路由精确选择网卡；host 不擅自选另一张快卡。`/adapters.items[]` 数值
+`receive_link_bps/transmit_link_bps` 单位 bit/s，另附 `hardware_interface/virtual`；0、缺失、回环或虚拟网卡不冒充物理速率。
+`hardware.encoder/decoder` 仍为 `unprobed`，不将开发机一次探测外推为部署两端的能力。`/health.stream_revision=2`，product_revision 仍为2。
 
 ### POST /stream/plan
 
-请求 `{config:{...部分配置...},refresh:false}`，两个字段均可省略；refresh 必须为布尔值。
-按已保存配置合并并校验草稿，**不写配置、不启动进程、不注册虚拟卡、不更改网卡**。
-采集后台调用返回 403，应在主机计算双端预算。校验失败 400，成功计算 200（即使组合不可运行）。
+请求 `{config:{...部分配置...},refresh:false}`；只读，不写配置、不启停进程、不注册设备、不改网卡。
+校验失败400，capture角色403；成功计算200，即使配置不可运行。
 
-- `video`: 目标尺寸/fps/codec/transform 与 `raw_frame_bytes`。
-- `network`: `status`, `is_estimate`, `host`, `capture`, `payload_bytes`, `packets_per_frame`,
-  `payload_bps`, `wire_bps`, `link_bps`, `known_upper_bound_bps`, `headroom_pct`, `usable_bps`, `max_raw_fps`。
-- `network.status`: `fits` 预算容纳；`margin` 未超物理线速但侵入余量；`exceeds` 已知端口足以证明超限；
-  `down` 网卡未连接；`unknown` 信息不足，不能确认。
-- `host` 用接收速率，`capture` 用发送速率；两端已知才给 `link_bps=min(rx,tx)`，仅一端已知保留 null。
-  单端已知且需求更大仍可判 exceeds。回环及已识别的虚拟/非硬件设备不提供物理链路容量。
-- `implementation`: `supported`, `reasons[]`, `hardware_verified:false`。预算 fits 不等于 supported。
-- `can_start`: 原生路径已实现、MTU 一致、单帧包数不超 uint16，且没有 exceeds/down。
-  未知速率只警告，不破坏既有 raw 的兼容启动；margin 只建议调整，不静默降级。
-- `warnings[]`: 包含速率未知、旧后台缺探测接口、编码突发、DDA 帧率未硬限速、未实测吞吐等说明。
-
-探测仅调用本机枚举和对端固定 GET `/stream/capabilities`；按 ROOT/IP/网卡缓存 10 秒（最多 16 项），
-refresh=true 强制重取。UI 编辑防抖 600ms，单次请求串行，过时回复不覆盖新草稿。
-产品启动重新探测，不使用预算缓存作为最终准入依据。
+- `video`：尺寸/fps/codec/transform/raw_frame_bytes。
+- `network`：`status,is_estimate,host,capture,payload_bytes,packets_per_frame,payload_bps,wire_bps,link_bps,known_upper_bound_bps,headroom_pct,usable_bps,max_raw_fps`。
+- `status=fits|margin|exceeds|down|unknown`；采用 host RX 与 capture TX 较慢者，两端已知才称 fits；一端慢速已足以证明 exceeds。
+- `implementation={supported,reasons[],hardware_verified:false}`，`can_start` 还要求实际原生能力、peer revision=2、MTU 一致和无 exceeds/down。
+  速度未知只警告，但旧 peer 缺会话协商是硬错误；margin 不自动降级。
+- NIC/peer 探测按 ROOT/IP/网卡缓存10秒（最多16项），refresh 强制重取；启动必须 refresh。
+  UI 防抖600ms、串行请求、旧回复不覆盖新草稿。编码均摊预算不保证 IDR 突发/编码吞吐/画质。
 
 ## 线速预算
 
@@ -82,12 +75,61 @@ max_raw_fps = floor(usable_bps / (wire_frame_bytes * 8))
 H.264/H.265 用最大码率均摊成每帧字节数，再估计分包开销；`is_estimate=true`，
 `max_raw_fps=null`。码率窗口不保证单个 IDR 帧大小或瞬时突发，更不能证明编码器吞吐/画质。
 
-## 启动保护与兼容
+## 显式产品会话与低层兼容
 
-- `/product/start`、`/product/local/start` 在调用注册/拉起原生程序之前拒绝未实现的尺寸、transform 或 codec（409）。
-- 主机产品启动若确定超过物理线速/网卡断开，或收发 MTU 不一致，注册前 409 拒绝。
-- 低层 `/sender/start`、`/receiver/start` 仍是原有冻结 CLI；显式携带新尺寸/变换/codec/码率字段时 409，
-  避免底层程序忽略字段后偷偷按 640 运行。没有新字段的历史调用不变。
-- UI 允许保存待实现草案，明确显示“待接通/待接入”；总览禁止启动这些组合，停止/清理入口仍可用。
-- 原有 raw 的帧哈希、性能门限与错误回滚不变。本阶段不引入编码流、不改 packet flags、不分配可变尺寸 SHM。
-- 后续可变尺寸/编码需要显式会话能力协商与版本化 IPC；旧后台不能因版本号相同就被当成支持新模式。
+28B `proto/vc_wire.h` 完全不改。控制面 descriptor：
+
+```json
+{"revision":2,"pixel_format":"nv12","codec":"raw","width":416,"height":416,
+ "fps":240,"mtu":9000,"transform":"crop","source_mac":"02:12:34:56:78:ab"}
+```
+
+主机每次生成随机本地管理源 MAC 作为流隔离标识；它不是认证/加密，不替换系统 NIC MAC 配置。
+sender 只改发出的以太帧 source，receiver 在解析 VC 包前精确过滤 source；不占用包头字段或保留 flags。
+
+1. 主机检查 health/product/stream revision、版本、对端角色、两端实际原生能力和新鲜预算；失败必须在注册前拒绝。
+2. 本机 receive 使用保存的 capture 尺寸/fps 与 receive MTU 校验 descriptor；注册原有 vcam，起 receiver。
+3. `/product/local/start` 下发 `{capture:{...},auto_adapter:true,stream:<descriptor>}`；capture 校验全部键/类型/值，缺字段或不匹配409。
+4. 双端启动结果回显 `stream`；sender 未确认同一 descriptor 时主机停止两侧并回收。旧后台不因同为0.4.1而被接受。
+5. 一次会话中禁止热改尺寸；改配置先停止。自定义诊断角色保留旧 640 桩测试，不允许偷偷忽略可变尺寸配置。
+
+CLI 追加 sender `--width/--height/--transform/--source-mac/--capabilities`，receiver
+`--width/--height/--fps/--source-mac/--capabilities`；旧无参数默认为640×640@240。
+低层 `/sender/start`、`/receiver/start` 接受成对 width/height、fps、source_mac（sender 另有 transform）；显式新字段必须先探测原生能力。
+Raw 的码率参数、编码模式、收端缩放、错误几何等拒绝，不忽略。没有新字段的历史诊断调用保留原语义。
+receiver 按会话严格校验 total、seq、每包 payload_len、pattern 一致性与完整字节覆盖，迟到包不得重新发布已完成帧。
+
+## SHM v3 与 DShow
+
+- 布局唯一来源 `vcam/vcam_shm.h`，magic `VCA3`，version3；64B header 中 offset32/36/40 为 width/height/fps，其余为保留。
+  原12槽、64B槽头、data_off4096、seqlock、异步整帧哈希和交替事件保持；总长度 `4096+12*frame_bytes`。
+- 每槽数据步长为 header.frame_bytes，不是编译常量614400。`hash_fid==frame_id` 才能使用异步 hash。
+- writer 不复用已经存在的同名 mapping：提示关闭旧 receiver/预览/下游设备后重试，不覆盖其他会话的尺寸或活动映射。
+- 新 reader 接受 v2 固定640×640@240 和合法 v3，检查实际映射容量；旧 v2 reader 遇 VCA3 判无信号。
+  Python `scripts/vc_shm.py`、monitor 使用同一校验/动态步长，不能截断读取成640。
+- DShow 在 filter 实例创建时从有效 mapping 固定格式，仅公布该会话一档尺寸/fps，allocator/样本长度跟随实际帧字节数。
+  不再公布工作线程实际上不执行的假帧率。没有 mapping 时默认640但遵守D12不输出；先开始采集再在下游打开设备。
+- 切尺寸必须在下游重新打开设备；已连接 filter 不偷偷换格式。D12 保留：从无有效帧不输出，有过有效帧后才可静默重复最后好帧。
+- verifier 可 `--dll <绝对路径> --shm <隔离映射> --width W --height H --fps F --seconds N --hashlog ...`，
+  在进程内加载 DLL、连接真实 allocator/IMediaSample sink，无 regsvr32；`--capabilities` 仅探测导出能力。
+  诊断进程环境 `VCAM_FRAME_MAP` 可覆盖映射名，不修改 HKCU/系统环境；产品不设置此变量。
+
+## 验证边界
+
+`python scripts/p6_raw_verify.py` 为开发专用 motion/batch1/Loopback 全链路矩阵，不随便携包交付，也不调用5143或注册DLL。
+`--dda` 要求真实变化桌面；测试不会自动启动动画源。实际报告见 `docs/bringup/bringup-20261103-p6-raw.md`。
+本机证明不替代双机、物理链路吞吐或长期使用验收；H.264/H.265 仍硬拒绝，不能套用 Raw 像素哈希门。
+
+## P6-3 开发后端CLI（非产品支持）
+
+`vc-codec-probe [--width W --height H --fps F]`仅枚举/激活/类型协商，固定frames_tested=0；打包MFT缺CLSID时输出null/clsid_hr。
+```text
+vc-codec-roundtrip --codec h264|hevc --width W --height H --fps F --frames N --bitrate <bit/s>
+  --encoder-clsid <GUID>|--encoder-name <exact> --decoder-clsid <GUID>|--decoder-name <exact>
+  [--hardware-encoder] [--hardware-decoder] [--max-in-flight 1..8] [--hashlog <path>]
+```
+默认640×640@240、30帧、20Mbps、in-flight=1；两侧身份各必须明确提供且唯一匹配，CLSID和name不能同时提供。
+`--selftest`独立验证NV12 aperture/stride/UV/容量，无需激活codec。非法参数退出2，MFT不支持/超时/帧序错误退出1。
+编码输出复制到新sample再解码，记录源/解码hash但不判两者相等；fps为媒体元数据，此工具不按墙钟送帧，不能据此宣称实时吞吐。
+真实候选与H.264/HEVC回环已在开发机验证，但产品仍不启用；HEVC需显式2帧in-flight，不能静默加深队列。
+工具不随便携包交付、不注册/调用agent/修改网卡。完整边界与证据：`docs/proposals/codec-backend-20261103.md`。

@@ -48,7 +48,7 @@ def test_package_support_files_exclude_caches_tests_and_build_scripts(tmp_path):
     stage.mkdir()
     for name in ("version.json", "packaging/Start-VirtualCapture.cmd", "packaging/Start-Capture-Worker.cmd", "docs/runbooks/package-quickstart.md",
                  "ctrl/run_remote.py", "ctrl/tests/test_private.py", "ctrl/__pycache__/x.pyc",
-                 "scripts/runtime-paths.ps1", "scripts/verify.py", "scripts/package.py",
+                 "scripts/runtime-paths.ps1", "scripts/verify.py", "scripts/package.py", "scripts/p6_raw_verify.py", "scripts/p6_product_verify.py",
                  "vc-config.json", "run/customer.hash.jsonl"):
         put(root, name)
     package.copy_support_files(root, stage)
@@ -57,7 +57,7 @@ def test_package_support_files_exclude_caches_tests_and_build_scripts(tmp_path):
     # A BOM is required for Windows PowerShell 5.1 to parse non-ASCII scripts.
     assert (stage / "scripts/runtime-paths.ps1").read_bytes().startswith(b"\xef\xbb\xbf")
     for excluded in ("ctrl/tests", "ctrl/__pycache__", "scripts/package.py", "scripts/verify.py",
-                     "vc-config.json", "run"):
+                     "scripts/p6_raw_verify.py", "scripts/p6_product_verify.py", "vc-config.json", "run"):
         assert not (stage / excluded).exists()
 
 

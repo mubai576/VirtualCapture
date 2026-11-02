@@ -20,9 +20,10 @@ three days of satisfactory use on 2026-11-02. This is not a new zero-loss or con
 Current product deployment is PC2 capture -> PC1 host; follow runtime roles, not historical PC labels. Scope = capture + transport only;
 inference side and exclusive-fullscreen hook are out of scope (PLAN D8).
 P6 is now authorized (PLAN D19): configurable output sizes/transforms, link budgeting and additional H.264/H.265
-lossy modes while retaining raw. P6-1 only adds draft configuration/budgeting; the native path is still fixed raw
-640x640. Pending combinations must fail before startup, not silently run the legacy format. The 28 B packet
-header and historical raw test gates remain frozen. See `references/stream-config.md` for staged support.
+lossy modes while retaining raw. Development P6-2 now implements variable-size Raw, four transforms, a real
+send-rate ceiling, SHM v3 and session-sized DShow. The stable deployment remains unchanged. H.264/H.265
+are still rejected by product startup pending P6-3. The 28 B packet header and historical raw test gates remain
+frozen. See `references/stream-config.md` and `docs/bringup/bringup-20261103-p6-raw.md` for local evidence.
 
 Repo map, commands, rules and multi-AI conventions: **root `AGENTS.md`** (single source; not repeated here).
 Progress and open decisions: `PLAN.md`. Specs: `docs/spec/` (requirements / test-plan / deployment,
@@ -34,7 +35,7 @@ early docs with dated SUPERSEDED notes). This skill holds the domain knowledge +
 |---|---|
 | `proto/vc_wire.h` | **Wire header — frozen.** `vc_pkt_hdr_t` 28 B. `reserved` is now `pattern`. Do not resize without bumping protocol + updating both ends + this skill. |
 | `sender/pattern.h` | Test-source suite (5 patterns, integer-only, seed=`frame_id`). C++/Python bit-exact by construction (no float/sin). Mirror: `ctrl/pattern_ref.py`. |
-| `common/crc32.h`, `common/fnv1a.h` | Shared transport checksums; sender and receiver link the `vc-common` header-only target. Algorithms and vectors are unchanged. |
+| `common/crc32.h`, `common/fnv1a.h`, `common/stream.h` | Shared checksums, session geometry, integer transforms and frame cap; sender/receiver link `vc-common`. Legacy vectors unchanged. |
 | `references/wire-protocol.md` | L2 layout, MTU/pacing math, `--batch` sendqueue semantics. |
 | `references/agent-api.md` | Agent REST contract (/adapters, /files paging, /update stage + /activate). |
 | `references/test-matrix.md` | T0–T5 definitions, D1 gates, triage. |

@@ -16,6 +16,8 @@
 #include <thread>
 #include <mutex>
 #include <deque>
+#include <vector>
+#include "../../vcam/vcam_shm.h"
 #pragma comment(lib,"d3d11.lib")
 #pragma comment(lib,"dxgi.lib")
 #pragma comment(lib,"d3dcompiler.lib")
@@ -23,36 +25,44 @@
 #pragma comment(lib,"msimg32.lib")
 
 // ── constants ─────────────────────────────────────────────────────────────────
-static const int    VCAM_W      = 640;
-static const int    VCAM_H      = 640;
+static int          VCAM_W      = 640;
+static int          VCAM_H      = 640;
 static const int    WIN_W       = 640;
 static const int    WIN_H       = 640;
-static const UINT   FRAME_BYTES = 614400;
+static UINT         FRAME_BYTES = 614400;
 static const UINT   SHM_SLOTS   = 12;            // vcam_shm.h VC_SHM_SLOTS
 static const UINT   SHM_DATA_OFF= 4096;          // vcam_shm.h VC_SHM_DATA_OFF
-static const UINT32 SHM_MAGIC   = 0x32414356u;   // "VCA2" (v2)
 static const char*  SHM_NAME    = "Local\\VirtualCaptureVcamFrame";
 static const int    HIST_N      = 120;
 
 enum { IDM_OSD_FULL=1001, IDM_OSD_MINI, IDM_OSD_OFF, IDM_QUIT };
 static wchar_t g_run_dir[MAX_PATH];
 
-// ── SHM (layout v2, mirrors vcam/vcam_shm.h) ─────────────────────────────────
-#pragma pack(push,1)
-struct ShmHdr  { uint32_t magic,version,slots,frame_bytes,data_off; int32_t latest_slot,latest_seq; uint32_t writer_pid; uint8_t r[32]; };
-struct ShmSlot { int32_t seq; uint32_t frame_id; uint64_t qpc_first_ns,qpc_pub_ns,hash; uint32_t hash_fid; uint8_t r[28]; };
-#pragma pack(pop)
-static_assert(sizeof(ShmHdr)==64&&sizeof(ShmSlot)==64,"shm v2 layout");
+// ── SHM (canonical vcam/vcam_shm.h, accepts v2/v3) ─────────────────────────────────
+using ShmHdr=vc_shm_hdr_t;
+using ShmSlot=vc_shm_slot_t;
 static HANDLE  g_hMap  = nullptr;
 static void*   g_pView = nullptr;
-static uint8_t g_frame_buf[FRAME_BYTES];
+static std::vector<uint8_t> g_frame_buf(FRAME_BYTES);
+static bool OpenSHM(){
+    if(g_pView) return true;
+    g_hMap=OpenFileMappingA(FILE_MAP_READ,FALSE,SHM_NAME);
+    if(!g_hMap) return false;
+    g_pView=MapViewOfFile(g_hMap,FILE_MAP_READ,0,0,0);
+    const ShmHdr* h=(const ShmHdr*)g_pView; MEMORY_BASIC_INFORMATION m={};
+    if(!h || !VirtualQuery(h,&m,sizeof(m)) || m.RegionSize<64 || !vc_shm_valid(h) || m.RegionSize<vc_shm_size(h->frame_bytes)){
+      if(g_pView) UnmapViewOfFile(g_pView); CloseHandle(g_hMap); g_hMap=nullptr; g_pView=nullptr; return false;
+    }
+    VCAM_W=h->version==3?h->width:640; VCAM_H=h->version==3?h->height:640;
+    FRAME_BYTES=h->frame_bytes; g_frame_buf.resize(FRAME_BYTES); return true;
+}
 
 struct FrameInfo { uint32_t fid; uint64_t hash; bool valid; };
 static FrameInfo ReadSHMFrame() {
     if (!g_pView) return {0,0,false};
     const uint8_t* b=(const uint8_t*)g_pView;
     const ShmHdr* h=(const ShmHdr*)b;
-    if (h->magic!=SHM_MAGIC||h->version!=2||h->slots!=SHM_SLOTS||h->frame_bytes!=FRAME_BYTES) return {0,0,false};
+    if (!vc_shm_valid(h)||h->frame_bytes!=FRAME_BYTES) return {0,0,false};
     int32_t i=*(volatile const int32_t*)&h->latest_slot;
     if (i<0||i>=(int32_t)SHM_SLOTS) return {0,0,false};
     const ShmSlot* sl=(const ShmSlot*)(b+64+64*i);
@@ -60,7 +70,7 @@ static FrameInfo ReadSHMFrame() {
     if (s1&1) return {sl->frame_id,0,false};
     uint32_t fid=sl->frame_id;
     MemoryBarrier();
-    memcpy(g_frame_buf,b+SHM_DATA_OFF+(size_t)i*FRAME_BYTES,FRAME_BYTES);
+    memcpy(g_frame_buf.data(),b+SHM_DATA_OFF+(size_t)i*FRAME_BYTES,FRAME_BYTES);
     MemoryBarrier();
     return {fid,0,s1==*(volatile const int32_t*)&sl->seq};
 }
@@ -79,7 +89,7 @@ SamplerState      Smp  :register(s0);
 cbuffer CB:register(b0){ float4 sig; float pad[4]; };
 float4 PS(float4 pos:SV_Position,float2 uv:TEXCOORD):SV_Target{
     if(pos.x>=4&&pos.x<20&&pos.y>=4&&pos.y<20) return sig;
-    float2 v=float2(pos.x/640,pos.y/640);
+    float2 v=uv;
     float  Y =TexY .Sample(Smp,v).r;
     float2 UV=TexUV.Sample(Smp,v).rg;
     float Cb=UV.r-.5f,Cr=UV.g-.5f;
@@ -219,6 +229,13 @@ static bool InitD3D(HWND hw){
     g_dev->CreateSamplerState(&sd2,&g_samp);
     D3D11_BUFFER_DESC cbd={sizeof(CBData),D3D11_USAGE_DYNAMIC,D3D11_BIND_CONSTANT_BUFFER,D3D11_CPU_ACCESS_WRITE,0,0};
     g_dev->CreateBuffer(&cbd,nullptr,&g_cb);
+    return true;
+}
+static bool EnsureTextures(){
+    static int w=0,h=0;
+    if(w==VCAM_W && h==VCAM_H) return true;
+    if(g_srvY){g_srvY->Release();g_srvY=nullptr;} if(g_srvUV){g_srvUV->Release();g_srvUV=nullptr;}
+    if(g_texY){g_texY->Release();g_texY=nullptr;} if(g_texUV){g_texUV->Release();g_texUV=nullptr;}
     D3D11_TEXTURE2D_DESC td={};td.MipLevels=1;td.ArraySize=1;td.SampleDesc.Count=1;
     td.Usage=D3D11_USAGE_DYNAMIC;td.BindFlags=D3D11_BIND_SHADER_RESOURCE;td.CPUAccessFlags=D3D11_CPU_ACCESS_WRITE;
     td.Width=VCAM_W;td.Height=VCAM_H;td.Format=DXGI_FORMAT_R8_UNORM;
@@ -228,6 +245,8 @@ static bool InitD3D(HWND hw){
     td.Width=VCAM_W/2;td.Height=VCAM_H/2;td.Format=DXGI_FORMAT_R8G8_UNORM;
     g_dev->CreateTexture2D(&td,nullptr,&g_texUV);sv.Format=DXGI_FORMAT_R8G8_UNORM;
     g_dev->CreateShaderResourceView(g_texUV,&sv,&g_srvUV);
+    if(!g_texY || !g_texUV || !g_srvY || !g_srvUV) return false;
+    w=VCAM_W;h=VCAM_H;
     return true;
 }
 static void UploadFrame(const uint8_t* nv12){
@@ -466,7 +485,9 @@ static void Render(bool valid){
     }
     prev=now;
     float clear[4]={0.04f,0.04f,0.05f,1};
-    D3D11_VIEWPORT vp={0,0,(float)WIN_W,(float)WIN_H,0,1};
+    float vw=(float)WIN_W,vh=(float)WIN_H;
+    if(VCAM_W>VCAM_H) vh=vw*VCAM_H/VCAM_W; else vw=vh*VCAM_W/VCAM_H;
+    D3D11_VIEWPORT vp={(WIN_W-vw)/2,(WIN_H-vh)/2,vw,vh,0,1};
     g_ctx->RSSetViewports(1,&vp);
     g_ctx->OMSetRenderTargets(1,&g_rtv,nullptr);
     g_ctx->ClearRenderTargetView(g_rtv,clear);
@@ -555,8 +576,7 @@ int WINAPI WinMain(HINSTANCE hi,HINSTANCE,LPSTR,int){
         wchar_t* p=wcsrchr(exe,L'\\');if(p)*p=0;else break;
     }
     if(!found)swprintf_s(g_run_dir,L"%s\\run",exe);
-    g_hMap=OpenFileMappingA(FILE_MAP_READ,FALSE,SHM_NAME);
-    if(g_hMap)g_pView=MapViewOfFile(g_hMap,FILE_MAP_READ,0,0,(SIZE_T)SHM_DATA_OFF+(SIZE_T)SHM_SLOTS*FRAME_BYTES);
+    OpenSHM();
     WNDCLASSEXW wc={sizeof(wc)};
     wc.style=CS_HREDRAW|CS_VREDRAW;wc.lpfnWndProc=WndProc;wc.hInstance=hi;
     wc.hCursor=LoadCursorW(nullptr,MAKEINTRESOURCEW(32512));wc.lpszClassName=L"VCMonitor";
@@ -567,7 +587,8 @@ int WINAPI WinMain(HINSTANCE hi,HINSTANCE,LPSTR,int){
     if(!g_hwnd){wchar_t e[128];swprintf_s(e,L"CreateWindowExW: %lu",GetLastError());MessageBoxW(nullptr,e,L"Error",MB_OK);return 1;}
     if(!InitD3D(g_hwnd)){MessageBoxW(g_hwnd,L"D3D11 init failed.",L"Error",MB_OK);return 1;}
     InitFonts();
-    {static uint8_t grey[FRAME_BYTES];memset(grey,128,FRAME_BYTES);UploadFrame(grey);}
+    if(!EnsureTextures()){MessageBoxW(g_hwnd,L"Video texture allocation failed.",L"Error",MB_OK);return 1;}
+    {std::vector<uint8_t> grey(FRAME_BYTES,128);UploadFrame(grey.data());}
     ShowWindow(g_hwnd,SW_SHOW);UpdateWindow(g_hwnd);
     SetTimer(g_hwnd,1,500,nullptr);
     std::thread st(StatsThread);st.detach();
@@ -577,9 +598,11 @@ int WINAPI WinMain(HINSTANCE hi,HINSTANCE,LPSTR,int){
             TranslateMessage(&msg);DispatchMessageW(&msg);
             if(msg.message==WM_QUIT)goto done;
         }
+        OpenSHM();
+        if(!EnsureTextures()) break;
         auto fi=ReadSHMFrame();
         if(fi.valid&&fi.fid!=g_last_fid.load()){
-            g_last_fid.store(fi.fid);g_has_signal.store(true);UploadFrame(g_frame_buf);
+            g_last_fid.store(fi.fid);g_has_signal.store(true);UploadFrame(g_frame_buf.data());
         }
         Render(fi.valid&&g_has_signal.load());
         Sleep(1);

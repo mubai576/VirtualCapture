@@ -26,7 +26,7 @@ NATIVE_FILES = (
     "vc-monitor.exe", "vc-monitor-diag.exe", "vc-vcam-verify.exe",
 )
 RUNTIME_FILES = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
-BUILD_ONLY_SCRIPTS = {"verify.py", "package.py"}
+BUILD_ONLY_SCRIPTS = {"verify.py", "package.py", "p6_raw_verify.py", "p6_product_verify.py"}
 
 
 class PackageError(Exception):

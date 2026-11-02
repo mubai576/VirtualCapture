@@ -10,7 +10,8 @@ raw L2 EtherType `0x88B5`（Npcap）发到主机重组，逐帧 FNV-1a64 对账�
 当前部署为 PC2 192.168.2.59 采集 → PC1 192.168.2.100 接收/GUI/虚拟卡（:5143），不按历史报告固定角色。
 2026-11-02 owner 确认约三天实际使用满意；封存与未验收边界见 `PLAN.md`、`docs/bringup/bringup-20261102.md`。
 同日 owner 批准进入 P6：可变分辨率、裁切/缩放、链路预算及 H.264/H.265（保留 raw）；
-当前先落地配置/预算，原生管线仍为上述固定 raw 格式，未接通的配置必须拒绝启动。设计见 `docs/proposals/configurable-stream-20261102.md`。
+开发版 P6-2 已接通可变尺寸 Raw、四种裁切/缩放、真正发送限速、SHM v3 和动态 DShow；稳定部署仍为上述固定格式。
+H.264/H.265 进入 P6-3，未接通的组合仍拒绝启动。本机验证见 `docs/bringup/bringup-20261103-p6-raw.md`。设计见 `docs/proposals/configurable-stream-20261102.md`。
 **范围：只管采集与传输；推理端不在本项目范围**（PLAN D8）。
 
 ## 读什么（按任务）
@@ -32,12 +33,12 @@ raw L2 EtherType `0x88B5`（Npcap）发到主机重组，逐帧 FNV-1a64 对账�
 | 路径 | 内容 | 归属/规则 |
 |---|---|---|
 | `CMakeLists.txt` + `cmake/` | 根构建编排、统一编译/输出规则、Npcap SDK 查找、long-path manifest | 从根目录配置；产物跟随 `-B` |
-| `common/` | 发收端共用 CRC32 / FNV-1a64 头文件（`vc-common` CMake target） | 算法只保留一份 |
+| `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mf_codec.h` MF后端原型（`vc-common` CMake target） | 算法只保留一份 |
 | `proto/vc_wire.h` | 28B 包头，**冻结** | 仅 owner 可改 |
 | `sender/` | `vc-sender.exe`（pattern/file/dda，`--batch`，`pattern.h` 整数测试源，`dda.h` 桌面采集） | C++17 |
-| `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，NV12 640x640@240，motion 帧源） | C++17 |
+| `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，会话 NV12 尺寸/fps，SHM v3，motion 仅显式 bring-up） | C++17 |
 | `receiver/` | `vc-receiver.exe`（重组、hash、stats、hashlog 带 qpc_ns） | C++17 |
-| `tools/` | `monitor/` 预览与诊断、`testwin/` DDA 动画源、`vcam_verify/` DShow 枚举/格式验收 | C++17；随根 CMake 一起构建，现有产物路径保留 |
+| `tools/` | `monitor/` 预览与诊断、`testwin/` DDA 动画源、`vcam_verify/` DShow 枚举/隔离取帧、`codec_probe/` MF 候选与实际编解码回环（仅开发，不交付） | C++17；随根 CMake 一起构建，现有产物路径保留 |
 | `agent/vc-agent.py` | 主机 UI / 被采集机后台（REST :5143，/exec 白名单，/files 分页，stage/activate OTA） | 单文件零依赖 |
 | `ctrl/` | `vc-ctrl.py` 编排判分、`bringup.py` 联调报告、`reconcile.py` 对账、`run_remote.py` 远控/OTA、`vc-monitor-tui.py` 文本仪表、`pattern_ref.py` Python 镜像 | |
 | `ctrl/tests/` | pytest：matrix（向量/判据/live）、OTA、GUI、package（打包保护/回滚/路径） | |

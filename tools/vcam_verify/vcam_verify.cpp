@@ -9,6 +9,11 @@
 #include <ksmedia.h>
 #include <string>
 #include <cstdio>
+#include <atomic>
+#include <fstream>
+#include <filesystem>
+#include "../../common/fnv1a.h"
+#include "../../common/stream.h"
 #pragma comment(lib,"strmiids.lib")
 #pragma comment(lib,"ole32.lib")
 #pragma comment(lib,"oleaut32.lib")
@@ -24,7 +29,7 @@ static void FreeMediaType(AM_MEDIA_TYPE* pmt) {
     CoTaskMemFree(pmt);
 }
 
-int main() {
+static int enumerate(int width,int height,int fps) {
     printf("P4-4 J1+J2: DShow vcam enumerate + format check\n");
     printf("================================================\n");
 
@@ -97,10 +102,10 @@ int main() {
                                        w, h2, fcc, (unsigned)pmt->subtype.Data1);
                                 printf("    AvgTimePerFrame=%lld (%.1f fps)\n",
                                        (long long)avg, avg ? 1e7/(double)avg : 0.0);
-                                bool ok = (w == 640 && h2 == 640 &&
+                                bool ok = (w == (DWORD)width && h2 == (DWORD)height &&
                                            (fourcc == 0x3231564EU || subtype_nv12) &&
-                                           avg == 41666);
-                                if (ok) { printf("  J2 PASS: NV12 640x640 AvgTimePerFrame=41666\n"); j2_pass = true; }
+                                           avg == 10000000LL/fps);
+                                if (ok) { printf("  J2 PASS: NV12 %dx%d AvgTimePerFrame=%lld\n",width,height,10000000LL/fps); j2_pass = true; }
                                 else      printf("  J2 FAIL: format mismatch\n");
                                 FreeMediaType(pmt);
                             } else {
@@ -128,4 +133,111 @@ int main() {
     bool all_pass = j1_pass && j2_pass;
     printf("\nResult: %s\n", all_pass ? "PASS" : "FAIL");
     return all_pass ? 0 : 1;
+}
+
+
+// A real allocator/IMediaSample sink, loaded in-process without COM registration or a graph UI.
+class VerifySink : public IPin, public IMemInputPin {
+  LONG refs=1;
+  VCStream stream;
+  std::ofstream hashes;
+  HANDLE flushed=CreateEvent(nullptr,TRUE,FALSE,nullptr);
+  bool block_receive=false;
+public:
+  std::atomic<uint64_t> samples{0}, invalid{0};
+  VerifySink(const VCStream& s,const std::string& path,bool block):stream(s),block_receive(block){ if(!path.empty()) hashes.open(path,std::ios::binary); }
+  ~VerifySink(){if(flushed)CloseHandle(flushed);}
+  STDMETHODIMP QueryInterface(REFIID id,void** out){
+    if(!out) return E_POINTER; *out=nullptr;
+    if(id==IID_IUnknown || id==IID_IPin) *out=(IPin*)this;
+    else if(id==IID_IMemInputPin) *out=(IMemInputPin*)this;
+    else return E_NOINTERFACE; AddRef(); return S_OK;
+  }
+  STDMETHODIMP_(ULONG) AddRef(){ return InterlockedIncrement(&refs); }
+  STDMETHODIMP_(ULONG) Release(){ LONG r=InterlockedDecrement(&refs); if(!r) delete this; return r; }
+  STDMETHODIMP Connect(IPin*,const AM_MEDIA_TYPE*){ return E_NOTIMPL; }
+  STDMETHODIMP ReceiveConnection(IPin*,const AM_MEDIA_TYPE* mt){
+    if(!mt || mt->cbFormat<sizeof(VIDEOINFOHEADER) || !mt->pbFormat) return VFW_E_TYPE_NOT_ACCEPTED;
+    auto* v=(VIDEOINFOHEADER*)mt->pbFormat;
+    return v->bmiHeader.biWidth==stream.width && v->bmiHeader.biHeight==stream.height &&
+      v->bmiHeader.biSizeImage==stream.frame_bytes() && v->AvgTimePerFrame==10000000LL/stream.fps &&
+      mt->subtype==MEDIASUBTYPE_NV12_EXPECTED ? S_OK:VFW_E_TYPE_NOT_ACCEPTED;
+  }
+  STDMETHODIMP Disconnect(){ return S_OK; }
+  STDMETHODIMP ConnectedTo(IPin** p){if(p)*p=nullptr;return VFW_E_NOT_CONNECTED;}
+  STDMETHODIMP ConnectionMediaType(AM_MEDIA_TYPE*){return E_NOTIMPL;}
+  STDMETHODIMP QueryPinInfo(PIN_INFO* p){if(!p)return E_POINTER;ZeroMemory(p,sizeof(*p));p->dir=PINDIR_INPUT;return S_OK;}
+  STDMETHODIMP QueryDirection(PIN_DIRECTION* p){if(!p)return E_POINTER;*p=PINDIR_INPUT;return S_OK;}
+  STDMETHODIMP QueryId(LPWSTR*){return E_NOTIMPL;}
+  STDMETHODIMP QueryAccept(const AM_MEDIA_TYPE* p){return ReceiveConnection(nullptr,p);}
+  STDMETHODIMP EnumMediaTypes(IEnumMediaTypes**){return E_NOTIMPL;}
+  STDMETHODIMP QueryInternalConnections(IPin**,ULONG*){return E_NOTIMPL;}
+  STDMETHODIMP EndOfStream(){return S_OK;}
+  STDMETHODIMP BeginFlush(){SetEvent(flushed);return S_OK;}
+  STDMETHODIMP EndFlush(){return S_OK;}
+  STDMETHODIMP NewSegment(REFERENCE_TIME,REFERENCE_TIME,double){return S_OK;}
+  STDMETHODIMP GetAllocator(IMemAllocator** p){return CoCreateInstance(CLSID_MemoryAllocator,nullptr,CLSCTX_INPROC_SERVER,IID_IMemAllocator,(void**)p);}
+  STDMETHODIMP NotifyAllocator(IMemAllocator*,BOOL){return S_OK;}
+  STDMETHODIMP GetAllocatorRequirements(ALLOCATOR_PROPERTIES*){return E_NOTIMPL;}
+  STDMETHODIMP Receive(IMediaSample* sample){
+    BYTE* p=nullptr;
+    if(!sample || sample->GetActualDataLength()!=stream.frame_bytes() || FAILED(sample->GetPointer(&p)) || !p){invalid++;return E_FAIL;}
+    uint64_t hash=vc_fnv1a64(p,stream.frame_bytes());
+    REFERENCE_TIME start=0,end=0; sample->GetTime(&start,&end);
+    if(end-start!=10000000LL/stream.fps) invalid++;
+    char hex[17];vc_fnv1a64_hex(hash,hex);
+    if(hashes) hashes<<"{\"sample\":"<<samples.load()<<",\"hash\":\""<<hex<<"\",\"start_100ns\":"<<start<<"}\n";
+    samples++;if(block_receive)WaitForSingleObject(flushed,INFINITE);return S_OK;
+  }
+  STDMETHODIMP ReceiveMultiple(IMediaSample** s,LONG n,LONG* done){*done=0;for(LONG i=0;i<n;i++){HRESULT h=Receive(s[i]);if(FAILED(h))return h;(*done)++;}return S_OK;}
+  STDMETHODIMP ReceiveCanBlock(){return block_receive?S_OK:S_FALSE;}
+};
+
+int main(int argc,char** argv){
+  VCStream stream; std::string dll,map,hashlog; int seconds=2; bool capabilities=false,allow_empty=false,block=false;
+  for(int i=1;i<argc;i++){
+    std::string arg=argv[i];
+    auto value=[&](){if(i+1>=argc){fprintf(stderr,"missing value\n");exit(2);}return std::string(argv[++i]);};
+    if(arg=="--dll") dll=value(); else if(arg=="--shm") map=value(); else if(arg=="--hashlog") hashlog=value();
+    else if(arg=="--width") stream.width=vc_cli_int(value().c_str()); else if(arg=="--height") stream.height=vc_cli_int(value().c_str());
+    else if(arg=="--fps") stream.fps=vc_cli_int(value().c_str()); else if(arg=="--seconds") seconds=vc_cli_int(value().c_str());
+    else if(arg=="--capabilities") capabilities=true; else if(arg=="--allow-empty") allow_empty=true;
+    else if(arg=="--block-receive") block=true;
+    else {fprintf(stderr,"unknown arg %s\n",arg.c_str());return 2;}
+  }
+  if(!stream.valid() || seconds<1 || seconds>120) return 2;
+  if(dll.empty()) return enumerate(stream.width,stream.height,stream.fps);
+  HMODULE module=LoadLibraryW(std::filesystem::absolute(dll).wstring().c_str());
+  if(!module){fprintf(stderr,"LoadLibrary failed: %lu\n",GetLastError());return 1;}
+  auto caps=(const char* (__cdecl*)())GetProcAddress(module,"VCStreamCapabilities");
+  if(!caps){fprintf(stderr,"DLL lacks P6 stream capabilities\n");FreeLibrary(module);return 1;}
+  if(capabilities){puts(caps());FreeLibrary(module);return 0;}
+  if(!map.empty()) SetEnvironmentVariableW(L"VCAM_FRAME_MAP",std::filesystem::path(map).wstring().c_str());
+  CoInitializeEx(nullptr,COINIT_MULTITHREADED);
+  static const CLSID clsid={0xb84c7e21,0x4a5f,0x4e2b,{0x9c,0x11,0x5a,0x3d,0x7f,0x01,0x22,0x9a}};
+  auto get=(HRESULT (STDAPICALLTYPE*)(REFCLSID,REFIID,void**))GetProcAddress(module,"DllGetClassObject");
+  IClassFactory* factory=nullptr;IBaseFilter* filter=nullptr;IPin* pin=nullptr;IGraphBuilder* graph=nullptr;
+  HRESULT hr=get?get(clsid,IID_IClassFactory,(void**)&factory):E_FAIL;
+  if(SUCCEEDED(hr)) hr=factory->CreateInstance(nullptr,IID_IBaseFilter,(void**)&filter);
+  if(factory) factory->Release();
+  if(SUCCEEDED(hr)) hr=CoCreateInstance(CLSID_FilterGraph,nullptr,CLSCTX_INPROC_SERVER,IID_IGraphBuilder,(void**)&graph);
+  if(SUCCEEDED(hr)) hr=graph->AddFilter(filter,L"Isolated VirtualCapture");
+  if(SUCCEEDED(hr)) hr=filter->FindPin(L"Capture",&pin);
+  VerifySink* sink=new VerifySink(stream,hashlog,block);
+  if(SUCCEEDED(hr)) hr=pin->Connect(sink,nullptr);
+  if(SUCCEEDED(hr)) hr=filter->Run(0);
+  if(SUCCEEDED(hr)) Sleep((DWORD)seconds*1000);
+  if(filter) filter->Stop();
+  bool pass=SUCCEEDED(hr) && sink->invalid==0 && (allow_empty || sink->samples>0);
+  printf("DLL stream %dx%d@%d samples=%llu invalid=%llu hr=0x%08x %s\n",stream.width,stream.height,stream.fps,
+    (unsigned long long)sink->samples.load(),(unsigned long long)sink->invalid.load(),(unsigned)hr,pass?"PASS":"FAIL");
+  if(pin){pin->Disconnect();pin->Release();}
+  if(filter) filter->Release();
+  if(graph) graph->Release();
+  sink->Release();
+  CoUninitialize();
+  auto unload=(HRESULT (STDAPICALLTYPE*)())GetProcAddress(module,"DllCanUnloadNow");
+  if(!unload || unload()!=S_OK){fprintf(stderr,"DLL retained COM references after Stop/Disconnect\n");return 1;}
+  FreeLibrary(module);
+  return pass?0:1;
 }

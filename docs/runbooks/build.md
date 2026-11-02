@@ -66,6 +66,8 @@ cmake --build build/clean --config Release
 | `vc-testwin` | `build/Release/vc-testwin.exe` | DDA 动画测试源 |
 | `vc-monitor` | `build/Release/vc-monitor.exe` | NV12 预览仪表 |
 | `vc-monitor-diag` | `build/Release/vc-monitor-diag.exe` | D3D11 诊断 |
+| `vc-codec-roundtrip`（仅开发） | `build/Release/vc-codec-roundtrip.exe` | 显式MFT实际编码/解码原型与aperture自测；不交付，命令见codec-backend提案 |
+| `vc-codec-probe`（仅开发） | `build/Release/vc-codec-probe.exe` | MF候选/类型探测，不含在便携包中，不代表产品支持 |
 | `vc-vcam-verify` | `build/vcam_verify/Release/vc-vcam-verify.exe` | 保留原有验收工具输出路径 |
 
 Debug 对应 `Debug/`；单配置生成器不加配置子目录。辅助工具源码迁入 `tools/` 不改变上述 Release 路径。
@@ -80,7 +82,9 @@ python scripts/verify.py --no-build --live Loopback
 第一条运行 build + 发收端 selftest + pattern_ref + pytest；第二条在已有默认构建上加跑本机回环 live。
 `verify.py` 固定查找默认 `build/`，自定义构建目录请直接运行对应产物。
 未指定 `VC_ADAPTER` 时 pytest 跳过 live 用例，T3 默认跳过；这些跳过不等于双机验收通过。
-工具与专项验收入口见 `development-tools.md`，双机判据见 skill `references/test-matrix.md`。
+P6-2 开发专项：`python scripts/p6_raw_verify.py`（motion/batch1/Loopback/真实DShow）；`--dda`需变化桌面。
+`python scripts/p6_product_verify.py`验证隔离HTTP产品编排，只有注册操作被替换，使用随机端口/私有映射，不触碰稳定5143或注册表。
+这些脚本不随成品交付；DLL隔离加载不注册。工具与专项验收入口见 `development-tools.md`，双机判据见 skill `references/test-matrix.md`。
 
 ## Agent 打包
 

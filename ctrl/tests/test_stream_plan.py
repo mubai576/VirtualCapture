@@ -8,13 +8,14 @@ import pytest
 
 
 @pytest.fixture
-def agent(tmp_path):
+def agent(tmp_path, monkeypatch):
     path = Path(__file__).resolve().parents[2] / "agent/vc-agent.py"
     spec = importlib.util.spec_from_file_location("stream_plan_agent", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     module.ROOT = str(tmp_path)
     module.state["role"] = "host"
+    monkeypatch.setattr(module, "stream_native_errors", lambda kind: [])
     return module
 
 
@@ -69,7 +70,7 @@ def test_pending_settings_persist_without_claiming_support(agent):
     assert result["network"]["status"] == "fits"
     assert result["network"]["is_estimate"]
     assert not result["implementation"]["supported"] and not result["can_start"]
-    assert len(result["implementation"]["reasons"]) == 3
+    assert len(result["implementation"]["reasons"]) == 1
     assert result["implementation"]["hardware_verified"] is False
     assert any("IDR" in message for message in result["warnings"])
 
@@ -83,7 +84,7 @@ def test_exact_640_l2_budget_and_baseline_support(agent):
     assert net["wire_bps"] == (614400 + 69 * 66) * 8 * 240
     assert net["usable_bps"] == 2000000000 and net["max_raw_fps"] == 403
     assert net["status"] == "fits" and result["can_start"]
-    assert any("尚未按目标帧率硬限速" in message for message in result["warnings"])
+    assert any("按目标帧率限速" in message for message in result["warnings"])
 
 
 @pytest.mark.parametrize("width,height,fps,status", [
@@ -95,7 +96,8 @@ def test_preset_budgets_do_not_confuse_network_with_implementation(agent, width,
     result = plan(agent, width=width, height=height, fps=fps)
     assert result["network"]["status"] == status
     assert result["video"]["raw_frame_bytes"] == width * height * 3 // 2
-    assert not result["implementation"]["supported"] and not result["can_start"]
+    assert result["implementation"]["supported"]
+    assert result["can_start"] == (status != "exceeds")
 
 
 def test_padding_and_mtu_math(agent):
@@ -171,7 +173,7 @@ def test_old_peer_does_not_invent_link_speed(agent, monkeypatch):
     monkeypatch.setattr(agent, "peer_call", lambda *a, **k: (404, {"error": "unknown"}))
     code, result = agent.stream_plan({"adapter": "DirectNIC", "peer_url": "http://192.168.2.59:5143"})
     assert code == 200 and result["network"]["status"] == "unknown"
-    assert result["can_start"]  # retain legacy raw startup when speed is unknown
+    assert not result["can_start"]  # old peers lack explicit session negotiation
     assert any("新版速率探测" in message for message in result["warnings"])
 
 
@@ -196,7 +198,7 @@ def test_plan_url_validation_and_capture_role(agent, monkeypatch):
     assert agent.stream_plan()[0] == 403
 
 
-@pytest.mark.parametrize("capture", [{"width": 416, "height": 416}, {"codec": "h264"}, {"transform": "fit"}])
+@pytest.mark.parametrize("capture", [{"codec": "h264"}, {"codec": "hevc"}])
 def test_unimplemented_product_start_has_no_side_effects(agent, monkeypatch, capture):
     assert agent.save_config({"capture": capture})[0] == 200
     monkeypatch.setattr(agent, "peer_call", lambda *a, **k: pytest.fail("must reject before remote calls"))
@@ -211,7 +213,7 @@ def test_unimplemented_product_start_has_no_side_effects(agent, monkeypatch, cap
 def test_physical_budget_rejection_precedes_registration(agent, monkeypatch):
     agent.save_config({"adapter": "DirectNIC", "peer_url": "http://192.168.2.59:5143"})
     def peer(path, **kwargs):
-        if path == "/health": return 200, {"product_revision": 2, "product_role": "capture"}
+        if path == "/health": return 200, {"product_revision": 2, "product_role": "capture", "stream_revision": 2}
         if path == "/config": return 200, {"role": "capture"}
         if path == "/version": return 200, {"version": agent.read_version()}
         return 200, {"revision": 1, "adapter": nic(1000000000)}
@@ -244,5 +246,5 @@ def test_capture_capabilities_use_control_route_without_starting(agent, monkeypa
     capabilities = agent.stream_capabilities("192.168.2.100")
     assert capabilities["adapter"]["transmit_link_bps"] == 2500000000
     assert capabilities["native"]["codecs"] == ["raw"]
-    assert not capabilities["native"]["variable_resolution"]
+    assert capabilities["native"]["variable_resolution"]
     assert capabilities["hardware"] == {"encoder": "unprobed", "decoder": "unprobed"}

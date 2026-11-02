@@ -5,17 +5,17 @@ Base: `http://<ctrl-ip>:5143`（2026-10-29 起产品固定端口；旧部署 180
 
 | 方法 | 路径 | 入参 | 出参 |
 |---|---|---|---|
-| GET | `/health` | — | `{ok, version, role, running, updater, pid, staged, product_revision:2, stream_revision:1, product_role:capture|receive, root}`；root 为运行目录绝对路径，启动器据角色、能力与目录识别已有服务 |
+| GET | `/health` | — | `{ok, version, role, running, updater, pid, staged, product_revision:2, stream_revision:2, product_role:capture|receive, root}`；root 为运行目录绝对路径，启动器据角色、能力与目录识别已有服务 |
 | GET | `/version` | — | `{version[, git_sha]}` |
 | GET | `/adapters` | — | `{text, names[], items[{name,description,label?,mac?,status?,receive_link_bps?,transmit_link_bps?,hardware_interface?,virtual?,addresses?[{ip,prefix}]}], exe}`；速率为数值 bit/s，虚拟网卡不视为物理容量，Npcap 列表与 Windows 网卡 GUID 关联，不启动采集；自动选择时使用完整 NPF 设备名 |
 | POST | `/update` | 二进制 zip → `{staged, version}`（只 stage，不重启）；`{rollback:true}` → 经 activate 回滚 prev |
 | POST | `/activate` | `{version}` 或 `{rollback:true}` | `{activated, version, rollback, restart}`（`restart=execv`，原地接管，无 detached 进程） |
-| POST | `/sender/start` | `{mode, pattern, fps, frames, ethertype, mtu, pacing_us, adapter*, dst_mac, ...}`（*adapter 必填，缺省 400 + adapters 列表，不拉起进程） | `{session_id, args}` |
+| POST | `/sender/start` | `{mode, pattern, fps, frames, ethertype, mtu, pacing_us, adapter*, dst_mac, ...}`（*adapter 必填；P6-2 追加成对 width/height、fps、source_mac；sender 另有 transform，详见 stream-config.md） | `{session_id, args}` |
 | POST | `/sender/stop` | — | `{session_id, stopped}` |
 | GET | `/sender/stats` | — | `{session_id, running, sent_frames, sent_packets, pps, bps, fps_actual, send_errors, pattern, gpu_ms, gpu_dispatch_ms, gpu_dispatch_samples, pc1_seg_avg_ms, pc1_seg_p99_ms, pc1_seg_max_ms, gpu_convert, cpu_pct, cap_lag_avg_ms, cap_lag_p99_ms, cap_lag_max_ms}`（P4-1：gpu_ms=wall-clock；gpu_dispatch_ms=D3D11 timestamp 真 GPU 拷贝时间，0 样本时为 0） |
-| POST | `/receiver/start` | `{adapter*, ethertype, mtu, expect_frames, timeout_s, shm}`（*adapter 必填，缺省 400 + adapters 列表，不拉起进程） | `{session_id, args}` |
+| POST | `/receiver/start` | `{adapter*, ethertype, mtu, expect_frames, timeout_s, shm}`（*adapter 必填；P6-2 追加成对 width/height、fps、source_mac；sender 另有 transform，详见 stream-config.md） | `{session_id, args}` |
 | POST | `/receiver/stop` | — | `{session_id, stopped}` |
-| GET | `/receiver/stats` | — | `{session_id, running, complete, dropped, packets_recv, packets_lost, pps, bps, gaps, hash_mismatch, inter_arrival_avg_ms, inter_arrival_p99_ms, rseg_avg_ms, rseg_p50_ms, rseg_p99_ms, rseg_max_ms, shm_published, vseg_avg_ms, vseg_p50_ms, vseg_p99_ms, vseg_max_ms, vcam_delivered, vcam_repeats, hash_queue_max}`（vseg=receiver 发布→vcam 交付，同机 QPC；shm 布局见 vcam/vcam_shm.h v2） |
+| GET | `/receiver/stats` | — | `{session_id, running, complete, dropped, packets_recv, packets_lost, pps, bps, gaps, hash_mismatch, inter_arrival_avg_ms, inter_arrival_p99_ms, rseg_avg_ms, rseg_p50_ms, rseg_p99_ms, rseg_max_ms, shm_published, vseg_avg_ms, vseg_p50_ms, vseg_p99_ms, vseg_max_ms, vcam_delivered, vcam_repeats, hash_queue_max}`（vseg=receiver 发布→vcam 交付，同机 QPC；shm 布局见 vcam/vcam_shm.h v3） |
 | GET | `/receiver/report` | -- | {version, sender, receiver} (both-side stats snapshot) |
 | POST | `/pcap/start` | `{seconds}` |
 | POST | `/exec` | `{argv:[...], timeout_s}` (allowlist, see below) | `{exec_id, exit_code, stdout, stderr, timed_out, duration_s}` |
@@ -32,8 +32,8 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 | POST | `/config` | 部分字段（未知键丢弃，子对象逐键合并） | `{saved, config}`；校验失败 400 `{error, details[]}`。产品角色由启动方式固定；主机 peer_url 只接受 `http://IPv4:5143`，UI 只填 IP。adapter 接受安全描述子串或完整 `\Device\NPF_{GUID}` / `\Device\NPF_Loopback`；运行时拒绝更改连接配置（409） |
 | GET | `/vcam/status` | — | `{dll, registered, match}`（HKCU InprocServer32 是否指向本机 ROOT 下 dll） |
 | POST | `/vcam/register` | — | regsvr32 /s 本机 dll；同步 FrameMap，Motion=0；200 需 exit=0 且 match。产品 UI 不提供手动注册入口 |
-| POST | `/product/local/start` `/product/local/stop` | 采集后台 start 可带 `{capture:{...},auto_adapter:true}` | host 起/停 receiver（固定默认 SHM，timeout 0），接收前注册 vcam、接收结束回收；capture 起/停 sender，参数由主机下发。auto_adapter 按请求来源 IP 的本机出站地址精确匹配系统网卡，匹配不唯一时 409，不随意选首卡 |
-| POST | `/product/start` | — | 主机发起：检查采集后台 product_revision=2、角色与版本 → 注册并启动本机接收 → 0.5s → 下发采集设置；被采集机无需配置 peer_url/网卡。获取到主机选定网卡 MAC 时自动单播。发端失败先尽力停发端，再停止并回收收端。`{ok, steps[{side,code,result,rollback?}]}`；采集后台不接受此编排命令（403） |
+| POST | `/product/local/start` `/product/local/stop` | 采集后台 start 必须带 `{capture:{...},auto_adapter:true,stream:<descriptor>}`；成功回显 stream | host 起/停 receiver（固定默认 SHM，timeout 0），接收前注册 vcam、接收结束回收；capture 起/停 sender，参数由主机下发。auto_adapter 按请求来源 IP 的本机出站地址精确匹配系统网卡，匹配不唯一时 409，不随意选首卡 |
+| POST | `/product/start` | — | 主机发起：检查采集后台 product_revision=2、stream_revision=2、角色、版本与实际原生能力 → 注册并启动本机接收 → 0.5s → 下发采集设置；被采集机无需配置 peer_url/网卡。获取到主机选定网卡 MAC 时自动单播。发端失败先尽力停发端，再停止并回收收端。`{ok, steps[{side,code,result,rollback?}]}`；采集后台不接受此编排命令（403） |
 | POST | `/product/stop` | — | 先停发端再停收端并回收 vcam；对端失联也继续处理本机。`{ok, steps}`；部分失败时 ok=false |
 | GET | `/product/status` | — | `{ts, local{online,config,version,sender,receiver,vcam}, peer{online,url,version,config,sender,receiver,vcam}|null}`；对端只调固定 GET 端点（无通用反代） |
 - `/sender/start` 新增可选 `gpu_convert:true` → `--gpu-convert`。
@@ -46,21 +46,21 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 - `auto_adapter` 在控制连接为本机回环时精确选择 `\\Device\\NPF_Loopback`，仅用于本机诊断。回环测试使用 batch=1；产品默认 batch=69、MTU=9000 不变，本机证据不能代替双机验收。
 - 控制台连接配置仅提供被采集机 IP、本机网卡和目标帧率；2026-10-29 按 owner 要求移除画面来源（含测试图案）、像素转换、发送批大小和 MTU 控件。保存时保留后台已有的隐藏参数，配置 API 与默认值不变。
 
-## P6-1 配置与预算（D19，2026-11-02）
+## P6 配置、预算与显式会话（D19；P6-2，2026-11-03）
 
 上述 2026-10-29 的精简 UI 已被本轮新增配置要求扩展；仍隐藏测试源/GPU/batch/MTU。
 新增五档分辨率预设 + 自定义、crop/fit/fill/stretch、raw/h264/hevc、码率及预留余量。
-非 640/crop/raw 目前是可保存草案而不是可运行能力，产品启动在任何注册/拉起前 409 拒绝。
+开发版 Raw 可变尺寸与四种变换已接通；H.264/H.265 仍为草案，产品启动在任何注册/拉起前409拒绝。
 
 | 方法 | 路径 | 请求 | 返回 |
 |---|---|---|---|
-| GET | `/stream/capabilities` | — | `{revision:1,presets[],native,hardware,adapter,adapter_error?}`；capture 按 HTTP 来源路由选择网卡并附数值收发速率；本阶段 hardware 均 unprobed，不启动采集 |
-| POST | `/stream/plan` | `{config:{...部分配置...},refresh:false}` | 200 `{revision:1,video,network,implementation,can_start,warnings[]}`；校验失败400，capture角色403；不写配置、不启停、不注册。详情、预算数学与缓存见 stream-config.md |
+| GET | `/stream/capabilities` | — | `{revision:2,presets[],native,hardware,adapter,adapter_error?}`；capture 按 HTTP 来源路由选择网卡并附数值收发速率；本阶段 hardware 均 unprobed，不启动采集 |
+| POST | `/stream/plan` | `{config:{...部分配置...},refresh:false}` | 200 `{revision:2,video,network,implementation,can_start,warnings[]}`；校验失败400，capture角色403；不写配置、不启停、不注册。详情、预算数学与缓存见 stream-config.md |
 
 产品主机启动额外做新鲜链路预算；已知超线速、断开网卡、MTU 不一致在注册前拒绝，
-速率未知只警告保留旧 raw 兼容启动。低层 `/sender/start`、`/receiver/start` 不接受新流字段，
-显式携带 width/height/transform/codec/bitrate_mbps/max_bitrate_mbps 时 409，不会忽略后启动。
-冻结 CLI、28B packet、SHM v2 与历史 raw 验收判据均未改变。
+速率未知只警告，但旧后台缺显式会话能力必须拒绝。低层接口支持成对 width/height、fps、source_mac；sender支持transform，显式新字段先探测原生能力再停旧进程。
+Raw码率参数、不支持codec、收端缩放及错误几何拒绝。主机生成descriptor、收端先起、capture逐键确认并回显，不一致回滚双端。
+两端stats追加 width/height/frame_bytes/fps_limit/codec，sender另有transform/source_skipped。28B包头与历史raw判据未变；SHM已升级v3，下游须重新打开，完整契约见stream-config.md。
 
 ## /exec policy (added 0.2.0, allowlist-bound, NOT a general shell)
 

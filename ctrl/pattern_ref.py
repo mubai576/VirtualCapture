@@ -125,6 +125,48 @@ def verify_samples(Y: bytes, UV: bytes, fid: int, pattern: str, n: int = 4096):
 PATS = ["counter", "checker", "rings", "noise", "motion"]
 GENS = {"counter": gen_counter, "checker": gen_checker, "rings": gen_rings, "noise": gen_noise, "motion": gen_motion}
 
+
+def gen_native(pattern, fid, w, h):
+    """Native full-size suite, including non-eight-byte tails; legacy small64 functions stay unchanged."""
+    if pattern not in PATS or w < 2 or h < 2 or w % 2 or h % 2:
+        raise ValueError("invalid native pattern geometry")
+    def prng(state, count):
+        out = bytearray()
+        for _ in range(count // 8):
+            state, value = splitmix64(state)
+            out.extend(value.to_bytes(8, "little"))
+        for _ in range(count % 8):
+            state, value = splitmix64(state)
+            out.append(value & 255)
+        return state, out
+    if pattern == "noise":
+        state = (fid << 32) ^ 0x123456789ABC
+        state, y = prng(state, w*h)
+        _, uv = prng(state, w*h//2)
+        return bytes(y), bytes(uv)
+    if pattern != "motion":
+        return GENS[pattern](fid, w, h)
+    y = bytearray(((x + fid*3 + (yy >> 2)) & 255) for yy in range(h) for x in range(w))
+    sprite = min(64, min(w, h)-1)
+    for k in range(4):
+        px = ((fid*(5+k*2) + k*173) & 0xffffffff) % (w-sprite)
+        py = ((fid*(3+k) + k*311) & 0xffffffff) % (h-sprite)
+        c = 60 + k*50
+        for yy in range(sprite):
+            for x in range(sprite):
+                y[(py+yy)*w+px+x] = 255-c if (x ^ yy) & 8 else c
+    noise = min(256, w, h)
+    x0, y0 = (w-noise)//2, (h-noise)//2
+    state = (fid << 32) ^ 0x4D4F54494F4E
+    for yy in range(noise):
+        state, row = prng(state, noise)
+        y[(y0+yy)*w+x0:(y0+yy)*w+x0+noise] = row
+    uv = bytearray(w*h//2)
+    for yy in range(h//2):
+        for x in range(0, w, 2):
+            uv[yy*w+x], uv[yy*w+x+1] = (x+fid) & 255, (yy*2-fid) & 255
+    return bytes(y), bytes(uv)
+
 if __name__ == "__main__":
     assert gen_noise_y(7) == gen_noise_y(7), "PRNG non-deterministic"
     n0, n1 = gen_noise_y(0), gen_noise_y(1)

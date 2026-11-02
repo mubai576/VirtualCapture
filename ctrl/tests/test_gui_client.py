@@ -37,7 +37,7 @@ vm.runInContext(input.assertions, sandbox);
 """
     result = subprocess.run([node, "-e", harness], input=json.dumps({
         "script": script, "assertions": assertions
-    }), text=True, capture_output=True, timeout=15)
+    }), text=True, capture_output=True, encoding="utf-8", timeout=15)
     assert result.returncode == 0, result.stdout + result.stderr
 def test_fps_resets_and_counter_regression(client):
     check(client, """
@@ -70,7 +70,7 @@ assert(getSides(status).receive === status.local);
 READY = """
 const config = {role:'receive',adapter:'I226',peer_url:'http://192.168.2.59:5143'};
 const status = {local:{online:true,config,version:'0.4.1',receiver:{running:false},sender:{running:false}},
-    peer:{online:true,version:'0.4.1',product_revision:2,product_role:'capture',config:{role:'capture',adapter:'Realtek'},
+    peer:{online:true,version:'0.4.1',product_revision:2,stream_revision:2,product_role:'capture',config:{role:'capture',adapter:'Realtek'},
           sender:{running:false},receiver:{running:false}}};
 """
 
@@ -164,7 +164,7 @@ assert(captureSource({mode:'dda'},{capture:{mode:'pattern'}}) === '桌面采集 
 
 def test_pending_pipeline_blocks_start_not_stop(client):
     check(client, READY + """
-for (const capture of [{width:416,height:416}, {codec:'h264'}, {codec:'hevc'}, {transform:'fit'}]) {
+for (const capture of [{codec:'h264'}, {codec:'hevc'}]) {
   status.local.config.capture = capture;
   assert(!readiness(status,false).canStart);
   assert(readiness(status,false).title.includes('尚不可运行'));
@@ -175,7 +175,7 @@ for (const capture of [{width:416,height:416}, {codec:'h264'}, {codec:'hevc'}, {
   assert(!readiness(status,false).canStart, 'an old failure must not bypass pending-mode guard');
   delete status.peer.sender.error;
 }
-status.local.config.capture = {width:640,height:640,codec:'raw',transform:'crop'};
+status.local.config.capture = {width:416,height:416,codec:'raw',transform:'fit'};
 assert(readiness(status,false).canStart);
 """)
 

@@ -18,6 +18,8 @@ struct DDACap {
   Err err_code = E_NODDA;
   std::string err_msg = "uninitialized";
   int out_w = 0, out_h = 0;
+  VCStream stream;
+  uint64_t last_image_qpc=0, source_skipped=0;
 #ifdef _WIN32
   ID3D11Device* dev = nullptr;
   ID3D11DeviceContext* ctx = nullptr;
@@ -37,6 +39,7 @@ struct DDACap {
   uint64_t gpu_samples = 0;
   double last_gpu_ms = 0;
   uint64_t last_present_qpc = 0; // DXGI_OUTDUPL_FRAME_INFO.LastPresentTime (raw QPC ticks, same machine)
+  uint64_t last_convert_qpc = 0; // excludes the blocking AcquireNextFrame wait
   bool gpu_qok = false;
   std::string gpu_qmsg = "uninitialized";
   const char* err() const { return err_msg.c_str(); }
@@ -71,6 +74,10 @@ bool DDACap::init(std::string& detail){
   hr = output1->DuplicateOutput(dev, &dup); output1->Release();
   if(hr==DXGI_ERROR_UNSUPPORTED||hr==E_ACCESSDENIED){ shutdown(); err_code = E_FULLSCREEN; err_msg = "exclusive fullscreen or protected output"; return false; }
   if(FAILED(hr)||!dup){ shutdown(); err_code = E_INTERNAL; err_msg = "DuplicateOutput failed"; return false; }
+  DXGI_OUTDUPL_DESC duplication_desc={}; dup->GetDesc(&duplication_desc);
+  if(duplication_desc.Rotation!=DXGI_MODE_ROTATION_IDENTITY && duplication_desc.Rotation!=DXGI_MODE_ROTATION_UNSPECIFIED){
+    err_code=E_FORMAT; err_msg="rotated outputs are not supported"; return false;
+  }
   // 建戳/disjoint查询，尽力而为
   // 失败只停新字段采样，不判采集失败
   gpu_qmsg = "query create failed (wall-clock only)";
@@ -88,6 +95,8 @@ bool DDACap::init(std::string& detail){
       }
     }
   }
+  VCTransform test;
+  if(!test.init(out_w,out_h,stream)){ err_code=E_SMALL; err_msg="desktop is smaller than requested crop"; return false; }
   char db[64]; snprintf(db, sizeof(db), "%dx%d", out_w, out_h); detail = db;
   err_code = OK; err_msg = "ok"; return true;
 }
@@ -97,7 +106,7 @@ bool DDACap::start_gpu(std::string& why){
   if(gpu){ want_gpu = true; why = "already started"; return true; }
   gpu = new DDAGpu();
   if(!gpu){ why = "out of memory"; return false; }
-  if(!gpu->init(dev, ctx, qDisjoint, qStart, qEnd)){ why = gpu->err(); delete gpu; gpu = nullptr; return false; }
+  if(!gpu->init(dev, ctx, qDisjoint, qStart, qEnd, stream)){ why = gpu->err(); delete gpu; gpu = nullptr; return false; }
   want_gpu = true; why = "gpu-convert on (compute shader)"; return true;
 }
 #endif
@@ -144,6 +153,12 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
   if(hr == DXGI_ERROR_WAIT_TIMEOUT){ err_code = E_TIMEOUT; err_msg = "AcquireNextFrame timeout (output idle?)"; return false; }
   if(hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL){ err_code = E_LOST; err_msg = "output lost (mode change?)"; return false; }
   if(FAILED(hr) || !res){ err_code = E_INTERNAL; err_msg = "AcquireNextFrame failed"; return false; }
+  LARGE_INTEGER convert_start; QueryPerformanceCounter(&convert_start);
+  if(info.LastPresentTime.QuadPart==0 || (uint64_t)info.LastPresentTime.QuadPart==last_image_qpc){
+    res->Release(); dup->ReleaseFrame(); source_skipped++; err_code=E_TIMEOUT; err_msg="pointer-only or unchanged frame"; return false;
+  }
+  last_image_qpc=(uint64_t)info.LastPresentTime.QuadPart;
+  if(info.AccumulatedFrames>1) source_skipped+=info.AccumulatedFrames-1;
   last_present_qpc = (uint64_t)info.LastPresentTime.QuadPart;  // 0 = pointer-only update
   ID3D11Texture2D* tex = nullptr;
   hr = res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&tex); res->Release();
@@ -151,16 +166,17 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
   D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
   int w = (int)d.Width, h = (int)d.Height;
   if(d.Format != DXGI_FORMAT_B8G8R8A8_UNORM){ tex->Release(); dup->ReleaseFrame(); err_code = E_FORMAT; err_msg = "only B8G8R8A8 supported"; return false; }
-  if(w < 640 || h < 640){ tex->Release(); dup->ReleaseFrame(); err_code = E_SMALL; err_msg = "desktop smaller than 640"; return false; }
-  // latency: only the centred 640x640 is copied (was full-desktop CopyResource, ~9x the bytes)
-  if(!want_gpu && (!staging || stag_w != w || stag_h != h)){
-    if(staging){ staging->Release(); staging = nullptr; }
-    D3D11_TEXTURE2D_DESC sd; sd.Width = 640; sd.Height = 640; sd.MipLevels = 1; sd.ArraySize = 1;
-    sd.Format = d.Format; sd.SampleDesc.Count = 1; sd.SampleDesc.Quality = 0;
-    sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0; sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
-    hr = dev->CreateTexture2D(&sd, NULL, &staging);
-    if(FAILED(hr) || !staging){ tex->Release(); dup->ReleaseFrame(); err_code = E_INTERNAL; err_msg = "staging texture failed"; return false; }
-    stag_w = w; stag_h = h;
+  VCTransform transform;
+  if(!transform.init(w,h,stream)){ tex->Release(); dup->ReleaseFrame(); err_code=E_SMALL; err_msg="unsupported source/output crop or size"; return false; }
+  bool cropped=stream.transform=="crop";
+  int copy_w=cropped?stream.width:w, copy_h=cropped?stream.height:h;
+  if(!want_gpu && (!staging || stag_w!=copy_w || stag_h!=copy_h)){
+    if(staging){ staging->Release(); staging=nullptr; }
+    D3D11_TEXTURE2D_DESC sd={}; sd.Width=copy_w; sd.Height=copy_h; sd.MipLevels=1; sd.ArraySize=1;
+    sd.Format=d.Format; sd.SampleDesc.Count=1; sd.Usage=D3D11_USAGE_STAGING; sd.CPUAccessFlags=D3D11_CPU_ACCESS_READ;
+    hr=dev->CreateTexture2D(&sd,nullptr,&staging);
+    if(FAILED(hr)){ tex->Release(); dup->ReleaseFrame(); err_code=E_INTERNAL; err_msg="staging texture failed"; return false; }
+    stag_w=copy_w; stag_h=copy_h;
   }
   bool stamped = gpu_qok && qDisjoint && qStart && qEnd;
   if(want_gpu){
@@ -174,15 +190,16 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
     if(!gpu->readback(Y, UV)){ err_code = E_INTERNAL; err_msg = gpu->err(); return false; }
   } else {
   if(stamped){ ctx->Begin(qDisjoint); ctx->End(qStart); }
-  { D3D11_BOX box; box.left = (UINT)((w - 640) / 2); box.top = (UINT)((h - 640) / 2); box.front = 0;
-    box.right = box.left + 640; box.bottom = box.top + 640; box.back = 1;
-    ctx->CopySubresourceRegion(staging, 0, 0, 0, 0, tex, 0, &box); }
+  { D3D11_BOX box={}; box.left=cropped?transform.ox:0; box.top=cropped?transform.oy:0;
+    box.right=box.left+copy_w; box.bottom=box.top+copy_h; box.back=1;
+    ctx->CopySubresourceRegion(staging,0,0,0,0,tex,0,&box); }
   tex->Release();
   if(stamped){ ctx->End(qEnd); ctx->End(qDisjoint); }
   D3D11_MAPPED_SUBRESOURCE mp;
   hr = ctx->Map(staging, 0, D3D11_MAP_READ, 0, &mp);
   if(FAILED(hr)){ dup->ReleaseFrame(); err_code = E_INTERNAL; err_msg = "staging map failed"; return false; }
-  dda_bgrx_to_nv12((const uint8_t*)mp.pData, (unsigned)mp.RowPitch, 640, 640, Y, UV);  // staging is already the crop
+  if(cropped) transform.init(copy_w,copy_h,stream);
+  vc_bgrx_nv12((const uint8_t*)mp.pData,(size_t)mp.RowPitch,transform,Y,UV);
   ctx->Unmap(staging, 0);
   dup->ReleaseFrame();
   }
@@ -210,6 +227,8 @@ bool DDACap::capture(uint8_t* Y, uint8_t* UV){
       }
     }
   }
+  LARGE_INTEGER convert_end; QueryPerformanceCounter(&convert_end);
+  last_convert_qpc=(uint64_t)(convert_end.QuadPart-convert_start.QuadPart);
   err_code = OK; err_msg = "ok"; return true;
 #else
   (void)Y; (void)UV;
@@ -235,10 +254,17 @@ int dda_gpu_selftest(){
   if(FAILED(hr) || !dev || !ctx){ printf("DDA-GPU: SKIP no D3D11 device\n"); return 2; }
   DDAGpu g;
   if(!g.init(dev, ctx, nullptr, nullptr, nullptr)){ printf("DDA-GPU: FAIL gpu init (%s)\n", g.err()); if(ctx)ctx->Release(); if(dev)dev->Release(); return 1; }
-  struct Case { int w, h, fill; };
-  const Case cases[] = { {640,640,0}, {640,640,1}, {800,700,2}, {1024,768,3}, {960,800,2} };
+  struct Case { int w, h, fill; int ow=640,oh=640; const char* transform="crop"; };
+  const Case cases[] = { {640,640,0}, {640,640,1}, {800,700,2}, {1024,768,3}, {960,800,2},
+    {800,700,3,416,416,"crop"}, {1278,718,3,418,282,"fit"},
+    {700,800,3,418,282,"fill"}, {800,700,3,2,2,"stretch"},
+    {1278,718,3,1280,720,"fit"}, {800,700,3,1920,1080,"fill"},
+    {1024,768,3,2560,1440,"stretch"}, {640,640,3,6,2,"crop"},
+    {640,640,3,2,6,"fit"}, {640,640,3,2,8192,"fill"}, {16,16,3,4096,4096,"stretch"} };
   bool ok = true;
   for(const auto& c : cases){
+    VCStream config; config.width=c.ow; config.height=c.oh; config.transform=c.transform;
+    if(!g.init(dev,ctx,nullptr,nullptr,nullptr,config)){ printf("DDA-GPU: FAIL init %s\n",g.err()); ok=false; continue; }
     std::vector<uint8_t> bgra((size_t)c.w*c.h*4);
     if(c.fill==0){ for(size_t i=0;i<bgra.size();i+=4){ bgra[i]=255; bgra[i+1]=255; bgra[i+2]=255; bgra[i+3]=0; } }
     else if(c.fill==1){ for(size_t i=0;i<bgra.size();i+=4){ bgra[i]=0; bgra[i+1]=0; bgra[i+2]=255; bgra[i+3]=0; } }
@@ -252,8 +278,13 @@ int dda_gpu_selftest(){
     sd.pSysMem=bgra.data(); sd.SysMemPitch=(UINT)(c.w*4);
     ID3D11Texture2D* tex=nullptr;
     if(FAILED(dev->CreateTexture2D(&td,&sd,&tex))||!tex){ printf("DDA-GPU: FAIL texture %dx%d\n",c.w,c.h); ok=false; continue; }
-    std::vector<uint8_t> eY(VC_Y_BYTES), eUV(VC_UV_BYTES), gY(VC_Y_BYTES), gUV(VC_UV_BYTES);
-    dda_bgrx_to_nv12(bgra.data(), (unsigned)c.w*4u, c.w, c.h, eY.data(), eUV.data());
+    std::vector<uint8_t> eY(config.y_bytes()), eUV(config.uv_bytes()), gY(config.y_bytes()), gUV(config.uv_bytes());
+    VCTransform transform; transform.init(c.w,c.h,config);
+    vc_bgrx_nv12(bgra.data(), (size_t)c.w*4, transform, eY.data(), eUV.data());
+    if(c.ow==640 && c.oh==640 && config.transform=="crop"){
+      dda_bgrx_to_nv12(bgra.data(),(unsigned)c.w*4,c.w,c.h,gY.data(),gUV.data());
+      if(eY!=gY || eUV!=gUV){ printf("DDA-GPU: FAIL legacy CPU changed\n"); ok=false; }
+    }
     if(!g.run(tex,c.w,c.h)){ printf("DDA-GPU: FAIL run %dx%d (%s)\n",c.w,c.h,g.err()); ok=false; tex->Release(); continue; }
     if(!g.readback(gY.data(),gUV.data())){ printf("DDA-GPU: FAIL readback %dx%d (%s)\n",c.w,c.h,g.err()); ok=false; tex->Release(); continue; }
     tex->Release();
@@ -265,11 +296,11 @@ int dda_gpu_selftest(){
         du,du<eUV.size()?eUV[du]:-1,du<gUV.size()?gUV[du]:-1);
       ok=false; continue;
     }
-    printf("DDA-GPU: case %dx%d fill=%d exact (%s)\n", c.w, c.h, c.fill, drv);
+    printf("DDA-GPU: case %dx%d -> %dx%d %s fill=%d exact (%s)\n", c.w, c.h, c.ow,c.oh,c.transform,c.fill,drv);
   }
   g.shutdown(); ctx->Release(); dev->Release();
   if(!ok){ printf("DDA-GPU: FAIL\n"); return 1; }
-  printf("DDA-GPU: PASS 5 cases bit-exact (%s)\n", drv);
+  printf("DDA-GPU: PASS %zu cases bit-exact (%s)\n", sizeof(cases)/sizeof(cases[0]), drv);
   return 0;
 }
 #else

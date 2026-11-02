@@ -32,6 +32,7 @@
 #include "pattern.h"
 #include "fnv1a.h"
 #include "crc32.h"
+#include "../common/stream.h"
 
 #ifdef _WIN32
 static volatile LONG g_stop = 0;
@@ -62,6 +63,8 @@ static uint64_t qpc_ns_now(){
 }
 
 struct Args{
+  VCStream stream;
+  std::string source_mac;
   std::string adapter="";
   uint16_t ethertype=0x88B5; int mtu=9000;
   std::string session="manual", stats="", hashlog="";
@@ -80,6 +83,7 @@ static uint16_t parse_et(const std::string&s){
 static void usage(){
   // 打印用法
   printf("vc-receiver.exe --adapter <substr> --ethertype 0x88B5 --mtu 9000\n"
+    "  [--width 640 --height 640 --fps 240 --source-mac <session MAC>] [--capabilities]\n"
     "  --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]\n");
 }
 static void ensure_parent(const std::string&path){
@@ -115,16 +119,16 @@ struct ReasmStats{
 };
 // 整帧哈希 + 测试源比对（live 模式在哈希线程，selftest 内联）
 static bool rx_verify(const uint8_t* f,uint32_t fid,uint8_t pattern,uint64_t& fh,
-                      std::vector<uint8_t>& eY,std::vector<uint8_t>& eUV){
-  fh=vc_fnv1a64(f,VC_FRAME_BYTES);
+                      std::vector<uint8_t>& eY,std::vector<uint8_t>& eUV,const VCStream& stream=VCStream()){
+  fh=vc_fnv1a64(f,stream.frame_bytes());
   if(pattern>4) return true;
-  eY.resize(VC_Y_BYTES); eUV.resize(VC_UV_BYTES);
+  eY.resize(stream.y_bytes()); eUV.resize(stream.uv_bytes());
   switch(pattern){
-    case 0:vc_gen_counter(fid,eY.data(),eUV.data());break;
-    case 1:vc_gen_checker(fid,eY.data(),eUV.data());break;
-    case 2:vc_gen_rings(fid,eY.data(),eUV.data());break;
-    case 3:vc_gen_noise(fid,eY.data(),eUV.data());break;
-    default:vc_gen_motion(fid,eY.data(),eUV.data());break;
+    case 0:vc_gen_counter(fid,eY.data(),eUV.data(),stream.width,stream.height);break;
+    case 1:vc_gen_checker(fid,eY.data(),eUV.data(),stream.width,stream.height);break;
+    case 2:vc_gen_rings(fid,eY.data(),eUV.data(),stream.width,stream.height);break;
+    case 3:vc_gen_noise(fid,eY.data(),eUV.data(),stream.width,stream.height);break;
+    default:vc_gen_motion(fid,eY.data(),eUV.data(),stream.width,stream.height);break;
   }
   return vc_fnv1a64_two(eY.data(),eY.size(),eUV.data(),eUV.size())==fh;
 }
@@ -139,13 +143,15 @@ struct FramePool{
   std::vector<std::vector<uint8_t>> own;
   bool filling[N]={}; uint64_t last_use[N]={}; int latest=-1; uint64_t tick=0, published=0;
   std::mutex mu; std::condition_variable cv; bool hashing[N]={};   // hashing 受 mu 保护
-  FramePool(){ own.resize(N); }
-  uint8_t* data(int i){ if(shm) return vc_shm_data(shm,(uint32_t)i); if(own[i].empty()) own[i].resize(VC_FRAME_BYTES); return own[i].data(); }
+  VCStream stream;
+  explicit FramePool(const VCStream& config=VCStream()):stream(config){ own.resize(N); }
+  uint8_t* data(int i){ if(shm) return vc_shm_data(shm,(uint32_t)i); if(own[i].empty()) own[i].resize(stream.frame_bytes()); return own[i].data(); }
 #ifdef _WIN32
   bool open_shm(const std::string& name){
-    hMap=CreateFileMappingA(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,(DWORD)VC_SHM_SIZE,name.c_str());
+    hMap=CreateFileMappingA(INVALID_HANDLE_VALUE,nullptr,PAGE_READWRITE,0,(DWORD)vc_shm_size(stream.frame_bytes()),name.c_str());
     if(!hMap) return false;
-    shm=(uint8_t*)MapViewOfFile(hMap,FILE_MAP_WRITE,0,0,VC_SHM_SIZE);
+    if(GetLastError()==ERROR_ALREADY_EXISTS){ CloseHandle(hMap); hMap=nullptr; SetLastError(ERROR_ALREADY_EXISTS); return false; }
+    shm=(uint8_t*)MapViewOfFile(hMap,FILE_MAP_WRITE,0,0,vc_shm_size(stream.frame_bytes()));
     if(!shm){ CloseHandle(hMap); hMap=nullptr; return false; }  // 例如旧 v1（更小）映射仍被占用
     for(int k=0;k<2;k++){
       std::string en=name+".evt"+std::to_string(k);
@@ -155,7 +161,8 @@ struct FramePool{
     }
     vc_shm_hdr_t* h=(vc_shm_hdr_t*)shm;
     h->magic=0; MemoryBarrier();
-    h->version=VC_SHM_VERSION; h->slots=VC_SHM_SLOTS; h->frame_bytes=(uint32_t)VC_FRAME_BYTES;
+    h->version=VC_SHM_VERSION; h->slots=VC_SHM_SLOTS; h->frame_bytes=(uint32_t)stream.frame_bytes();
+    h->width=stream.width; h->height=stream.height; h->fps=stream.fps;
     h->data_off=VC_SHM_DATA_OFF; h->latest_slot=-1; h->writer_pid=GetCurrentProcessId();
     for(uint32_t i=0;i<VC_SHM_SLOTS;i++){ vc_shm_slot_t* sl=vc_shm_slot(shm,i); sl->seq|=1; sl->hash_fid=VC_SHM_HASH_NONE; }
     MemoryBarrier(); h->magic=VC_SHM_MAGIC;
@@ -234,13 +241,15 @@ public:
   std::map<uint32_t,FrameSlot> slots; // 仅存活帧
   std::deque<uint64_t> arrivals; // 完成到达时间，留120个
   uint64_t last_complete_ns=0;
+  uint32_t last_complete_fid=0;
   std::deque<uint64_t> rseg_ns; // P4-2步骤1：R(N)=首包到达→重组完成，同机QPC，最新10000帧窗口
   size_t payload_max;
   FramePool own_pool;
   FramePool* pool;
   bool inline_verify=true;   // selftest：完成即哈希/比对/释放；live：调用方发布 + 哈希线程异步
   std::vector<uint8_t> vY,vUV;
-  Reassembler(int mtu=9000,FramePool* p=nullptr){ payload_max=(size_t)(mtu-42); pool=p?p:&own_pool; }
+  VCStream stream;
+  Reassembler(int mtu=9000,FramePool* p=nullptr,const VCStream& config=VCStream()):own_pool(config),stream(config){ payload_max=(size_t)(mtu-42); pool=p?p:&own_pool; }
   void drop_slot(std::map<uint32_t,FrameSlot>::iterator it){
     st.dropped++; st.packets_lost+=(it->second.total-it->second.got_n);
     pool->abandon(it->second.buf); slots.erase(it);
@@ -248,8 +257,10 @@ public:
   // 本包凑齐整帧则真（live 模式下 out 给出待发布缓冲）
   bool on_packet(const vc_pkt_hdr_t&h,const uint8_t*payload,DoneFrame*out=nullptr){
     if(h.magic!=VC_MAGIC) return false;
-    if(h.total==0||h.seq>=h.total||h.payload_len==0) { st.packets_lost++; return false; }
-    if(h.payload_len>((h.seq==(uint16_t)(h.total-1))?payload_max+1:payload_max+1)) { st.packets_lost++; return false; }
+    size_t expected_total=(stream.frame_bytes()+payload_max-1)/payload_max;
+    if(h.total!=expected_total || h.seq>=h.total){ st.packets_lost++; return false; }
+    size_t expected_len=std::min(payload_max,stream.frame_bytes()-(size_t)h.seq*payload_max);
+    if(h.payload_len!=expected_len){ st.packets_lost++; return false; }
     uint32_t c=vc_crc32(payload,h.payload_len);
     if(c!=h.payload_crc){ st.packets_lost++; return false; }
     st.packets_recv++; st.bytes_recv+=14+28+h.payload_len;
@@ -259,6 +270,7 @@ public:
       if(h.frame_id>st.max_seen_fid+1) st.gaps+=(h.frame_id-st.max_seen_fid-1);
       st.max_seen_fid=h.frame_id;
     }
+    if(last_complete_ns && h.frame_id<=last_complete_fid) return false;
     auto it=slots.find(h.frame_id);
     if(it==slots.end()){
       // 超8帧逐出最旧
@@ -271,10 +283,10 @@ public:
       it=slots.emplace(h.frame_id,std::move(s)).first;
     }
     FrameSlot&s=it->second;
-    if(h.total!=s.total){ st.packets_lost++; return false; } // 总包数对不上记丢
+    if(h.total!=s.total || h.pattern!=s.pattern){ st.packets_lost++; return false; } // 总包数对不上记丢
     if(s.got[h.seq]) return false; // 重包：已计入收包数
     size_t off=(size_t)h.seq*payload_max;
-    if(off+h.payload_len>VC_FRAME_BYTES){ st.packets_lost++; return false; }
+    if(off+h.payload_len>stream.frame_bytes()){ st.packets_lost++; return false; }
     memcpy(pool->data(s.buf)+off,payload,h.payload_len);
     s.got[h.seq]=1; s.got_n++;
     if(s.got_n==s.total){
@@ -282,7 +294,7 @@ public:
       uint64_t now=qpc_ns_now();
       if(inline_verify||!out){
         uint64_t fh=0;
-        if(!rx_verify(pool->data(s.buf),s.fid,s.pattern,fh,vY,vUV)) st.hash_mismatch++;
+        if(!rx_verify(pool->data(s.buf),s.fid,s.pattern,fh,vY,vUV,stream)) st.hash_mismatch++;
         pool->abandon(s.buf);
       } else {
         out->buf=s.buf; out->fid=s.fid; out->pattern=s.pattern; out->first_ns=s.first_ns; out->done_ns=now;
@@ -290,7 +302,7 @@ public:
       st.complete++;
       if(rseg_ns.size()>=10000) rseg_ns.pop_front(); rseg_ns.push_back(now>=s.first_ns?now-s.first_ns:0); // 最新10000帧窗口（满了丢最旧）
       if(last_complete_ns!=0&&arrivals.size()<10000){ arrivals.push_back(now-last_complete_ns); if(arrivals.size()>120)arrivals.pop_front(); }
-      last_complete_ns=now;
+      last_complete_ns=now; last_complete_fid=s.fid;
       uint32_t donefid=s.fid;
       slots.erase(it);
       // 旧残帧记丢（新帧到达规则）
@@ -419,6 +431,30 @@ static int run_selftest(){
   if(R.st.packets_lost!=2){printf("FAIL lost!=2 got %llu\n",(unsigned long long)R.st.packets_lost);ok=false;}
   { double ra,rp50,rp99,rmx; R.rseg_stats(ra,rp50,rp99,rmx);
     if(R.rseg_ns.size()!=R.st.complete){printf("FAIL rseg samples!=complete got %zu\n",R.rseg_ns.size());ok=false;} }
+  for(auto size : {std::pair<int,int>{2,2},{416,416},{418,282},{1280,720},{1920,1080},{2560,1440}}){
+    VCStream stream; stream.width=size.first; stream.height=size.second;
+    Reassembler variable(9000,nullptr,stream);
+    std::vector<uint8_t> frame(stream.frame_bytes());
+    vc_gen_motion(9,frame.data(),frame.data()+stream.y_bytes(),stream.width,stream.height);
+    size_t total=(frame.size()+P-1)/P;
+    vc_pkt_hdr_t head={}; head.magic=VC_MAGIC; head.frame_id=9; head.pattern=4;
+    head.total=(uint16_t)(total+1); head.payload_len=(uint16_t)std::min(P,frame.size());
+    head.payload_crc=vc_crc32(frame.data(),head.payload_len);
+    variable.on_packet(head,frame.data());
+    head.total=(uint16_t)total; head.payload_len--;
+    head.payload_crc=vc_crc32(frame.data(),head.payload_len);
+    variable.on_packet(head,frame.data());
+    if(variable.st.complete || !variable.slots.empty() || variable.st.packets_lost!=2){ printf("FAIL malformed geometry packet\n");ok=false; }
+    for(size_t n=total;n>0;n--){
+      size_t seq=n-1,off=seq*P,len=std::min(P,frame.size()-off);
+      head.seq=(uint16_t)seq; head.payload_len=(uint16_t)len; head.payload_crc=vc_crc32(frame.data()+off,len);
+      variable.on_packet(head,frame.data()+off);
+    }
+    variable.on_packet(head,frame.data()); // A late packet must not publish the same frame twice.
+    if(variable.st.complete!=1 || variable.st.hash_mismatch!=0 || !variable.slots.empty()){
+      printf("FAIL variable reassembly %dx%d\n",stream.width,stream.height);ok=false;
+    } else printf("RAW: %dx%d reverse-order complete, exact coverage, malformed/late rejection PASS\n",stream.width,stream.height);
+  }
   if(!ok){printf("FAIL: receiver selftest\n");return 1;}
   printf("PASS: receiver selftest\n");
   return 0;
@@ -518,14 +554,19 @@ int main(int argc,char**argv){
   for(int i=1;i<argc;i++){
     std::string k=argv[i];
     auto need=[&](std::string&out){ if(i+1>=argc){fprintf(stderr,"missing value for %s\n",k.c_str());exit(2);} out=argv[++i]; };
-    if(k=="--adapter"){need(a.adapter);}
-    else if(k=="--ethertype"){a.ethertype=parse_et(argv[++i]);}
-    else if(k=="--mtu"){a.mtu=atoi(argv[++i]);}
+    if(k=="--capabilities"){ puts(vc_stream_capabilities()); return 0; }
+    else if(k=="--width"){ std::string v; need(v); a.stream.width=vc_cli_int(v); }
+    else if(k=="--height"){ std::string v; need(v); a.stream.height=vc_cli_int(v); }
+    else if(k=="--fps"){ std::string v; need(v); a.stream.fps=vc_cli_int(v); }
+    else if(k=="--source-mac"){ need(a.source_mac); }
+    else if(k=="--adapter"){need(a.adapter);}
+    else if(k=="--ethertype"){std::string v; need(v); a.ethertype=parse_et(v);}
+    else if(k=="--mtu"){std::string v; need(v); a.mtu=vc_cli_int(v);}
     else if(k=="--session"){need(a.session);}
     else if(k=="--stats"){need(a.stats);}
     else if(k=="--hashlog"){need(a.hashlog);}
-    else if(k=="--timeout-s"){a.timeout_s=atoll(argv[++i]);}
-    else if(k=="--expect-frames"){a.expect_frames=atoll(argv[++i]);}
+    else if(k=="--timeout-s"){std::string v; need(v); a.timeout_s=vc_cli_number(v);}
+    else if(k=="--expect-frames"){std::string v; need(v); a.expect_frames=vc_cli_number(v);}
     else if(k=="--shm"){need(a.shm);}
     else if(k=="--selftest"){a.selftest=true;}
     else if(k=="--help"||k=="-h"){usage();return 0;}
@@ -535,6 +576,9 @@ int main(int argc,char**argv){
   SetConsoleCtrlHandler(chandler, TRUE);
 #endif
   if(a.selftest) return run_selftest();
+  uint8_t source_mac[6];
+  if(!a.stream.valid() || a.mtu<=42 || a.mtu>9042 || (a.stream.frame_bytes()+(a.mtu-43))/(a.mtu-42)>65535 ||
+      (!a.source_mac.empty() && !vc_parse_mac(a.source_mac,source_mac))){ fprintf(stderr,"invalid stream configuration\n"); return 2; }
   if(a.stats.empty()) a.stats="run/"+a.session+".receiver.stats.json";
   if(a.hashlog.empty()) a.hashlog="run/"+a.session+".receiver.hash.jsonl";
   printf("[receiver] session=%s mtu=%d ethertype=0x%04x timeout=%lld expect=%lld\n",
@@ -606,16 +650,16 @@ int main(int argc,char**argv){
 #else
   fprintf(stderr,"live capture only on Windows/Npcap\n"); return 1;
 #endif
-  FramePool pool;
-  Reassembler R(a.mtu,&pool);
+  FramePool pool(a.stream);
+  Reassembler R(a.mtu,&pool,a.stream);
   R.inline_verify=false;   // 哈希/比对/hashlog 移出关键路径（哈希线程）
   { ensure_parent(a.hashlog); std::ofstream f(a.hashlog,std::ios::trunc); }
   std::ofstream hashlog(a.hashlog,std::ios::app|std::ios::binary);
 #ifdef _WIN32
   VstatReader vst;
   if(!a.shm.empty()){
-    if(!pool.open_shm(a.shm)){ fprintf(stderr,"shm open failed: %s (err=%lu; old v1 mapping still held by a reader?)\n",a.shm.c_str(),GetLastError()); return 1; }
-    printf("[receiver] shm v2 publish -> %s (%zu bytes, %u slots, events %s.evt0/1)\n",a.shm.c_str(),(size_t)VC_SHM_SIZE,(unsigned)VC_SHM_SLOTS,a.shm.c_str());
+    if(!pool.open_shm(a.shm)){ fprintf(stderr,"shm open failed: %s (err=%lu; mapping already held by another receiver/reader; close downstream clients and retry)\n",a.shm.c_str(),GetLastError()); return 1; }
+    printf("[receiver] shm v3 publish -> %s (%zu bytes, %u slots, events %s.evt0/1)\n",a.shm.c_str(),vc_shm_size(a.stream.frame_bytes()),(unsigned)VC_SHM_SLOTS,a.shm.c_str());
     vst.name=a.shm+".vcam";
   }
   rx_boost_thread();
@@ -633,7 +677,7 @@ int main(int argc,char**argv){
         if(hq.empty()) break;
         f=hq.front(); hq.pop_front(); }
       uint64_t fh=0;
-      if(!rx_verify(pool.data(f.buf),f.fid,f.pattern,fh,eY,eUV)) R.st.hash_mismatch++;
+      if(!rx_verify(pool.data(f.buf),f.fid,f.pattern,fh,eY,eUV,a.stream)) R.st.hash_mismatch++;
       pool.hashed(f.buf,f.fid,fh);
       char hx[17]; vc_fnv1a64_hex(fh,hx);
       hashlog << "{\"frame_id\":" << f.fid << ",\"hash\":\"" << hx << "\",\"qpc_ns\":" << f.done_ns << "}\n";
@@ -657,7 +701,7 @@ int main(int argc,char**argv){
       PcapHdr* ph=(PcapHdr*)pkt_hdr; uint8_t* eth=(uint8_t*)pkt_data;
       if(ph->caplen>=14+28){
         uint16_t et=(uint16_t)((eth[12]<<8)|eth[13]);
-        if(et==a.ethertype){
+        if(et==a.ethertype && (a.source_mac.empty() || memcmp(eth+6,source_mac,6)==0)){
           vc_pkt_hdr_t hdr; memcpy(&hdr,eth+14,sizeof(hdr));
           uint8_t* pl=eth+14+sizeof(hdr);
           size_t avail=ph->caplen-(14+sizeof(hdr));
@@ -698,7 +742,10 @@ int main(int argc,char**argv){
         pps,bps,(unsigned long long)R.st.gaps,R.trailing_packets(),
         (unsigned long long)R.st.hash_mismatch.load(),avg,p99,rg_a,rg_p50,rg_p99,rg_mx,up,a.mtu,a.ethertype,
         (unsigned long long)shm_n,vseg_json(vst,(unsigned long long)hq_max.load()).c_str());
-      atomic_write(a.stats,buf);
+      { std::string stats=buf; stats.pop_back();
+        stats+=",\"width\":"+std::to_string(a.stream.width)+",\"height\":"+std::to_string(a.stream.height)+
+          ",\"frame_bytes\":"+std::to_string(a.stream.frame_bytes())+",\"fps_limit\":"+std::to_string(a.stream.fps)+",\"codec\":\"raw\"}";
+        atomic_write(a.stats,stats); }
     }
   }
   { std::lock_guard<std::mutex> lk(hq_mu); hq_stop=true; }
@@ -725,7 +772,10 @@ int main(int argc,char**argv){
       (unsigned long long)R.st.packets_recv,(unsigned long long)R.st.packets_lost,
       pps,bps,(unsigned long long)R.st.gaps,R.trailing_packets(),
       (unsigned long long)R.st.hash_mismatch.load(),avg,p99,rg_a,rg_p50,rg_p99,rg_mx,up,(unsigned long long)shm_n,vseg_json(vst,(unsigned long long)hq_max.load()).c_str());
-    atomic_write(a.stats,buf); }
+    { std::string stats=buf; stats.pop_back();
+        stats+=",\"width\":"+std::to_string(a.stream.width)+",\"height\":"+std::to_string(a.stream.height)+
+          ",\"frame_bytes\":"+std::to_string(a.stream.frame_bytes())+",\"fps_limit\":"+std::to_string(a.stream.fps)+",\"codec\":\"raw\"}";
+        atomic_write(a.stats,stats); } }
 #ifdef _WIN32
   d.closeh(h);
 #endif

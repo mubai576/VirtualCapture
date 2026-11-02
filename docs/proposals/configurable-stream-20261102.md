@@ -58,7 +58,7 @@ Raw 640@240 的净载荷 1.179648Gbps，加入当前 MTU9000 分包完整开销�
 ## 本轮验证记录
 
 实现文件：`agent/vc-agent.py`；专项测试 `ctrl/tests/test_stream_plan.py`，浏览器逻辑与 HTTP 回归追加至现有 GUI 测试。
-实现与验证跨至 2026-11-03，P6-1 已 DONE；尚未完成原生可变尺寸、缩放或编解码，不作这些功能的验收声明。
+实现与验证跨至 2026-11-03，P6-1 已 DONE；该阶段尚未完成原生可变尺寸、缩放或编解码，不作这些功能的验收声明。后续P6-2/P6-3进度见文末。
 
 ### 自动回归
 
@@ -93,4 +93,11 @@ Python pattern_ref 与 C++ 向量对账全部通过；pytest **122 passed / 4 sk
 - 稳定主机成品 87/87 载荷大小/SHA256 仍匹配；封存脚本复核 424 项快照、87 项载荷、299 项原始源码均通过。
 - 稳定服务仍为两端 `0.4.1 / product_revision=2`，主机 PID 28040、capture PID 12828；本轮未替换、重启或激活。
 - 独立测试 agent 与浏览器于 2026-11-03 00:01 清理，测试端口已不监听；仅关闭核实属于该 ROOT 的进程。
-- 证据：同目录 `stable-verification.json`、`cleanup.json`。源码未 commit，未生成或覆盖便携包。
+- 证据：同目录 `stable-verification.json`、`cleanup.json`。当时源码未commit，未生成或覆盖便携包。既有工作随后按owner要求提交为d15e97f。
+
+## 2026-11-03 后续实现
+
+P6-2开发与本机垂直验证已完成：可变尺寸Raw、四种整数变换、真正发送上限、显式会话、SHM v3和动态DShow。
+原P6-1对非640/缩放的拒绝已被开发版解锁，稳定成品不替换。证据：`docs/bringup/bringup-20261103-p6-raw.md`。
+P6-3已有实际MF H.264/HEVC回环原型，但压缩传输/恢复和产品接线未完成，编码模式仍硬拒绝。
+本机HEVC额外缓存一帧的发现不能隐藏；后续边界见 `docs/proposals/codec-backend-20261103.md`。

@@ -90,6 +90,8 @@ def kill_slot(slot):
 
 def launch(kind, args):
     # 起一端：先停旧，再拉新会话
+    errors = low_level_stream_errors(kind, args)
+    if errors: raise ValueError("；".join(errors))
     slot = state[kind]
     kill_slot(slot)  # idempotent: stop old first
     slot["adapter"] = str(args.get("adapter", ""))
@@ -150,6 +152,11 @@ def launch(kind, args):
         _shm = args.get("shm", None)
         if _shm:
             cmd += ["--shm", str(_shm)]
+    if any(key in args for key in ("width", "height", "source_mac", "transform")):
+        cmd += ["--width", str(args.get("width", 640)), "--height", str(args.get("height", 640))]
+        if kind == "receiver": cmd += ["--fps", str(args.get("fps", 240))]
+        if kind == "sender": cmd += ["--transform", str(args.get("transform", "crop"))]
+        if args.get("source_mac"): cmd += ["--source-mac", args["source_mac"]]
     # 过滤空网卡参数
     cmd2 = []
     skip_next = False
@@ -1023,26 +1030,98 @@ STREAM_CACHE_LOCK = threading.Lock()
 
 
 def stream_implementation_errors(capture):
+    return (["H.264/H.265 编解码后端尚未接入，也未验证两端硬件能力；当前仅可运行 raw NV12。"]
+            if capture["codec"] != "raw" else [])
+
+
+NATIVE_STREAM_CACHE = {}
+NATIVE_STREAM_LOCK = threading.Lock()
+
+
+def native_stream_capabilities(kind):
+    """Probe the actual executable/DLL, not the Python source revision or version string."""
+    exe = exe_path(kind)
+    command = [exe, "--capabilities"]
+    paths = [exe]
+    if kind == "vcam":
+        candidates = [os.path.join(BUILD_DIR, "vcam_verify", "Release", "vc-vcam-verify.exe"),
+                      os.path.join(BUILD_DIR, "Release", "vc-vcam-verify.exe"), os.path.join(ROOT, "vc-vcam-verify.exe")]
+        exe = next((path for path in candidates if os.path.isfile(path)), "")
+        dll = _vcam_dll()
+        paths = [exe, dll]
+        command = [exe, "--dll", dll, "--capabilities"]
+    try:
+        key = (kind, tuple((os.path.abspath(path), os.stat(path).st_mtime_ns, os.stat(path).st_size) for path in paths))
+        with NATIVE_STREAM_LOCK:
+            if key in NATIVE_STREAM_CACHE: return dict(NATIVE_STREAM_CACHE[key])
+            result = subprocess.run(command, capture_output=True, text=True, timeout=10, cwd=ROOT,
+                                    **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+            caps = json.loads(result.stdout) if result.returncode == 0 else {}
+            if (not isinstance(caps, dict) or caps.get("stream_revision") != 2 or
+                    caps.get("shm_version") != 3 or caps.get("variable_resolution") is not True or
+                    caps.get("dda_fps_limit") is not True or caps.get("codecs") != ["raw"]):
+                return {"error": "%s 缺少 P6-2 原生能力；请构建匹配版本，不会沿用旧的固定格式。" % kind}
+            if len(NATIVE_STREAM_CACHE) >= 32: NATIVE_STREAM_CACHE.clear()
+            NATIVE_STREAM_CACHE[key] = caps
+            return dict(caps)
+    except Exception as error:
+        return {"error": "%s 原生能力探测失败：%s" % (kind, error)}
+
+
+def stream_native_errors(kind):
     errors = []
-    if (capture["width"], capture["height"]) != (640, 640):
-        errors.append("当前原生采集/接收/虚拟卡仍固定 640×640；可变分辨率管线尚未接通。")
-    if capture["transform"] != "crop":
-        errors.append("当前仅实现居中 1:1 裁切；所选缩放方式尚未接通。")
-    if capture["codec"] != "raw":
-        errors.append("H.264/H.265 编解码后端尚未接入，也未验证两端硬件能力；当前仅可运行 raw NV12。")
+    for target in (("receiver", "vcam") if kind == "receiver" else (kind,)):
+        capability = native_stream_capabilities(target)
+        if capability.get("error"): errors.append(capability["error"])
     return errors
 
 
 def stream_capabilities(controller_ip=None):
-    result = {"revision": 1, "presets": [{"width": w, "height": h} for w, h in STREAM_PRESETS],
-              "native": {"codecs": ["raw"], "width": 640, "height": 640, "transforms": ["crop"],
-                         "variable_resolution": False, "dda_fps_limit": False},
+    kind = "sender" if deployment_role() == "capture" else "receiver"
+    errors = stream_native_errors(kind)
+    result = {"revision": 2, "presets": [{"width": w, "height": h} for w, h in STREAM_PRESETS],
+              "native": {"codecs": ["raw"] if not errors else [], "transforms": ["crop", "fit", "fill", "stretch"],
+                         "variable_resolution": not errors, "dda_fps_limit": not errors, "shm_version": 3,
+                         "errors": errors},
               "hardware": {"encoder": "unprobed", "decoder": "unprobed"}, "adapter": None}
     if deployment_role() == "capture" and controller_ip:
         code, adapter = _choose_capture_adapter(controller_ip)
         if code == 200: result["adapter"] = adapter
         else: result["adapter_error"] = adapter.get("error", "采集网卡识别失败。")
     return result
+
+
+def stream_session(capture):
+    token = uuid.uuid4().hex[:10]
+    return {"revision": 2, "pixel_format": "nv12", "codec": capture["codec"],
+            **{key: capture[key] for key in ("width", "height", "fps", "mtu", "transform")},
+            "source_mac": "02:" + ":".join(token[i:i+2] for i in range(0, 10, 2))}
+
+
+def validate_stream_session(session, capture):
+    if not isinstance(session, dict): return ["缺少显式 P6-2 流会话；拒绝使用旧格式启动。"]
+    expected = {"revision": 2, "pixel_format": "nv12", "codec": "raw",
+                **{key: capture[key] for key in ("width", "height", "fps", "mtu", "transform")}}
+    if set(session) != set(expected) | {"source_mac"}: return ["流会话字段不完整或含未知字段。"]
+    if any(type(session[key]) is not type(value) or session[key] != value for key, value in expected.items()):
+        return ["两端流会话的尺寸/帧率/MTU/格式/变换不一致。"]
+    if not _re.fullmatch(r"02(?::[0-9a-f]{2}){5}", str(session["source_mac"])): return ["流会话来源 MAC 无效。"]
+    return []
+
+
+def low_level_stream_errors(kind, args):
+    fields = ("width", "height", "transform", "codec", "bitrate_mbps", "max_bitrate_mbps", "source_mac")
+    if not any(key in args for key in fields): return []
+    if ("width" in args) != ("height" in args): return ["必须同时提供 width 和 height。"]
+    capture = _merge(CONFIG_DEFAULT["capture"], {key: args[key] for key in (*fields, "fps", "mtu") if key in args and key != "source_mac"})
+    config = _merge(CONFIG_DEFAULT, {"capture": capture})
+    errors = validate_config(config) + stream_implementation_errors(capture)
+    if any(key in args for key in ("bitrate_mbps", "max_bitrate_mbps")): errors.append("Raw 不接受编码码率参数。")
+    if kind == "receiver" and args.get("transform", "crop") != "crop": errors.append("接收端不能再次变换像素。")
+    if "source_mac" in args and not _re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", str(args["source_mac"])):
+        errors.append("source_mac 无效。")
+    if not errors: errors.extend(stream_native_errors(kind))
+    return errors
 
 
 def _stream_selected_adapter(items, selection):
@@ -1067,7 +1146,7 @@ def _stream_link(adapter, direction):
     return {"state": "up", "bps": speed, "name": adapter.get("name"), "label": adapter.get("label")}
 
 
-def calculate_stream_plan(config, host_adapter=None, capture_adapter=None, discovery_warnings=()):
+def calculate_stream_plan(config, host_adapter=None, capture_adapter=None, discovery_warnings=(), discovery_errors=()):
     """只算预算，不改配置、不启停进程；输入需先经 validate_config。"""
     cp = config["capture"]
     fps, payload = cp["fps"], cp["mtu"] - 42
@@ -1093,7 +1172,7 @@ def calculate_stream_plan(config, host_adapter=None, capture_adapter=None, disco
     elif link_bps is None: status = "unknown"
     elif wire_bps > usable_bps: status = "margin"
     else: status = "fits"
-    errors = stream_implementation_errors(cp)
+    errors = stream_implementation_errors(cp) + list(discovery_errors)
     if cp["mtu"] != config["receive"]["mtu"]:
         errors.append("两端 MTU 不一致，不能用不同切包参数启动。")
     if packets > 65535:
@@ -1104,9 +1183,9 @@ def calculate_stream_plan(config, host_adapter=None, capture_adapter=None, disco
     if encoded:
         warnings.append("编码预算按最大码率均摊估算，不约束 IDR 帧瞬时突发；不代表编码器吞吐或画质已达标。")
     if cp["mode"] == "dda":
-        warnings.append("当前 DDA 由桌面新帧驱动，尚未按目标帧率硬限速；预算只以填写帧率为假设。")
+        warnings.append("P6-2 DDA 只发送新桌面图像，按目标帧率限速；静态桌面不重复发送，实际帧率可能更低。")
     warnings.append("协商速率不是实测吞吐；源桌面尺寸、编解码吞吐与端到端效果未在本次计算中验证。")
-    return {"revision": 1, "video": {"width": cp["width"], "height": cp["height"], "fps": fps,
+    return {"revision": 2, "video": {"width": cp["width"], "height": cp["height"], "fps": fps,
             "codec": cp["codec"], "transform": cp["transform"], "raw_frame_bytes": raw_bytes},
             "network": {"status": status, "is_estimate": encoded, "host": host, "capture": capture,
                         "payload_bytes": payload, "packets_per_frame": packets,
@@ -1124,21 +1203,24 @@ def _stream_discovery(config, refresh=False):
         cached = STREAM_CACHE.get(key)
         if not refresh and cached and time.monotonic() - cached[0] < 10:
             return cached[1]
-        warnings = []
+        warnings, errors = [], []
         code, adapters = get_adapters()
         host = _stream_selected_adapter(adapters.get("items", []), config["adapter"]) if code == 200 else None
         if host is None: warnings.append("未能唯一识别主机所选网卡的速率。")
         capture = None
         if config["peer_url"]:
             code, peer = peer_call("/stream/capabilities", timeout=35, url=config["peer_url"])
-            if code == 200 and isinstance(peer, dict) and peer.get("revision") == 1:
+            native = peer.get("native", {}) if isinstance(peer, dict) else {}
+            if code != 200 or not isinstance(peer, dict) or peer.get("revision") != 2 or native.get("variable_resolution") is not True or native.get("dda_fps_limit") is not True:
+                errors.append("采集后台或原生 sender 缺少 P6-2 能力；旧后台不能忽略新会话参数。")
+            if code == 200 and isinstance(peer, dict) and peer.get("revision") in (1, 2):
                 capture = peer.get("adapter")
                 if peer.get("adapter_error"): warnings.append(str(peer["adapter_error"]))
             else:
                 warnings.append("采集后台未提供新版速率探测接口或暂不可达，未假设对端也是 2.5G。")
         else:
             warnings.append("尚未填写采集后台地址。")
-        result = (host, capture, warnings)
+        result = (host, capture, warnings, errors)
         if len(STREAM_CACHE) >= 16: STREAM_CACHE.pop(next(iter(STREAM_CACHE)))
         STREAM_CACHE[key] = (time.monotonic(), result)
         return result
@@ -1156,7 +1238,12 @@ def stream_plan(patch=None, refresh=False):
             ipaddress.IPv4Address(match[1])
         except ValueError:
             return 400, {"error": "被采集机地址必须是 IPv4，端口固定为 5143。"}
-    return 200, calculate_stream_plan(config, *_stream_discovery(config, refresh))
+    result = calculate_stream_plan(config, *_stream_discovery(config, refresh))
+    errors = stream_native_errors("receiver")
+    if errors:
+        result["implementation"]["reasons"].extend(errors)
+        result["implementation"]["supported"] = result["can_start"] = False
+    return 200, result
 
 
 def stream_plan_request(args):
@@ -1265,6 +1352,13 @@ def _product_local_start(args, controller_ip):
     errors = validate_config(c)
     if errors: return 400, {"error": "invalid capture config", "details": errors}
     errors = stream_implementation_errors(c["capture"])
+    if deployment_role(): errors.extend(stream_native_errors("sender" if role == "capture" else "receiver"))
+    if role == "receive" and c["capture"]["mtu"] != c["receive"]["mtu"]: errors.append("两端 MTU 不一致。")
+    descriptor = args.get("stream")
+    if not deployment_role() and descriptor is None and any(c["capture"][key] != CONFIG_DEFAULT["capture"][key] for key in ("width", "height", "transform")):
+        errors.append("可变尺寸诊断也需要显式 stream 会话，不能沿用旧默认值。")
+    if descriptor is None and role == "receive" and deployment_role(): descriptor = stream_session(c["capture"])
+    if deployment_role() or descriptor is not None: errors.extend(validate_stream_session(descriptor, c["capture"]))
     if errors: return 409, {"error": "；".join(errors), "details": errors}
     if role == "capture" and args:
         if args.get("auto_adapter"):
@@ -1277,7 +1371,7 @@ def _product_local_start(args, controller_ip):
     if deployment_role() and not os.path.isfile(exe_path("receiver" if role == "receive" else "sender")):
         return 503, {"error": "缺少采集或接收程序，请先完成构建。"}
     if role == "receive":
-        rv = c["receive"]; out = {"role": role}
+        rv = c["receive"]; out = {"role": role, "stream": descriptor}
         if rv["vcam_autoregister"]:
             vc, out["vcam"] = vcam_register()
             if vc != 200:
@@ -1289,7 +1383,9 @@ def _product_local_start(args, controller_ip):
         else:
             out["vcam"] = vcam_status()
         try:
-            sid, info = launch_product("receiver", {"adapter": c["adapter"], "mtu": rv["mtu"], "shm": rv["shm"], "timeout_s": 0})
+            sid, info = launch_product("receiver", {"adapter": c["adapter"], "mtu": rv["mtu"], "shm": rv["shm"], "timeout_s": 0,
+                                                     **({"width": c["capture"]["width"], "height": c["capture"]["height"], "fps": c["capture"]["fps"],
+                                                         "source_mac": descriptor["source_mac"]} if descriptor else {})})
         except Exception as error:
             if state["vcam_managed"]: out["cleanup"] = vcam_unregister()[1]
             return 500, dict(out, error="接收程序启动失败：%s" % error)
@@ -1299,10 +1395,12 @@ def _product_local_start(args, controller_ip):
     try:
         sid, info = launch_product("sender", {"adapter": c["adapter"], "mode": cp["mode"], "pattern": cp["pattern"],
                                              "fps": cp["fps"], "frames": 0, "mtu": cp["mtu"], "batch": cp["batch"],
-                                             "dst_mac": cp["dst_mac"], "gpu_convert": cp["gpu_convert"]})
+                                             "dst_mac": cp["dst_mac"], "gpu_convert": cp["gpu_convert"],
+                                             **({"width": cp["width"], "height": cp["height"], "transform": cp["transform"],
+                                                 "source_mac": descriptor["source_mac"]} if descriptor else {})})
     except Exception as error:
         return 500, {"role": role, "error": str(error), "diagnostics": slot_stats("sender")}
-    return 200, {"role": role, "session_id": sid, "args": info}
+    return 200, {"role": role, "session_id": sid, "args": info, "stream": descriptor}
 
 def product_local_stop():
     with PRODUCT_LOCK:
@@ -1318,9 +1416,9 @@ def product_local_stop():
         return 200, result
 
 # ---- 产品模式：主机编排 ----
-def _side_call(side, local_role, op):
+def _side_call(side, local_role, op, stream=None):
     if side == local_role:
-        return product_local_start() if op == "start" else product_local_stop()
+        return product_local_start({"stream": stream} if stream else {}) if op == "start" else product_local_stop()
     args = {}
     if side == "capture" and op == "start" and deployment_role() == "receive":
         cp = dict(load_config()["capture"])
@@ -1330,7 +1428,7 @@ def _side_call(side, local_role, op):
             selected = [item for item in adapters.get("items", []) if item["name"] == load_config()["adapter"]]
             if selected and selected[0].get("mac"):
                 cp["dst_mac"] = selected[0]["mac"].replace("-", ":").lower()
-        args = {"capture": cp, "auto_adapter": True}
+        args = {"capture": cp, "auto_adapter": True, "stream": stream}
     return peer_call("/product/local/" + op, args, timeout=45)
 
 def product_start():
@@ -1346,9 +1444,11 @@ def _product_start():
     if errors: return 400, {"ok": False, "error": "invalid config", "details": errors}
     errors = stream_implementation_errors(c["capture"])
     if errors: return 409, {"ok": False, "error": "；".join(errors), "details": errors}
+    if not deployment_role() and any(c["capture"][key] != CONFIG_DEFAULT["capture"][key] for key in ("width", "height", "transform")):
+        return 409, {"ok": False, "error": "可变尺寸产品链路需要 host/capture 角色及显式会话协商。"}
     if deployment_role() == "receive":
         hc, health = peer_call("/health")
-        if hc != 200 or health.get("product_revision") != 2 or health.get("product_role") != "capture":
+        if hc != 200 or health.get("product_revision") != 2 or health.get("product_role") != "capture" or health.get("stream_revision") != 2:
             return 409, {"ok": False, "error": "请更新被采集机后台，并使用 --role capture 在 5143 端口启动。"}
     pc, pcfg = peer_call("/config")
     if pc != 200: return 502, {"ok": False, "error": "peer config: %s" % pcfg.get("error", pc)}
@@ -1367,13 +1467,17 @@ def _product_start():
             return 409, {"ok": False, "error": "；".join(reasons) if reasons else
                          "所选网卡未连接或参数超过已知物理线速，请先调整配置。", "plan": plan}
     steps = []
-    code, r = _side_call("receive", me, "start"); steps.append({"side": "receive", "code": code, "result": r})
+    descriptor = stream_session(c["capture"]) if deployment_role() else None
+    code, r = _side_call("receive", me, "start", descriptor); steps.append({"side": "receive", "code": code, "result": r})
     if code != 200: return 502, {"ok": False, "steps": steps}
     time.sleep(0.5)  # 收端先就绪，避免首帧丢
     if deployment_role() == "receive" and not slot_stats("receiver")["running"]:
         sc, sr = product_local_stop(); steps.append({"side": "receive", "code": sc, "result": sr, "rollback": True})
         return 502, {"ok": False, "error": "接收程序已退出，请检查运行日志。", "steps": steps}
-    code, r = _side_call("capture", me, "start"); steps.append({"side": "capture", "code": code, "result": r})
+    code, r = _side_call("capture", me, "start", descriptor)
+    if code == 200 and descriptor is not None and r.get("stream") != descriptor:
+        code, r = 409, {"error": "采集后台未确认同一流会话，已拒绝运行。"}
+    steps.append({"side": "capture", "code": code, "result": r})
     if code != 200:
         # 请求超时可能发生在对端已经启动之后，先尽力停止再回收本机。
         sc, sr = _side_call("capture", me, "stop"); steps.append({"side": "capture", "code": sc, "result": sr, "rollback": True})
@@ -1421,7 +1525,7 @@ def product_status():
             out["peer"] = {"online": False, "url": url, "error": h.get("error", code)}
         else:
             p = {"online": True, "url": url, "version": h.get("version"),
-                 "product_revision": h.get("product_revision"), "product_role": h.get("product_role")}
+                 "product_revision": h.get("product_revision"), "product_role": h.get("product_role"), "stream_revision": h.get("stream_revision")}
             for k, path in (("config", "/config"), ("sender", "/sender/stats"), ("receiver", "/receiver/stats"), ("vcam", "/vcam/status")):
                 cc, d = peer_call(path, timeout=1.5, url=url)
                 p[k] = d if cc == 200 else None
@@ -1537,7 +1641,7 @@ UI_HTML = r'''<!doctype html>
 <div class="field"><label for="c_width">输出宽度</label><input id="c_width" type="number" min="2" max="8192" step="2" required><p>2–8192 的偶数；直接输入可切换为自定义。</p></div>
 <div class="field"><label for="c_height">输出高度</label><input id="c_height" type="number" min="2" max="8192" step="2" required><p>NV12 色度采样要求宽高均为偶数。</p></div>
 <div class="field"><label for="c_fps">目标帧率</label><input id="c_fps" type="number" min="1" max="1000" step="1" required><p>当前 DDA 由桌面新帧驱动，尚不硬限速；此数值用于预算，不是已达成帧率。</p></div>
-<div class="field"><label for="c_transform">裁切 / 缩放方式</label><select id="c_transform"><option value="crop">居中裁切 · 1:1 像素</option><option value="fit">完整画面 · 等比缩放 + 黑边（待接通）</option><option value="fill">铺满输出 · 等比缩放 + 裁切（待接通）</option><option value="stretch">拉伸填满 · 不保持比例（待接通）</option></select><p>居中裁切不缩放；其他方式目前只保存配置。</p></div>
+<div class="field"><label for="c_transform">裁切 / 缩放方式</label><select id="c_transform"><option value="crop">居中裁切 · 1:1 像素</option><option value="fit">完整画面 · 等比缩放 + 黑边</option><option value="fill">铺满输出 · 等比缩放 + 裁切</option><option value="stretch">拉伸填满 · 不保持比例</option></select><p>居中裁切不缩放；其他方式使用确定性的整数最近邻采样。裁切输出大于源桌面时拒绝启动。</p></div>
 </div></div>
 <div class="form-section"><div class="form-heading"><span class="step">03</span><h2>传输模式与预算</h2></div>
 <div class="field-grid">
@@ -1584,9 +1688,6 @@ function hasRunning(status) {
     (machine.sender && machine.sender.running || machine.receiver && machine.receiver.running));
 }
 function pendingPipeline(capture = {}) {
-  if ((capture.width ?? 640) !== 640 || (capture.height ?? 640) !== 640)
-    return '当前原生管线固定为 640×640；可变分辨率尚未接通。请查看连接配置中的实现状态。';
-  if ((capture.transform || 'crop') !== 'crop') return '所选缩放方式尚未接通，当前仅支持居中 1:1 裁切。';
   if ((capture.codec || 'raw') !== 'raw') return 'H.264/H.265 后端尚未接入，当前仅支持 Raw NV12。';
   return '';
 }
@@ -1602,7 +1703,7 @@ function readiness(status, unsaved) {
   if (!config.peer_url || !config.adapter) return result('warn','连接被采集机','请在连接配置中填写被采集机 IP，并选择本机网卡。');
   if (!peer || !peer.online) return result('warn','等待采集后台上线','请确认被采集机后台已启动，IP 正确，5143 端口可达。');
   if (!peer.config || !peer.sender || !peer.receiver) return result('warn','对端状态读取不完整','检查对端 agent 是否支持当前控制台，稍后重试。');
-  if (peer.product_revision !== 2 || peer.product_role !== 'capture') return result('warn','请更新被采集机后台','需要支持当前主机控制流程的采集后台，控制端口为 5143。');
+  if (peer.product_revision !== 2 || peer.product_role !== 'capture' || peer.stream_revision !== 2) return result('warn','请更新被采集机后台','需要支持当前主机控制流程的采集后台，控制端口为 5143。');
   if (peer.config.role !== 'capture') return result('warn','对端未以采集后台运行','请在被采集机使用 --role capture 启动后台服务。');
   if (local.version && peer.version && local.version !== peer.version) return result('warn','两端版本不一致','本机 '+local.version+'，对端 '+peer.version+'。请统一版本后开始采集。');
   if (tx.note === 'stub-no-binary' && tx.running || rx.note === 'stub-no-binary' && rx.running) return result('warn','占位进程运行中 · 没有真实传输','缺少采集或接收程序，请先完成构建并停止占位进程。');
@@ -1861,7 +1962,7 @@ function renderStreamPlan(plan) {
     '\n'+(network.is_estimate ? '编码均摊估算' : 'NV12 线速需求')+' '+speed(network.wire_bps)+
     '（含 L2 / VC 包头、FCS、前导码、帧间隙）\n预留 '+network.headroom_pct+'% 后预算 '+speed(network.usable_bps)+
     (network.max_raw_fps !== null ? ' · 此尺寸理论上限 '+network.max_raw_fps+' fps' : ''));
-  text('planDetails',(implementation.reasons.length ? implementation.reasons.join('\n') : '当前已有 640×640 居中裁切 / Raw NV12 实现。')+
+  text('planDetails',(implementation.reasons.length ? implementation.reasons.join('\n') : '当前软件已接通可变尺寸 / 四种变换 / Raw NV12；启动时仍须确认两端原生能力。')+
     '\n本次未探测编解码硬件，也没有进行该参数组合的实机验收。');
   text('planWarnings',plan.warnings.join('\n'));
 }
@@ -2006,7 +2107,7 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/health":
             anyrun = any((state[k].get("proc") is not None and state[k]["proc"].poll() is None) for k in ("sender", "receiver"))
             self._j({"ok": True, "version": read_version(), "role": state["role"], "running": anyrun, "updater": updater_status(), "pid": os.getpid(), "staged": STAGED.get("version"),
-                     "product_revision": 2, "stream_revision": 1,
+                     "product_revision": 2, "stream_revision": 2,
                      "product_role": deployment_role() or load_config()["role"], "root": os.path.abspath(ROOT)})
         elif self.path == "/version":
             self._j({"version": read_version()})
@@ -2058,8 +2159,8 @@ class H(BaseHTTPRequestHandler):
         if _p5_post(self, args if isinstance(args, dict) else {}): return
         if self.path == "/sender/start":
             _a = (args if isinstance(args, dict) else {})
-            if any(key in _a for key in ("width", "height", "transform", "codec", "bitrate_mbps", "max_bitrate_mbps")):
-                self._j({"error": "低层原生 CLI 尚不支持新流参数，请使用 /config 与 /stream/plan；不会忽略参数启动。"}, 409)
+            errors = low_level_stream_errors("sender", _a)
+            if errors: self._j({"error": "；".join(errors)}, 409)
             elif not str(_a.get("adapter", "")).strip():
                 _code, _ad = get_adapters()
                 self._j({"error": "missing --adapter; GET /adapters first", "adapters": _ad}, 400)
@@ -2068,8 +2169,8 @@ class H(BaseHTTPRequestHandler):
                 self._j({"session_id": sid, "args": info})
         elif self.path == "/receiver/start":
             _a = (args if isinstance(args, dict) else {})
-            if any(key in _a for key in ("width", "height", "transform", "codec", "bitrate_mbps", "max_bitrate_mbps")):
-                self._j({"error": "低层原生 CLI 尚不支持新流参数，请使用 /config 与 /stream/plan；不会忽略参数启动。"}, 409)
+            errors = low_level_stream_errors("receiver", _a)
+            if errors: self._j({"error": "；".join(errors)}, 409)
             elif not str(_a.get("adapter", "")).strip():
                 _code, _ad = get_adapters()
                 self._j({"error": "missing --adapter; GET /adapters first", "adapters": _ad}, 400)

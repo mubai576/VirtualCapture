@@ -1,12 +1,12 @@
 #pragma once
-// vcam_shm.h -- receiver -> vcam frame handoff, layout v2 (2026-10-28, latency work).
+// vcam_shm.h -- receiver -> vcam frame handoff, layout v3 (P6-2); retains the v2 ring/event publication design.
 // Canonical layout; every reader/writer includes or mirrors this file (NOT proto/: proto/ is owner-frozen).
 // Mirrors: tools/monitor/monitor.cpp, scripts/p4_4_shm_verify.py, scripts/p4_4_vcam_verify.py.
 //
 // v2 = multi-slot ring + in-place reassembly + event wake (replaces v1 single-slot copy + polling).
 //   [0,64)                      vc_shm_hdr_t
 //   [64, 64+64*VC_SHM_SLOTS)    vc_shm_slot_t[VC_SHM_SLOTS]
-//   [VC_SHM_DATA_OFF + i*VC_FRAME_BYTES)  slot i frame bytes (NV12 614400, 4K aligned)
+//   [VC_SHM_DATA_OFF + i*VC_FRAME_BYTES)  slot i frame bytes (session NV12, packed)
 //
 // Writer (receiver, single process):
 //   - reassembles packets DIRECTLY into a free slot: slot.seq++ (odd = filling), hash_fid = ~0.
@@ -28,8 +28,8 @@
 #include "../sender/pattern.h"  // VC_Y_BYTES / VC_UV_BYTES
 #include "../proto/vc_wire.h"    // VC_FRAME_BYTES (614400)
 
-#define VC_SHM_MAGIC    0x32414356u   /* "VCA2" little-endian; v1 was 0x5643414d */
-#define VC_SHM_VERSION  2u
+#define VC_SHM_MAGIC    0x33414356u   /* "VCA3"; v2 readers reject variable geometry */
+#define VC_SHM_VERSION  3u
 #define VC_SHM_SLOTS    12u
 #define VC_SHM_DATA_OFF 4096u
 #define VC_SHM_SIZE     ((size_t)VC_SHM_DATA_OFF + (size_t)VC_SHM_SLOTS * (size_t)VC_FRAME_BYTES)
@@ -40,12 +40,13 @@ typedef struct {
   uint32_t magic;          // VC_SHM_MAGIC
   uint32_t version;        // VC_SHM_VERSION
   uint32_t slots;          // VC_SHM_SLOTS
-  uint32_t frame_bytes;    // VC_FRAME_BYTES
+  uint32_t frame_bytes;    // width * height * 3 / 2
   uint32_t data_off;       // VC_SHM_DATA_OFF
   int32_t  latest_slot;    // -1 = nothing published yet
   int32_t  latest_seq;     // publish counter (0 = none), monotonically increasing
   uint32_t writer_pid;
-  uint8_t  reserved[32];
+  uint32_t width, height, fps;  // v3 session geometry; immutable for this mapping
+  uint8_t  reserved[20];
 } vc_shm_hdr_t;            // 64 B
 typedef struct {
   int32_t  seq;            // odd = filling, even = stable
@@ -67,7 +68,18 @@ static inline vc_shm_slot_t* vc_shm_slot(uint8_t* base, uint32_t i) {
   return (vc_shm_slot_t*)(base + 64 + 64 * (size_t)i);
 }
 static inline uint8_t* vc_shm_data(uint8_t* base, uint32_t i) {
-  return base + VC_SHM_DATA_OFF + (size_t)i * (size_t)VC_FRAME_BYTES;
+  return base + VC_SHM_DATA_OFF + (size_t)i * ((vc_shm_hdr_t*)base)->frame_bytes;
+}
+static inline size_t vc_shm_size(size_t frame_bytes) {
+  return VC_SHM_DATA_OFF + VC_SHM_SLOTS * frame_bytes;
+}
+static inline bool vc_shm_valid(const vc_shm_hdr_t* h) {
+  if(h->slots!=VC_SHM_SLOTS || h->data_off!=VC_SHM_DATA_OFF) return false;
+  if(h->magic==0x32414356u && h->version==2u) return h->frame_bytes==VC_FRAME_BYTES;
+  return h->magic==VC_SHM_MAGIC && h->version==VC_SHM_VERSION &&
+    h->width>=2 && h->height>=2 && h->width<=8192 && h->height<=8192 &&
+    !(h->width&1) && !(h->height&1) && h->fps>=1 && h->fps<=1000 &&
+    h->frame_bytes==(uint64_t)h->width*h->height*3/2;
 }
 
 // ---- vcam -> receiver feedback ring (latency measurement only, same machine QPC) ----

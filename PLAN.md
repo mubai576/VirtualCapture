@@ -10,8 +10,8 @@
 P4 历史测试结论保留；2026-11-02 已只读封存当前部署，不新增性能结论。owner 已反馈约三天实际使用满意，优先保住已用版本，不追加压力测试或扩展 G3/G4。详见 `docs/bringup/bringup-20261102.md`。
 
 封存后 owner 已批准继续开发（D19）：分辨率预设 `416×416 / 640×640 / 720p / 1080p / 1440p` + 自定义，
-裁切/缩放、双端链路预算、H.264/H.265。P6-1 配置与预算已完成隔离验证；下一步 P6-2 原生可变尺寸。
-现有部署不替换，原生数据面尚未扩展。
+裁切/缩放、双端链路预算、H.264/H.265。P6-1 与 P6-2 开发版已接通，原生 Raw/四种变换/发送限速/动态 SHM 与虚拟卡完成本机隔离验证。
+P6-3 编解码后端开始开发；尚未开放产品编码模式。现有部署不替换，双机新模式验收留在 P6-4。
 
 | 维度 | 状态 |
 |---|---|
@@ -38,7 +38,7 @@ PC1=192.168.2.100 接收；历史报告中的 PC1 sender / PC2 receiver 不代�
 
 ### 1.1 包头与链路
 - `proto/vc_wire.h`：`vc_pkt_hdr_t` 28B，EtherType `0x88B5`，`payload = mtu - 42`，
-  `total = ceil(614400/payload)`。proto/ 归 owner 锁定。
+  `total = ceil(B/payload)`，`B=width*height*3/2`；缺省仍为614400。P6-2 控制面显式协商几何/MTU/源MAC，不占用包头/flags。proto/ 归 owner 锁定。
 
 ### 1.2 构建
 - 根 `CMakeLists.txt` 编排 `common/`、`sender/`、`receiver/`、`vcam/` 与 `tools/`，MSVC 优先；统一规则在 `cmake/`。默认 `-B build` 下发收端入口仍为 `build/vc-sender.exe`、`build/vc-receiver.exe`；各目标路径见 `docs/runbooks/build.md`。
@@ -49,19 +49,23 @@ PC1=192.168.2.100 接收；历史报告中的 PC1 sender / PC2 receiver 不代�
 vc-sender.exe --adapter <子串> --mode pattern|file|dda --pattern motion --fps 240
   --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff
   --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest] [--gpu-convert]
+  [--width 640 --height 640 --transform crop|fit|fill|stretch --source-mac <MAC>] [--capabilities]
 vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
   --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]
+  [--width 640 --height 640 --fps 240 --source-mac <MAC>] [--capabilities]
 ```
+
+P6-3开发工具（不在产品载荷）：`vc-codec-probe --width W --height H --fps F`只探测候选；`vc-codec-roundtrip`要求显式encoder/decoder CLSID或精确name，支持codec/几何/fps/frames/bitrate/硬件类别/max-in-flight/hashlog及无硬件selftest。完整CLI见skill `references/stream-config.md`；不是生产codec能力或吞吐保证。
 
 ### 1.4 文件型 IPC
 - stats ~500ms 原子覆写（tmp→rename）；hashlog 每帧 append 一行。
-- `sender.hash.jsonl`：`{"frame_id":N,"hash":"<16hex>","qpc_ns":T}`
+- `sender.hash.jsonl`：`{"frame_id":N,"hash":"<16hex>","qpc_ns":T,"send_qpc_ns":S}`；T为采集/生成开始，S为开始分包发送
 - receiver hashlog D3 carries qpc_ns; reconcile compares frame_id and hash only.
 - vcam DShow 设备契约（2026-10-25）：FriendlyName `VirtualCapture`，pin `Capture`（PIN_CATEGORY_CAPTURE），仿 GC573 枚举为 `(video)`；HKCU CLSID 键下可选 REG_SZ `FrameMap`、REG_DWORD `Motion`=1（D12 显式 bring-up）。
 - receiver `--shm <name>` (P4-3): publish latest complete frame to named file mapping (layout vcam/vcam_shm.h, NOT proto/); stats adds `shm_published`; agent /receiver/start forwards `shm`.
-- **shm v2（D15，2026-10-28）**：`vcam/vcam_shm.h` 为唯一布局（magic `VCA2`，12 槽 ring，数据区 4096 起）；receiver 原地重组进空闲槽，发布=翻槽 seq + 置命名事件 `<name>.evt0/.evt1`（manual-reset 交替），整帧哈希在发布后由哈希线程写入（`hash_fid==frame_id` 才有效）；vcam 事件驱动（新帧立即交付，静默 1.5 帧后才重复上一帧，D12 不变）。v1 读端遇 v2 映射判"无信号"，不崩。Python 镜像 `scripts/vc_shm.py`，monitor 内联镜像。
+- **shm v2（D15 历史；开发版由下述 P6-2 v3 替代）**：`vcam/vcam_shm.h` 为唯一布局（magic `VCA2`，12 槽 ring，数据区 4096 起）；receiver 原地重组进空闲槽，发布=翻槽 seq + 置命名事件 `<name>.evt0/.evt1`（manual-reset 交替），整帧哈希在发布后由哈希线程写入（`hash_fid==frame_id` 才有效）；vcam 事件驱动（新帧立即交付，静默 1.5 帧后才重复上一帧，D12 不变）。v1 读端遇 v2 映射判"无信号"，不崩。Python 镜像 `scripts/vc_shm.py`，monitor 使用公共布局。
 - vcam→receiver 回写环 `<name>.vcam`（`vc_vstat_*`，仅测量）：receiver stats 新增 `vseg_avg_ms/vseg_p50_ms/vseg_p99_ms/vseg_max_ms`（receiver 发布→vcam 交付下游，同机 QPC，不含重复帧）、`vcam_delivered`、`vcam_repeats`、`hash_queue_max`；sender stats 新增 `cap_lag_avg_ms/cap_lag_p99_ms/cap_lag_max_ms`（dda：DXGI LastPresentTime→转换完成，同机 QPC）。
-- receiver hashlog `qpc_ns` = 重组完成时刻（原为当次循环起点，差 <1 包）；sender PC1 段不再含整帧哈希（哈希移到末包之后）。dda 模式不再按 `--fps` 睡眠节流，由 AcquireNextFrame 节拍。
+- receiver hashlog `qpc_ns` = 重组完成时刻（原为当次循环起点，差 <1 包）；sender PC1 段不再含整帧哈希（哈希移到末包之后）。历史 D15 的 DDA 不限速由 P6-2 替代：发送开始间隔至少 ceil(1e9/fps) ns、不补发追赶；timeout/鼠标更新/重复 LastPresentTime 不发送或递增frame_id。
 - sender stats 新增 `gpu_dispatch_ms`（D3D11 timestamp 包住 CopyResource 的真 GPU 时间均值）+ `gpu_dispatch_samples`（有效样本数）；`gpu_ms` 仍为 capture() wall-clock，待 P4-1 实测分布后按 D10 决定是否切换口径。
 - sender stats 新增 `gpu_convert`（0/1，采集走 CPU 还是 GPU compute shader；GPU 失败显式报错，不静默回退）。
 - P4-2步骤1（免协议改动）：receiver stats 新增 `rseg_avg_ms/rseg_p50_ms/rseg_p99_ms/rseg_max_ms`（R(N)=首包到达→重组完成，同机QPC）；sender stats 新增 `pc1_seg_avg_ms/pc1_seg_p99_ms/pc1_seg_max_ms`（PC1段=采集/生成完成→末包发出，同机QPC）；确认包（flags bit1）仍待 owner 终审后做步骤2。
@@ -69,8 +73,9 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 - P5-U2（D17）：仅主机（默认 `--role host`）提供 UI，收端角色固定；被采集机 `--role capture` 仅后台。产品控制端口 5143，UI 只填 IPv4，网卡自动枚举后下拉选择；主机下发采集参数，对端按控制路由匹配网卡。默认 SHM 固定隐藏，接收前注册 vcam，停止/失败/子进程退出时回收；开始/停止采集合为一个按钮。API 追加能力标记、网卡详情与生命周期语义，详见 agent-api.md；数据面与判据不变。
 - P5-U2 后续精简：连接配置仅显示 IP、网卡和目标帧率，移除画面来源、像素转换、发送批大小及 MTU；隐藏参数沿用后台配置，保存时保留原值，底层 API 与默认值不变。
 - P5-U3 后端整合：产品启动约 1 秒存活检查，提前退出失败并回滚；stats 追加进程诊断和实际采集方式，界面等待首帧。`/health.root` 支持启动器校验同目录/同角色复用；主机与采集后台各有便携启动入口。契约见 agent-api.md、packaging.md。
-- P6-1（D19）：配置新增输出宽高、crop/fit/fill/stretch、raw/h264/hevc、目标/最大码率与链路预留余量；旧配置仍为 640×640 / crop / raw。新增只读 `GET /stream/capabilities` 与草稿 `POST /stream/plan`，`/adapters` 追加数值型收/发链路速率，`/health.stream_revision=1`。原生尚未接通的新组合可保存，但在注册/启动前 409 拒绝；禁止低层接口静默忽略新流参数。预算使用 mtu-42 和完整 L2 线速开销，不是实测吞吐或帧率保证；速率未知不冒充可行。完整契约见 skill `references/stream-config.md`。
-- 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 614400B。
+- P6-1（D19）：配置新增输出宽高、crop/fit/fill/stretch、raw/h264/hevc、目标/最大码率与链路预留余量；旧配置仍为 640×640 / crop / raw。新增只读 `GET /stream/capabilities` 与草稿 `POST /stream/plan`，`/adapters` 追加数值型收/发链路速率，`/health.stream_revision=1`（历史，现已由P6-2的2替代）。该阶段的非640/缩放拒绝由P6-2解锁；编码模式仍在注册/启动前409拒绝；禁止低层接口静默忽略新流参数。预算使用 mtu-42 和完整 L2 线速开销，不是实测吞吐或帧率保证；速率未知不冒充可行。完整契约见 skill `references/stream-config.md`。
+- P6-2（D19）：`stream_revision=2`、显式 descriptor 双端回显、实际原生能力探测与源 MAC 会话过滤；旧后台/二进制拒绝。可变尺寸 Raw、整数 crop/fit/fill/stretch、发送帧率上限已接通。SHM v3（VCA3，header offset32/36/40=width/height/fps，动态12槽步长）；新读端兼容固定v2，旧读端拒绝v3，writer拒绝已有同名映射。DShow 创建时固定一档真实会话格式，改尺寸先关下游再重新开始/打开；D12不变。详情与低层API见 skill `references/stream-config.md`。
+- 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 B 字节（旧默认614400B）。
 
 ### 1.5 全局禁止
 1. 不改包头尺寸/字段顺序。 2. 像素生成禁用浮点。 3. 原有 raw 模式禁止压缩；D19 单独批准新增 H.264/H.265 有损模式，不得复用 raw 逐像素哈希门来声称有损正确性。
@@ -155,13 +160,13 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 
 五档预设 + 自定义、四种裁切/缩放草案、raw/H.264/H.265 规划、两端方向速率及 L2 线速预算；verify ALL PASS（122 passed / 4 skipped）+ Edge 隔离桌面/手机宽度 13 项检查通过。原生/包头/SHM/部署未修改，未实现组合拒绝启动；稳定成品 87/87 与封存 424/424 完整性复核通过。证据：`docs/proposals/configurable-stream-20261102.md`。
 
-### P6-2 可变尺寸 raw 全链路 — TODO
+### P6-2 可变尺寸 raw 全链路 — DONE（开发实现与本机验证，2026-11-03）
 
-会话协商、DDA/GPU 整数变换、明确的帧率上限、receiver 动态帧缓冲、版本化 SHM、monitor/验证器/DShow 格式与重连；默认 640 raw 逐字节回归，先隔离回环再双机，不改 28B 包头或历史判据。
+显式会话/真实原生能力、可变尺寸Raw、四种整数变换、发送上限、SHM v3及动态DShow已打通；motion回环七组1665帧、DDA/GPU三组300帧全量对账零错，产品HTTP→真实原生→DShow 121/121一致。双机与交付留P6-4。证据：`docs/bringup/bringup-20261103-p6-raw.md`（含总闸与生命周期负例）。
 
-### P6-3 编解码能力与后端 — TODO
+### P6-3 编解码能力与后端 — IN PROGRESS（2026-11-03）
 
-分别探测采集端编码器与主机解码器，先实测低延迟后端再接 H.264/H.265；保留 raw，不静默回退。定义有损模式的传输完整性、解码、画质与丢包恢复证据，不能拿编码前后 NV12 相等判通过。
+已实现Windows MF同步/异步后端原型，H.264/HEVC六种尺寸共12组/360帧实际编码→字节复制→解码通过；显式后端、不回退、强制IDR、精确display aperture。H.264单帧in-flight可用；本机HEVC解码需显式2帧，不能冒充Raw延迟。编码分包/丢包恢复/解码后SHM、PC2实际encoder与产品启用仍待完成，H.264/H.265启动继续409。证据及命令：`docs/proposals/codec-backend-20261103.md`。
 
 ### P6-4 组合验收与交付 — TODO
 

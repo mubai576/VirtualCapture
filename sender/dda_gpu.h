@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include "pattern.h"
+#include "../common/stream.h"
 #ifdef _WIN32
 #include <d3d11.h>
 #include <d3dcompiler.h>
@@ -16,48 +17,51 @@
 // HLSL：输入B8G8R8A8_UNORM用Load精确取数，反归一化 floor(v*255+0.5) 对8位精确
 // 数学与 dda_bgrx_to_nv12 完全同构：Y=(77r+150g+29b)>>8；2x2均值(>>2)后
 // U=((−43r−84g+127b)>>8)+128，V=((127r−106g−21b)>>8)+128，clamp8
-static const char* kDdaGpuHLSText =
-"Texture2D<float4> g_src : register(t0);\n"
-"RWStructuredBuffer<uint> g_y : register(u0);\n"
-"RWStructuredBuffer<uint> g_uv : register(u1);\n"
-"cbuffer CC : register(b0) { uint g_ox; uint g_oy; uint g_pad0; uint g_pad1; };\n"
-"int C8(int v){ return v<0?0:(v>255?255:v); }\n"
-"[numthreads(64,1,1)]\n"
-"void CSY(uint3 tid : SV_DispatchThreadID){\n"
-"  uint px = tid.x * 4u;\n"
-"  uint x = px % 640u, y = px / 640u;\n"
-"  uint r = 0u;\n"
-"  for(uint k=0;k<4;k++){\n"
-"    float4 c = g_src.Load(int3(int(g_ox+x+k), int(g_oy+y), 0));\n"
-"    int rr = int(c.x*255.0f+0.5f), gg = int(c.y*255.0f+0.5f), bb = int(c.z*255.0f+0.5f);\n"
-"    uint yy = uint((77*rr+150*gg+29*bb)>>8);\n"
-"    r |= (yy & 255u) << (k*8u);\n"
-"  }\n"
-"  g_y[tid.x] = r;\n"
-"}\n"
-"[numthreads(64,1,1)]\n"
-"void CSU(uint3 tid : SV_DispatchThreadID){\n"
-"  uint pair = tid.x * 2u;\n"
-"  uint x = (pair % 320u) * 2u, y2 = pair / 320u;\n"
-"  uint r = 0u;\n"
-"  for(uint k=0;k<2;k++){\n"
-"    int sr=0, sg=0, sb=0;\n"
-"    for(uint dy=0;dy<2;dy++){\n"
-"      for(uint dx=0;dx<2;dx++){\n"
-"        float4 c = g_src.Load(int3(int(g_ox+x+k*2u+dx), int(g_oy+y2*2u+dy), 0));\n"
-"        sr += int(c.x*255.0f+0.5f); sg += int(c.y*255.0f+0.5f); sb += int(c.z*255.0f+0.5f);\n"
-"      }\n"
-"    }\n"
-"    sr >>= 2; sg >>= 2; sb >>= 2;\n"
-"    uint uu = uint(C8(((-43*sr-84*sg+127*sb)>>8)+128));\n"
-"    uint vv = uint(C8((((127*sr-106*sg-21*sb)>>8)+128)));\n"
-"    r |= (uu & 255u) << (k*16u);\n"
-"    r |= (vv & 255u) << (k*16u+8u);\n"
-"  }\n"
-"  g_uv[tid.x] = r;\n"
-"}\n";
+static const char* kDdaGpuHLSText = R"HLSL(
+Texture2D<float4> g_src : register(t0);
+RWStructuredBuffer<uint> g_y : register(u0);
+RWStructuredBuffer<uint> g_uv : register(u1);
+cbuffer CC : register(b0) {
+  uint ox,oy,rw,rh; uint dx,dy,dw,dh; uint width,height,pad0,pad1;
+};
+int C8(int v){ return clamp(v,0,255); }
+int3 RGB(uint x,uint y){
+  if(x<dx || y<dy || x>=dx+dw || y>=dy+dh) return int3(0,0,0);
+  float4 c=g_src.Load(int3(ox+(x-dx)*rw/dw,oy+(y-dy)*rh/dh,0));
+  return int3(c.xyz*255.0f+0.5f);
+}
+[numthreads(64,1,1)]
+void CSY(uint3 tid : SV_DispatchThreadID){
+  uint index=tid.x+tid.y*4194240u;
+  uint off=index*4, n=width*height;
+  if(off>=n) return;
+  uint packed=0;
+  for(uint k=0;k<4 && off+k<n;k++){
+    uint pos=off+k;
+    int3 c=RGB(pos%width,pos/width);
+    packed |= uint((77*c.x+150*c.y+29*c.z)>>8)<<(k*8);
+  }
+  g_y[index]=packed;
+}
+[numthreads(64,1,1)]
+void CSU(uint3 tid : SV_DispatchThreadID){
+  uint index=tid.x+tid.y*4194240u;
+  uint off=index*4, n=width*height/2;
+  if(off>=n) return;
+  uint packed=0;
+  for(uint k=0;k<2 && off+k*2<n;k++){
+    uint pos=off+k*2, x=pos%width, y=pos/width*2;
+    int3 c=(RGB(x,y)+RGB(x+1,y)+RGB(x,y+1)+RGB(x+1,y+1))>>2;
+    uint u=uint(C8(((-43*c.x-84*c.y+127*c.z)>>8)+128));
+    uint v=uint(C8(((127*c.x-106*c.y-21*c.z)>>8)+128));
+    packed |= u<<(k*16); packed |= v<<(k*16+8);
+  }
+  g_uv[index]=packed;
+}
+)HLSL";
 
 struct DDAGpu {
+  VCStream stream;
   ID3D11Device* dev = nullptr;
   ID3D11DeviceContext* ctx = nullptr;
   ID3D11Query *qDisjoint = nullptr, *qStart = nullptr, *qEnd = nullptr;
@@ -86,8 +90,10 @@ struct DDAGpu {
   }
   ~DDAGpu() { shutdown(); }
   bool init(ID3D11Device* d, ID3D11DeviceContext* c,
-            ID3D11Query* dj, ID3D11Query* ts, ID3D11Query* te) {
+            ID3D11Query* dj, ID3D11Query* ts, ID3D11Query* te, const VCStream& config=VCStream()) {
     shutdown();
+    stream=config;
+    if(!stream.valid()) { errmsg="invalid stream geometry"; return false; }
     if (!d || !c) { errmsg = "null device/context"; return false; }
     dev = d; ctx = c; qDisjoint = dj; qStart = ts; qEnd = te;
     ID3DBlob* blob = nullptr; ID3DBlob* errs = nullptr;
@@ -110,7 +116,7 @@ struct DDAGpu {
     hr = dev->CreateComputeShader(blob->GetBufferPointer(), blob->GetBufferSize(), nullptr, &csU);
     blob->Release();
     if (FAILED(hr) || !csU) { errmsg = "CreateComputeShader CSU failed"; return false; }
-    const size_t yN = (size_t)VC_Y_BYTES / 4, uvN = (size_t)VC_UV_BYTES / 4;
+    const size_t yN = (stream.y_bytes()+3)/4, uvN = (stream.uv_bytes()+3)/4;
     D3D11_BUFFER_DESC bd; memset(&bd, 0, sizeof(bd));
     bd.ByteWidth = (UINT)(yN * 4); bd.Usage = D3D11_USAGE_DEFAULT;
     bd.BindFlags = D3D11_BIND_UNORDERED_ACCESS; bd.MiscFlags = D3D11_RESOURCE_MISC_BUFFER_STRUCTURED;
@@ -132,13 +138,14 @@ struct DDAGpu {
     sd.ByteWidth = (UINT)(uvN * 4);
     if (FAILED(dev->CreateBuffer(&sd, nullptr, &uvStag))) { errmsg = "uvStag failed"; return false; }
     D3D11_BUFFER_DESC cd; memset(&cd, 0, sizeof(cd));
-    cd.ByteWidth = 16; cd.Usage = D3D11_USAGE_DEFAULT; cd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    cd.ByteWidth = 48; cd.Usage = D3D11_USAGE_DEFAULT; cd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     if (FAILED(dev->CreateBuffer(&cd, nullptr, &cbuf))) { errmsg = "cbuf failed"; return false; }
     errmsg = "ok"; return true;
   }
   // 源纹理（B8G8R8A8_UNORM）上建SRV + 更新裁剪常量；纹理切换时重建
   bool ensure_src(ID3D11Texture2D* tex, int w, int h) {
-    if (!tex || w < 640 || h < 640) { errmsg = "bad src texture"; return false; }
+    VCTransform t;
+    if (!tex || !t.init(w,h,stream)) { errmsg = "bad src texture"; return false; }
     if (tex != srcTex) {
       if (srv) { srv->Release(); srv = nullptr; }
       D3D11_SHADER_RESOURCE_VIEW_DESC vd; memset(&vd, 0, sizeof(vd));
@@ -148,8 +155,7 @@ struct DDAGpu {
       if (FAILED(dev->CreateShaderResourceView(tex, &vd, &srv))) { errmsg = "SRV failed"; return false; }
       srcTex = tex;
     }
-    uint32_t cc[4]; cc[0] = (uint32_t)((w - 640) / 2); cc[1] = (uint32_t)((h - 640) / 2);
-    cc[2] = cc[3] = 0;
+    uint32_t cc[12]={t.ox,t.oy,t.rw,t.rh,t.dx,t.dy,t.dw,t.dh,t.width,t.height,0,0};
     ctx->UpdateSubresource(cbuf, 0, nullptr, cc, 0, 0);
     return true;
   }
@@ -160,14 +166,16 @@ struct DDAGpu {
     ID3D11ShaderResourceView* srvs[1] = { srv };
     ID3D11UnorderedAccessView* uavs[2] = { yUAV, uvUAV };
     ID3D11Buffer* cbs[1] = { cbuf };
-    const size_t yN = (size_t)VC_Y_BYTES / 4, uvN = (size_t)VC_UV_BYTES / 4;
+    const size_t yN = (stream.y_bytes()+3)/4, uvN = (stream.uv_bytes()+3)/4;
     ctx->CSSetConstantBuffers(0, 1, cbs);
     ctx->CSSetShaderResources(0, 1, srvs);
     ctx->CSSetUnorderedAccessViews(0, 2, uavs, nullptr);
     ctx->CSSetShader(csY, nullptr, 0);
-    ctx->Dispatch((UINT)(yN / 64), 1, 1);
+    size_t gy=(yN+63)/64;
+    ctx->Dispatch((UINT)std::min(gy,(size_t)65535),(UINT)((gy+65534)/65535),1);
     ctx->CSSetShader(csU, nullptr, 0);
-    ctx->Dispatch((UINT)(uvN / 64), 1, 1);
+    size_t gu=(uvN+63)/64;
+    ctx->Dispatch((UINT)std::min(gu,(size_t)65535),(UINT)((gu+65534)/65535),1);
     ID3D11ShaderResourceView* nsrv[1] = { nullptr };
     ID3D11UnorderedAccessView* nuav[2] = { nullptr, nullptr };
     ID3D11Buffer* ncb[1] = { nullptr };
@@ -183,10 +191,10 @@ struct DDAGpu {
     if (!Y || !UV) { errmsg = "null output"; return false; }
     D3D11_MAPPED_SUBRESOURCE my, muv;
     if (FAILED(ctx->Map(yStag, 0, D3D11_MAP_READ, 0, &my))) { errmsg = "yStag map failed"; return false; }
-    memcpy(Y, my.pData, VC_Y_BYTES);
+    memcpy(Y, my.pData, stream.y_bytes());
     ctx->Unmap(yStag, 0);
     if (FAILED(ctx->Map(uvStag, 0, D3D11_MAP_READ, 0, &muv))) { errmsg = "uvStag map failed"; return false; }
-    memcpy(UV, muv.pData, VC_UV_BYTES);
+    memcpy(UV, muv.pData, stream.uv_bytes());
     ctx->Unmap(uvStag, 0);
     return true;
   }

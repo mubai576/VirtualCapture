@@ -1,5 +1,5 @@
 // vc-vcam.cpp — P4-3 DShow source filter (user-mode COM, no driver signing).
-// Push source: 1 output pin, NV12 640x640, AvgTimePerFrame=41666 (240fps).
+// Push source: one NV12 output pin; geometry/fps are fixed per filter instance from the SHM session.
 // Frame source (bring-up): local integer pattern generator (sender/pattern.h motion,
 // deterministic in fid). Receiver shared-memory feed replaces FillFrame() at PC2 wiring (P4-4).
 // Registration: HKCU-only (no admin): CLSID + VideoInputDeviceCategory instance.
@@ -11,6 +11,9 @@
 #include <cstdio>
 #include <new>
 #include <string>
+#include <memory>
+#include <vector>
+#include "../common/stream.h"
 #include <timeapi.h>  // timeBeginPeriod(1) for 240Hz pacing
 #include "../sender/pattern.h"  // vc_gen_motion (integer-only)
 #include "vcam_shm.h"  // receiver -> vcam latest-frame handoff (canonical layout)
@@ -70,7 +73,6 @@ static const wchar_t* VCAM_PIN_ID = L"Capture";
 static const wchar_t* VCAM_CLSID_KEY =
   L"Software\\Classes\\CLSID\\{B84C7E21-4A5F-4E2B-9C11-5A3D7F01229A}";
 static const wchar_t* VCAM_SHM_DEFAULT = L"Local\\VirtualCaptureVcamFrame";
-static const LONG VCAM_W = 640, VCAM_H = 640;
 static const GUID VCAM_AMPROPSETID_Pin =
   // AMPROPSETID_Pin per SDK shared/uuids.h. The tail was previously mistyped
   // (00a024cbed26), so every client's pin-category query failed and ffmpeg/OBS
@@ -80,14 +82,14 @@ static const GUID VCAM_PIN_CATEGORY_CAPTURE =
   {0xfb6c4281, 0x0353, 0x11d1, {0x90, 0x5f, 0x00, 0x00, 0xc0, 0xcc, 0x16, 0xba}};
 #define VCAM_AMPROPERTY_PIN_CATEGORY 0
 #define VCAM_KSPROPERTY_SUPPORT_GET 1
-static const LONGLONG VCAM_FRAME_100NS = 41666;  // 240fps
-static const LONG VCAM_FRAME_BYTES = 640 * 640 * 3 / 2;
 
 static HMODULE g_hMod = nullptr;
 static LONG g_locks = 0;
 static LONG g_objs = 0;
 // ---------- media-type helpers ----------
-static AM_MEDIA_TYPE* VCamCreateType() {
+static AM_MEDIA_TYPE* VCamCreateType(const VCStream& stream=VCStream()) {
+  const LONG VCAM_W=stream.width, VCAM_H=stream.height, VCAM_FRAME_BYTES=(LONG)stream.frame_bytes();
+  const LONGLONG VCAM_FRAME_100NS=10000000LL/stream.fps;
   AM_MEDIA_TYPE* mt = (AM_MEDIA_TYPE*)CoTaskMemAlloc(sizeof(AM_MEDIA_TYPE));
   if (!mt) return nullptr;
   ZeroMemory(mt, sizeof(*mt));
@@ -96,7 +98,7 @@ static AM_MEDIA_TYPE* VCamCreateType() {
   ZeroMemory(vih, sizeof(*vih));
   vih->rcSource.right = VCAM_W; vih->rcSource.bottom = VCAM_H;
   vih->rcTarget.right = VCAM_W; vih->rcTarget.bottom = VCAM_H;
-  vih->dwBitRate = (DWORD)(VCAM_FRAME_BYTES * 8 * 240);
+  vih->dwBitRate = (DWORD)(std::min(0xffffffffull,(uint64_t)VCAM_FRAME_BYTES * 8 * stream.fps));
   vih->AvgTimePerFrame = VCAM_FRAME_100NS;
   BITMAPINFOHEADER& b = vih->bmiHeader;
   b.biSize = sizeof(b); b.biWidth = VCAM_W; b.biHeight = VCAM_H;
@@ -138,7 +140,8 @@ static HRESULT VCamCopyType(AM_MEDIA_TYPE* dst, const AM_MEDIA_TYPE* src) {
   }
   return S_OK;
 }
-static BOOL VCamTypeMatches(const AM_MEDIA_TYPE* mt) {
+static BOOL VCamTypeMatches(const AM_MEDIA_TYPE* mt,const VCStream& stream=VCStream()) {
+  const LONG VCAM_W=stream.width, VCAM_H=stream.height;
   if (!mt) return FALSE;
   if (mt->majortype != GUID_NULL && mt->majortype != MEDIATYPE_Video) return FALSE;
   if (mt->subtype != GUID_NULL && memcmp(&mt->subtype, &VCAM_SUBTYPE_NV12, sizeof(GUID)) != 0) return FALSE;
@@ -146,6 +149,7 @@ static BOOL VCamTypeMatches(const AM_MEDIA_TYPE* mt) {
   if (mt->formattype == FORMAT_VideoInfo && mt->cbFormat >= sizeof(VIDEOINFOHEADER) && mt->pbFormat) {
     const VIDEOINFOHEADER* v = (const VIDEOINFOHEADER*)mt->pbFormat;
     if (v->bmiHeader.biWidth != VCAM_W || v->bmiHeader.biHeight != VCAM_H) return FALSE;
+    if(v->AvgTimePerFrame!=10000000LL/stream.fps || v->bmiHeader.biSizeImage!=stream.frame_bytes()) return FALSE;
     if (v->bmiHeader.biCompression != (DWORD)MAKEFOURCC('N', 'V', '1', '2')) return FALSE;
   }
   return TRUE;
@@ -159,7 +163,8 @@ class CVCamPin;
 class CEnumPins : public IEnumPins {
   LONG m_cRef = 1; CVCamPin* m_pin; BOOL m_done = FALSE;
 public:
-  explicit CEnumPins(CVCamPin* p) : m_pin(p) {}
+  explicit CEnumPins(CVCamPin* p);
+  ~CEnumPins();
   STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
     if (riid == IID_IUnknown || riid == IID_IEnumPins) { *ppv = (IEnumPins*)this; AddRef(); return S_OK; }
@@ -187,7 +192,8 @@ public:
 class CEnumMT : public IEnumMediaTypes {
   LONG m_cRef = 1; BOOL m_done = FALSE;
 public:
-  CEnumMT() {}
+  VCStream m_stream;
+  explicit CEnumMT(const VCStream& stream=VCStream()):m_stream(stream) {}
   STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
     if (riid == IID_IUnknown || riid == IID_IEnumMediaTypes) { *ppv = (IEnumMediaTypes*)this; AddRef(); return S_OK; }
@@ -202,7 +208,7 @@ public:
     if (!pp) return E_POINTER;
     ULONG got = 0;
     while (got < c && !m_done) {
-      AM_MEDIA_TYPE* t = VCamCreateType();
+      AM_MEDIA_TYPE* t = VCamCreateType(m_stream);
       if (!t) { for (ULONG i = 0; i < got; i++) VCamFreeType(pp[i]); return E_OUTOFMEMORY; }
       pp[got++] = t; m_done = TRUE;
     }
@@ -217,7 +223,7 @@ public:
   STDMETHODIMP Reset() { m_done = FALSE; return S_OK; }
   STDMETHODIMP Clone(IEnumMediaTypes** pp) {
     if (!pp) return E_POINTER;
-    CEnumMT* e = new (std::nothrow) CEnumMT();
+    CEnumMT* e = new (std::nothrow) CEnumMT(m_stream);
     if (!e) return E_OUTOFMEMORY;
     e->m_done = m_done; *pp = e; return S_OK;
   }
@@ -272,7 +278,8 @@ public:
   }
   // IPersist
   STDMETHODIMP GetClassID(CLSID* p) { if (!p) return E_POINTER; *p = CLSID_VirtualCaptureCam; return S_OK; }
-  void ShmEnsureOpen();
+  VCStream stream;
+  void ShmEnsureOpen(bool discover=false);
   void ShmClose();
   // IMediaFilter
   STDMETHODIMP Stop();
@@ -299,8 +306,7 @@ public:
   STDMETHODIMP QueryFilterInfo(FILTER_INFO* p);
   STDMETHODIMP JoinFilterGraph(IFilterGraph* p, LPCWSTR) {
     Lock();
-    if (m_pGraph) m_pGraph->Release();
-    m_pGraph = p; if (m_pGraph) m_pGraph->AddRef();
+    m_pGraph = p;  // The graph owns its filters; a strong reference here creates a cycle.
     Unlock(); return S_OK;
   }
   STDMETHODIMP QueryPinVersion(LONG*) { return E_NOTIMPL; }
@@ -315,22 +321,20 @@ class CVCamPin : public IPin, public IAMStreamConfig,
                  public IKsPropertySet, public ISpecifyPropertyPages,
                  public IKsControlVC, public IKsPinVC {
   friend class CVCamFilter;
-  LONG m_cRef = 1;
-  CVCamFilter* m_pFilter;  // owning filter, ref'd
+  CVCamFilter* m_pFilter;  // External pin references delegate to the filter, avoiding a ref cycle.
   IPin* m_pPeer = nullptr;
   IMemInputPin* m_pInput = nullptr;
   IMemAllocator* m_pAlloc = nullptr;
   AM_MEDIA_TYPE m_mt; BOOL m_connected = FALSE;
 public:
   explicit CVCamPin(CVCamFilter* f) : m_pFilter(f) {
-    m_pFilter->AddRef(); ZeroMemory(&m_mt, sizeof(m_mt));
+    ZeroMemory(&m_mt, sizeof(m_mt));
   }
   ~CVCamPin() {
     VCamClearType(&m_mt);
     if (m_pAlloc) m_pAlloc->Release();
     if (m_pInput) m_pInput->Release();
     if (m_pPeer) m_pPeer->Release();
-    m_pFilter->Release();
   }
   // IUnknown
   STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
@@ -344,10 +348,9 @@ public:
     else { *ppv = nullptr; return E_NOINTERFACE; }
     AddRef(); return S_OK;
   }
-  STDMETHODIMP_(ULONG) AddRef() { return (ULONG)InterlockedIncrement(&m_cRef); }
+  STDMETHODIMP_(ULONG) AddRef() { return m_pFilter->AddRef(); }
   STDMETHODIMP_(ULONG) Release() {
-    LONG n = InterlockedDecrement(&m_cRef);
-    if (!n) delete this; return (ULONG)n;
+    return m_pFilter->Release();
   }
   // IPin
   STDMETHODIMP Connect(IPin* pPeer, const AM_MEDIA_TYPE* pmt);
@@ -382,11 +385,11 @@ public:
   }
   STDMETHODIMP QueryAccept(const AM_MEDIA_TYPE* p) {
     if (!p) return E_POINTER;
-    return VCamTypeMatches(p) ? S_OK : S_FALSE;
+    return VCamTypeMatches(p,m_pFilter->stream) ? S_OK : S_FALSE;
   }
   STDMETHODIMP EnumMediaTypes(IEnumMediaTypes** pp) {
     if (!pp) return E_POINTER;
-    *pp = new (std::nothrow) CEnumMT();
+    *pp = new (std::nothrow) CEnumMT(m_pFilter->stream);
     return *pp ? S_OK : E_OUTOFMEMORY;
   }
   STDMETHODIMP QueryInternalConnections(IPin**, ULONG*) { return E_NOTIMPL; }
@@ -394,26 +397,20 @@ public:
   STDMETHODIMP BeginFlush() { return S_OK; }
   STDMETHODIMP EndFlush() { return S_OK; }
   STDMETHODIMP NewSegment(REFERENCE_TIME, REFERENCE_TIME, double) { return S_OK; }
-  // IAMStreamConfig — expose 3 caps entries (30/60/240 fps) so clients
-  // populate their resolution/fps dropdowns instead of showing "no capabilities".
-  // All three use the same 640x640 NV12 format; only AvgTimePerFrame differs.
-  static const int kNumCaps = 3;
-  static constexpr LONGLONG kFrameIntervals[3] = {
-    416666LL,  // ~24fps
-    333333LL,  // 30fps
-    41666LL,   // 240fps
-  };
+  // Advertise only the immutable session format; do not claim frame rates the worker ignores.
+  static const int kNumCaps = 1;
   STDMETHODIMP GetNumberOfCapabilities(int* piCount, int* piSize) {
     if (!piCount || !piSize) return E_POINTER;
     *piCount = kNumCaps; *piSize = sizeof(VIDEO_STREAM_CONFIG_CAPS); return S_OK;
   }
   STDMETHODIMP SetFormat(AM_MEDIA_TYPE* p) {
     if (!p) return E_POINTER;
-    return VCamTypeMatches(p) ? S_OK : VFW_E_TYPE_NOT_ACCEPTED;
+    if(m_connected) return VFW_E_ALREADY_CONNECTED;
+    return VCamTypeMatches(p,m_pFilter->stream) ? S_OK : VFW_E_TYPE_NOT_ACCEPTED;
   }
   STDMETHODIMP GetFormat(AM_MEDIA_TYPE** pp) {
     if (!pp) return E_POINTER;
-    AM_MEDIA_TYPE* t = VCamCreateType();
+    AM_MEDIA_TYPE* t = VCamCreateType(m_pFilter->stream);
     if (!t) return E_OUTOFMEMORY;
     *pp = t; return S_OK;
   }
@@ -474,16 +471,17 @@ public:
   STDMETHODIMP_(LONG) KsEvent(void*,ULONG,void*,ULONG,ULONG* b)
     { if(b)*b=0; return (LONG)0xC00000BBL; }
 
-  // GetStreamCaps: 3 entries (30/60/240fps) so clients populate dropdowns
+  // GetStreamCaps: exactly the negotiated session format.
   STDMETHODIMP GetStreamCaps(int i, AM_MEDIA_TYPE** pp, BYTE* caps) {
     if (i < 0 || i >= kNumCaps || !pp || !caps) return E_INVALIDARG;
-    AM_MEDIA_TYPE* t = VCamCreateType();
+    AM_MEDIA_TYPE* t = VCamCreateType(m_pFilter->stream);
     if (!t) return E_OUTOFMEMORY;
     // Override AvgTimePerFrame for each capability entry
     VIDEOINFOHEADER* vih = (VIDEOINFOHEADER*)t->pbFormat;
-    LONGLONG fi = kFrameIntervals[i];
+    const LONG VCAM_W=m_pFilter->stream.width, VCAM_H=m_pFilter->stream.height;
+    LONGLONG fi = 10000000LL/m_pFilter->stream.fps;
     vih->AvgTimePerFrame = fi;
-    vih->dwBitRate = (DWORD)(VCAM_FRAME_BYTES * 8LL * (10000000LL / fi));
+    vih->dwBitRate = (DWORD)std::min(0xffffffffull,(uint64_t)m_pFilter->stream.frame_bytes()*8*m_pFilter->stream.fps);
     VIDEO_STREAM_CONFIG_CAPS* c = (VIDEO_STREAM_CONFIG_CAPS*)caps;
     ZeroMemory(c, sizeof(*c));
     c->guid                = FORMAT_VideoInfo;
@@ -498,11 +496,14 @@ public:
     c->OutputGranularityX  = 1; c->OutputGranularityY = 1;
     c->MinFrameInterval    = fi;
     c->MaxFrameInterval    = fi;
-    c->MinBitsPerSecond    = (LONG)vih->dwBitRate;
-    c->MaxBitsPerSecond    = (LONG)vih->dwBitRate;
+    c->MinBitsPerSecond    = (LONG)std::min(0x7fffffffull,(uint64_t)m_pFilter->stream.frame_bytes()*8*m_pFilter->stream.fps);
+    c->MaxBitsPerSecond    = c->MinBitsPerSecond;
     *pp = t; return S_OK;
   }
 }; // end class CVCamPin
+
+CEnumPins::CEnumPins(CVCamPin* p):m_pin(p){ m_pin->AddRef(); }
+CEnumPins::~CEnumPins(){ m_pin->Release(); }
 
 STDMETHODIMP CEnumPins::Next(ULONG c, IPin** pp, ULONG* pc) {
   if (!pp) return E_POINTER;
@@ -518,10 +519,11 @@ STDMETHODIMP CEnumPins::Next(ULONG c, IPin** pp, ULONG* pc) {
 CVCamFilter::CVCamFilter() {
   InitializeCriticalSection(&m_cs);
   InterlockedIncrement(&g_objs);
+  ShmEnsureOpen(true);
   m_pPin = new (std::nothrow) CVCamPin(this);
-  m_lastGoodFrame = new (std::nothrow) uint8_t[VCAM_FRAME_BYTES];  // D12
+  m_lastGoodFrame = new (std::nothrow) uint8_t[stream.frame_bytes()];  // D12
 }
-void CVCamFilter::ShmEnsureOpen() {
+void CVCamFilter::ShmEnsureOpen(bool discover) {
   // called with m_cs held; early-out once mapped and valid
   if (m_shmView) return;
   std::wstring name = VCAM_SHM_DEFAULT;
@@ -536,16 +538,23 @@ void CVCamFilter::ShmEnsureOpen() {
       m_motionEnable = (mv != 0);
     RegCloseKey(k);
   }
+  wchar_t testMap[260];
+  DWORD testLen=GetEnvironmentVariableW(L"VCAM_FRAME_MAP",testMap,260);
+  if(testLen>0 && testLen<260) name=testMap; // Explicit isolated verifier override; never writes registration.
   if (!m_hShmMap) {
     m_hShmMap = OpenFileMappingW(FILE_MAP_READ, FALSE, name.c_str());
     if (!m_hShmMap) return;  // receiver not publishing (yet)
   }
-  // a v1 (single-slot, smaller) mapping fails here -> treated as "no feed", retried next tick
-  m_shmView = (uint8_t*)MapViewOfFile(m_hShmMap, FILE_MAP_READ, 0, 0, VC_SHM_SIZE);
-  vc_shm_hdr_t* h = (vc_shm_hdr_t*)m_shmView;
-  if (!m_shmView || h->magic != VC_SHM_MAGIC || h->version != VC_SHM_VERSION ||
-      h->slots != VC_SHM_SLOTS || h->frame_bytes != (uint32_t)VC_FRAME_BYTES || h->data_off != VC_SHM_DATA_OFF) {
-    ShmClose(); return;
+  m_shmView=(uint8_t*)MapViewOfFile(m_hShmMap,FILE_MAP_READ,0,0,0);
+  vc_shm_hdr_t* h=(vc_shm_hdr_t*)m_shmView;
+  MEMORY_BASIC_INFORMATION memory={};
+  if(!h || !VirtualQuery(h,&memory,sizeof(memory)) || memory.RegionSize<64 || !vc_shm_valid(h) ||
+      memory.RegionSize<vc_shm_size(h->frame_bytes)){ ShmClose(); return; }
+  VCStream incoming;
+  if(h->version==3){ incoming.width=h->width; incoming.height=h->height; incoming.fps=h->fps; }
+  if(discover) stream=incoming;
+  if(incoming.width!=stream.width || incoming.height!=stream.height || incoming.fps!=stream.fps){
+    ShmClose(); return; // Media type is immutable: reopen the downstream device after a session size change.
   }
   for (int i = 0; i < 2; i++) {
     std::wstring en = name + (i ? L".evt1" : L".evt0");
@@ -573,9 +582,8 @@ CVCamFilter::~CVCamFilter() {
   Deactivate();
   ShmClose();
   if (m_lastGoodFrame) { delete[] m_lastGoodFrame; m_lastGoodFrame = nullptr; }  // D12
-  if (m_pPin) m_pPin->Release();
+  delete m_pPin;
   if (m_pClock) m_pClock->Release();
-  if (m_pGraph) m_pGraph->Release();
   DeleteCriticalSection(&m_cs);
 }
 IMemInputPin* CVCamFilter::Input() {
@@ -615,16 +623,21 @@ HRESULT CVCamFilter::Activate() {
 void CVCamFilter::Deactivate() {
   HANDLE th = nullptr, ev = nullptr;
   IMemAllocator* alloc = nullptr;
+  IMemInputPin* input = nullptr;
   Lock();
   th = m_hThread; m_hThread = nullptr;
-  ev = m_hStop; m_hStop = nullptr;
+  ev = m_hStop;
   if (m_pPin && m_pPin->m_pAlloc) { alloc = m_pPin->m_pAlloc; alloc->AddRef(); }
+  if (m_pPin && m_pPin->m_pInput) { input = m_pPin->m_pInput; input->AddRef(); }
   Unlock();
-  // Decommit first: unblocks a worker stuck in GetBuffer; join is bounded after that.
+  if(input){IPin* pin=nullptr;if(SUCCEEDED(input->QueryInterface(IID_IPin,(void**)&pin))){pin->BeginFlush();pin->Release();}}
+  // Decommit unblocks GetBuffer; keep the stop event and buffers alive until the worker exits.
   if (alloc) { alloc->Decommit(); alloc->Release(); }
   if (ev) SetEvent(ev);
-  if (th) { WaitForSingleObject(th, 2000); CloseHandle(th); }
+  if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
+  if(input){IPin* pin=nullptr;if(SUCCEEDED(input->QueryInterface(IID_IPin,(void**)&pin))){pin->EndFlush();pin->Release();}input->Release();}
   if (ev) CloseHandle(ev);
+  m_hStop = nullptr;
   ShmClose();  // worker joined: drop receiver mapping (re-resolves on next Run)
   m_hasLastGood = false;  // D12: reset per-session last-frame state
 }
@@ -653,7 +666,7 @@ static uint64_t VCamQpcNs(uint64_t freq) {
 // Stable latest publish -> (slot, seq) token. Read-only view: plain aligned loads only (D11).
 static bool VCamPeek(uint8_t* view, uint32_t& slot, LONG& seq) {
   vc_shm_hdr_t* h = (vc_shm_hdr_t*)view;
-  if (h->magic != VC_SHM_MAGIC) return false;
+  if (!vc_shm_valid(h)) return false;
   LONG i = *(volatile LONG*)&h->latest_slot;
   if (i < 0 || i >= (LONG)VC_SHM_SLOTS) return false;
   LONG s = *(volatile LONG*)&vc_shm_slot(view, (uint32_t)i)->seq;
@@ -665,7 +678,7 @@ static bool VCamCopySlot(uint8_t* view, uint32_t slot, LONG seq, uint8_t* dst, u
   vc_shm_slot_t* sl = vc_shm_slot(view, slot);
   fid = *(volatile uint32_t*)&sl->frame_id; pub = *(volatile uint64_t*)&sl->qpc_pub_ns;
   MemoryBarrier();
-  memcpy(dst, vc_shm_data(view, slot), VC_FRAME_BYTES);
+  memcpy(dst, vc_shm_data(view, slot), ((vc_shm_hdr_t*)view)->frame_bytes);
   MemoryBarrier();
   return *(volatile LONG*)&sl->seq == seq;
 }
@@ -679,12 +692,14 @@ void CVCamFilter::VstatPush(uint32_t fid, uint64_t pub, uint64_t del, uint32_t f
   MemoryBarrier(); e->n = (uint32_t)k + 1;
 }
 DWORD CVCamFilter::Worker() {
-  static uint8_t Y[VC_Y_BYTES], UV[VC_UV_BYTES];  // motion bring-up planes
+  const size_t VCAM_FRAME_BYTES=stream.frame_bytes(), VC_Y_BYTES_LOCAL=stream.y_bytes(), VC_UV_BYTES_LOCAL=stream.uv_bytes();
+  const LONGLONG VCAM_FRAME_100NS=10000000LL/stream.fps;
+  std::vector<uint8_t> Y(VC_Y_BYTES_LOCAL), UV(VC_UV_BYTES_LOCAL);
   uint32_t fid = 0;
   LONGLONG tcount = 0, lastStart = -1;
   BOOL discont = TRUE;
   const uint64_t freq = VCamQpcFreq();
-  const uint64_t FRAME_NS = 4166666ULL, FIRST_REPEAT_NS = 6250000ULL;  // repeat only after 1.5 frames of silence
+  const uint64_t FRAME_NS=(1000000000ULL+stream.fps-1)/stream.fps, FIRST_REPEAT_NS=FRAME_NS*3/2;  // repeat only after 1.5 frames of silence
   timeBeginPeriod(1);
   // MMCSS on our own worker thread only (never touch the host process priority class)
   typedef HANDLE (WINAPI *avset_fn)(LPCWSTR, LPDWORD);
@@ -760,12 +775,17 @@ DWORD CVCamFilter::Worker() {
         memcpy(buf, m_lastGoodFrame, VCAM_FRAME_BYTES);           // freeze: repeat, not fake bytes
         outFid = lastFid; outPub = lastPub; flags = VC_VSTAT_FLAG_REPEAT;
       } else if (m_motionEnable) {
-        vc_gen_motion(fid++, Y, UV);
-        memcpy(buf, Y, VC_Y_BYTES); memcpy(buf + VC_Y_BYTES, UV, VC_UV_BYTES);
+        vc_gen_motion(fid++, Y.data(), UV.data(),stream.width,stream.height);
+        memcpy(buf,Y.data(),VC_Y_BYTES_LOCAL); memcpy(buf+VC_Y_BYTES_LOCAL,UV.data(),VC_UV_BYTES_LOCAL);
         flags = VC_VSTAT_FLAG_REPEAT;  // not a receiver frame: excluded from vseg
       }
     }
-    s->SetActualDataLength(VCAM_FRAME_BYTES);
+    if(!ok && !m_hasLastGood && !m_motionEnable){
+      s->Release(); input->Release(); if(clk) clk->Release(); discont=TRUE;
+      next_ns=VCamQpcNs(freq)+FRAME_NS; continue;
+    }
+    if(ok && m_lastGoodFrame){ memcpy(m_lastGoodFrame,buf,VCAM_FRAME_BYTES); m_hasLastGood=true; lastFid=outFid; lastPub=outPub; }
+    s->SetActualDataLength((long)VCAM_FRAME_BYTES);
     // timestamps on the graph clock (stream time = now - tStart); counter fallback when paused / no clock
     REFERENCE_TIME ts = tcount;
     if (clk && st == State_Running) { REFERENCE_TIME now = 0; if (SUCCEEDED(clk->GetTime(&now))) ts = now - t0; }
@@ -780,11 +800,6 @@ DWORD CVCamFilter::Worker() {
     hr = input->Receive(s);
     s->Release(); input->Release();
     VstatPush(outFid, outPub, del, (uint32_t)flags);
-    // off the latency path: refresh the freeze cache from the slot (seqlock-checked)
-    if (ok && m_lastGoodFrame) {
-      uint32_t f2 = 0; uint64_t p2 = 0;
-      if (VCamCopySlot(view, slot, seq, m_lastGoodFrame, f2, p2)) { m_hasLastGood = true; lastFid = f2; lastPub = p2; }
-    }
     uint64_t n = VCamQpcNs(freq);
     if (ok) next_ns = n + FIRST_REPEAT_NS;
     else { next_ns += FRAME_NS; if (n > next_ns + 20000000ULL) next_ns = n; }  // no catch-up burst
@@ -806,15 +821,15 @@ STDMETHODIMP CVCamPin::Connect(IPin* pPeer, const AM_MEDIA_TYPE* pmt) {
   AM_MEDIA_TYPE* use = nullptr;
   AM_MEDIA_TYPE* owned = nullptr;
   if (pmt) {
-    if (!VCamTypeMatches(pmt)) { m_pFilter->Unlock(); return VFW_E_TYPE_NOT_ACCEPTED; }
+    if (!VCamTypeMatches(pmt,m_pFilter->stream)) { m_pFilter->Unlock(); return VFW_E_TYPE_NOT_ACCEPTED; }
     use = (AM_MEDIA_TYPE*)pmt;
   } else {
-    owned = VCamCreateType();
+    owned = VCamCreateType(m_pFilter->stream);
     if (!owned) { m_pFilter->Unlock(); return E_OUTOFMEMORY; }
     use = owned;
   }
+  std::unique_ptr<AM_MEDIA_TYPE,decltype(&VCamFreeType)> guard(owned,VCamFreeType);
   HRESULT hr = pPeer->ReceiveConnection((IPin*)this, use);
-  if (owned) VCamFreeType(owned);
   if (FAILED(hr)) { m_pFilter->Unlock(); return hr; }
   IMemInputPin* input = nullptr;
   hr = pPeer->QueryInterface(IID_IMemInputPin, (void**)&input);
@@ -826,6 +841,7 @@ STDMETHODIMP CVCamPin::Connect(IPin* pPeer, const AM_MEDIA_TYPE* pmt) {
                           IID_IMemAllocator, (void**)&alloc);
   }
   if (SUCCEEDED(hr) && alloc) {
+    const LONG VCAM_FRAME_BYTES=(LONG)m_pFilter->stream.frame_bytes();
     ALLOCATOR_PROPERTIES req = { 2, (long)VCAM_FRAME_BYTES, 1, 0 }  /* 2: bound downstream queueing to 1 frame */, act = { 0 };
     hr = alloc->SetProperties(&req, &act);
     if (SUCCEEDED(hr) && act.cbBuffer < VCAM_FRAME_BYTES) hr = VFW_E_SIZENOTSET;
@@ -962,3 +978,5 @@ BOOL APIENTRY DllMain(HMODULE h, DWORD r, LPVOID) {
   if (r == DLL_PROCESS_ATTACH) { g_hMod = h; DisableThreadLibraryCalls(h); }
   return TRUE;
 }
+
+extern "C" __declspec(dllexport) const char* __cdecl VCStreamCapabilities(){ return vc_stream_capabilities(); }

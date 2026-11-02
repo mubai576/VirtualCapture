@@ -5,9 +5,10 @@
 
 ## 一帧的账
 
-- 帧：`640×640 NV12 = 614400 B`（`width*height*3/2`），`@240Hz → 147.5 MB/s ≈ 1.18 Gbps`。
-- 包：MTU 9000，单包载荷 ≈8980 B（含 28 B 头）→ **~69 包/帧，16.5k pps**。
-- 反例：MTU 1500 → ~421 包/帧 → **~101k pps**，Windows 用户态 Npcap 必丢（故 Jumbo 强制）。
+- 会话帧为 `B=width*height*3/2`（P6-2 控制面协商；默认 `640×640`）。以下为历史默认预算，不是任意尺寸的吞吐保证。
+- 默认帧：`640×640 NV12 = 614400 B`（`width*height*3/2`），`@240Hz → 147.5 MB/s ≈ 1.18 Gbps`。
+- 包：MTU 9000，单包有效载荷 `P=mtu-42=8958 B`（以太头14 + VC头28另计）→ **~69 包/帧，16.5k pps**。
+- 反例：MTU 1500 → 422 包/帧 → **~101k pps**，Windows 用户态 Npcap 必丢（故 Jumbo 强制）。
 
 ## 包头 `vc_pkt_hdr_t`（28 B，pack(1)）
 
@@ -25,6 +26,14 @@
 EtherType：`0x88B5`（实验段，无标准冲突，头内另有 magic 双保险）。
 网线序列化时间：`614400 B / 2.5 Gbps ≈ 2 ms`，故端到端 <4.16 ms 预算极紧，
 接收策略：缺包整帧丢、只留最新 1 帧、FIFO 堆积必须为 0。
+
+## P6-2 会话隔离与重组
+
+包头完全不改：宽高/fps/MTU/raw-NV12/transform/随机源MAC在控制面显式确认。
+每帧 `total=ceil(B/P)`；非尾包payload_len=P，尾包为剩余字节，receiver严格校验尺寸/seq/total/长度/pattern/CRC和完整覆盖。
+源MAC只用于会话隔离（非认证），不改系统网卡MAC；收端在解析VC头前过滤，迟到帧不能重新发布。
+`qpc_ns`保留同机含义；sender hashlog另有send_qpc_ns，用于验证发送开始间隔≥ceil(1e9/fps)，无追赶突发。
+DDA只发新桌面图像，静态/鼠标更新不重放。旧低层默认640仍可诊断，新产品会话须双方stream_revision=2。
 
 ## 发送 pacing（T4 定默认）
 

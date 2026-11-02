@@ -2,7 +2,7 @@
 import ctypes, ctypes.wintypes as wt, struct, time, json, os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from vc_shm import ShmReader, fnv1a64, SHM_NAME, SHM_SIZE  # layout v2 mirror of vcam/vcam_shm.h
+from vc_shm import ShmReader, fnv1a64, SHM_NAME, SHM_DATA_OFF, SHM_SLOTS
 
 def main():
     rx_session = sys.argv[1] if len(sys.argv) > 1 else "s-0144d793"
@@ -13,7 +13,8 @@ def main():
     except OSError as e:
         print("FAIL: %s" % e)
         return False
-    print("SHM v2 mapped (%d bytes)" % SHM_SIZE)
+    print("SHM mapped (%d bytes, %dx%d@%d)" %
+          (SHM_DATA_OFF + SHM_SLOTS * rd.frame_bytes, rd.width, rd.height, rd.fps))
 
     # Load receiver hashlog
     rx_hashes = {}
