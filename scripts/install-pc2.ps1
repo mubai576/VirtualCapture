@@ -3,14 +3,14 @@
   install-pc2.ps1 — PC2(零环境)现场安装: Npcap检查 -> 文件落盘 -> 计划任务自启 -> 防火墙 -> /health验证。
 .DESCRIPTION
   在 PC2 上用管理员 pwsh 从发布包解压目录运行:
-    pwsh -ExecutionPolicy Bypass -File install-pc2.ps1 -Role receiver -Port 18080
+    pwsh -ExecutionPolicy Bypass -File install-pc2.ps1 -Role receiver -Port 5143
   发布包内含 vc-agent.exe(单文件, 无需 Python), vc-sender/receiver.exe, version.json。
   agent 以 ROOT=exe 所在目录运行: C:\vc\vc-agent.exe + C:\vc\build\vc-{sender,receiver}.exe
   + C:\vc\version.json + C:\vc\run\(自动建)。用 --root 可覆盖 ROOT。
 .PARAMETER Role
   sender | receiver (PC2 一般填 receiver)。
 .PARAMETER Port
-  agent 端口, 默认 18080。
+  agent 端口, 默认 5143。
 .PARAMETER InstallDir
   安装目录, 默认 C:\vc。
 .PARAMETER PackageDir
@@ -26,7 +26,7 @@
 [CmdletBinding(SupportsShouldProcess = $true)]
 param(
   [Parameter(Mandatory = $true)][ValidateSet("sender", "receiver")][string]$Role,
-  [int]$Port = 18080,
+  [int]$Port = 5143,
   [string]$InstallDir = "C:\vc",
   [string]$PackageDir = (Split-Path $PSScriptRoot -Parent),
   [string]$ControlSubnet = "192.168.2.0/24",

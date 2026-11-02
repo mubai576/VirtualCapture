@@ -2,7 +2,7 @@
 单文件零依赖，双机同一份代码。
 启停查：组CLI→记pid→幂等启停；stats/hashlog落run/。
 升级：验zip→staging→快照prev→execv切换，不起孤进程。"""
-import argparse, time, uuid, json, os, sys, signal, subprocess, shutil, zipfile, threading
+import argparse, time, uuid, json, os, sys, signal, subprocess, shutil, zipfile, threading, ipaddress, socket
 
 VERSION_DEFAULT = "dev"
 import sys as _sys
@@ -46,7 +46,8 @@ def read_version():
     except Exception:
         return VERSION_DEFAULT
 
-state = {"role": None, "port": 18080,
+DEFAULT_PORT = 5143
+state = {"role": None, "port": DEFAULT_PORT, "vcam_managed": False,
          "sender": {"session_id": None, "proc": None, "started_at": 0, "stats": "", "hashlog": ""},
          "receiver": {"session_id": None, "proc": None, "started_at": 0, "stats": "", "hashlog": ""}}
 
@@ -91,6 +92,11 @@ def launch(kind, args):
     # 起一端：先停旧，再拉新会话
     slot = state[kind]
     kill_slot(slot)  # idempotent: stop old first
+    slot["adapter"] = str(args.get("adapter", ""))
+    slot["stdout"] = ""
+    if kind == "sender":
+        slot["mode"] = args.get("mode", "pattern")
+        slot["pattern"] = args.get("pattern", "motion")
     sid = "s-%s" % uuid.uuid4().hex[:8]
     os.makedirs(RUN_DIR, exist_ok=True)
     stats = os.path.join(RUN_DIR, "%s.%s.stats.json" % (sid, kind))
@@ -155,7 +161,8 @@ def launch(kind, args):
     slot.update(session_id=sid, started_at=time.time(), stats=stats, hashlog=hashlog)
     # 截断输出防爆
     open(hashlog, "w", encoding="utf-8").close()
-    popen_kw = {"cwd": ROOT, "stdout": open(os.path.join(RUN_DIR, sid + "." + kind + ".stdout.log"), "wb"),
+    slot["stdout"] = os.path.join(RUN_DIR, sid + "." + kind + ".stdout.log")
+    popen_kw = {"cwd": ROOT, "stdout": open(slot["stdout"], "wb"),
                 "stderr": subprocess.STDOUT}
     if os.name == "nt":
         popen_kw["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
@@ -187,9 +194,62 @@ def get_adapters():
                 line=line.strip()
                 if line.lower().startswith("adapter["):
                     names.append(line)
-        return 200, {"text": text.strip(), "names": names, "exe": os.path.basename(exe)}
+        if p.returncode:
+            return 503, {"error": "adapter enumeration failed", "text": text.strip(), "names": []}
+        items = [{"name": m.group(1), "description": m.group(2).strip()}
+                 for m in re.finditer(r"adapter\[\d+\] name=(\S+) desc=([^\r\n]*)", text)]
+        metadata = _adapter_metadata()
+        for item in items:
+            guid = item["name"].rsplit("_", 1)[-1].strip("{}").lower()
+            item.update(metadata.get(guid, {}))
+        return 200, {"text": text.strip(), "names": names, "items": items, "exe": os.path.basename(exe)}
     except Exception as e:
         return 500, {"error": str(e), "text": "", "names": []}
+
+
+def _adapter_metadata():
+    """关联 Npcap GUID 与系统网卡，用控制连接路由选择采集网口。"""
+    if os.name != "nt": return {}
+    script = r'''[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
+$ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+@(Get-NetAdapter -IncludeHidden | ForEach-Object {
+  $nic = $_
+  [pscustomobject]@{guid=[string]$nic.InterfaceGuid; label=$nic.Name; mac=$nic.MacAddress;
+    status=[string]$nic.Status; receive_link_bps=[uint64]$nic.ReceiveLinkSpeed;
+    transmit_link_bps=[uint64]$nic.TransmitLinkSpeed;
+    hardware_interface=[bool]$nic.HardwareInterface; virtual=[bool]$nic.Virtual;
+    addresses=@($ips | Where-Object InterfaceIndex -eq $nic.ifIndex |
+      ForEach-Object { [pscustomobject]@{ip=$_.IPAddress; prefix=$_.PrefixLength} })}
+}) | ConvertTo-Json -Depth 4 -Compress'''
+    try:
+        result = subprocess.run(["powershell.exe", "-NoProfile", "-Command", script],
+                                capture_output=True, encoding="utf-8", timeout=15,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        rows = json.loads(result.stdout or "[]")
+        if isinstance(rows, dict): rows = [rows]
+        return {row["guid"].strip("{}").lower(): {key: value for key, value in row.items() if key != "guid"}
+                for row in rows}
+    except Exception:
+        return {}
+
+
+def _choose_capture_adapter(controller_ip):
+    code, result = get_adapters()
+    if code != 200: return code, result
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            probe.connect((controller_ip, DEFAULT_PORT))
+            local_ip = probe.getsockname()[0]
+    except OSError as error:
+        return 409, {"error": "无法确定连接主机的网口：%s" % error}
+    matches = [item for item in result.get("items", [])
+               if any(addr.get("ip") == local_ip for addr in item.get("addresses", []))]
+    if ipaddress.IPv4Address(local_ip).is_loopback:
+        # Npcap 回环设备没有 Windows 网卡 GUID，只在本机联调时按精确设备名匹配。
+        matches = [item for item in result.get("items", []) if item["name"] == r"\Device\NPF_Loopback"]
+    if len(matches) != 1:
+        return 409, {"error": "无法唯一匹配被采集机控制连接的网卡，请检查该网口的 IPv4 配置。"}
+    return 200, matches[0]
 
 def slot_stats(kind):
     # 读槽位统计（缺文件则报停止）
@@ -201,18 +261,60 @@ def slot_stats(kind):
     path = slot.get("stats", "")
     if not path or not os.path.exists(path):
         # 兜底读同类最新run文件
-        return {"session_id": sid, "running": running, "uptime_s": up}
+        return dict({"session_id": sid, "running": running, "uptime_s": up}, **process_details(kind))
     try:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception as e:
-        return {"session_id": sid, "running": running, "uptime_s": up, "stats_error": str(e)}
+        return dict({"session_id": sid, "running": running, "uptime_s": up, "stats_error": str(e)}, **process_details(kind))
     if isinstance(data, dict):
         data = dict(data)
         data["running"] = bool(running and data.get("running", True))
         data["uptime_s"] = up
+        data["adapter"] = slot.get("adapter", "")
         if data.get("session_id") is None: data["session_id"] = sid
+        data.update(process_details(kind))
     return data
+
+
+def process_details(kind):
+    """把原生进程退出和限长日志带回界面，避免只有一个 stopped 标记。"""
+    slot = state[kind]; proc = slot.get("proc")
+    out = {"adapter": slot.get("adapter", "")}
+    if kind == "sender" and slot.get("mode"):
+        out.update(mode=slot["mode"], pattern=slot.get("pattern", "motion"))
+    if proc is None: return out
+    code = proc.poll()
+    out.update(pid=getattr(proc, "pid", None), exit_code=code)
+    if code is not None and code != 0:
+        path = slot.get("stdout", "")
+        try:
+            with open(path, "rb") as f:
+                f.seek(0, os.SEEK_END); size = f.tell(); f.seek(max(0, size - 4096))
+                out["log_tail"] = f.read().decode("utf-8", errors="replace")[-2048:]
+        except OSError: pass
+        label = "采集" if kind == "sender" else "接收"
+        out["error"] = "%s程序异常退出（退出码 %s），请检查运行日志。" % (label, code)
+        if path: out["stdout"] = os.path.relpath(path, ROOT).replace(os.sep, "/")
+    return out
+
+
+def launch_product(kind, args):
+    sid, info = launch(kind, args)
+    if deployment_role() and "cmd" in info:
+        # 原生程序错误通常在初始化阶段退出；先确认它存活，再向主机报成功。
+        deadline = time.monotonic() + 1.0
+        while True:
+            proc = state[kind]["proc"]
+            code = proc.poll() if proc is not None else -1
+            if code is not None:
+                details = process_details(kind)
+                label = "采集" if kind == "sender" else "接收"
+                raise RuntimeError("%s程序启动失败（退出码 %s）。%s" %
+                                   (label, code, details.get("log_tail", "请检查运行日志。")))
+            if time.monotonic() >= deadline: break
+            time.sleep(0.05)
+    return sid, info
 
 
 EXEC_DEFAULT_TIMEOUT = 30
@@ -633,6 +735,9 @@ def _do_activate(ver_or_none, is_rollback):
                 return 500, {"error": "staged vc-agent.py does not compile"}
         kill_slot(state["sender"])
         kill_slot(state["receiver"])
+        if state.get("vcam_managed"):
+            code, cleanup = vcam_unregister()
+            if code != 200: return code, {"error": "升级前虚拟采集卡回收失败", "vcam": cleanup}
         _vn = _want if isinstance(_want, str) and _want else "rollback"
         _applied, _exe_live = _apply_staged_to_live(_target, _vn)
         if not _applied:
@@ -790,20 +895,42 @@ def _respond_activate(handler, code, res):
         except Exception:
             pass
 # ===================== P5 GUI（D16 方案 A）=====================
-# 统一配置 vc-config.json + 产品模式一键开播/停播 + vcam 注册 + 内置 Web UI（/ui）。
+# 统一配置 vc-config.json + 主机开始/停止采集 + vcam 注册 + 内置 Web UI（/ui）。
 # 只复用本 agent 已有能力（launch/kill_slot/slot_stats）与对端 agent 的固定端点；无通用反代、不新增数据面逻辑。
 import re as _re, urllib.request as _ureq, urllib.error as _uerr
 CONFIG_NAME = "vc-config.json"
 CONFIG_DEFAULT = {
     "role": "",          # capture | receive | ""（未设）
-    "peer_url": "",      # 对端 agent，例 http://192.168.2.100:18080
+    "peer_url": "",      # 主机只填被采集机 IPv4，产品端口固定 5143
     "adapter": "",       # 本机 2.5G 网卡子串（--adapter）
     "capture": {"mode": "dda", "pattern": "motion", "gpu_convert": True, "fps": 240, "batch": 69,
-                "mtu": 9000, "dst_mac": "ff:ff:ff:ff:ff:ff"},
+                "mtu": 9000, "dst_mac": "ff:ff:ff:ff:ff:ff", "width": 640, "height": 640,
+                "transform": "crop", "codec": "raw", "bitrate_mbps": 50, "max_bitrate_mbps": 80},
+    "transport": {"headroom_pct": 20},
     "receive": {"shm": "Local\\VirtualCaptureVcamFrame", "mtu": 9000, "vcam_autoregister": True},
 }
 CONFIG_LOCK = threading.Lock()
+PRODUCT_LOCK = threading.RLock()
 VCAM_CLSID = "{B84C7E21-4A5F-4E2B-9C11-5A3D7F01229A}"
+
+
+def deployment_role():
+    return {"host": "receive", "receiver": "receive", "receive": "receive",
+            "capture": "capture", "sender": "capture"}.get(state["role"])
+
+
+def _product_config(config):
+    role = deployment_role()
+    if role:
+        config["role"] = role
+        config["receive"].update(shm=CONFIG_DEFAULT["receive"]["shm"], vcam_autoregister=True)
+        # 旧 URL 配置只保留 IP，产品控制端口统一迁移到 5143。
+        if role == "receive" and config["peer_url"]:
+            match = _re.fullmatch(r"http://([0-9.]+):\d+", config["peer_url"])
+            if match:
+                try: config["peer_url"] = "http://%s:%d" % (ipaddress.IPv4Address(match[1]), DEFAULT_PORT)
+                except ValueError: pass
+    return config
 
 def _config_path():
     return os.path.join(ROOT, CONFIG_NAME)
@@ -822,9 +949,9 @@ def _merge(base, over):
 def load_config():
     try:
         with open(_config_path(), "r", encoding="utf-8") as f: d = json.load(f)
-        if isinstance(d, dict): return _merge(CONFIG_DEFAULT, d)
+        if isinstance(d, dict): return _product_config(_merge(CONFIG_DEFAULT, d))
     except Exception: pass
-    return _merge(CONFIG_DEFAULT, {})
+    return _product_config(_merge(CONFIG_DEFAULT, {}))
 
 def _is_int(v, lo, hi):
     return isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
@@ -836,10 +963,25 @@ def validate_config(c):
     if c["role"] not in ("", "capture", "receive"): e.append("role must be capture|receive|''")
     if not isinstance(c["peer_url"], str) or (c["peer_url"] and not _re.fullmatch(r"http://[A-Za-z0-9.\-]{1,64}:\d{1,5}", c["peer_url"])):
         e.append("peer_url must be http://host:port")
-    if not isinstance(c["adapter"], str) or not _re.fullmatch(r"[A-Za-z0-9 _.()\-]{0,64}", c["adapter"]):
+    if not isinstance(c["adapter"], str) or not (_re.fullmatch(r"[A-Za-z0-9 _.()\-]{0,64}", c["adapter"])
+            or _re.fullmatch(r"\\Device\\NPF_(?:\{[0-9A-Fa-f\-]{36}\}|Loopback)", c["adapter"])):
         e.append("adapter: up to 64 chars of [A-Za-z0-9 _.()-]")
     if cp.get("mode") not in ("dda", "pattern"): e.append("capture.mode must be dda|pattern")
     if cp.get("pattern") not in ("counter", "checker", "rings", "noise", "motion"): e.append("capture.pattern invalid")
+    for key in ("width", "height"):
+        if not _is_int(cp.get(key), 2, 8192) or cp[key] % 2:
+            e.append("capture.%s 必须是 2..8192 的偶数整数。" % key)
+    if cp.get("transform") not in ("crop", "fit", "fill", "stretch"):
+        e.append("capture.transform 必须是 crop|fit|fill|stretch。")
+    if cp.get("codec") not in ("raw", "h264", "hevc"):
+        e.append("capture.codec 必须是 raw|h264|hevc。")
+    for key in ("bitrate_mbps", "max_bitrate_mbps"):
+        if not _is_int(cp.get(key), 1, 10000): e.append("capture.%s 必须是 1..10000 的整数。" % key)
+    if (_is_int(cp.get("bitrate_mbps"), 1, 10000) and _is_int(cp.get("max_bitrate_mbps"), 1, 10000)
+            and cp["max_bitrate_mbps"] < cp["bitrate_mbps"]):
+        e.append("最大码率不能低于目标码率。")
+    if not _is_int(c["transport"].get("headroom_pct"), 0, 50):
+        e.append("transport.headroom_pct 必须是 0..50 的整数。")
     if not _is_int(cp.get("fps"), 1, 1000): e.append("capture.fps 1..1000")
     if not _is_int(cp.get("batch"), 1, 1000): e.append("capture.batch 1..1000")
     if not _is_int(cp.get("mtu"), 1500, 9000): e.append("capture.mtu 1500..9000")
@@ -853,14 +995,174 @@ def validate_config(c):
     return e
 
 def save_config(patch):
-    with CONFIG_LOCK:
+    with PRODUCT_LOCK, CONFIG_LOCK:
         c = _merge(load_config(), patch if isinstance(patch, dict) else {})
+        if deployment_role():
+            c["role"] = deployment_role()
+            c["receive"].update(shm=CONFIG_DEFAULT["receive"]["shm"], vcam_autoregister=True)
+            if c["role"] == "receive" and c["peer_url"]:
+                try:
+                    match = _re.fullmatch(r"http://([0-9.]+):5143", c["peer_url"])
+                    if not match: raise ValueError()
+                    ipaddress.IPv4Address(match[1])
+                except ValueError:
+                    return 400, {"error": "invalid config", "details": ["被采集机地址必须是 IPv4，端口固定为 5143。"]}
+            if has_product_process():
+                return 409, {"error": "请先停止采集，再修改连接配置。"}
         err = validate_config(c)
         if err: return 400, {"error": "invalid config", "details": err}
         tmp = _config_path() + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f: json.dump(c, f, indent=2, ensure_ascii=False)
         os.replace(tmp, _config_path())
         return 200, {"saved": True, "config": c}
+
+# ---- P6-1：配置草案与链路预算；未实现的数据面组合必须显式拒绝 ----
+STREAM_PRESETS = ((416, 416), (640, 640), (1280, 720), (1920, 1080), (2560, 1440))
+STREAM_CACHE = {}
+STREAM_CACHE_LOCK = threading.Lock()
+
+
+def stream_implementation_errors(capture):
+    errors = []
+    if (capture["width"], capture["height"]) != (640, 640):
+        errors.append("当前原生采集/接收/虚拟卡仍固定 640×640；可变分辨率管线尚未接通。")
+    if capture["transform"] != "crop":
+        errors.append("当前仅实现居中 1:1 裁切；所选缩放方式尚未接通。")
+    if capture["codec"] != "raw":
+        errors.append("H.264/H.265 编解码后端尚未接入，也未验证两端硬件能力；当前仅可运行 raw NV12。")
+    return errors
+
+
+def stream_capabilities(controller_ip=None):
+    result = {"revision": 1, "presets": [{"width": w, "height": h} for w, h in STREAM_PRESETS],
+              "native": {"codecs": ["raw"], "width": 640, "height": 640, "transforms": ["crop"],
+                         "variable_resolution": False, "dda_fps_limit": False},
+              "hardware": {"encoder": "unprobed", "decoder": "unprobed"}, "adapter": None}
+    if deployment_role() == "capture" and controller_ip:
+        code, adapter = _choose_capture_adapter(controller_ip)
+        if code == 200: result["adapter"] = adapter
+        else: result["adapter_error"] = adapter.get("error", "采集网卡识别失败。")
+    return result
+
+
+def _stream_selected_adapter(items, selection):
+    exact = [item for item in items if item.get("name") == selection]
+    if len(exact) == 1: return exact[0]
+    if not selection: return None
+    matches = [item for item in items if selection.lower() in
+               (item.get("name", "") + " " + item.get("description", "")).lower()]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _stream_link(adapter, direction):
+    if not isinstance(adapter, dict): return {"state": "unknown", "bps": None}
+    status = str(adapter.get("status", "")).lower()
+    if status in ("down", "disconnected", "disabled", "not present", "lowerlayerdown"):
+        return {"state": "down", "bps": None, "name": adapter.get("name")}
+    speed = adapter.get(direction + "_link_bps")
+    # 0、缺失、字符串或虚拟回环速率都不能当作真实链路容量。
+    if (adapter.get("name") == r"\Device\NPF_Loopback" or adapter.get("virtual") is True
+            or adapter.get("hardware_interface") is False or not _is_int(speed, 1, 10**15)):
+        return {"state": "unknown", "bps": None, "name": adapter.get("name")}
+    return {"state": "up", "bps": speed, "name": adapter.get("name"), "label": adapter.get("label")}
+
+
+def calculate_stream_plan(config, host_adapter=None, capture_adapter=None, discovery_warnings=()):
+    """只算预算，不改配置、不启停进程；输入需先经 validate_config。"""
+    cp = config["capture"]
+    fps, payload = cp["fps"], cp["mtu"] - 42
+    raw_bytes = cp["width"] * cp["height"] * 3 // 2
+    encoded = cp["codec"] != "raw"
+    frame_bytes = ((cp["max_bitrate_mbps"] * 1000000 + 8 * fps - 1) // (8 * fps)
+                   if encoded else raw_bytes)
+    packets = (frame_bytes + payload - 1) // payload
+    last = frame_bytes - (packets - 1) * payload
+    # 每包 14B 以太头 + 28B VC 头 + FCS4 + preamble/SFD8 + IFG12；尾包补足以太网最小帧。
+    wire_frame_bytes = frame_bytes + packets * 66 + max(0, 18 - last)
+    wire_bps = wire_frame_bytes * 8 * fps
+    host = _stream_link(host_adapter, "receive")
+    capture = _stream_link(capture_adapter, "transmit")
+    speeds = (host["bps"], capture["bps"])
+    link_bps = min(speeds) if all(speed is not None for speed in speeds) else None
+    usable_bps = link_bps * (100 - config["transport"]["headroom_pct"]) // 100 if link_bps else None
+    known = [speed for speed in speeds if speed is not None]
+    # 只知道一端时仍能证明超限，但不能据此宣称链路可行。
+    upper_bound = min(known) if known else None
+    if "down" in (host["state"], capture["state"]): status = "down"
+    elif upper_bound is not None and wire_bps > upper_bound: status = "exceeds"
+    elif link_bps is None: status = "unknown"
+    elif wire_bps > usable_bps: status = "margin"
+    else: status = "fits"
+    errors = stream_implementation_errors(cp)
+    if cp["mtu"] != config["receive"]["mtu"]:
+        errors.append("两端 MTU 不一致，不能用不同切包参数启动。")
+    if packets > 65535:
+        errors.append("单帧包数超过冻结包头的 uint16 上限。")
+    warnings = list(discovery_warnings)
+    if status == "unknown": warnings.append("未取得两端实际网卡速率，不能确认链路预算可行。")
+    if status == "margin": warnings.append("未超过物理线速，但侵入预留余量；建议降低分辨率/帧率或使用编码模式。")
+    if encoded:
+        warnings.append("编码预算按最大码率均摊估算，不约束 IDR 帧瞬时突发；不代表编码器吞吐或画质已达标。")
+    if cp["mode"] == "dda":
+        warnings.append("当前 DDA 由桌面新帧驱动，尚未按目标帧率硬限速；预算只以填写帧率为假设。")
+    warnings.append("协商速率不是实测吞吐；源桌面尺寸、编解码吞吐与端到端效果未在本次计算中验证。")
+    return {"revision": 1, "video": {"width": cp["width"], "height": cp["height"], "fps": fps,
+            "codec": cp["codec"], "transform": cp["transform"], "raw_frame_bytes": raw_bytes},
+            "network": {"status": status, "is_estimate": encoded, "host": host, "capture": capture,
+                        "payload_bytes": payload, "packets_per_frame": packets,
+                        "payload_bps": frame_bytes * 8 * fps, "wire_bps": wire_bps,
+                        "link_bps": link_bps, "known_upper_bound_bps": upper_bound,
+                        "headroom_pct": config["transport"]["headroom_pct"], "usable_bps": usable_bps,
+                        "max_raw_fps": usable_bps // (wire_frame_bytes * 8) if usable_bps and not encoded else None},
+            "implementation": {"supported": not errors, "reasons": errors, "hardware_verified": False},
+            "can_start": not errors and status not in ("exceeds", "down"), "warnings": warnings}
+
+
+def _stream_discovery(config, refresh=False):
+    key = (ROOT, config["peer_url"], config["adapter"])
+    with STREAM_CACHE_LOCK:
+        cached = STREAM_CACHE.get(key)
+        if not refresh and cached and time.monotonic() - cached[0] < 10:
+            return cached[1]
+        warnings = []
+        code, adapters = get_adapters()
+        host = _stream_selected_adapter(adapters.get("items", []), config["adapter"]) if code == 200 else None
+        if host is None: warnings.append("未能唯一识别主机所选网卡的速率。")
+        capture = None
+        if config["peer_url"]:
+            code, peer = peer_call("/stream/capabilities", timeout=35, url=config["peer_url"])
+            if code == 200 and isinstance(peer, dict) and peer.get("revision") == 1:
+                capture = peer.get("adapter")
+                if peer.get("adapter_error"): warnings.append(str(peer["adapter_error"]))
+            else:
+                warnings.append("采集后台未提供新版速率探测接口或暂不可达，未假设对端也是 2.5G。")
+        else:
+            warnings.append("尚未填写采集后台地址。")
+        result = (host, capture, warnings)
+        if len(STREAM_CACHE) >= 16: STREAM_CACHE.pop(next(iter(STREAM_CACHE)))
+        STREAM_CACHE[key] = (time.monotonic(), result)
+        return result
+
+
+def stream_plan(patch=None, refresh=False):
+    if deployment_role() == "capture": return 403, {"error": "请在主机计算双端链路预算。"}
+    config = _merge(load_config(), patch if isinstance(patch, dict) else {})
+    errors = validate_config(config)
+    if errors: return 400, {"error": "invalid config", "details": errors}
+    if config["peer_url"] and deployment_role() == "receive":
+        match = _re.fullmatch(r"http://([0-9.]+):5143", config["peer_url"])
+        try:
+            if not match: raise ValueError()
+            ipaddress.IPv4Address(match[1])
+        except ValueError:
+            return 400, {"error": "被采集机地址必须是 IPv4，端口固定为 5143。"}
+    return 200, calculate_stream_plan(config, *_stream_discovery(config, refresh))
+
+
+def stream_plan_request(args):
+    if not isinstance(args.get("config", {}), dict) or not isinstance(args.get("refresh", False), bool):
+        return 400, {"error": "请求应为 {config:{...}, refresh:true|false}。"}
+    return stream_plan(args.get("config", {}), args.get("refresh", False))
 
 # ---- vcam 注册（HKCU，与运行 DShow 客户端的用户相同） ----
 def _vcam_dll():
@@ -886,9 +1188,39 @@ def vcam_register():
     if not dll: return 404, {"error": "vc-vcam.dll not found under ROOT/build"}
     if os.name != "nt": return 400, {"error": "windows only"}
     exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "regsvr32.exe")
-    r = subprocess.run([exe, "/s", dll], timeout=30)
+    try:
+        r = subprocess.run([exe, "/s", dll], timeout=30)
+        if r.returncode == 0:
+            # 产品映射固定；清除旧诊断开关，避免默认输出测试运动帧。
+            import winreg as _wr
+            with _wr.OpenKey(_wr.HKEY_CURRENT_USER, r"Software\Classes\CLSID\%s" % VCAM_CLSID,
+                             0, _wr.KEY_SET_VALUE) as key:
+                _wr.SetValueEx(key, "FrameMap", 0, _wr.REG_SZ, load_config()["receive"]["shm"])
+                _wr.SetValueEx(key, "Motion", 0, _wr.REG_DWORD, 0)
+    except Exception as error:
+        return 500, dict(vcam_status(), error="虚拟采集卡注册未完成：%s" % error)
     st = vcam_status(); st["exit_code"] = r.returncode
     return (200 if r.returncode == 0 and st["match"] else 500), st
+
+
+def vcam_unregister():
+    st = vcam_status()
+    if not st["registered"]:
+        state["vcam_managed"] = False
+        return 200, dict(st, reclaimed=True)
+    if not st["match"]:
+        return 409, dict(st, error="虚拟采集卡路径不符，未回收其他目录的注册。")
+    exe = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "regsvr32.exe")
+    result = subprocess.run([exe, "/s", "/u", st["dll"]], timeout=30)
+    st = vcam_status()
+    ok = result.returncode == 0 and not st["registered"]
+    if ok: state["vcam_managed"] = False
+    return (200 if ok else 500), dict(st, reclaimed=ok, exit_code=result.returncode)
+
+
+def has_product_process():
+    return any(state[k].get("proc") is not None and state[k]["proc"].poll() is None
+               for k in ("sender", "receiver"))
 
 # ---- 对端调用（只用固定路径，不做通用反代） ----
 def peer_call(path, body=None, timeout=3.0, url=None):
@@ -920,59 +1252,141 @@ def _stop_kind(kind):
     except Exception: pass
 
 # ---- 产品模式：本机一侧 ----
-def product_local_start():
+def product_local_start(args=None, controller_ip=None):
+    with PRODUCT_LOCK:
+        return _product_local_start(args or {}, controller_ip)
+
+
+def _product_local_start(args, controller_ip):
     c = load_config(); role = c["role"]
     if role not in ("capture", "receive"): return 409, {"error": "local role not set (config.role)"}
+    if role == "capture" and args:
+        c = _merge(c, {"capture": args.get("capture", {})})
+    errors = validate_config(c)
+    if errors: return 400, {"error": "invalid capture config", "details": errors}
+    errors = stream_implementation_errors(c["capture"])
+    if errors: return 409, {"error": "；".join(errors), "details": errors}
+    if role == "capture" and args:
+        if args.get("auto_adapter"):
+            code, adapter = _choose_capture_adapter(controller_ip)
+            if code != 200: return code, adapter
+            c["adapter"] = adapter["name"]
+        errors = validate_config(c)
+        if errors: return 400, {"error": "invalid capture config", "details": errors}
     if not c["adapter"]: return 409, {"error": "local adapter not set (config.adapter)"}
+    if deployment_role() and not os.path.isfile(exe_path("receiver" if role == "receive" else "sender")):
+        return 503, {"error": "缺少采集或接收程序，请先完成构建。"}
     if role == "receive":
         rv = c["receive"]; out = {"role": role}
-        if rv["vcam_autoregister"] and not vcam_status()["match"]:
+        if rv["vcam_autoregister"]:
             vc, out["vcam"] = vcam_register()
-            if vc != 200: return 500, dict(out, error="vcam register failed")
+            if vc != 200:
+                if vcam_status()["match"]:
+                    state["vcam_managed"] = True
+                    out["cleanup"] = vcam_unregister()[1]
+                return 500, dict(out, error="vcam register failed")
+            state["vcam_managed"] = True
         else:
             out["vcam"] = vcam_status()
-        sid, info = launch("receiver", {"adapter": c["adapter"], "mtu": rv["mtu"], "shm": rv["shm"], "timeout_s": 0})
+        try:
+            sid, info = launch_product("receiver", {"adapter": c["adapter"], "mtu": rv["mtu"], "shm": rv["shm"], "timeout_s": 0})
+        except Exception as error:
+            if state["vcam_managed"]: out["cleanup"] = vcam_unregister()[1]
+            return 500, dict(out, error="接收程序启动失败：%s" % error)
         out.update(session_id=sid, args=info)
         return 200, out
     cp = c["capture"]
-    sid, info = launch("sender", {"adapter": c["adapter"], "mode": cp["mode"], "pattern": cp["pattern"],
-                                  "fps": cp["fps"], "frames": 0, "mtu": cp["mtu"], "batch": cp["batch"],
-                                  "dst_mac": cp["dst_mac"], "gpu_convert": cp["gpu_convert"]})
+    try:
+        sid, info = launch_product("sender", {"adapter": c["adapter"], "mode": cp["mode"], "pattern": cp["pattern"],
+                                             "fps": cp["fps"], "frames": 0, "mtu": cp["mtu"], "batch": cp["batch"],
+                                             "dst_mac": cp["dst_mac"], "gpu_convert": cp["gpu_convert"]})
+    except Exception as error:
+        return 500, {"role": role, "error": str(error), "diagnostics": slot_stats("sender")}
     return 200, {"role": role, "session_id": sid, "args": info}
 
 def product_local_stop():
-    role = load_config()["role"]
-    kinds = {"capture": ("sender",), "receive": ("receiver",)}.get(role, ("sender", "receiver"))
-    out = {}
-    for k in kinds:
-        out[k] = state[k].get("session_id"); _stop_kind(k)
-    return 200, {"role": role, "stopped": out}
+    with PRODUCT_LOCK:
+        role = load_config()["role"]
+        kinds = {"capture": ("sender",), "receive": ("receiver",)}.get(role, ("sender", "receiver"))
+        out = {}
+        for k in kinds:
+            out[k] = state[k].get("session_id"); _stop_kind(k)
+        result = {"role": role, "stopped": out}
+        if state["vcam_managed"]:
+            code, result["vcam"] = vcam_unregister()
+            if code != 200: return code, dict(result, error="虚拟采集卡回收失败，请重试停止采集。")
+        return 200, result
 
-# ---- 产品模式：编排（任一台都可发起） ----
+# ---- 产品模式：主机编排 ----
 def _side_call(side, local_role, op):
     if side == local_role:
         return product_local_start() if op == "start" else product_local_stop()
-    return peer_call("/product/local/" + op, {}, timeout=45)
+    args = {}
+    if side == "capture" and op == "start" and deployment_role() == "receive":
+        cp = dict(load_config()["capture"])
+        # 主机负责参数；被采集机自动选择控制连接所在网口，无需另开页面。
+        code, adapters = get_adapters()
+        if code == 200:
+            selected = [item for item in adapters.get("items", []) if item["name"] == load_config()["adapter"]]
+            if selected and selected[0].get("mac"):
+                cp["dst_mac"] = selected[0]["mac"].replace("-", ":").lower()
+        args = {"capture": cp, "auto_adapter": True}
+    return peer_call("/product/local/" + op, args, timeout=45)
 
 def product_start():
+    with PRODUCT_LOCK:
+        return _product_start()
+
+
+def _product_start():
     c = load_config(); me = c["role"]
+    if deployment_role() == "capture": return 403, {"ok": False, "error": "采集后台仅接受主机下发的采集命令。"}
     if me not in ("capture", "receive"): return 409, {"ok": False, "error": "local role not set (config.role)"}
+    errors = validate_config(c)
+    if errors: return 400, {"ok": False, "error": "invalid config", "details": errors}
+    errors = stream_implementation_errors(c["capture"])
+    if errors: return 409, {"ok": False, "error": "；".join(errors), "details": errors}
+    if deployment_role() == "receive":
+        hc, health = peer_call("/health")
+        if hc != 200 or health.get("product_revision") != 2 or health.get("product_role") != "capture":
+            return 409, {"ok": False, "error": "请更新被采集机后台，并使用 --role capture 在 5143 端口启动。"}
     pc, pcfg = peer_call("/config")
     if pc != 200: return 502, {"ok": False, "error": "peer config: %s" % pcfg.get("error", pc)}
     want = "receive" if me == "capture" else "capture"
     if pcfg.get("role") != want:
         return 409, {"ok": False, "error": "peer role is %r, need %r" % (pcfg.get("role"), want)}
+    if deployment_role():
+        vc, version = peer_call("/version")
+        if vc != 200 or version.get("version") != read_version():
+            return 409, {"ok": False, "error": "两端版本不一致，请更新被采集机后台。"}
+    if deployment_role() == "receive":
+        code, plan = stream_plan(refresh=True)
+        if code != 200: return code, dict(plan, ok=False)
+        if not plan["can_start"]:
+            reasons = plan["implementation"]["reasons"]
+            return 409, {"ok": False, "error": "；".join(reasons) if reasons else
+                         "所选网卡未连接或参数超过已知物理线速，请先调整配置。", "plan": plan}
     steps = []
     code, r = _side_call("receive", me, "start"); steps.append({"side": "receive", "code": code, "result": r})
     if code != 200: return 502, {"ok": False, "steps": steps}
     time.sleep(0.5)  # 收端先就绪，避免首帧丢
+    if deployment_role() == "receive" and not slot_stats("receiver")["running"]:
+        sc, sr = product_local_stop(); steps.append({"side": "receive", "code": sc, "result": sr, "rollback": True})
+        return 502, {"ok": False, "error": "接收程序已退出，请检查运行日志。", "steps": steps}
     code, r = _side_call("capture", me, "start"); steps.append({"side": "capture", "code": code, "result": r})
     if code != 200:
+        # 请求超时可能发生在对端已经启动之后，先尽力停止再回收本机。
+        sc, sr = _side_call("capture", me, "stop"); steps.append({"side": "capture", "code": sc, "result": sr, "rollback": True})
         sc, sr = _side_call("receive", me, "stop"); steps.append({"side": "receive", "code": sc, "result": sr, "rollback": True})
         return 502, {"ok": False, "steps": steps}
     return 200, {"ok": True, "steps": steps}
 
 def product_stop():
+    with PRODUCT_LOCK:
+        return _product_stop()
+
+
+def _product_stop():
     me = load_config()["role"]
     if me not in ("capture", "receive"): return 409, {"ok": False, "error": "local role not set (config.role)"}
     steps = []
@@ -980,11 +1394,23 @@ def product_stop():
         code, r = _side_call(side, me, "stop"); steps.append({"side": side, "code": code, "result": r})
     return 200, {"ok": all(s["code"] == 200 for s in steps), "steps": steps}
 
+def reap_vcam():
+    if not state["vcam_managed"] or not PRODUCT_LOCK.acquire(blocking=False): return
+    try:
+        if state["vcam_managed"] and not slot_stats("receiver")["running"]:
+            vcam_unregister()
+    finally:
+        PRODUCT_LOCK.release()
+
+
 def _local_summary():
     c = load_config()
+    reap_vcam()
+    vc = vcam_status() if c["role"] == "receive" else None
+    if vc is not None: vc["managed"] = state["vcam_managed"]
     return {"online": True, "config": c, "version": read_version(),
             "sender": slot_stats("sender"), "receiver": slot_stats("receiver"),
-            "vcam": vcam_status() if c["role"] == "receive" else None}
+            "vcam": vc}
 
 def product_status():
     out = {"ts": time.time(), "local": _local_summary(), "peer": None}
@@ -994,7 +1420,8 @@ def product_status():
         if code != 200:
             out["peer"] = {"online": False, "url": url, "error": h.get("error", code)}
         else:
-            p = {"online": True, "url": url, "version": h.get("version")}
+            p = {"online": True, "url": url, "version": h.get("version"),
+                 "product_revision": h.get("product_revision"), "product_role": h.get("product_role")}
             for k, path in (("config", "/config"), ("sender", "/sender/stats"), ("receiver", "/receiver/stats"), ("vcam", "/vcam/status")):
                 cc, d = peer_call(path, timeout=1.5, url=url)
                 p[k] = d if cc == 200 else None
@@ -1004,20 +1431,26 @@ def product_status():
 def _p5_get(h):
     p = h.path.split("?")[0]
     if p in ("/", "/ui", "/ui/"):
+        if deployment_role() == "capture" or load_config()["role"] == "capture":
+            h._j({"error": "采集后台不提供控制台，请在主机打开界面。"}, 404)
+            return True
         b = UI_HTML.encode("utf-8")
         h.send_response(200); h.send_header("Content-Type", "text/html; charset=utf-8")
         h.send_header("Cache-Control", "no-store"); h.send_header("Content-Length", str(len(b)))
         h.end_headers(); h.wfile.write(b); return True
     if p == "/config": h._j(load_config()); return True
+    if p == "/stream/capabilities": h._j(stream_capabilities(h.client_address[0])); return True
     if p == "/vcam/status": h._j(vcam_status()); return True
     if p == "/product/status": h._j(product_status()); return True
     return False
 
 def _p5_post(h, args):
     routes = {"/config": lambda: save_config(args),
+              "/stream/plan": lambda: stream_plan_request(args),
               "/vcam/register": vcam_register,
               "/product/start": product_start, "/product/stop": product_stop,
-              "/product/local/start": product_local_start, "/product/local/stop": product_local_stop}
+              "/product/local/start": lambda: product_local_start(args, h.client_address[0]),
+              "/product/local/stop": product_local_stop}
     fn = routes.get(h.path.split("?")[0])
     if not fn: return False
     try:
@@ -1027,100 +1460,538 @@ def _p5_post(h, args):
     h._j(res, code); return True
 
 UI_HTML = r'''<!doctype html>
-<html lang="zh"><head><meta charset="utf-8"><title>VirtualCapture 控制台</title>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>VirtualCapture 控制台</title>
 <style>
-:root{--bg:#111418;--card:#1b2027;--fg:#e6e9ee;--mut:#8b95a3;--ok:#3fb950;--bad:#f85149;--warn:#d29922;--acc:#58a6ff}
-*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.45 "Segoe UI","Microsoft YaHei",sans-serif}
-header{display:flex;align-items:center;gap:16px;padding:12px 20px;border-bottom:1px solid #262c35}
-h1{font-size:18px;margin:0}main{display:grid;grid-template-columns:repeat(auto-fit,minmax(360px,1fr));gap:14px;padding:14px 20px}
-.card{background:var(--card);border-radius:8px;padding:14px 16px}.card h2{font-size:14px;margin:0 0 10px;color:var(--mut);font-weight:600}
-.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:6px;background:var(--mut)}
-.on{background:var(--ok)}.off{background:var(--bad)}.big{font-size:26px;font-weight:700}
-table{width:100%;border-collapse:collapse}td,th{padding:3px 6px;text-align:right}td:first-child,th:first-child{text-align:left;color:var(--mut)}
-th{color:var(--mut);font-weight:500;border-bottom:1px solid #2a313b}
-button{background:#238636;color:#fff;border:0;border-radius:6px;padding:8px 18px;font-size:14px;cursor:pointer}
-button.stop{background:#b62324}button.sec{background:#30363d}button:disabled{opacity:.5;cursor:default}
-input,select{background:#0d1117;color:var(--fg);border:1px solid #30363d;border-radius:4px;padding:4px 6px;width:100%}
-.grid2{display:grid;grid-template-columns:130px 1fr;gap:6px 10px;align-items:center}
-.mut{color:var(--mut)}.bad{color:var(--bad)}.ok{color:var(--ok)}.warn{color:var(--warn)}
-canvas{width:100%;height:120px;background:#0d1117;border-radius:4px}#msg{white-space:pre-wrap;font-family:Consolas,monospace;font-size:12px;max-height:160px;overflow:auto}
-.wide{grid-column:1/-1}.row{display:flex;gap:10px;align-items:center;flex-wrap:wrap}
-</style></head><body>
-<header><h1>VirtualCapture 控制台</h1><span id="state" class="mut">连接中…</span>
-<span style="flex:1"></span><button id="bStart">开播</button><button id="bStop" class="stop">停播</button></header>
-<main>
-<section class="card"><h2>采集机（发端）</h2><div id="mCap"></div></section>
-<section class="card"><h2>接收机（收端 + 虚拟采集卡）</h2><div id="mRx"></div></section>
-<section class="card"><h2>链路指标</h2><table id="tM"></table></section>
-<section class="card"><h2>延迟 p99（ms，近 60s）<span class="mut" style="float:right"><span style="color:#58a6ff">■</span> 发端 <span style="color:#3fb950">■</span> 重组 <span style="color:#d29922">■</span> vcam</span></h2><canvas id="cv" width="600" height="120"></canvas></section>
-<section class="card"><h2>本机配置 <span id="cfgWho" class="mut"></span></h2>
-<div class="grid2">
-<label>角色</label><select id="c_role"><option value="">未设</option><option value="capture">采集机（发）</option><option value="receive">接收机（收）</option></select>
-<label>对端 agent</label><input id="c_peer_url" placeholder="http://192.168.2.100:18080">
-<label>本机网卡子串</label><input id="c_adapter" placeholder="I226 / Realtek">
-<label class="cap">采集模式</label><select class="cap" id="c_mode"><option>dda</option><option>pattern</option></select>
-<label class="cap">测试源</label><select class="cap" id="c_pattern"><option>motion</option><option>noise</option><option>rings</option><option>checker</option><option>counter</option></select>
-<label class="cap">GPU 转换</label><select class="cap" id="c_gpu"><option value="1">开</option><option value="0">关</option></select>
-<label class="cap">fps / batch</label><div class="cap row"><input id="c_fps" style="width:80px"><input id="c_batch" style="width:80px"></div>
-<label class="cap">目标 MAC</label><input class="cap" id="c_dst" placeholder="接收机网卡 MAC">
-<label class="rcv">共享内存名</label><input class="rcv" id="c_shm">
-<label class="rcv">自动注册 vcam</label><select class="rcv" id="c_auto"><option value="1">是</option><option value="0">否</option></select>
-</div><div class="row" style="margin-top:10px"><button class="sec" id="bSave">保存</button><button class="sec" id="bReg">注册虚拟采集卡</button><a id="peerLink" class="mut" target="_blank"></a></div></section>
-<section class="card"><h2>操作记录</h2><div id="msg" class="mut"></div></section>
-</main>
+:root{--bg:#101214;--surface:#181b1e;--raised:#202428;--line:#2b3035;--text:#edf0f2;--muted:#949da5;--green:#b0e868;--red:#ff8d86;--amber:#eec17b;--blue:#82b1ed;--purple:#b8a0e8}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.55 "Segoe UI","Microsoft YaHei",sans-serif}button,input,select{font:inherit}button,a,input,select,summary{-webkit-tap-highlight-color:transparent}button,a{touch-action:manipulation}button{cursor:pointer}button:disabled{opacity:.4;cursor:not-allowed}button:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--green);outline-offset:4px}input:focus,select:focus{outline:2px solid #b0e86855;border-color:var(--green)}[hidden]{display:none!important}a{color:var(--text);text-decoration:none}svg{width:18px;height:18px;fill:none;stroke:currentColor;stroke-width:1.6;stroke-linecap:round;stroke-linejoin:round;flex-shrink:0}.sprite{position:absolute;width:0;height:0;overflow:hidden}
+.app{display:grid;grid-template-columns:216px minmax(0,1fr);min-height:100vh}.sidebar{border-right:1px solid var(--line);padding:30px 20px;display:flex;flex-direction:column;gap:42px;position:sticky;top:0;height:100vh}.brand{display:flex;align-items:center;gap:10px;font-size:17px;font-weight:650;letter-spacing:-.5px}.brand-mark{display:grid;place-items:center;width:31px;height:31px;color:var(--green);background:#b0e86812;border:1px solid #b0e86838;border-radius:9px}.brand-mark svg{width:22px;height:22px}.brand small{display:block;font-size:10px;font-weight:500;letter-spacing:1.8px;color:var(--muted);margin-top:2px}.nav-label{font-size:11px;letter-spacing:2px;color:#737e87;padding:0 12px;margin-bottom:12px}.nav{display:grid;gap:7px}.nav button{border:0;background:none;text-align:left;color:var(--muted);padding:12px;display:flex;gap:12px;align-items:center;border-radius:7px}.nav button[aria-current="page"]{background:#b0e86812;color:var(--green)}.nav button:hover{background:var(--raised)}.sidebar-foot{margin-top:auto;font-size:11px;color:var(--muted);line-height:1.9}.sidebar-foot strong{font-weight:500;color:#c3cbd1}.sidebar-foot .dot{margin-right:7px;background:var(--green)}
+.main{max-width:1500px;width:100%;padding:30px 40px 24px;margin:auto}.topbar{display:flex;justify-content:space-between;align-items:center;gap:20px;margin-bottom:29px}.eyebrow{font-size:11px;color:var(--muted);letter-spacing:.8px;margin-bottom:5px}h1{font-size:26px;line-height:1.3;letter-spacing:-.6px;margin:0;font-weight:600}.toolbar{display:flex;align-items:center;gap:13px}.stamp{font-size:11px;color:var(--muted);white-space:nowrap}.badge{display:inline-flex;align-items:center;gap:7px;font-size:11px;white-space:nowrap;border:1px solid var(--line);border-radius:20px;padding:5px 10px;background:var(--surface)}.dot{display:inline-block;width:6px;height:6px;border-radius:50%;background:currentColor;flex-shrink:0}.muted{color:var(--muted)}.good{color:var(--green)}.warn{color:var(--amber)}.bad{color:var(--red)}.mono{font-family:Consolas,"SFMono-Regular",monospace;font-variant-numeric:tabular-nums}.btn{border:1px solid var(--line);background:var(--raised);color:var(--text);border-radius:7px;padding:9px 14px;display:inline-flex;align-items:center;justify-content:center;gap:8px;white-space:nowrap;font-size:13px;font-weight:500}.btn:hover:not(:disabled){background:#2a3035;border-color:#4a535b}.btn.primary{color:#19240d;background:var(--green);border-color:var(--green)}.btn.primary:hover:not(:disabled){background:#c0f180}.btn.danger{color:var(--red);background:#ff8d8608;border-color:#ff8d862b}.btn.icon{padding:9px}.btn.quiet{background:transparent}.btn.small{font-size:11px;padding:6px 10px}.btn svg{width:15px;height:15px}.btn[aria-busy="true"] svg{animation:spin 1.2s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+.hero{display:flex;justify-content:space-between;align-items:center;gap:24px;border:1px solid var(--line);background:var(--surface);border-radius:11px;padding:22px 24px;margin-bottom:23px}.hero-copy{display:flex;gap:14px;align-items:center;min-width:0}.hero-icon{width:40px;height:40px;display:grid;place-items:center;border:1px solid currentColor;border-radius:50%;opacity:.8;flex-shrink:0}.hero h2{margin:0 0 4px;font-size:16px;font-weight:600}.hero p{margin:0;color:var(--muted);font-size:12px;overflow-wrap:anywhere}.actions{display:flex;gap:8px;align-items:center}.kpis{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:14px;margin-bottom:24px}.kpi{padding:19px 21px;border:1px solid var(--line);border-radius:10px;background:var(--surface);min-width:0}.kpi-label{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:7px}.kpi-label svg{width:14px;height:14px}.kpi-value{display:flex;align-items:baseline;gap:7px;margin-top:13px;min-height:45px}.kpi-value strong{font-size:34px;line-height:1.2;letter-spacing:-1.2px;font-weight:500;font-variant-numeric:tabular-nums}.kpi-value small{font-size:11px;color:var(--muted)}.kpi-note{font-size:10px;color:#7f8992;margin-top:6px;min-height:16px}
+.section-heading{display:flex;justify-content:space-between;align-items:center;margin:0 0 12px;gap:10px}.section-heading h2{font-size:13px;font-weight:500;margin:0}.section-heading span{font-size:11px;color:var(--muted)}.topology{display:grid;grid-template-columns:minmax(0,1fr) 94px minmax(0,1fr);align-items:center;margin-bottom:25px}.device{border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:18px 21px;min-width:0}.device-head{display:flex;align-items:center;gap:11px;margin-bottom:17px}.device-icon{background:var(--raised);width:34px;height:34px;display:grid;place-items:center;border-radius:8px;color:#c1c9d0}.device h3{margin:0;font-size:13px;font-weight:600}.device small{font-size:10px;color:var(--muted)}.device-state{margin-left:auto;display:flex;align-items:center;gap:6px;font-size:11px;white-space:nowrap}.device dl{margin:0;display:grid;grid-template-columns:68px minmax(0,1fr);gap:8px;font-size:11px}.device dt{color:var(--muted)}.device dd{margin:0;overflow-wrap:anywhere}.device-bottom{border-top:1px solid var(--line);margin-top:14px;padding-top:11px;font-size:10px;color:var(--muted);display:flex;justify-content:space-between;gap:10px}.wire{display:grid;place-items:center;gap:7px;font-size:9px;color:var(--muted)}.wire-line{display:flex;align-items:center;width:100%;color:#69757f}.wire-line:before,.wire-line:after{content:"";height:1px;background:var(--line);flex:1}.wire-line svg{width:15px;height:15px;margin:0 4px}.wire.live .wire-line{color:var(--green)}.wire.live .wire-line:before,.wire.live .wire-line:after{background:#b0e86855}
+.analysis{display:grid;grid-template-columns:minmax(0,1fr) 268px;gap:17px;margin-bottom:24px}.panel{border:1px solid var(--line);border-radius:10px;background:var(--surface);padding:20px 22px;min-width:0}.panel-head{display:flex;justify-content:space-between;align-items:center;gap:12px;margin-bottom:20px}.panel h2{font-size:13px;font-weight:500;margin:0}.panel-head p{font-size:10px;color:var(--muted);margin:3px 0 0}.legend{display:flex;gap:12px;font-size:10px;color:var(--muted);flex-wrap:wrap}.legend i{display:inline-block;width:5px;height:5px;border-radius:50%;margin-right:5px}.chart{position:relative;height:170px}canvas{display:block;width:100%;height:170px}.chart-empty{position:absolute;inset:0;display:grid;place-items:center;font-size:11px;color:var(--muted);pointer-events:none}.latency-values{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));border-top:1px solid var(--line);margin-top:14px;padding-top:15px;gap:12px}.latency-values small{font-size:10px;color:var(--muted)}.latency-values strong{display:block;font-size:19px;font-weight:500;margin:4px 0;font-variant-numeric:tabular-nums}.latency-values strong span{font-size:10px;color:var(--muted);margin-left:4px}.latency-values em{font-style:normal;font-size:9px;color:var(--muted)}.quality-row{display:flex;align-items:center;justify-content:space-between;font-size:11px;padding:11px 0;border-bottom:1px solid var(--line);gap:8px}.quality-row span{color:var(--muted)}.quality-row strong{font-weight:500;font-variant-numeric:tabular-nums}.quality-row:last-of-type{border-bottom:0}.quality-foot{font-size:10px;color:var(--muted);padding-top:12px;line-height:1.7}.events{padding-top:17px;padding-bottom:8px}.events .panel-head{margin-bottom:7px}.event-list{max-height:180px;overflow:auto}.event{display:grid;grid-template-columns:61px 6px minmax(0,1fr);gap:11px;align-items:baseline;padding:10px 0;border-top:1px solid #ffffff08;font-size:11px}.event time{color:#7f8992;font-size:10px}.event p{margin:0;overflow-wrap:anywhere}.event-list:empty:before{content:"开始、停止采集和配置结果会显示在这里。";display:block;color:var(--muted);font-size:11px;padding:15px 0 20px}.footer{display:flex;justify-content:space-between;gap:15px;font-size:10px;color:#737e87;padding-top:18px}
+.config-intro{color:var(--muted);font-size:12px;margin:-7px 0 24px}.config-layout{display:grid;grid-template-columns:minmax(0,1fr) 264px;gap:22px;align-items:start}.config-card{border:1px solid var(--line);border-radius:10px;background:var(--surface);overflow:hidden}.form-section{padding:23px 25px;border-bottom:1px solid var(--line)}.form-section:last-child{border-bottom:0}.form-heading{display:flex;gap:10px;align-items:center;margin-bottom:18px}.step{font-size:10px;color:var(--green);border:1px solid #b0e86830;border-radius:5px;padding:2px 5px}.form-heading h2{font-size:13px;margin:0;font-weight:500}.field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:18px 19px}.field{display:grid;gap:7px;align-content:start;min-width:0}.field.full{grid-column:1/-1}.field label{font-size:12px}.field p{margin:0;font-size:10px;color:var(--muted)}input,select{width:100%;min-width:0;background:#111416;border:1px solid #363d43;color:var(--text);border-radius:6px;padding:10px 11px;font-size:12px;height:40px}input::placeholder{color:#626e78}input:user-invalid,select:user-invalid{border-color:var(--red)}select{cursor:pointer}.input-action{display:flex;gap:8px}.input-action input,.input-action select{flex:1}.field-error{color:var(--red);font-size:11px;white-space:pre-line;margin-top:15px}.form-actions{display:flex;align-items:center;justify-content:space-between;gap:15px;padding:18px 25px;background:#ffffff02}.form-actions span{font-size:11px;color:var(--muted)}.help-card{border:1px solid var(--line);border-radius:10px;padding:20px;background:var(--surface);font-size:11px;color:var(--muted)}.help-card h2{font-size:13px;font-weight:500;color:var(--text);margin:0 0 15px}.help-step{display:flex;gap:10px;margin:14px 0}.help-step b{font-size:11px;color:var(--green);font-weight:500}.help-step p{margin:0}.help-note{border-top:1px solid var(--line);padding-top:15px;margin-top:18px;font-size:10px;line-height:1.8}.adapters{font-size:11px;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--muted);max-height:150px;overflow:auto;margin:0}.adapters:not(:empty){padding-top:10px}.config-extra{margin-top:19px}summary{font-size:11px;color:var(--muted);cursor:pointer;list-style-position:inside}.config-extra[open] summary{margin-bottom:17px}.note-banner{border-left:2px solid var(--green);background:#b0e86808;padding:13px 15px;font-size:11px;color:#b8c6aa;margin-top:16px}.inline-feedback{font-size:11px;white-space:pre-line;margin:13px 0 0}
+@media(min-width:1600px){.main{padding-top:38px}.topbar{margin-bottom:35px}.chart,canvas{height:200px}}
+@media(max-width:1150px){.main{padding:26px}.sidebar{padding:27px 15px}.app{grid-template-columns:190px minmax(0,1fr)}.analysis{grid-template-columns:minmax(0,1fr) 220px}.kpi{padding:17px}.kpi-value strong{font-size:28px}.config-layout{grid-template-columns:minmax(0,1fr)}.help-card{display:none}.hero{padding:19px}.stamp{display:none}}
+@media(max-width:900px){.app{display:block}.sidebar{position:static;height:auto;display:flex;flex-direction:row;align-items:center;justify-content:space-between;padding:15px 24px;border-right:0;border-bottom:1px solid var(--line);gap:15px}.brand small,.nav-label,.sidebar-foot{display:none}.nav{display:flex}.nav button{padding:9px 12px;font-size:12px}.main{padding:25px}.analysis{grid-template-columns:minmax(0,1fr) 245px}.topbar{margin-bottom:22px}.hero{gap:15px}}
+@media(max-width:650px){.sidebar{padding:14px 16px}.brand{font-size:15px}.brand-mark{width:27px;height:27px}.nav button{font-size:11px;padding:8px}.nav button svg{display:none}.main{padding:22px 16px}.topbar{gap:12px}h1{font-size:23px}.eyebrow{font-size:9px}.toolbar{gap:8px}.badge{font-size:10px;padding:4px 8px}.hero{align-items:stretch;flex-direction:column;padding:18px;gap:18px}.hero-icon{width:32px;height:32px}.hero h2{font-size:14px}.hero p{font-size:11px}.actions{justify-content:flex-end}.actions .btn{flex:1}.kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.kpi{padding:16px}.kpi-value{min-height:35px;margin-top:9px}.kpi-value strong{font-size:29px}.kpi-note{font-size:9px}.topology{grid-template-columns:minmax(0,1fr);gap:0}.wire{height:53px;gap:2px}.wire-line{width:80px}.analysis{grid-template-columns:minmax(0,1fr)}.panel{padding:18px}.panel-head{gap:9px}.legend{gap:9px;font-size:9px}.chart,canvas{height:160px}.quality-row{padding:10px 0}.field-grid{grid-template-columns:minmax(0,1fr)}.form-section{padding:21px 18px}.form-actions{padding:17px 18px;flex-wrap:wrap}.footer{flex-direction:column;gap:5px}.device{padding:18px}.latency-values strong{font-size:18px}.latency-values em{font-size:8px}}
+@media(prefers-reduced-motion:reduce){*,*:before,*:after{animation:none!important;scroll-behavior:auto!important}}
+</style>
+</head>
+<body>
+<svg class="sprite" aria-hidden="true"><defs>
+<symbol id="i-logo" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5"/><rect x="8" y="8" width="8" height="8" rx="1.5"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></symbol>
+<symbol id="i-sliders" viewBox="0 0 24 24"><path d="M4 7h8m5 0h3M4 17h3m5 0h8"/><circle cx="14" cy="7" r="3"/><circle cx="10" cy="17" r="3"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><path d="m8 5 11 7-11 7Z"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="6" y="6" width="12" height="12" rx="1"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><path d="M20 10a8 8 0 1 0-1 7M20 4v6h-6"/></symbol>
+<symbol id="i-monitor" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="13" rx="2"/><path d="M8 21h8m-4-4v4"/></symbol>
+<symbol id="i-capture" viewBox="0 0 24 24"><path d="M8 3H3v5m13-5h5v5M3 16v5h5m13-5v5h-5M8 12h8m-4-4v8"/></symbol>
+<symbol id="i-arrow" viewBox="0 0 24 24"><path d="M4 12h16m-6-6 6 6-6 6"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><path d="m5 12 4 4L19 6"/></symbol>
+<symbol id="i-signal" viewBox="0 0 24 24"><path d="M4 20v-4m5 4v-8m5 8V8m5 12V4"/></symbol>
+</defs></svg>
+<div class="app">
+<aside class="sidebar">
+<a class="brand" href="#overview" aria-label="VirtualCapture 总览"><span class="brand-mark"><svg aria-hidden="true"><use href="#i-logo"/></svg></span><span>VirtualCapture<small>HOST CONSOLE</small></span></a>
+<div><div class="nav-label">控制台</div><nav class="nav" aria-label="主导航"><button type="button" data-view="overview" aria-current="page"><svg aria-hidden="true"><use href="#i-grid"/></svg>链路总览</button><button type="button" data-view="config"><svg aria-hidden="true"><use href="#i-sliders"/></svg>连接配置<span id="dirtyDot" class="dot warn" hidden></span></button></nav></div>
+<div class="sidebar-foot"><div><span class="dot"></span>原始像素，直接传输</div><strong>NV12 · 640 × 640 · 240 fps</strong><br>VirtualCapture <span id="appVersion">—</span></div>
+</aside>
+<main class="main">
+<header class="topbar"><div><div class="eyebrow">采集与传输 / 主机控制台</div><h1 id="pageTitle">链路总览</h1></div><div class="toolbar"><span id="lastUpdate" class="stamp">等待连接</span><span id="connectionBadge" class="badge muted"><i class="dot"></i><span>连接中</span></span><button id="bRefresh" class="btn quiet icon" title="刷新连接状态" aria-label="刷新连接状态"><svg aria-hidden="true"><use href="#i-refresh"/></svg></button></div></header>
+<section id="overviewView" aria-label="链路总览">
+<div class="hero"><div class="hero-copy"><span id="heroIcon" class="hero-icon muted"><svg aria-hidden="true"><use href="#i-signal"/></svg></span><div><h2 id="stateTitle">正在连接控制服务</h2><p id="stateDetail">读取两端状态，请稍候。</p></div></div><div class="actions"><button class="btn quiet" data-view="config"><svg aria-hidden="true"><use href="#i-sliders"/></svg>配置</button><button id="bCapture" class="btn primary" disabled><svg aria-hidden="true"><use href="#i-play"/></svg><span>开始采集</span></button></div></div>
+<div class="kpis">
+<article class="kpi"><div class="kpi-label"><svg aria-hidden="true"><use href="#i-monitor"/></svg>接收帧率</div><div class="kpi-value"><strong id="rxFps">—</strong><small>fps</small></div><div id="rxFpsNote" class="kpi-note">等待接收完整帧</div></article>
+<article class="kpi"><div class="kpi-label"><svg aria-hidden="true"><use href="#i-capture"/></svg>采集帧率</div><div class="kpi-value"><strong id="txFps">—</strong><small>fps</small></div><div id="txFpsNote" class="kpi-note">等待采集会话</div></article>
+<article class="kpi"><div class="kpi-label"><svg aria-hidden="true"><use href="#i-arrow"/></svg>链路带宽</div><div class="kpi-value"><strong id="bandwidth">—</strong><small>Gbps</small></div><div class="kpi-note">未压缩 NV12 · raw L2</div></article>
+<article class="kpi"><div class="kpi-label"><svg aria-hidden="true"><use href="#i-check"/></svg>已接收帧</div><div class="kpi-value"><strong id="complete">—</strong><small>帧</small></div><div id="frameNote" class="kpi-note">当前接收会话累计</div></article>
+</div>
+<div class="section-heading"><h2>设备与链路</h2><span>采集 → 接收 → 虚拟采集卡</span></div>
+<div class="topology">
+<article id="capCard" class="device"><div class="device-head"><span class="device-icon"><svg aria-hidden="true"><use href="#i-capture"/></svg></span><div><h3>被采集机</h3><small data-device="location">发端</small></div><span class="device-state muted" data-device="state"><i class="dot"></i><span>等待配置</span></span></div><dl><dt>控制地址</dt><dd class="mono" data-device="url">—</dd><dt>网络适配器</dt><dd data-device="adapter">—</dd><dt>采集方式</dt><dd data-device="output">桌面采集 · NV12</dd></dl><div class="device-bottom"><span data-device="session">尚无会话</span><span data-device="version">—</span></div></article>
+<div id="wire" class="wire"><div class="wire-line"><svg aria-hidden="true"><use href="#i-arrow"/></svg></div><span>Raw L2</span><span>0x88B5</span></div>
+<article id="rxCard" class="device"><div class="device-head"><span class="device-icon"><svg aria-hidden="true"><use href="#i-monitor"/></svg></span><div><h3>主机</h3><small data-device="location">收端</small></div><span class="device-state muted" data-device="state"><i class="dot"></i><span>等待配置</span></span></div><dl><dt>控制地址</dt><dd class="mono" data-device="url">—</dd><dt>网络适配器</dt><dd data-device="adapter">—</dd><dt>虚拟采集卡</dt><dd data-device="output">等待读取注册状态</dd></dl><div class="device-bottom"><span data-device="session">尚无会话</span><span data-device="version">—</span></div></article>
+</div>
+<div class="analysis">
+<section class="panel"><div class="panel-head"><div><h2>分段延迟</h2><p>p99 · 最近 60 秒 · 毫秒</p></div><div class="legend"><span><i style="background:var(--blue)"></i>发送</span><span><i style="background:var(--green)"></i>重组</span><span><i style="background:var(--purple)"></i>虚拟卡</span></div></div><div class="chart"><canvas id="cv" aria-label="最近60秒各段p99延迟，详细数值见下方" role="img"></canvas><div id="chartEmpty" class="chart-empty">采集开始后显示延迟曲线</div></div><div class="latency-values"><div><small>发送段 p99</small><strong><b id="txLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="txLatencyRange">平均 — · 最大 —</em></div><div><small>重组段 p99</small><strong><b id="rxLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="rxLatencyRange">平均 — · 最大 —</em></div><div><small>虚拟卡交付 p99</small><strong><b id="vcLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="vcLatencyRange">平均 — · 最大 —</em></div></div></section>
+<section class="panel"><div class="panel-head"><h2>传输质量</h2><span id="qualityBadge" class="badge muted">等待数据</span></div><div class="quality-row"><span>丢失帧</span><strong id="dropped">—</strong></div><div class="quality-row"><span>哈希错误</span><strong id="hashErrors">—</strong></div><div class="quality-row"><span>丢失包</span><strong id="packetLoss">—</strong></div><div class="quality-row"><span>虚拟卡交付</span><strong id="vcDelivered">—</strong></div><div class="quality-row"><span>重复帧</span><strong id="vcRepeats">—</strong></div><div class="quality-foot">每帧 FNV-1a64 对账。<br>计数来自当前接收会话，缺失数据以 — 显示。</div></section>
+</div>
+<section class="panel events"><div class="panel-head"><h2>操作记录 <span id="eventCount" class="muted"></span></h2><button id="bClear" class="btn quiet small">清空显示</button></div><div id="events" class="event-list" role="log" aria-label="操作记录"></div></section>
+</section>
+<section id="configView" aria-label="连接配置" hidden>
+<div class="config-intro">在主机填写连接信息，被采集机只需运行后台服务。</div>
+<div class="config-layout"><form id="configForm" class="config-card" novalidate>
+<div class="form-section"><div class="form-heading"><span class="step">01</span><h2>连接被采集机</h2></div><div class="field-grid">
+<div class="field full"><label for="c_peer_ip">被采集机 IP</label><input id="c_peer_ip" required inputmode="decimal" autocomplete="off" spellcheck="false" placeholder="192.168.2.59"><p>只填写 IPv4 地址，控制端口固定为 5143。</p></div>
+<div class="field full"><label for="c_adapter">本机网络适配器</label><div class="input-action"><select id="c_adapter" required><option value="">正在获取网络适配器…</option></select><button type="button" id="bAdapters" class="btn">刷新网卡</button></div><p id="adapterResult" class="inline-feedback" aria-live="polite">自动获取网卡后，选择连接被采集机的网口。</p></div>
+</div></div>
+<div class="form-section"><div class="form-heading"><span class="step">02</span><h2>采集设置</h2></div>
+<div class="field-grid">
+<div class="field full"><label for="c_resolution">输出分辨率预设</label><select id="c_resolution"><option value="416x416">416 × 416 · 方形</option><option value="640x640">640 × 640 · 当前已实现</option><option value="1280x720">720p · 1280 × 720</option><option value="1920x1080">1080p · 1920 × 1080</option><option value="2560x1440">1440p · 2560 × 1440</option><option value="custom">自定义宽高</option></select><p>这是传输及虚拟卡的目标 NV12 尺寸，不会修改桌面显示分辨率。非 640 尺寸目前仅用于配置与预算。</p></div>
+<div class="field"><label for="c_width">输出宽度</label><input id="c_width" type="number" min="2" max="8192" step="2" required><p>2–8192 的偶数；直接输入可切换为自定义。</p></div>
+<div class="field"><label for="c_height">输出高度</label><input id="c_height" type="number" min="2" max="8192" step="2" required><p>NV12 色度采样要求宽高均为偶数。</p></div>
+<div class="field"><label for="c_fps">目标帧率</label><input id="c_fps" type="number" min="1" max="1000" step="1" required><p>当前 DDA 由桌面新帧驱动，尚不硬限速；此数值用于预算，不是已达成帧率。</p></div>
+<div class="field"><label for="c_transform">裁切 / 缩放方式</label><select id="c_transform"><option value="crop">居中裁切 · 1:1 像素</option><option value="fit">完整画面 · 等比缩放 + 黑边（待接通）</option><option value="fill">铺满输出 · 等比缩放 + 裁切（待接通）</option><option value="stretch">拉伸填满 · 不保持比例（待接通）</option></select><p>居中裁切不缩放；其他方式目前只保存配置。</p></div>
+</div></div>
+<div class="form-section"><div class="form-heading"><span class="step">03</span><h2>传输模式与预算</h2></div>
+<div class="field-grid">
+<div class="field full"><label for="c_codec">链路像素 / 编码模式</label><select id="c_codec"><option value="raw">Raw NV12 · 无压缩 / 当前可运行</option><option value="h264">H.264 · 低延迟有损编码（待接入）</option><option value="hevc">H.265 / HEVC · 低延迟有损编码（待接入）</option></select><p>编码只规划用于两机链路；主机解码后仍向虚拟卡提供 NV12。尚未探测两端编解码能力。</p></div>
+<div id="bitrateFields" class="field full" hidden><div class="field-grid"><div class="field"><label for="c_bitrate">目标码率 · Mbps</label><input id="c_bitrate" type="number" min="1" max="10000" step="1" required></div><div class="field"><label for="c_max_bitrate">最大码率 · Mbps</label><input id="c_max_bitrate" type="number" min="1" max="10000" step="1" required></div></div><p>按最大码率估算，不保证关键帧瞬时突发受限；当前不会拉起编码器。</p></div>
+<div class="field"><label for="c_headroom">链路预留余量 · %</label><input id="c_headroom" type="number" min="0" max="50" step="1" required><p>仅预算建议，不是修改历史性能验收门限。</p></div>
+</div>
+<div class="note-banner" id="streamPlan" role="status" aria-live="polite"><strong id="planTitle">等待计算链路预算</strong><p id="planSummary" class="inline-feedback">配置读取后自动计算，不保存草稿，也不启停采集。</p><p id="planDetails" class="inline-feedback"></p><p id="planWarnings" class="inline-feedback"></p></div>
+<button type="button" id="bPlan" class="btn small" style="margin-top:14px">重新检测两端链路</button>
+<div id="configError" class="field-error" role="alert" hidden></div></div>
+<div class="form-actions"><span id="saveState" role="status">配置读取中…</span><div class="actions"><button type="button" id="bReset" class="btn quiet" disabled>撤销修改</button><button type="submit" id="bSave" class="btn primary" disabled><svg aria-hidden="true"><use href="#i-check"/></svg>保存配置</button></div></div>
+</form><aside><div class="help-card"><h2>配置不等于能力已达标</h2><div class="help-step"><b>1</b><p>先选尺寸、画面处理与传输模式，再看两端链路预算。</p></div><div class="help-step"><b>2</b><p>预算、原生实现和实机验收分开显示，不会自动降低清晰度或切换编码。</p></div><div class="help-step"><b>3</b><p>当前可运行的仍为 640 × 640 居中裁切 / Raw NV12。其他组合可保存，但启动会明确拦截。</p></div><div class="help-note">开始接收自动注册虚拟采集卡，停止后回收。正在运行时不允许修改配置。</div></div><div class="note-banner">稳定版保持不动<br>H.264 / H.265 及可变尺寸管线分阶段接入，不将选项存在当成已支持。</div></aside></div>
+</section>
+<footer class="footer"><span>分段延迟在各自机器内测量，不代表跨机端到端延迟。</span><span id="footerStatus">自动刷新 · 约每秒一次</span></footer>
+</main></div>
 <script>
-const $=id=>document.getElementById(id);const H=[];let prev=null,cfgLoaded=false,busy=false;
-const f=(v,d=2)=>v==null||isNaN(v)?'–':(+v).toFixed(d);
-function log(t,cls){const e=$('msg');e.innerHTML=`<div class="${cls||''}">${new Date().toLocaleTimeString()} ${t.replace(/</g,'&lt;')}</div>`+e.innerHTML}
-async function api(p,b){const r=await fetch(p,b===undefined?{}:{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)});let j={};try{j=await r.json()}catch(e){}return [r.status,j]}
-function sides(s){const L=s.local,P=s.peer||{};const lr=L.config.role;
- const cap=lr==='capture'?L:(P.config&&P.config.role==='capture'?P:null);const rx=lr==='receive'?L:(P.config&&P.config.role==='receive'?P:null);return {cap,rx}}
-function machine(m,kind){if(!m)return '<span class="mut">未配置（检查两端 role / peer_url）</span>';
- if(m.online===false)return `<span class="dot off"></span>离线 <span class="mut">${m.url||''} ${m.error||''}</span>`;
- const st=kind==='cap'?m.sender:m.receiver;const run=st&&st.running;let x=`<div><span class="dot ${run?'on':''}"></span>${run?'运行中':'已停止'} <span class="mut">v${m.version||'?'} · ${m.url||'本机'} · 网卡 ${m.config?m.config.adapter||'未设':'?'}</span></div>`;
- if(kind==='rx'&&m.vcam)x+=`<div>虚拟采集卡：${m.vcam.match?'<span class="ok">已注册</span>':'<span class="warn">未注册/路径不符</span>'} <span class="mut">${m.vcam.registered||''}</span></div>`;
- if(st&&st.session_id)x+=`<div class="mut">会话 ${st.session_id} · ${f(st.uptime_s,0)}s</div>`;return x}
-function rate(cur,key,p,dt){return p&&cur&&dt>0&&cur[key]!=null&&p[key]!=null?(cur[key]-p[key])/dt:null}
-function render(s){const {cap,rx}=sides(s);$('mCap').innerHTML=machine(cap,'cap');$('mRx').innerHTML=machine(rx,'rx');
- const tx=cap&&cap.sender||{},r=rx&&rx.receiver||{};const dt=prev?s.ts-prev.ts:0;
- const ftx=rate(tx,'sent_frames',prev&&prev.tx,dt),frx=rate(r,'complete',prev&&prev.rx,dt);prev={ts:s.ts,tx,rx:r};
- const bad=(r.dropped||0)+(r.hash_mismatch||0);
- $('tM').innerHTML=`<tr><th></th><th>值</th><th></th><th>值</th></tr>
- <tr><td>发端 fps</td><td class="big">${f(ftx,0)}</td><td>收端 fps</td><td class="big">${f(frx,0)}</td></tr>
- <tr><td>带宽</td><td>${f((tx.bps||r.bps||0)/1e9,2)} Gbps</td><td>完成帧</td><td>${r.complete??'–'}</td></tr>
- <tr><td>丢帧 / 哈希错</td><td class="${bad?'bad':'ok'}">${r.dropped??'–'} / ${r.hash_mismatch??'–'}</td><td>丢包 / 断档</td><td>${r.packets_lost??'–'} / ${r.gaps??'–'}</td></tr>
- <tr><td>发端段 avg/p99</td><td>${f(tx.pc1_seg_avg_ms)} / ${f(tx.pc1_seg_p99_ms)}</td><td>采集滞后 p99</td><td>${f(tx.cap_lag_p99_ms)}</td></tr>
- <tr><td>重组 avg/p99/max</td><td>${f(r.rseg_avg_ms)} / ${f(r.rseg_p99_ms)} / ${f(r.rseg_max_ms)}</td><td>vcam avg/p99</td><td>${f(r.vseg_avg_ms,3)} / ${f(r.vseg_p99_ms,3)}</td></tr>
- <tr><td>发端 CPU</td><td>${f(tx.cpu_pct,1)}%</td><td>vcam 交付 / 重复</td><td>${r.vcam_delivered??'–'} / ${r.vcam_repeats??'–'}</td></tr>`;
- H.push([tx.pc1_seg_p99_ms,r.rseg_p99_ms,r.vseg_p99_ms]);if(H.length>60)H.shift();draw();
- $('state').innerHTML=s.peer&&s.peer.online?'<span class="ok">两端在线</span>':'<span class="warn">对端未连接</span>';
- if(!cfgLoaded){fillCfg(s.local.config);cfgLoaded=true}
- const pu=s.local.config.peer_url;$('peerLink').textContent=pu?'打开对端控制台 ↗':'';$('peerLink').href=pu?pu+'/ui':'#'}
-function draw(){const c=$('cv'),g=c.getContext('2d');c.width=c.clientWidth;const W=c.width,Hh=c.height;g.clearRect(0,0,W,Hh);
- let mx=1;H.forEach(r=>r.forEach(v=>{if(v>mx)mx=v}));mx=Math.ceil(mx);g.fillStyle='#8b95a3';g.font='11px sans-serif';g.fillText(mx+' ms',4,12);
- ['#58a6ff','#3fb950','#d29922'].forEach((col,i)=>{g.strokeStyle=col;g.lineWidth=1.5;g.beginPath();let st=false;
-  H.forEach((r,k)=>{const v=r[i];if(v==null)return;const x=W*k/59,y=Hh-4-(Hh-18)*v/mx;st?g.lineTo(x,y):g.moveTo(x,y);st=true});g.stroke()})}
-function fillCfg(c){$('c_role').value=c.role;$('c_peer_url').value=c.peer_url;$('c_adapter').value=c.adapter;
- $('c_mode').value=c.capture.mode;$('c_pattern').value=c.capture.pattern;$('c_gpu').value=c.capture.gpu_convert?'1':'0';
- $('c_fps').value=c.capture.fps;$('c_batch').value=c.capture.batch;$('c_dst').value=c.capture.dst_mac;
- $('c_shm').value=c.receive.shm;$('c_auto').value=c.receive.vcam_autoregister?'1':'0';roleVis()}
-function roleVis(){const r=$('c_role').value;document.querySelectorAll('.cap').forEach(e=>e.style.display=r==='capture'?'':'none');
- document.querySelectorAll('.rcv').forEach(e=>e.style.display=r==='receive'?'':'none');$('bReg').style.display=r==='receive'?'':'none'}
-$('c_role').onchange=roleVis;
-$('bSave').onclick=async()=>{const b={role:$('c_role').value,peer_url:$('c_peer_url').value.trim(),adapter:$('c_adapter').value.trim(),
- capture:{mode:$('c_mode').value,pattern:$('c_pattern').value,gpu_convert:$('c_gpu').value==='1',fps:parseInt($('c_fps').value),batch:parseInt($('c_batch').value),dst_mac:$('c_dst').value.trim()},
- receive:{shm:$('c_shm').value.trim(),vcam_autoregister:$('c_auto').value==='1'}};
- const [c,j]=await api('/config',b);c===200?log('配置已保存','ok'):log('保存失败：'+(j.details||[j.error]).join('；'),'bad')};
-async function act(p,name){if(busy)return;busy=true;$('bStart').disabled=$('bStop').disabled=true;log(name+'…');
- try{const [c,j]=await api(p,{});const steps=(j.steps||[]).map(s=>`${s.side}${s.rollback?'(回滚)':''}:${s.code}${s.result&&s.result.error?' '+s.result.error:''}`).join('，');
-  log(`${name}${j.ok?'成功':'失败'}${j.error?'：'+j.error:''} ${steps}`,j.ok?'ok':'bad')}catch(e){log(name+'异常：'+e,'bad')}
- busy=false;$('bStart').disabled=$('bStop').disabled=false}
-$('bStart').onclick=()=>act('/product/start','开播');$('bStop').onclick=()=>act('/product/stop','停播');
-$('bReg').onclick=async()=>{const [c,j]=await api('/vcam/register',{});log(c===200?'虚拟采集卡已注册：'+j.dll:'注册失败：'+(j.error||JSON.stringify(j)),c===200?'ok':'bad')};
-async function tick(){try{const [c,s]=await api('/product/status');if(c===200)render(s)}catch(e){$('state').innerHTML='<span class="bad">本机 agent 无响应</span>'}setTimeout(tick,1000)}
-tick();
-</script></body></html>
+'use strict';
+const $ = id => document.getElementById(id);
+const history = [];
+let lastStatus = null, previous = null, savedConfig = null, dirty = false, busy = false;
+let polling = false, pollTimer = null, eventCount = 0, scanBusy = false, configGeneration = 0, busyAction = '';
+let planTimer = null, planGeneration = 0, planInFlight = false, planPending = false, planRefresh = false;
+const finite = value => typeof value === 'number' && Number.isFinite(value);
+const fmt = (value, digits = 2) => finite(value) ? value.toFixed(digits) : '—';
+const count = value => finite(value) ? value.toLocaleString('zh-CN') : '—';
+const clone = value => JSON.parse(JSON.stringify(value));
+
+function frameRate(current, old, key, seconds) {
+  if (!current || !old || !current.running || !old.running || !finite(seconds) || seconds <= 0 || seconds > 10) return null;
+  if (current.session_id !== old.session_id || current.uptime_s < old.uptime_s) return null;
+  if (!finite(current[key]) || !finite(old[key]) || current[key] < old[key]) return null;
+  return (current[key] - old[key]) / seconds;
+}
+function getSides(status) {
+  const local = status && status.local, peer = status && status.peer;
+  return {capture:peer || (local ? {online:false,url:local.config && local.config.peer_url} : null), receive:local};
+}
+function activeStats(machine, kind) {
+  const stats = machine && machine[kind];
+  return machine && machine.online !== false && stats && stats.running && stats.note !== 'stub-no-binary' ? stats : {};
+}
+function hasRunning(status) {
+  return [status && status.local,status && status.peer].some(machine => machine &&
+    (machine.sender && machine.sender.running || machine.receiver && machine.receiver.running));
+}
+function pendingPipeline(capture = {}) {
+  if ((capture.width ?? 640) !== 640 || (capture.height ?? 640) !== 640)
+    return '当前原生管线固定为 640×640；可变分辨率尚未接通。请查看连接配置中的实现状态。';
+  if ((capture.transform || 'crop') !== 'crop') return '所选缩放方式尚未接通，当前仅支持居中 1:1 裁切。';
+  if ((capture.codec || 'raw') !== 'raw') return 'H.264/H.265 后端尚未接入，当前仅支持 Raw NV12。';
+  return '';
+}
+function readiness(status, unsaved) {
+  const local = status && status.local, peer = status && status.peer;
+  const config = local && local.config || {};
+  const sides = getSides(status);
+  const tx = sides.capture && sides.capture.sender || {}, rx = sides.receive && sides.receive.receiver || {};
+  const canStop = !!(local && local.online !== false && (hasRunning(status) || local.vcam && local.vcam.managed));
+  const result = (level,title,detail,canStart=false) => ({level,title,detail,canStart,canStop});
+  if (!local || local.online === false) return result('bad','本机控制服务未连接','请检查 agent 是否运行，服务恢复后会自动重连。');
+  if (unsaved) return result('warn','配置尚未保存','请在连接配置中保存修改后，再开始新的采集。');
+  if (!config.peer_url || !config.adapter) return result('warn','连接被采集机','请在连接配置中填写被采集机 IP，并选择本机网卡。');
+  if (!peer || !peer.online) return result('warn','等待采集后台上线','请确认被采集机后台已启动，IP 正确，5143 端口可达。');
+  if (!peer.config || !peer.sender || !peer.receiver) return result('warn','对端状态读取不完整','检查对端 agent 是否支持当前控制台，稍后重试。');
+  if (peer.product_revision !== 2 || peer.product_role !== 'capture') return result('warn','请更新被采集机后台','需要支持当前主机控制流程的采集后台，控制端口为 5143。');
+  if (peer.config.role !== 'capture') return result('warn','对端未以采集后台运行','请在被采集机使用 --role capture 启动后台服务。');
+  if (local.version && peer.version && local.version !== peer.version) return result('warn','两端版本不一致','本机 '+local.version+'，对端 '+peer.version+'。请统一版本后开始采集。');
+  if (tx.note === 'stub-no-binary' && tx.running || rx.note === 'stub-no-binary' && rx.running) return result('warn','占位进程运行中 · 没有真实传输','缺少采集或接收程序，请先完成构建并停止占位进程。');
+  if (tx.running && rx.running) {
+    if ((rx.dropped || 0) + (rx.hash_mismatch || 0) > 0) return result('warn','链路运行中 · 请检查传输质量','发现丢帧或哈希错误，详细计数见传输质量。');
+    if (!finite(rx.complete) || rx.complete <= 0) return result('warn','等待首个完整画面','两端进程已启动，尚未收到完整帧；请检查采集源与网卡链路。');
+    return result('good','采集链路已启动','接收机将完整画面交给 VirtualCapture；实时帧率在下方更新。');
+  }
+  if (tx.error || rx.error) return result('bad','原生采集链路异常',tx.error || rx.error,!canStop && !pendingPipeline(config.capture));
+  if (tx.running || rx.running) return result('warn','链路仅有一端在运行','请先停止采集，再重新开始。');
+  if (local.vcam && local.vcam.managed) return result('warn','虚拟采集卡等待回收','点击停止采集重试回收。');
+  const pending = pendingPipeline(config.capture);
+  if (pending) return result('warn','所选配置尚不可运行',pending);
+  return result('good','两端已连接，可以开始采集','主机自动注册虚拟采集卡并开始接收，再通知对端推送画面。',true);
+}
+function friendlyError(message) {
+  const text = String(message || '未知错误');
+  const exact = {
+    'Failed to fetch':'无法连接控制服务，请检查 agent 和网络。',
+    'local role not set (config.role)':'请先设置本机角色。',
+    'local adapter not set (config.adapter)':'请先选择本机网卡。',
+    'peer_url not configured':'请先填写被采集机 IP。',
+    'invalid config':'配置校验未通过。',
+    'vc-vcam.dll not found under ROOT/build':'未找到虚拟采集卡程序，请先完成构建。',
+    'vcam register failed':'虚拟采集卡注册失败，请检查程序路径和当前用户。',
+    'role must be capture|receive|\'\'':'本机角色应为采集机或接收机。',
+    'peer_url must be http://host:port':'被采集机地址格式错误，请只填写 IPv4 地址。',
+    'adapter: up to 64 chars of [A-Za-z0-9 _.()-]':'网卡字段最多64字符，可填设备名或英文描述关键字。',
+    'capture.dst_mac must be aa:bb:cc:dd:ee:ff':'目标 MAC 应为 aa:bb:cc:dd:ee:ff 格式。',
+    'receive.shm must be Local\\<name>':'共享内存名称应为 Local\\名称 或 Global\\名称。'
+  };
+  if (exact[text]) return exact[text];
+  if (/peer role/.test(text)) return '请在被采集机使用 --role capture 启动后台服务。';
+  if (/peer unreachable|peer config/.test(text)) return '无法连接采集后台，请检查 IP、5143 端口和后台进程。';
+  if (/capture.fps/.test(text)) return '目标帧率必须为 1–1000 的整数。';
+  if (/capture.batch/.test(text)) return '批大小必须为 1–1000 的整数。';
+  if (/(capture|receive).mtu/.test(text)) return 'MTU 必须为 1500–9000 的整数。';
+  return text;
+}
+async function api(path, body, timeout = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(path, {signal:controller.signal, cache:'no-store',
+      ...(body === undefined ? {} : {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})});
+    const data = await response.json();
+    return [response.status,data];
+  } catch (error) {
+    throw new Error(error.name === 'AbortError' ? '请求超时，请检查连接后重试。' : friendlyError(error.message));
+  } finally { clearTimeout(timer); }
+}
+function text(id, value) { $(id).textContent = value; }
+function log(message, level = 'muted') {
+  const row = document.createElement('div'); row.className = 'event '+level;
+  const time = document.createElement('time'); time.textContent = new Date().toLocaleTimeString('zh-CN',{hour12:false});
+  const dot = document.createElement('i'); dot.className = 'dot';
+  const content = document.createElement('p'); content.textContent = message;
+  row.append(time,dot,content); $('events').prepend(row);
+  while ($('events').children.length > 80) $('events').lastElementChild.remove();
+  text('eventCount','· '+(++eventCount));
+}
+function showView(view) {
+  view = view === 'config' ? 'config' : 'overview';
+  $('overviewView').hidden = view !== 'overview'; $('configView').hidden = view !== 'config';
+  text('pageTitle',view === 'overview' ? '链路总览' : '连接配置');
+  document.querySelectorAll('.nav [data-view]').forEach(button => {
+    if (button.dataset.view === view) button.setAttribute('aria-current','page');
+    else button.removeAttribute('aria-current');
+  });
+  if (location.hash !== '#'+view) window.history.replaceState(null,'','#'+view);
+  if (view === 'overview') draw();
+}
+function syncControls() {
+  const state = readiness(lastStatus,dirty);
+  text('stateTitle',state.title); text('stateDetail',state.detail);
+  $('heroIcon').className = 'hero-icon '+state.level;
+  const stopping = state.canStop;
+  $('bCapture').disabled = busy || !(stopping || state.canStart);
+  $('bCapture').className = 'btn '+(stopping ? 'danger' : 'primary');
+  $('bCapture').title = state.detail;
+  $('bCapture').querySelector('use').setAttribute('href',stopping ? '#i-stop' : '#i-play');
+  $('bCapture').lastElementChild.textContent = busyAction || (stopping ? '停止采集' : '开始采集');
+  $('bSave').disabled = busy || !savedConfig || !dirty;
+  $('bReset').disabled = busy || !dirty;
+  $('dirtyDot').hidden = !dirty;
+  text('saveState',!savedConfig ? '配置尚未读取' : dirty ? '有未保存的修改' : '配置已同步');
+}
+function captureSource(stats, config) {
+  const source = stats.mode ? stats : config.capture || {};
+  return source.mode === 'pattern' ? '测试图案 · '+source.pattern : '桌面采集 · NV12';
+}
+function renderMachine(id, machine, kind, local) {
+  const card = $(id), set = (key,value) => { card.querySelector('[data-device="'+key+'"]').textContent = value; };
+  const online = !!machine && machine.online !== false;
+  const stats = machine && machine[kind] || {}, config = machine && machine.config || {};
+  let label = !machine ? '等待配置' : !online ? '离线' : stats.note === 'stub-no-binary' && stats.running ? '占位进程' : stats.running ? '运行中' : '已停止';
+  const level = !online ? 'muted' : stats.note === 'stub-no-binary' ? 'warn' : stats.running ? 'good' : 'muted';
+  const state = card.querySelector('[data-device="state"]'); state.className = 'device-state '+level; state.lastElementChild.textContent = label;
+  set('location',machine && machine === local ? '本机' : machine ? '对端' : kind === 'sender' ? '发端' : '收端');
+  set('url',machine ? machine === local ? location.origin : machine.url || local && local.config.peer_url || '—' : '—');
+  set('adapter',stats.adapter || config.adapter || (kind === 'sender' ? '按控制连接自动选择' : '未选择'));
+  set('version',online && machine.version ? 'v'+machine.version : '—');
+  set('session',online && stats.session_id ? stats.session_id+' · '+fmt(stats.uptime_s,0)+'s' : '尚无活动会话');
+  if (kind === 'sender') set('output',!online ? '等待连接' : captureSource(stats,config));
+  else set('output',!online ? '等待连接' : !machine.vcam ? '未读取到注册状态' : machine.vcam.match ? 'VirtualCapture · 已注册' : machine.vcam.registered ? '注册路径不符' : '接收时自动注册');
+}
+function render(status) {
+  const sides = getSides(status), tx = activeStats(sides.capture,'sender'), rx = activeStats(sides.receive,'receiver');
+  const dt = previous ? status.ts-previous.ts : 0;
+  const txFps = frameRate(tx,previous && previous.tx,'sent_frames',dt);
+  const rxFps = frameRate(rx,previous && previous.rx,'complete',dt);
+  const signature = [tx.session_id,rx.session_id].join('|');
+  if (previous && previous.signature !== signature) history.length = 0;
+  previous = {ts:status.ts,tx,rx,signature};
+  lastStatus = status;
+  if (status.local && status.local.online !== false && status.local.config && (!savedConfig || !dirty)) {
+    if (JSON.stringify(savedConfig) !== JSON.stringify(status.local.config)) fillConfig(status.local.config);
+  }
+  renderMachine('capCard',sides.capture,'sender',status.local);
+  renderMachine('rxCard',sides.receive,'receiver',status.local);
+  text('txFps',fmt(txFps,0)); text('rxFps',fmt(rxFps,0));
+  text('bandwidth',fmt(finite(tx.bps) ? tx.bps/1e9 : finite(rx.bps) ? rx.bps/1e9 : null,2));
+  text('complete',count(rx.complete));
+  text('txFpsNote',tx.running ? txFps === null ? '正在建立采样基线' : '当前采集会话 · 每秒更新' : '等待采集会话');
+  text('rxFpsNote',rx.running ? rxFps === null ? '正在建立采样基线' : rxFps > 0 ? '正在接收完整帧' : '暂未收到新的完整帧' : '等待接收完整帧');
+  text('frameNote',rx.session_id || '当前接收会话累计');
+  [['dropped','dropped'],['hashErrors','hash_mismatch'],['packetLoss','packets_lost'],['vcDelivered','vcam_delivered'],['vcRepeats','vcam_repeats']].forEach(pair => {
+    text(pair[0],count(rx[pair[1]]));
+    $(pair[0]).className = ['dropped','hashErrors','packetLoss'].includes(pair[0]) && rx[pair[1]] > 0 ? 'warn' : '';
+  });
+  const hasQuality = finite(rx.complete) && rx.complete > 0 && finite(rx.dropped) && finite(rx.hash_mismatch);
+  const errors = (rx.dropped || 0)+(rx.hash_mismatch || 0);
+  $('qualityBadge').className = 'badge '+(errors ? 'warn' : !hasQuality ? 'muted' : 'good');
+  text('qualityBadge',errors ? '需检查' : !hasQuality ? '等待数据' : '哈希对账正常');
+  [['tx',tx,'pc1_seg',2],['rx',rx,'rseg',2],['vc',rx,'vseg',3]].forEach(([id,stats,key,digits]) => {
+    text(id+'Latency',fmt(stats[key+'_p99_ms'],digits));
+    text(id+'LatencyRange','平均 '+fmt(stats[key+'_avg_ms'],digits)+' · 最大 '+fmt(stats[key+'_max_ms'],digits));
+  });
+  $('wire').className = 'wire'+(rxFps > 0 ? ' live' : '');
+  history.push({time:Date.now()/1000,values:[tx.pc1_seg_p99_ms,rx.rseg_p99_ms,rx.vseg_p99_ms]});
+  draw();
+  const online = !!status.local && status.local.online !== false;
+  $('connectionBadge').className = 'badge '+(!online ? 'bad' : status.peer && status.peer.online ? 'good' : 'muted');
+  $('connectionBadge').lastElementChild.textContent = !online ? '本机离线' : status.peer && status.peer.online ? '两端在线' : '本机在线';
+  text('lastUpdate',online ? '更新于 '+new Date().toLocaleTimeString('zh-CN',{hour12:false}) : '等待重新连接');
+  text('appVersion',status.local && status.local.version || '—');
+  text('footerStatus',online ? '自动刷新 · 约每秒一次' : '连接中断 · 自动重试');
+  syncControls();
+}
+function draw() {
+  const canvas = $('cv'), width = canvas.clientWidth, height = canvas.clientHeight;
+  if (!width || !height) return;
+  const now = Date.now()/1000;
+  while (history.length && history[0].time < now-60) history.shift();
+  const dpr = Math.min(window.devicePixelRatio || 1,2);
+  canvas.width = Math.round(width*dpr); canvas.height = Math.round(height*dpr);
+  const g = canvas.getContext('2d'); g.setTransform(dpr,0,0,dpr,0,0);
+  const left = 28, right = width-6, top = 10, bottom = height-22;
+  let max = 1, samples = 0;
+  history.forEach(sample => sample.values.forEach(value => { if (finite(value) && value >= 0) { max = Math.max(max,value); samples++; } }));
+  max = Math.ceil(max*1.15*10)/10;
+  g.font = '9px Segoe UI'; g.textBaseline = 'middle';
+  for (let i=0;i<4;i++) {
+    const y = top+(bottom-top)*i/3;
+    g.strokeStyle = '#2b3035'; g.lineWidth = .6; g.beginPath(); g.moveTo(left,y); g.lineTo(right,y); g.stroke();
+    g.fillStyle = '#77838d'; g.fillText((max*(1-i/3)).toFixed(max < 3 ? 1 : 0),0,y);
+  }
+  g.fillText('60 秒前',left,height-6); g.textAlign = 'right'; g.fillText('现在',right,height-6); g.textAlign = 'left';
+  ['#82b1ed','#b0e868','#b8a0e8'].forEach((color,index) => {
+    g.strokeStyle = color; g.lineWidth = 1.6; g.lineJoin = 'round'; g.beginPath();
+    let started = false;
+    history.forEach(sample => {
+      const value = sample.values[index];
+      if (!finite(value) || value < 0) { started = false; return; }
+      const x = left+(right-left)*(sample.time-now+60)/60, y = bottom-(bottom-top)*value/max;
+      if (started) g.lineTo(x,y); else { g.moveTo(x,y); g.arc(x,y,1.1,0,Math.PI*2); }
+      started = true;
+    });
+    g.stroke();
+  });
+  $('chartEmpty').hidden = samples > 0;
+}
+function peerUrl(ip) {
+  ip = ip.trim();
+  if (!/^(?:\d{1,3}\.){3}\d{1,3}$/.test(ip) || ip.split('.').some(part => Number(part)>255 || String(Number(part))!==part)) return null;
+  return 'http://'+ip+':5143';
+}
+function readConfig() {
+  if (!savedConfig) return null;
+  // MTU、批大小等未显示的参数沿用后台配置。
+  const config = clone(savedConfig);
+  config.peer_url = peerUrl($('c_peer_ip').value) || '';
+  config.adapter = $('c_adapter').value;
+  config.capture.fps = Number($('c_fps').value);
+  config.capture.width = Number($('c_width').value);
+  config.capture.height = Number($('c_height').value);
+  config.capture.transform = $('c_transform').value;
+  config.capture.codec = $('c_codec').value;
+  if (config.capture.codec !== 'raw') {
+    config.capture.bitrate_mbps = Number($('c_bitrate').value);
+    config.capture.max_bitrate_mbps = Number($('c_max_bitrate').value);
+  }
+  config.transport.headroom_pct = Number($('c_headroom').value);
+  return config;
+}
+function fillConfig(config) {
+  savedConfig = clone(config); dirty = false;
+  const match = /^http:\/\/([0-9.]+):\d+$/.exec(config.peer_url || '');
+  const cp = config.capture;
+  const values = {c_peer_ip:match ? match[1] : '',c_fps:cp.fps,c_width:cp.width,c_height:cp.height,
+    c_transform:cp.transform,c_codec:cp.codec,c_bitrate:cp.bitrate_mbps,c_max_bitrate:cp.max_bitrate_mbps,
+    c_headroom:config.transport.headroom_pct};
+  Object.entries(values).forEach(([id,value]) => { $(id).value = value; });
+  const preset = cp.width+'x'+cp.height;
+  $('c_resolution').value = [...$('c_resolution').options].some(option => option.value === preset) ? preset : 'custom';
+  syncCodecFields();
+  if (![...$('c_adapter').options].some(option => option.value === config.adapter)) {
+    const option = document.createElement('option'); option.value = config.adapter;
+    option.textContent = config.adapter ? '已保存 · '+config.adapter : '请选择网络适配器'; $('c_adapter').append(option);
+  }
+  $('c_adapter').value = config.adapter;
+  $('configError').hidden = true;
+  schedulePlan();
+}
+function markDirty(event) {
+  const id = event && event.target && event.target.id;
+  if (id === 'c_resolution' && $('c_resolution').value !== 'custom') {
+    const [width,height] = $('c_resolution').value.split('x');
+    $('c_width').value = width; $('c_height').value = height;
+  } else if (id === 'c_width' || id === 'c_height') $('c_resolution').value = 'custom';
+  syncCodecFields();
+  dirty = !!savedConfig && (JSON.stringify(readConfig()) !== JSON.stringify(savedConfig) || !peerUrl($('c_peer_ip').value));
+  $('configError').hidden = true; syncControls();
+  schedulePlan();
+}
+function syncCodecFields() {
+  const raw = $('c_codec').value === 'raw';
+  $('bitrateFields').hidden = raw;
+  $('c_bitrate').disabled = raw; $('c_max_bitrate').disabled = raw;
+}
+function schedulePlan(refresh = false) {
+  planGeneration++; planRefresh = planRefresh || refresh;
+  clearTimeout(planTimer);
+  text('planTitle','配置已变化，等待重新计算');
+  text('planSummary','计算不保存草稿、不启停进程，也不会自动修改分辨率、帧率或编码。');
+  text('planDetails',''); text('planWarnings','');
+  planTimer = setTimeout(updateStreamPlan,refresh ? 0 : 600);
+}
+function renderStreamPlan(plan) {
+  const network = plan.network, implementation = plan.implementation;
+  const labels = {fits:'带宽预算可容纳',margin:'带宽余量不足',exceeds:'超过已知物理线速',unknown:'链路预算尚不能确认',down:'网卡未连接'};
+  const speed = value => finite(value) && value > 0 ? (value/1e9).toFixed(3)+' Gbps' : '未知';
+  text('planTitle',labels[network.status]+(implementation.supported ? ' · 已有原生路径' : ' · 功能待接通'));
+  $('planTitle').className = !plan.can_start ? 'warn' : network.status === 'fits' ? 'good' : 'muted';
+  text('planSummary','采集端发送 '+speed(network.capture.bps)+' → 主机接收 '+speed(network.host.bps)+
+    '\n'+(network.is_estimate ? '编码均摊估算' : 'NV12 线速需求')+' '+speed(network.wire_bps)+
+    '（含 L2 / VC 包头、FCS、前导码、帧间隙）\n预留 '+network.headroom_pct+'% 后预算 '+speed(network.usable_bps)+
+    (network.max_raw_fps !== null ? ' · 此尺寸理论上限 '+network.max_raw_fps+' fps' : ''));
+  text('planDetails',(implementation.reasons.length ? implementation.reasons.join('\n') : '当前已有 640×640 居中裁切 / Raw NV12 实现。')+
+    '\n本次未探测编解码硬件，也没有进行该参数组合的实机验收。');
+  text('planWarnings',plan.warnings.join('\n'));
+}
+async function updateStreamPlan() {
+  if (planInFlight) { planPending = true; return; }
+  if (!savedConfig) return;
+  if ($('c_peer_ip').value.trim() && !peerUrl($('c_peer_ip').value)) {
+    text('planTitle','请先填写有效的被采集机 IPv4 地址'); return;
+  }
+  const generation = planGeneration, config = readConfig(), refresh = planRefresh;
+  planRefresh = false; planInFlight = true; $('bPlan').disabled = true;
+  text('planTitle','正在检测两端网卡并计算预算…');
+  try {
+    const [code,plan] = await api('/stream/plan',{config,refresh},75000);
+    if (generation !== planGeneration) return;
+    if (code !== 200) throw new Error((plan.details || [plan.error || '预算计算失败']).map(friendlyError).join('\n'));
+    renderStreamPlan(plan);
+  } catch (error) {
+    if (generation === planGeneration) { text('planTitle','预算暂不可用'); text('planSummary',error.message); }
+  } finally {
+    planInFlight = false; $('bPlan').disabled = false;
+    if (planPending) { planPending = false; updateStreamPlan(); }
+  }
+}
+async function save(event) {
+  event.preventDefault();
+  if (busy || !savedConfig) return;
+  if (!$('configForm').reportValidity()) return;
+  if (!peerUrl($('c_peer_ip').value)) {
+    text('configError','请只填写有效的 IPv4 地址，例如 192.168.2.59。'); $('configError').hidden = false;
+    return;
+  }
+  if (hasRunning(lastStatus)) {
+    text('configError','请先停止采集，再修改连接配置。'); $('configError').hidden = false;
+    return;
+  }
+  busy = true; syncControls(); text('saveState','正在保存…');
+  try {
+    const [code,result] = await api('/config',readConfig());
+    if (code !== 200) throw new Error((result.details || [result.error || '保存失败']).map(friendlyError).join('\n'));
+    fillConfig(result.config);
+    configGeneration++;
+    if (lastStatus && lastStatus.local) lastStatus.local.config = clone(result.config);
+    log('本机配置已保存。正在刷新两端连接状态。','good');
+  } catch (error) {
+    text('configError',error.message); $('configError').hidden = false;
+    log('保存失败：'+error.message,'bad');
+  } finally { busy = false; syncControls(); }
+  poll();
+}
+async function action(path, name) {
+  if (busy) return;
+  busy = true; busyAction = name+'中…'; syncControls();
+  const button = $('bCapture'); button.setAttribute('aria-busy','true');
+  log(name+'请求已发出，请稍候。');
+  try {
+    const [code,result] = await api(path,{},100000);
+    const steps = (result.steps || []).map(step => (step.side === 'capture' ? '被采集机' : '主机')+
+      (step.rollback ? '回滚' : '')+'：'+(step.code === 200 ? '完成' : friendlyError(step.result && step.result.error || '操作失败')));
+    const stub = (result.steps || []).some(step => step.result && step.result.args && step.result.args.warning);
+    const ok = code === 200 && result.ok === true;
+    log((stub ? '已启动占位进程，没有真实传输。请构建发收程序。' : name+(ok ? '完成。' : '失败。'))+
+      (result.error ? ' '+friendlyError(result.error) : '')+(steps.length ? ' '+steps.join('；') : ''),stub || !ok ? 'warn' : 'good');
+  } catch (error) { log(name+'失败：'+error.message,'bad'); }
+  finally {
+    busyAction = ''; button.removeAttribute('aria-busy');
+    // 操作后先刷新状态，避免短暂恢复成错误方向的按钮。
+    if (polling) await new Promise(resolve => { const check = () => polling ? setTimeout(check,50) : resolve(); check(); });
+    await poll(); busy = false; syncControls();
+  }
+}
+async function detectAdapters() {
+  if (scanBusy) return;
+  scanBusy = true; $('bAdapters').disabled = true; text('adapterResult','正在检测本机网卡…');
+  try {
+    const [code,result] = await api('/adapters',undefined,35000);
+    if (code !== 200) throw new Error(result.error && /no sender\/receiver binary/.test(result.error) ? '缺少发收程序，请先构建后再检测网卡。' : friendlyError(result.error));
+    const selected = $('c_adapter').value;
+    $('c_adapter').replaceChildren();
+    const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = '请选择网络适配器'; $('c_adapter').append(placeholder);
+    const items = result.items || (result.names || []).map(name => ({name,description:name}));
+    items.forEach(item => { const option = document.createElement('option'); option.value = item.name;
+      option.textContent = (item.label ? item.label+' · ' : '')+item.description+(item.status ? ' · '+item.status : '');
+      $('c_adapter').append(option); });
+    if (selected && !items.some(item => item.name === selected)) {
+      const option = document.createElement('option'); option.value = selected; option.textContent = '已保存 · '+selected; $('c_adapter').append(option);
+    }
+    $('c_adapter').value = selected;
+    text('adapterResult',items.length ? '已自动获取 '+items.length+' 个网络适配器，请选择连接被采集机的网口。' : '没有检测到可用网卡，请检查 Npcap。');
+  } catch (error) { text('adapterResult','检测失败：'+error.message); }
+  finally { scanBusy = false; $('bAdapters').disabled = false; if (savedConfig) schedulePlan(); }
+}
+async function poll() {
+  if (polling) return;
+  clearTimeout(pollTimer); polling = true; $('bRefresh').disabled = true;
+  const generation = configGeneration;
+  try {
+    const [code,status] = await api('/product/status');
+    if (code !== 200 || !status.local || !status.local.config) throw new Error('无法读取控制台状态');
+    if (generation !== configGeneration && savedConfig) status.local.config = clone(savedConfig);
+    render(status);
+  } catch (error) {
+    const wasOnline = !!lastStatus && lastStatus.local.online !== false;
+    const config = savedConfig || {role:'',peer_url:''};
+    render({ts:Date.now()/1000,local:{online:false,config,version:lastStatus && lastStatus.local.version},peer:null});
+    previous = null;
+    if (wasOnline) log('连接中断：'+error.message,'warn');
+  } finally {
+    polling = false; $('bRefresh').disabled = false; pollTimer = setTimeout(poll,1000);
+  }
+}
+function init() {
+  document.querySelectorAll('[data-view]').forEach(button => button.addEventListener('click',() => showView(button.dataset.view)));
+  document.querySelector('.brand').addEventListener('click',event => { event.preventDefault(); showView('overview'); });
+  $('configForm').addEventListener('input',markDirty); $('configForm').addEventListener('change',markDirty);
+  $('configForm').addEventListener('submit',save);
+  $('bReset').onclick = () => { fillConfig(savedConfig); syncControls(); };
+  $('bCapture').onclick = () => { const stopping = readiness(lastStatus,dirty).canStop;
+    action(stopping ? '/product/stop' : '/product/start',stopping ? '停止采集' : '开始采集'); };
+  $('bAdapters').onclick = detectAdapters; $('bRefresh').onclick = poll;
+  $('bPlan').onclick = () => schedulePlan(true);
+  $('bClear').onclick = () => { $('events').replaceChildren(); eventCount = 0; text('eventCount',''); };
+  if (typeof ResizeObserver !== 'undefined') new ResizeObserver(draw).observe($('cv'));
+  window.addEventListener('hashchange',() => showView(location.hash.slice(1)));
+  showView(location.hash.slice(1)); poll(); detectAdapters();
+}
+if (typeof document !== 'undefined') init();
+</script>
+</body>
+</html>
 '''
 
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -1134,7 +2005,9 @@ class H(BaseHTTPRequestHandler):
         if _p5_get(self): return
         if self.path == "/health":
             anyrun = any((state[k].get("proc") is not None and state[k]["proc"].poll() is None) for k in ("sender", "receiver"))
-            self._j({"ok": True, "version": read_version(), "role": state["role"], "running": anyrun, "updater": updater_status(), "pid": os.getpid(), "staged": STAGED.get("version")})
+            self._j({"ok": True, "version": read_version(), "role": state["role"], "running": anyrun, "updater": updater_status(), "pid": os.getpid(), "staged": STAGED.get("version"),
+                     "product_revision": 2, "stream_revision": 1,
+                     "product_role": deployment_role() or load_config()["role"], "root": os.path.abspath(ROOT)})
         elif self.path == "/version":
             self._j({"version": read_version()})
         elif self.path == "/adapters":
@@ -1185,7 +2058,9 @@ class H(BaseHTTPRequestHandler):
         if _p5_post(self, args if isinstance(args, dict) else {}): return
         if self.path == "/sender/start":
             _a = (args if isinstance(args, dict) else {})
-            if not str(_a.get("adapter", "")).strip():
+            if any(key in _a for key in ("width", "height", "transform", "codec", "bitrate_mbps", "max_bitrate_mbps")):
+                self._j({"error": "低层原生 CLI 尚不支持新流参数，请使用 /config 与 /stream/plan；不会忽略参数启动。"}, 409)
+            elif not str(_a.get("adapter", "")).strip():
                 _code, _ad = get_adapters()
                 self._j({"error": "missing --adapter; GET /adapters first", "adapters": _ad}, 400)
             else:
@@ -1193,7 +2068,9 @@ class H(BaseHTTPRequestHandler):
                 self._j({"session_id": sid, "args": info})
         elif self.path == "/receiver/start":
             _a = (args if isinstance(args, dict) else {})
-            if not str(_a.get("adapter", "")).strip():
+            if any(key in _a for key in ("width", "height", "transform", "codec", "bitrate_mbps", "max_bitrate_mbps")):
+                self._j({"error": "低层原生 CLI 尚不支持新流参数，请使用 /config 与 /stream/plan；不会忽略参数启动。"}, 409)
+            elif not str(_a.get("adapter", "")).strip():
                 _code, _ad = get_adapters()
                 self._j({"error": "missing --adapter; GET /adapters first", "adapters": _ad}, 400)
             else:
@@ -1273,8 +2150,9 @@ class H(BaseHTTPRequestHandler):
     def log_message(self, *a): pass
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(); ap.add_argument("--role", default="sender")
-    ap.add_argument("--port", type=int, default=18080)
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--role", default="host", help="host: 主机控制台（默认）；capture: 被采集机后台；兼容 sender/receiver 别名")
+    ap.add_argument("--port", type=int, default=DEFAULT_PORT, help="产品默认 5143；显式端口用于诊断/隔离测试")
     ap.add_argument("--root", default=""); a = ap.parse_args()
     if a.root: ROOT = a.root; RUN_DIR = os.path.join(ROOT, "run"); BUILD_DIR = os.path.join(ROOT, "build"); VERSION_FILE = os.path.join(ROOT, "version.json")
     state["role"] = a.role
@@ -1283,7 +2161,21 @@ if __name__ == "__main__":
     ThreadingHTTPServer.daemon_threads = True
     _gc_versioned_layout()
     ThreadingHTTPServer.allow_reuse_address = True
-    ThreadingHTTPServer(("0.0.0.0", a.port), H).serve_forever()
+    stop_reaper = threading.Event()
+    def _watch_receiver():
+        while not stop_reaper.wait(1):
+            try: reap_vcam()
+            except Exception: pass  # 回收失败保留 managed，下一次重试
+    threading.Thread(target=_watch_receiver, daemon=True).start()
+    server = ThreadingHTTPServer(("0.0.0.0", a.port), H)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop_reaper.set()
+        product_local_stop()
+        server.server_close()
 
 
 

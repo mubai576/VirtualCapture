@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
   update.ps1 — 推版本到双机 agent (P3)。双端 stage→activate→poll /version 一致才退出 0；无 detached 进程。
 .DESCRIPTION
@@ -11,7 +11,7 @@
 .PARAMETER ReceiverIP
   PC2 控制面 IP。
 .PARAMETER Port
-  agent 端口，默认 18080。
+  agent 端口，默认 5143。
 .EXAMPLE
   .\scripts\update.ps1 -VersionZip .\vc-0.1.0.zip -SenderIP 192.168.2.100 -ReceiverIP 192.168.2.59
 #>
@@ -20,7 +20,7 @@ param(
   [string]$VersionZip = "",
   [Parameter(Mandatory = $true)][string]$SenderIP,
   [Parameter(Mandatory = $true)][string]$ReceiverIP,
-  [int]$Port = 18080,
+  [int]$Port = 5143,
   [int]$TimeoutS = 60
 )
 $ErrorActionPreference = "Stop"

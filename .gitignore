@@ -13,5 +13,6 @@ prev/
 *.exe
 *.zip
 *.log
+/vc-config.json
 thirdparty/ninja-win.zip
 .tmp-ota-test/

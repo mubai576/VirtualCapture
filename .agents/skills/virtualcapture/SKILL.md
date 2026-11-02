@@ -11,12 +11,18 @@ All paths below are relative to **project root** unless stated otherwise.
 
 ## What this project is
 
-PC1 keeps `2K240` normal use; only `640x640@240 NV12` (614400 B/frame, ~1.18 Gbps)
-is sent over a 2.5G direct cable via **raw L2 custom EtherType `0x88B5`** (Npcap,
-NIC keeps its control IP) to PC2 for reassembly, hash-verified bit-exact, no codec.
-Transport is dual-host validated (T-06 closed 2026-10-22). Current phase P4: capture perf,
-capture->reassembly latency, PC2 virtual capture card output (DShow). Scope = capture + transport only;
+The capture machine keeps `2K240` normal use; only `640x640@240 NV12` (614400 B/frame, ~1.18 Gbps)
+is sent over the 2.5G link via **raw L2 custom EtherType `0x88B5`** (Npcap,
+NIC keeps its control IP) to the host for reassembly, hash-verified bit-exact, no codec.
+Transport is dual-host validated (T-06 closed 2026-10-22), and P4 capture/transport/DShow work is implemented.
+Current phase is P5 real-use feedback and deployed-baseline preservation: owner reported approximately
+three days of satisfactory use on 2026-11-02. This is not a new zero-loss or continuous-72h acceptance result.
+Current product deployment is PC2 capture -> PC1 host; follow runtime roles, not historical PC labels. Scope = capture + transport only;
 inference side and exclusive-fullscreen hook are out of scope (PLAN D8).
+P6 is now authorized (PLAN D19): configurable output sizes/transforms, link budgeting and additional H.264/H.265
+lossy modes while retaining raw. P6-1 only adds draft configuration/budgeting; the native path is still fixed raw
+640x640. Pending combinations must fail before startup, not silently run the legacy format. The 28 B packet
+header and historical raw test gates remain frozen. See `references/stream-config.md` for staged support.
 
 Repo map, commands, rules and multi-AI conventions: **root `AGENTS.md`** (single source; not repeated here).
 Progress and open decisions: `PLAN.md`. Specs: `docs/spec/` (requirements / test-plan / deployment,
@@ -33,13 +39,14 @@ early docs with dated SUPERSEDED notes). This skill holds the domain knowledge +
 | `references/agent-api.md` | Agent REST contract (/adapters, /files paging, /update stage + /activate). |
 | `references/test-matrix.md` | T0–T5 definitions, D1 gates, triage. |
 | `references/packaging.md` | One-command portable package, contents, output replacement and verification. |
+| `references/stream-config.md` | P6 configuration, capability/budget API and implemented versus pending modes. |
 
 ## Topology (shared-NIC since 2026-10-21: data + control on the same 2.5G port; see docs/history/plan-history.md S11)
 
 - **Data plane**: PC1-PC2 direct 2.5G cable, MTU 9000, EtherType 0x88B5 raw frames via Npcap.
   Raw EtherType and TCP coexist on one NIC, so the NIC keeps its control IP (no IP stripping).
 - **Control plane**: the same NICs on 192.168.2.x (PC1=192.168.2.100, PC2=192.168.2.59). All agent/ctrl HTTP goes here.
-- Sender agent: `http://<pc1-ctrl-ip>:18080`; receiver agent: `http://<pc2-ctrl-ip>:18080`.
+- 产品模式：主机 `--role host`（receiver + GUI），被采集机 `--role capture`（sender 后台，无 UI）；端口固定 5143。当前操作示例 PC1 为主机、PC2 为被采集机，具体角色以启动参数为准。旧传输报告中的 PC1 sender/PC2 receiver 为历史接线，不据此改变运行中部署。
 
 ## Test sources (use these, not static frames)
 
@@ -60,12 +67,12 @@ loss-replay debugging only. Online: 4K-sample spot check; offline: full hash rec
 # 0. Sanity (no hardware): full local gate = python scripts/verify.py ; quick check below
 python ctrl/pattern_ref.py            # expect PASS
 # 0.1 查卡（--adapter 必填，先 GET /adapters 再跑；adapter 空跑必被 agent/ctrl 拒绝）
-# curl http://127.0.0.1:18080/adapters  # -> {text, names[]}，选含 2.5G/Controller 子串
+# curl http://127.0.0.1:5143/adapters  # -> {text, names[]}，选含 2.5G/Controller 子串
 # 1. Control-plane loopback (no second PC needed)
 python agent/vc-agent.py --role sender --port 18081 &
 python ctrl/vc-ctrl.py --sender http://127.0.0.1:18081 --receiver http://127.0.0.1:18081 --seconds 10 --adapter <Loopback子串>
 # 2. Real dual-host T1 (fill in control-plane IPs，双机加 --batch 69 --dst-mac <对端MAC> 单播)
-python ctrl/vc-ctrl.py --sender http://192.168.2.100:18080 --receiver http://192.168.2.59:18080 --seconds 60 --adapter <2.5G子串> --batch 69 --dst-mac <peer-MAC>
+python ctrl/vc-ctrl.py --sender http://192.168.2.59:5143 --receiver http://192.168.2.100:5143 --seconds 60 --adapter <2.5G子串> --batch 69 --dst-mac <host-MAC>
 ```
 
 Pass criteria: T0 loopback hash-clean → T1 dual-host 60 s `dropped==0, hash_mismatch==0`
@@ -90,5 +97,6 @@ Full matrix + thresholds: `references/test-matrix.md`.
 - `references/wire-protocol.md` — L2 frame layout, header fields, MTU/pacing math.
 - `references/test-matrix.md` — T0–T5 definitions, pass thresholds, failure triage.
 - `references/packaging.md` — build/package entry point and portable directory layout.
+- `references/stream-config.md` — P6 draft stream settings, bandwidth math and fail-closed startup boundaries.
 
 

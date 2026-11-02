@@ -99,3 +99,23 @@ def test_product_start_rejects_wrong_peer_role(pair):
     c, r = _req(a, "/product/start", {})
     assert c == 409 and "peer role" in r["error"]
     assert not _req(a, "/sender/stats")[1].get("running") and not _req(b, "/receiver/stats")[1].get("running")
+
+
+def test_stream_plan_http_is_read_only_and_pending_settings_cannot_launch(pair):
+    (_, a), _ = pair
+    assert _req(a, "/health")[1]["stream_revision"] == 1
+    code, capabilities = _req(a, "/stream/capabilities")
+    assert code == 200 and capabilities["native"]["codecs"] == ["raw"]
+    assert capabilities["hardware"]["encoder"] == "unprobed"
+    code, result = _req(a, "/stream/plan", {"config": {"capture": {"width": 416, "height": 416}}})
+    assert code == 200 and result["network"]["status"] == "unknown"
+    assert not result["can_start"]
+    assert _req(a, "/config")[1]["capture"]["width"] == 640
+    assert _req(a, "/stream/plan", {"config": {"capture": {"width": 417}}})[0] == 400
+    assert _req(a, "/config", {"role": "receive", "adapter": "Loopback",
+                               "capture": {"width": 416, "height": 416}})[0] == 200
+    assert _req(a, "/product/local/start", {})[0] == 409
+    assert _req(a, "/product/start", {})[0] == 409
+    for kind in ("sender", "receiver"):
+        assert _req(a, "/" + kind + "/start", {"adapter": "Loopback", "width": 416})[0] == 409
+        assert not _req(a, "/" + kind + "/stats")[1]["running"]

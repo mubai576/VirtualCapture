@@ -6,12 +6,13 @@
 
 ## 启动
 
-1. 双击 `Start-VirtualCapture.cmd`，保持控制服务窗口运行。
-2. 浏览器打开 `http://127.0.0.1:18080/ui`。
-3. 在两台机器各自的控制台填写采集/接收角色、对端地址、本机网卡与目标 MAC，再保存并开播。
-4. 接收机按控制台提示注册虚拟采集卡，下游软件选择 `VirtualCapture`。操作细节见 `docs/runbooks/gui.md`。
+1. 主机双击 `Start-VirtualCapture.cmd`，打开 `http://127.0.0.1:5143/ui`。
+2. 被采集机在登录桌面用户下双击 `Start-Capture-Worker.cmd`，隐藏启动后台；无需浏览器或额外配置。
+3. 主机只填写被采集机 IP，从自动获取的列表选择本机网卡，保存后点击“开始采集”。
+4. 接收开始时自动注册虚拟采集卡，下游选择 `VirtualCapture`；同一按钮切换为“停止采集”，停止后自动回收。
 
-也可在 PowerShell 中运行：`./vc-agent.exe --port 18080`。`vc-monitor.exe` 用于预览，`vc-testwin.exe` 是 DDA 动画测试源。
+也可运行 `./vc-agent.exe --role host`（主机）或 `./vc-agent.exe --role capture`（后台），默认端口 5143。
+`vc-monitor.exe` 用于预览，`vc-testwin.exe` 是 DDA 动画测试源。详见 `docs/runbooks/gui.md`。
 首次使用时 `vc-config.json`、`run/` 由程序创建；包中不含开发机配置或历史日志。
 更新目录前先停止正在使用该目录的程序；保留自己的配置与运行证据。
 
@@ -39,5 +40,5 @@
 文件完整性可按 `package-manifest.json` 内各相对路径的 SHA-256 核对。
 这是完整便携目录；OTA `/update` 仅接受白名单文件，不能直接把整个目录压缩后作为 OTA 包上传。
 
-需要开机任务安装时，以管理员 PowerShell 执行 `scripts/install-pc2.ps1` 并显式指定角色与安装目录。
+`scripts/install-pc2.ps1` 保留历史 SYSTEM 计划任务部署；DDA 采集及主机虚拟卡需要登录用户会话，产品使用上面的启动方式。
 普通手动运行不需要执行安装脚本。打包脚本本身不会注册虚拟卡、修改网卡或部署到其他机器。

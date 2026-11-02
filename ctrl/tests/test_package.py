@@ -46,7 +46,7 @@ def test_package_refuses_unmanaged_output_without_touching_it(tmp_path):
 def test_package_support_files_exclude_caches_tests_and_build_scripts(tmp_path):
     root, stage = tmp_path / "repo", tmp_path / "payload"
     stage.mkdir()
-    for name in ("version.json", "packaging/Start-VirtualCapture.cmd", "docs/runbooks/package-quickstart.md",
+    for name in ("version.json", "packaging/Start-VirtualCapture.cmd", "packaging/Start-Capture-Worker.cmd", "docs/runbooks/package-quickstart.md",
                  "ctrl/run_remote.py", "ctrl/tests/test_private.py", "ctrl/__pycache__/x.pyc",
                  "scripts/runtime-paths.ps1", "scripts/verify.py", "scripts/package.py",
                  "vc-config.json", "run/customer.hash.jsonl"):

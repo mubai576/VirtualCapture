@@ -4,9 +4,13 @@
 
 ## 项目一句话
 
-PC1（2K240 正常使用）只把 `640x640@240 NV12`（614400 B/帧，~1.18 Gbps）经 2.5G 网线以
-raw L2 EtherType `0x88B5`（Npcap）发到 PC2 重组，逐帧 FNV-1a64 对账，零压缩零编解码。
-传输链路已双机验证（T0/T1/T2 全绿，T-06 已关）；当前阶段 = P4 产品链路（采集性能 / 采集→重组延迟 / PC2 虚拟采集卡出口）。
+被采集机（目标 2K240 正常使用）只把 `640x640@240 NV12`（614400 B/帧，~1.18 Gbps）经 2.5G 网线以
+raw L2 EtherType `0x88B5`（Npcap）发到主机重组，逐帧 FNV-1a64 对账，零压缩零编解码。
+传输链路已双机验证（T0/T1/T2 全绿，T-06 已关），P4 链路已落地；稳定版保留 P5 实际使用状态，开发进入 P6 可配置采集与传输。
+当前部署为 PC2 192.168.2.59 采集 → PC1 192.168.2.100 接收/GUI/虚拟卡（:5143），不按历史报告固定角色。
+2026-11-02 owner 确认约三天实际使用满意；封存与未验收边界见 `PLAN.md`、`docs/bringup/bringup-20261102.md`。
+同日 owner 批准进入 P6：可变分辨率、裁切/缩放、链路预算及 H.264/H.265（保留 raw）；
+当前先落地配置/预算，原生管线仍为上述固定 raw 格式，未接通的配置必须拒绝启动。设计见 `docs/proposals/configurable-stream-20261102.md`。
 **范围：只管采集与传输；推理端不在本项目范围**（PLAN D8）。
 
 ## 读什么（按任务）
@@ -34,7 +38,7 @@ raw L2 EtherType `0x88B5`（Npcap）发到 PC2 重组，逐帧 FNV-1a64 对账�
 | `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，NV12 640x640@240，motion 帧源） | C++17 |
 | `receiver/` | `vc-receiver.exe`（重组、hash、stats、hashlog 带 qpc_ns） | C++17 |
 | `tools/` | `monitor/` 预览与诊断、`testwin/` DDA 动画源、`vcam_verify/` DShow 枚举/格式验收 | C++17；随根 CMake 一起构建，现有产物路径保留 |
-| `agent/vc-agent.py` | 双机控制 agent（REST :18080，/exec 白名单，/files 分页，stage/activate OTA） | 单文件零依赖 |
+| `agent/vc-agent.py` | 主机 UI / 被采集机后台（REST :5143，/exec 白名单，/files 分页，stage/activate OTA） | 单文件零依赖 |
 | `ctrl/` | `vc-ctrl.py` 编排判分、`bringup.py` 联调报告、`reconcile.py` 对账、`run_remote.py` 远控/OTA、`vc-monitor-tui.py` 文本仪表、`pattern_ref.py` Python 镜像 | |
 | `ctrl/tests/` | pytest：matrix（向量/判据/live）、OTA、GUI、package（打包保护/回滚/路径） | |
 | `scripts/` | `package.py`（一键编译验证打包）、`verify.py`（本地总闸）、`brn.py`（双机 batch 探针）、`*.ps1`（装机/网卡/更新/watchdog） | |
@@ -52,10 +56,10 @@ python scripts/package.py              # 编译 + 验证 + 全量便携目录 �
 # 已确认包含当前未提交改动时：python scripts/package.py --allow-dirty
 python scripts/verify.py                 # 改完任何代码必跑：build + 双 selftest + pattern_ref + pytest
 python scripts/verify.py --no-build --live Loopback   # 加跑本机回环 live 用例
-curl http://127.0.0.1:18080/adapters     # 查卡；--adapter 必填
-python ctrl/vc-ctrl.py --sender http://192.168.2.100:18080 --receiver http://192.168.2.59:18080 `
-  --seconds 60 --adapter Controller --batch 69 --dst-mac <PC2-MAC>   # 双机 T1
-python ctrl/run_remote.py --agent http://192.168.2.59:18080 --update release/vc-<ver>.zip   # OTA
+curl http://127.0.0.1:5143/adapters     # 查卡；--adapter 必填
+python ctrl/vc-ctrl.py --sender http://192.168.2.59:5143 --receiver http://192.168.2.100:5143 `
+  --seconds 60 --adapter Controller --batch 69 --dst-mac <主机MAC>   # 双机 T1
+python ctrl/run_remote.py --agent http://192.168.2.59:5143 --update release/vc-<ver>.zip   # OTA
 ```
 
 环境：Windows，MSVC 19.44（cmake VS 生成器，cl 不在 PATH），python 3.14，Npcap。PC1=192.168.2.100，PC2=192.168.2.59（agent 手动部署在 PC2 的 Documents\VirtualCapture）。
@@ -63,13 +67,14 @@ python ctrl/run_remote.py --agent http://192.168.2.59:18080 --update release/vc-
 ## 硬规则（违反即打回）
 
 1. 不改包头尺寸/字段顺序；proto 变更须 owner 批。
-2. 像素生成禁用浮点；链路禁止任何压缩。
+2. 像素生成禁用浮点；原有 raw 模式禁止压缩。D19 已单独批准 P6 的 H.264/H.265 有损链路开发，
+   不得将其冒充 raw 逐像素哈希通过；不得静默切编码/降尺寸/降帧率，未实现或未支持的组合须明确拒绝。
 3. 性能结论必须用 `motion`，注明 pattern/batch/adapter；回环数据不得冒充双机结论。
 4. 跨机不比 QPC 绝对值，只报同机时段（inter-arrival、单端分段）。
 5. 不放宽 `references/test-matrix.md` 判据；改判据只能经 owner 决策（记入 PLAN §2）。
 6. 契约变更（CLI/API/IPC/拓扑/判据）必须同一改动内更新 skill `references/` 与 PLAN §1。
 7. 二进制/日志/运行数据不入 git；删除 PASS 报告或 receiver 证据前先归档到 `run/archive.d/`。
-8. 双机跑完**立刻**拉回 PC2 receiver hashlog（`/files` 支持 offset/limit 分页），PC2 run/ 不保证长存。
+8. 双机跑完**立刻**拉回远端完整 hashlog（历史 PC2 receiver，当前 PC2 sender；本机 receiver 证据也保留；`/files` 支持 offset/limit 分页），远端 run/ 不保证长存。
 
 ## 协作约定（多 AI 并行）
 

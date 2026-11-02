@@ -9,6 +9,8 @@
 |---|---|
 | 一键编译验证并打包完整目录 | `python scripts/package.py`；确认包含未提交改动时加 `--allow-dirty` |
 | 本地完整验证 | `python scripts/verify.py` |
+| GUI 前端状态逻辑 | `python -m pytest ctrl/tests/test_gui_client.py -q`；需要开发机有 Node.js，无 npm 依赖，agent 运行不需要 Node.js |
+| 主机/后台与虚拟卡生命周期 | `python -m pytest ctrl/tests/test_gui_host.py -q`；使用进程与注册替身，不操作真实注册表 |
 | 本机回环 live | `python scripts/verify.py --no-build --live Loopback` |
 | 查看构建产物时间 | `python scripts/check_bins.py` |
 | Python 测试源自检 | `python ctrl/pattern_ref.py` |
@@ -35,6 +37,8 @@
 | 用途 | 入口 |
 |---|---|
 | 安装 / OTA / watchdog | `scripts/install-pc2.ps1`、`scripts/update.ps1`、`scripts/update_sender.ps1`、`scripts/watchdog.ps1` |
+| 被采集机后台启动 | `scripts/start-capture-worker.ps1`；当前登录用户会话隐藏启动，控制端口 5143；主机 UI 用法见 `gui.md` |
+| 主机完整项目启动 | `scripts/start-host.ps1`；共用 `scripts/start-agent.ps1` 校验角色/目录并复用服务，支持 `-NoBrowser` |
 | 网卡检查 / 调优 | `scripts/netinfo.ps1`、`scripts/check_mtu.ps1`、`scripts/set_nic.ps1`、`scripts/tune_pc1_nic.ps1` |
 | 发端 / DDA 联调 | `scripts/run_T1.ps1`、`scripts/run_dda_sender.ps1`、`scripts/kill_sender.ps1` |
 | batch 探针 | `scripts/brn.py`、`scripts/batch_test.ps1` |

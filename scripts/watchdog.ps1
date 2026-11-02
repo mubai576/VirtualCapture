@@ -1,5 +1,5 @@
-# watchdog.ps1 - backstop probe for vc-agent.
-param([int]$Port = 18080, [string]$TaskName = "vc-agent", [int]$QuietMinutes = 10)
+﻿# watchdog.ps1 - backstop probe for vc-agent.
+param([int]$Port = 5143, [string]$TaskName = "vc-agent", [int]$QuietMinutes = 10)
 $listening = $false
 try { $c = Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop; if ($c) { $listening = $true } } catch { }
 $ok = $false

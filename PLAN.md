@@ -1,11 +1,17 @@
-# PLAN：VirtualCapture Phase 3（收口 ✅ → 双机放行 ✅ → 产品链路 P4）
+# PLAN：VirtualCapture（P5 稳定版封存 → P6 可配置采集与传输）
 
 > 入口与规则见根目录 `AGENTS.md`。本文件只放：现状、冻结契约、待决事项、当前任务卡。
 > 完成一项在卡头标 DONE + 一行证据；长证据写 `docs/bringup/` 或 `docs/proposals/`，这里只放链接。
 > 档案（只读）：旧 PLAN 全文与 "hist S11/S23/…" 编号 → `docs/history/plan-history.md`；
 > 已关闭的 P1~P3 卡原文 → `docs/history/phase3-closed-cards.md`。
 
-## 0. 现状快照（2026-10-23 EOD）
+## 0. 现状快照（2026-11-02；P6 进度更新 2026-11-03）
+
+P4 历史测试结论保留；2026-11-02 已只读封存当前部署，不新增性能结论。owner 已反馈约三天实际使用满意，优先保住已用版本，不追加压力测试或扩展 G3/G4。详见 `docs/bringup/bringup-20261102.md`。
+
+封存后 owner 已批准继续开发（D19）：分辨率预设 `416×416 / 640×640 / 720p / 1080p / 1440p` + 自定义，
+裁切/缩放、双端链路预算、H.264/H.265。P6-1 配置与预算已完成隔离验证；下一步 P6-2 原生可变尺寸。
+现有部署不替换，原生数据面尚未扩展。
 
 | 维度 | 状态 |
 |---|---|
@@ -18,11 +24,15 @@
 | P4-4 虚拟卡验收 | ✅ DONE 2026-10-23：三判据全通（J1 枚举/J2 NV12 640x640@240/J3 35069帧零错+SHM hash 27/27一致）；tools/vcam_verify/ + scripts/p4_4_shm_verify.py；docs/bringup/bringup-20261023-p4-4-vcam-acceptance.md |
 | 产品链路 P4 | ✅ P4-1/2/3/4 全部完成 |
 | 网卡调优 | ✅ PC2 I226-V: FlowControl=0, ITR=0（D14，docs/runbooks/pc2-nic-tuning.md）；PC1 Realtek 已同等设置 |
-| 版本 | 本机/PC1 0.4.1（scripts/PS1/sender 已更新）；PC2 主 agent 0.4.0（D9 待手动重启） |
+| P5 实际使用 | owner 于 2026-11-02 确认约三天实际效果测试、目前满意；不等同连续 72h 或全量零丢帧验收 |
+| 当前部署 | PC1 192.168.2.100 = host（I226-V，receiver + GUI + vcam）；PC2 192.168.2.59 = capture（Realtek 2.5G，sender）；两端 :5143 在线，封存时均停止采集 |
+| 版本与来源 | 两端 /health 均报 0.4.1 / product_revision=2；成品清单逐字节一致；主机 87 项载荷哈希通过，封存前 299 项源码与成品记录一致；远端实际二进制尚未独立核验 |
+| 已用版本封存 | `archive/baseline-20261102-230617/`：主机成品、双端配置/当前完整 hashlog、源码工作区和 Git bundle；未编译、重启、提交或 OTA |
 
 环境：MSVC 19.44（cmake VS 生成器直连，cl 不在 PATH）、python 3.14、Npcap 运行时、
-`thirdparty/npcap-sdk` + `thirdparty/ninja` 已 vendor。拓扑：同网口方案，PC1=192.168.2.100，
-PC2=192.168.2.59（agent 手动跑在 PC2 的 Documents\VirtualCapture，exe 在根目录），联调发单播 `--dst-mac`。
+`thirdparty/npcap-sdk` + `thirdparty/ninja` 已 vendor。当前产品接线：PC2=192.168.2.59 被采集，
+PC1=192.168.2.100 接收；历史报告中的 PC1 sender / PC2 receiver 不代表当前角色。主机 ROOT 为 `dist/VirtualCapture`，
+采集后台 ROOT 为 `C:\Users\s1973\Documents\VirtualCapture`，端口 5143；没有变更 IP、网卡或运行配置。
 
 ## 1. 冻结契约（改即全线返工，须 owner 批准）
 
@@ -56,10 +66,14 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 - sender stats 新增 `gpu_convert`（0/1，采集走 CPU 还是 GPU compute shader；GPU 失败显式报错，不静默回退）。
 - P4-2步骤1（免协议改动）：receiver stats 新增 `rseg_avg_ms/rseg_p50_ms/rseg_p99_ms/rseg_max_ms`（R(N)=首包到达→重组完成，同机QPC）；sender stats 新增 `pc1_seg_avg_ms/pc1_seg_p99_ms/pc1_seg_max_ms`（PC1段=采集/生成完成→末包发出，同机QPC）；确认包（flags bit1）仍待 owner 终审后做步骤2。
 - P5 GUI（D16）：agent 新增 `/ui`、`/config`（ROOT/vc-config.json）、`/vcam/status|register`、`/product/{start,stop,status}`、`/product/local/{start,stop}`；`/sender/start` 可选 `gpu_convert`。详见 agent-api.md。
+- P5-U2（D17）：仅主机（默认 `--role host`）提供 UI，收端角色固定；被采集机 `--role capture` 仅后台。产品控制端口 5143，UI 只填 IPv4，网卡自动枚举后下拉选择；主机下发采集参数，对端按控制路由匹配网卡。默认 SHM 固定隐藏，接收前注册 vcam，停止/失败/子进程退出时回收；开始/停止采集合为一个按钮。API 追加能力标记、网卡详情与生命周期语义，详见 agent-api.md；数据面与判据不变。
+- P5-U2 后续精简：连接配置仅显示 IP、网卡和目标帧率，移除画面来源、像素转换、发送批大小及 MTU；隐藏参数沿用后台配置，保存时保留原值，底层 API 与默认值不变。
+- P5-U3 后端整合：产品启动约 1 秒存活检查，提前退出失败并回滚；stats 追加进程诊断和实际采集方式，界面等待首帧。`/health.root` 支持启动器校验同目录/同角色复用；主机与采集后台各有便携启动入口。契约见 agent-api.md、packaging.md。
+- P6-1（D19）：配置新增输出宽高、crop/fit/fill/stretch、raw/h264/hevc、目标/最大码率与链路预留余量；旧配置仍为 640×640 / crop / raw。新增只读 `GET /stream/capabilities` 与草稿 `POST /stream/plan`，`/adapters` 追加数值型收/发链路速率，`/health.stream_revision=1`。原生尚未接通的新组合可保存，但在注册/启动前 409 拒绝；禁止低层接口静默忽略新流参数。预算使用 mtu-42 和完整 L2 线速开销，不是实测吞吐或帧率保证；速率未知不冒充可行。完整契约见 skill `references/stream-config.md`。
 - 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 614400B。
 
 ### 1.5 全局禁止
-1. 不改包头尺寸/字段顺序。 2. 像素生成禁用浮点。 3. 链路禁止任何压缩。
+1. 不改包头尺寸/字段顺序。 2. 像素生成禁用浮点。 3. 原有 raw 模式禁止压缩；D19 单独批准新增 H.264/H.265 有损模式，不得复用 raw 逐像素哈希门来声称有损正确性。
 4. 性能宣称必须用 `motion` 并注明 pattern/batch/adapter。 5. 跨机不报 QPC 差值延迟，只报 inter-arrival。
 6. 不许拿回环数据冒充双机结论。 7. 不许放宽 test-matrix 判据（改判据只能经 D1）。
 注：UNORM 解码允许 float（B8G8R8A8_UNORM→float→floor(v*255+0.5) 属格式转换，非像素生成；结果必须和 CPU 参考逐字节一致，dda_gpu 自测已证）；不许拿它当先例去别处用 float。
@@ -85,12 +99,15 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 | D10 | P4-1 测量口径与 idle 语义 | ✅批（2026-10-24）：`gpu_ms` 切真 GPU 时间待 PC1 2K240 实测分布后再定，`gpu_dispatch_ms` 先作诊断；dda selftest 连续 5x E_TIMEOUT（2.5s 无新帧）判 SKIP（idle 与故障不可分，live 已容忍超时） | P4-1 |
 | D14 | PC2 网卡调优（I226-V） | ✅执行（2026-10-23，AI 操作，owner 可回滚）：FlowControl=0、ITR=0、EEE=0、InterruptModeration=0；实测 rseg_max 1015ms→35ms（-97%），rseg_p99 8.3ms→6.7ms（-19%），全程 p99 12ms→9.8ms；步骤见 docs/runbooks/pc2-nic-tuning.md；回滚命令见同文件 | P4-2 |
 | D15 | 端到端延迟优化 1+2 组（含 shm v2 IPC 变更） | ✅批（2026-10-28，owner"1 2 一起优化"）：见 §1.4 shm v2 条；本机回环 motion/240/batch1 实测 pc1_seg 1.03→0.37ms、rseg 2.34→0.39ms、vcam 出口 vseg avg 0.03ms（旧轮询理论 +2.1ms）；双机（PC2 发→PC1 收+vcam，motion/240/batch69）rseg p99 6.70→2.05ms、max 35→2.26ms，vseg p99 0.08ms，7200 帧对账零错；证据 docs/bringup/bringup-20261028-latency-opt.md。PC2 已推 0.4.2（发版号 AI 暂定，owner 可改）；v1/v2 不互通，下游须重开 | ✅已部署 |
-| D16 | P5 GUI 整合方案 | ✅批 A（2026-10-29，owner）：agent 内置 Web UI；首批 G0 统一配置 + G1 仪表 + G2 一键开播已落地（agent/vc-agent.py、ctrl/tests/test_gui.py，操作见 docs/runbooks/gui.md）。未定：WebView2 外壳、访问控制，按默认（两台都可开控制台、无鉴权）先行 | P5 G3/G4 |
-| D9 | 本机主 agent 换代到 0.4.0 | ⏳待执行：agent 改动已由另一会话提交（d15287d），阻塞解除。注意 2026-10-23 00:10 对该进程 stage 成功但 /activate 无应答且未换代（pid 不变），建议直接手动重启本机 agent（本机，可逆），换代后 /health 应出新 pid | — |
+| D16 | P5 GUI 整合方案 | ✅批 A（2026-10-29，owner）：agent 内置 Web UI；首批 G0/G1/G2 已落地。双端均有 UI 的初始默认已由 D17 替代；WebView2 外壳、访问控制仍未定 | P5 G3/G4 |
+| D17 | 主机 UI 与采集后台分工 | ✅批（2026-10-29，owner 本轮要求）：取消角色选项，只有主机 UI；对端只填 IP，固定端口 5143；自动获取网卡后选择；SHM 隐藏固定；开始接收自动注册、结束自动回收；取消对端页面跳转；开始/停止采集共用按钮。实现与迁移见 docs/proposals/gui-host-20261029.md | P5-U2 |
+| D9 | 本机主 agent 换代到 0.4.0 | ✅被后续部署覆盖（2026-11-02 只读核对）：当前两端均为 0.4.1 / product_revision=2，不再为旧 0.4.0 事项重启。2026-10-23 的 activate 无应答记录保留为历史，不据此声称该竞争已修复 | — |
+| D18 | 实际使用反馈与本轮收口范围 | ✅owner（2026-11-02）：约三天实际使用、目前满意；按计划先封存已用版本、补准确状态、整理现有改动。使用反馈不代替 test-matrix 验收；不放宽门限、不改数据链路、不自动提交或发版。远端实际二进制封存仍需本地导出或可读共享 | P5-U4 |
+| D19 | 可配置采集与编解码扩展 | ✅owner（2026-11-02）：允许新增 H.264/H.265 有损链路，保留 raw；允许可变尺寸会话/SHM/虚拟卡契约扩展；预设 416、640、720p、1080p、1440p + 自定义宽高/帧率。28B 包头不因本授权自动解冻，历史 raw 判据不变，稳定部署不自动替换。按阶段落地，不把预算或选项存在当成原生能力/实测验收。设计见 docs/proposals/configurable-stream-20261102.md | P6 |
 
 ## 3. 任务卡
 
-派发顺序：`P4-1 × P4-3 并行` → `P4-2` → `P4-4（需 P4-3）`。每卡交付附验收命令完整 stdout；改代码必跑 `python scripts/verify.py`。
+当前优先：P6 分阶段开发；P5 已用版本封存保留，G3/G4 暂不推进。P4 卡保留历史完成证据；改代码必跑 `python scripts/verify.py`，不重建/替换正在使用的 dist 成品。
 
 ### 已关闭（原文见 docs/history/phase3-closed-cards.md）
 
@@ -107,7 +124,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 - stop 记来源 IP：agent 侧已提交（d15287d，写 run/exec.log），随下个版本上 PC2。
 - /activate 应答与 execv 竞争导致 RST，调用方靠轮询 /version；可改为先回应答再 execv。
 - T2 重跑盯：发端 203.5ms 间隔（batch69 后首次 >20ms）、外部 stop 是否复发。
-- PC2：role 标签仍为 sender（仅显示）；计划任务/watchdog 是否覆盖 Documents 部署未核实。
+- PC2 当前已为 capture 后台（2026-11-02 /health）；计划任务/watchdog 是否覆盖 Documents 部署仍未核实，本轮不调整启动方式。
 - 直连线：owner 决定短期不考虑；线到后补 广播 vs 单播 T2。
 
 ### S1 项目结构整理 — DONE（2026-10-29）
@@ -117,6 +134,38 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 ### S2 一键编译打包 — DONE（2026-10-29）
 
 `python scripts/package.py --allow-dirty` 实际生成 `dist/VirtualCapture/`（含当前 GUI）；verify ALL PASS（42 passed / 3 skipped）+ 成品隔离冒烟/PowerShell 5.1 检查/79 项载荷哈希通过。证据：`docs/proposals/packaging-20261029.md`。
+
+### P5-U1 GUI 优化 — DONE（2026-10-29）
+
+总览/连接配置改版，修复编辑覆盖、离线/桩进程指标与会话帧率基线；verify ALL PASS（46 passed / 4 skipped），桌面/窄屏及隔离双端交互通过。证据：`docs/proposals/gui-20261029.md`；当时未打包，后续已并入 U3 成品，当前来源核对见 `docs/bringup/bringup-20261102.md`。
+
+### P5-U2 主机 UI 与采集后台 — DONE（2026-10-29）
+
+落实 D17：主机专属 UI、固定 5143/纯 IP、网卡下拉选择、自动虚拟卡生命周期及统一开始/停止按钮；配置精简为 IP/网卡/目标帧率。verify ALL PASS（58 passed / 4 skipped）+ PowerShell 5.1 解析与隔离浏览器保存验证通过。证据：`docs/proposals/gui-host-20261029.md`；该轮仅隔离验证，后续打包与使用状态见 U3/U4，不回填未经专项验证的注册表结论。
+
+### P5-U3 后端与完整项目整合 — DONE（本机实现 2026-10-29；实际使用确认 2026-11-02）
+
+主机/后台真实编排、启动失败回传、实际会话状态与两个启动入口已接通；2026-10-29 本机 verify 含 Loopback live：65 passed / 2 skipped。motion 26957 帧、DDA 7431 帧收发全量对账零缺零错，两轮 SHM 各 20/20 一致，DShow 实际取帧通过。证据：`docs/proposals/gui-integration-20261029.md`。截至 2026-11-02 两端已上线，owner 约三天实际使用满意；专项自动化双机验收不据此补判通过。
+
+### P5-U4 已用版本封存 — 主机 DONE / 远端二进制待独立导出（2026-11-02）
+
+主机成品 87/87 哈希通过，封存前源码 299/299 与成品记录一致；双端清单/配置/最新完整 hashlog、源码及 Git bundle 已保全，原文件不动。证据：`docs/bringup/bringup-20261102.md`；远端仅文本接口可读，16 项 PE 文件只核对存在与大小，不冒充实际字节备份。历史 dropped=1 保留观察，不阻塞日常使用，也不改为零丢帧通过。
+
+### P6-1 GUI 配置与链路预算 — DONE（2026-11-03）
+
+五档预设 + 自定义、四种裁切/缩放草案、raw/H.264/H.265 规划、两端方向速率及 L2 线速预算；verify ALL PASS（122 passed / 4 skipped）+ Edge 隔离桌面/手机宽度 13 项检查通过。原生/包头/SHM/部署未修改，未实现组合拒绝启动；稳定成品 87/87 与封存 424/424 完整性复核通过。证据：`docs/proposals/configurable-stream-20261102.md`。
+
+### P6-2 可变尺寸 raw 全链路 — TODO
+
+会话协商、DDA/GPU 整数变换、明确的帧率上限、receiver 动态帧缓冲、版本化 SHM、monitor/验证器/DShow 格式与重连；默认 640 raw 逐字节回归，先隔离回环再双机，不改 28B 包头或历史判据。
+
+### P6-3 编解码能力与后端 — TODO
+
+分别探测采集端编码器与主机解码器，先实测低延迟后端再接 H.264/H.265；保留 raw，不静默回退。定义有损模式的传输完整性、解码、画质与丢包恢复证据，不能拿编码前后 NV12 相等判通过。
+
+### P6-4 组合验收与交付 — TODO
+
+raw / 编码分开验收，motion、尺寸/帧率/模式/网卡/batch 全记录；双机证据与完整 hashlog 保全。未专项验收的组合不标已达标，owner 确认后再安排发布/切换，稳定版可回退。
 
 ### P4 产品链路（按 docs/spec/requirements.md；提案与批示见 docs/proposals/）
 
@@ -139,6 +188,6 @@ P4-4 虚拟卡出口验收（不含推理）：DONE 2026-10-23
      J3 PASS：35069帧 shm_published==complete, dropped=0, hash_mismatch=0；SHM FNV-1a64 采样 27/27 与 receiver hashlog 一致。
      验收工具：build/vcam_verify/Release/vc-vcam-verify.exe + scripts/p4_4_shm_verify.py。
      证据：docs/bringup/bringup-20261023-p4-4-vcam-acceptance.md。
-范围外：推理端及其联调（D8）、独占全屏 Hook、分辨率超 2.5G 链路后的编解码方案（另立项，hist S24）。
+P4 原范围外：推理端及其联调（D8）、独占全屏 Hook。原“超 2.5G 后编解码另立项”（hist S24）已由 D19 解锁为 P6，非 P4 历史验收的一部分。
 owner 待决：①全程延迟门限 <10ms；②gpu_convert 默认开；③确认包是否实现；④T5 门限数字。
 ```

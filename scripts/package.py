@@ -1,5 +1,6 @@
 """编译、验证并生成完整便携目录：python scripts/package.py [--allow-dirty]。"""
 import argparse
+from contextlib import contextmanager
 from datetime import datetime, timezone
 import hashlib
 import importlib.metadata
@@ -13,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.request
 import uuid
 
@@ -71,7 +73,8 @@ def source_snapshot(root):
 
 def copy_support_files(root, stage):
     shutil.copy2(root / "version.json", stage / "version.json")
-    shutil.copy2(root / "packaging" / "Start-VirtualCapture.cmd", stage)
+    for name in ("Start-VirtualCapture.cmd", "Start-Capture-Worker.cmd"):
+        shutil.copy2(root / "packaging" / name, stage)
     shutil.copy2(root / "docs/runbooks/package-quickstart.md", stage / "README.md")
     # Copy only source scripts/docs, never caches, test data, local config or logs.
     for folder in ("ctrl", "scripts"):
@@ -93,7 +96,8 @@ def copy_support_files(root, stage):
 
 def require_payload(stage):
     required = (*NATIVE_FILES, *RUNTIME_FILES, "vc-agent.exe", "version.json",
-                "Start-VirtualCapture.cmd", "README.md")
+                "Start-VirtualCapture.cmd", "Start-Capture-Worker.cmd", "README.md",
+                "scripts/start-agent.ps1", "scripts/start-host.ps1", "scripts/start-capture-worker.ps1")
     missing = [name for name in required if not (stage / name).is_file()]
     if missing:
         raise PackageError("成品缺少必需文件：" + ", ".join(missing))
@@ -149,6 +153,23 @@ def run(argv, log, cwd=ROOT):
         raise PackageError(f"命令失败（退出码 {code}）：{subprocess.list2cmdline(argv)}")
 
 
+@contextmanager
+def smoke_directory():
+    directory = tempfile.TemporaryDirectory(prefix="vc-package-smoke-")
+    try:
+        yield Path(directory.name)
+    finally:
+        # Windows can retain the onefile image briefly after its process tree exits.
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                directory.cleanup()
+                break
+            except PermissionError:
+                if time.monotonic() >= deadline: raise
+                time.sleep(0.2)
+
+
 def smoke(stage, version, log):
     powershell = Path(os.environ["SystemRoot"]) / "System32/WindowsPowerShell/v1.0/powershell.exe"
     parser = r"""
@@ -167,8 +188,7 @@ Write-Output 'PASS PowerShell 5.1 scripts and portable binary lookup'
 """
     run([powershell, "-NoProfile", "-NonInteractive", "-Command", parser], log, cwd=stage)
     # An isolated runtime root checks the distributed files without touching the live agent.
-    with tempfile.TemporaryDirectory(prefix="vc-package-smoke-") as tmp:
-        sandbox = Path(tmp)
+    with smoke_directory() as sandbox:
         for p in stage.iterdir():
             if p.is_file() and (p.suffix in (".exe", ".dll") or p.name == "version.json"):
                 shutil.copy2(p, sandbox / p.name)
@@ -195,7 +215,9 @@ Write-Output 'PASS PowerShell 5.1 scripts and portable binary lookup'
                     if time.monotonic() >= deadline:
                         raise PackageError("成品 agent 启动超时") from None
                     time.sleep(0.2)
-            if not health.get("ok") or health.get("version") != version:
+            if (not health.get("ok") or health.get("version") != version
+                    or health.get("product_role") != "receive" or health.get("product_revision") != 2
+                    or Path(health.get("root", "")) != sandbox):
                 raise PackageError(f"成品 agent 健康检查/版本不符：{health}")
             # The GUI is built into the agent; verify it survives freezing.
             with urllib.request.urlopen(base + "/ui", timeout=5) as r:
@@ -210,6 +232,40 @@ Write-Output 'PASS PowerShell 5.1 scripts and portable binary lookup'
         finally:
             if proc.poll() is None:
                 # PyInstaller onefile has a bootloader parent and a server child.
+                subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            proc.wait(timeout=10)
+        # The capture worker must expose the control API without serving a GUI.
+        proc = subprocess.Popen([str(sandbox / "vc-agent.exe"), "--role", "capture", "--port", str(port)],
+                                cwd=sandbox, stdout=log, stderr=subprocess.STDOUT,
+                                creationflags=subprocess.CREATE_NO_WINDOW)
+        try:
+            deadline = time.monotonic() + 30
+            while True:
+                if proc.poll() is not None:
+                    raise PackageError("成品采集后台提前退出")
+                try:
+                    with urllib.request.urlopen(base + "/health", timeout=1) as r:
+                        health = json.load(r)
+                    break
+                except OSError:
+                    if time.monotonic() >= deadline:
+                        raise PackageError("成品采集后台启动超时") from None
+                    time.sleep(0.2)
+            if (health.get("product_role") != "capture" or health.get("version") != version
+                    or Path(health.get("root", "")) != sandbox):
+                raise PackageError(f"成品采集后台角色/版本/路径不符：{health}")
+            for path in ("/", "/ui", "/ui/"):
+                try:
+                    urllib.request.urlopen(base + path, timeout=5).close()
+                except urllib.error.HTTPError as error:
+                    if error.code == 404: continue
+                    raise
+                raise PackageError("采集后台不应提供 GUI：" + path)
+            print("PASS 成品采集后台 /health 与 UI 404", flush=True)
+            log.write("PASS frozen capture worker health + no GUI\n")
+        finally:
+            if proc.poll() is None:
                 subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             proc.wait(timeout=10)
