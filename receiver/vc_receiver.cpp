@@ -33,6 +33,7 @@
 #include "fnv1a.h"
 #include "crc32.h"
 #include "../common/stream.h"
+#include "../common/codec_session.h"
 
 #ifdef _WIN32
 static volatile LONG g_stop = 0;
@@ -64,6 +65,7 @@ static uint64_t qpc_ns_now(){
 
 struct Args{
   VCStream stream;
+  VCCodec codec;
   std::string source_mac;
   std::string adapter="";
   uint16_t ethertype=0x88B5; int mtu=9000;
@@ -71,6 +73,7 @@ struct Args{
   long long timeout_s=0; long long expect_frames=-1;
   std::string shm="";  // P4-3: publish latest complete frame to named file mapping ("" = off)
   bool selftest=false;
+  bool codec_check=false;
 };
 static uint16_t parse_et(const std::string&s){
   // 解析协议号
@@ -85,6 +88,9 @@ static void usage(){
   printf("vc-receiver.exe --adapter <substr> --ethertype 0x88B5 --mtu 9000\n"
     "  [--width 640 --height 640 --fps 240 --source-mac <session MAC>] [--capabilities]\n"
     "  --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]\n");
+  puts("  codec: --codec h264|hevc --codec-backend <CLSID|name:exact> --codec-hardware 0|1\n"
+       "  --bitrate 20000000 --max-bitrate 80000000 --gop 60 --decode-in-flight 2 --max-au-bytes 8388608\n"
+       "  --codec-backends | --codec-check <codec options> | --au-selftest");
 }
 static void ensure_parent(const std::string&path){
   // 建父目录
@@ -548,13 +554,18 @@ static std::string vseg_json(const VstatReader& vs,unsigned long long hq_max){
   return b;
 }
 
+#include "encoded_receiver.h"
+
 int main(int argc,char**argv){
   qpc_init();
   Args a;
   for(int i=1;i<argc;i++){
     std::string k=argv[i];
     auto need=[&](std::string&out){ if(i+1>=argc){fprintf(stderr,"missing value for %s\n",k.c_str());exit(2);} out=argv[++i]; };
-    if(k=="--capabilities"){ puts(vc_stream_capabilities()); return 0; }
+    if(k=="--capabilities"){ puts(vc_codec_capabilities()); return 0; }
+    else if(k=="--codec-backends"){return vc_codec_backends(false);}
+    else if(k=="--codec-check"){a.codec_check=true;}
+    else if(k=="--au-selftest"){return vcau::selftest();}
     else if(k=="--width"){ std::string v; need(v); a.stream.width=vc_cli_int(v); }
     else if(k=="--height"){ std::string v; need(v); a.stream.height=vc_cli_int(v); }
     else if(k=="--fps"){ std::string v; need(v); a.stream.fps=vc_cli_int(v); }
@@ -570,15 +581,16 @@ int main(int argc,char**argv){
     else if(k=="--shm"){need(a.shm);}
     else if(k=="--selftest"){a.selftest=true;}
     else if(k=="--help"||k=="-h"){usage();return 0;}
-    else {fprintf(stderr,"unknown arg %s\n",k.c_str());usage();return 2;}
+    else {std::string v;need(v);if(!a.codec.option(k,v)){fprintf(stderr,"unknown arg %s\n",k.c_str());usage();return 2;}}
   }
 #ifdef _WIN32
   SetConsoleCtrlHandler(chandler, TRUE);
 #endif
   if(a.selftest) return run_selftest();
   uint8_t source_mac[6];
-  if(!a.stream.valid() || a.mtu<=42 || a.mtu>9042 || (a.stream.frame_bytes()+(a.mtu-43))/(a.mtu-42)>65535 ||
+  if(!a.stream.valid() || !a.codec.valid(a.mtu) || a.mtu<=42 || a.mtu>9042 || (!a.codec.encoded() && (a.stream.frame_bytes()+(a.mtu-43))/(a.mtu-42)>65535) ||
       (!a.source_mac.empty() && !vc_parse_mac(a.source_mac,source_mac))){ fprintf(stderr,"invalid stream configuration\n"); return 2; }
+  if(a.codec_check){if(!a.codec.encoded())return 2;return vc_codec_check(a.codec,a.stream,false);}
   if(a.stats.empty()) a.stats="run/"+a.session+".receiver.stats.json";
   if(a.hashlog.empty()) a.hashlog="run/"+a.session+".receiver.hash.jsonl";
   printf("[receiver] session=%s mtu=%d ethertype=0x%04x timeout=%lld expect=%lld\n",
@@ -650,6 +662,7 @@ int main(int argc,char**argv){
 #else
   fprintf(stderr,"live capture only on Windows/Npcap\n"); return 1;
 #endif
+  if(a.codec.encoded()){int result=run_encoded_receiver(a,d,h);d.closeh(h);return result;}
   FramePool pool(a.stream);
   Reassembler R(a.mtu,&pool,a.stream);
   R.inline_verify=false;   // 哈希/比对/hashlog 移出关键路径（哈希线程）

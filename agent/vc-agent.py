@@ -157,6 +157,9 @@ def launch(kind, args):
         if kind == "receiver": cmd += ["--fps", str(args.get("fps", 240))]
         if kind == "sender": cmd += ["--transform", str(args.get("transform", "crop"))]
         if args.get("source_mac"): cmd += ["--source-mac", args["source_mac"]]
+    if args.get("codec", "raw") != "raw":
+        capture = _merge(CONFIG_DEFAULT["capture"], {key: args[key] for key in ("codec", *CODEC_FIELDS) if key in args})
+        cmd += codec_cli(capture, kind)
     # 过滤空网卡参数
     cmd2 = []
     skip_next = False
@@ -912,7 +915,10 @@ CONFIG_DEFAULT = {
     "adapter": "",       # 本机 2.5G 网卡子串（--adapter）
     "capture": {"mode": "dda", "pattern": "motion", "gpu_convert": True, "fps": 240, "batch": 69,
                 "mtu": 9000, "dst_mac": "ff:ff:ff:ff:ff:ff", "width": 640, "height": 640,
-                "transform": "crop", "codec": "raw", "bitrate_mbps": 50, "max_bitrate_mbps": 80},
+                "transform": "crop", "codec": "raw", "bitrate_mbps": 50, "max_bitrate_mbps": 80,
+                "codec_experimental": False, "encoder_backend": "", "decoder_backend": "",
+                "encoder_hardware": True, "decoder_hardware": False, "gop_frames": 60,
+                "decode_in_flight": 2, "max_au_bytes": 8388608},
     "transport": {"headroom_pct": 20},
     "receive": {"shm": "Local\\VirtualCaptureVcamFrame", "mtu": 9000, "vcam_autoregister": True},
 }
@@ -982,6 +988,16 @@ def validate_config(c):
         e.append("capture.transform 必须是 crop|fit|fill|stretch。")
     if cp.get("codec") not in ("raw", "h264", "hevc"):
         e.append("capture.codec 必须是 raw|h264|hevc。")
+    for key in ("codec_experimental", "encoder_hardware", "decoder_hardware"):
+        if not isinstance(cp.get(key), bool): e.append("capture.%s 必须是布尔值。" % key)
+    for key in ("encoder_backend", "decoder_backend"):
+        value = cp.get(key)
+        if not isinstance(value, str) or len(value) > 256 or (value and not (
+                _re.fullmatch(r"\{[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}", value)
+                or value.startswith("name:") and len(value) > 5 and all(ord(char) >= 32 for char in value))):
+            e.append("capture.%s 必须是明确的 MFT CLSID 或 name:精确名称。" % key)
+    for key, lo, hi in (("gop_frames", 1, 1000), ("decode_in_flight", 1, 8), ("max_au_bytes", 1024, 16777216)):
+        if not _is_int(cp.get(key), lo, hi): e.append("capture.%s 必须是 %d..%d 的整数。" % (key, lo, hi))
     for key in ("bitrate_mbps", "max_bitrate_mbps"):
         if not _is_int(cp.get(key), 1, 10000): e.append("capture.%s 必须是 1..10000 的整数。" % key)
     if (_is_int(cp.get("bitrate_mbps"), 1, 10000) and _is_int(cp.get("max_bitrate_mbps"), 1, 10000)
@@ -1027,11 +1043,71 @@ def save_config(patch):
 STREAM_PRESETS = ((416, 416), (640, 640), (1280, 720), (1920, 1080), (2560, 1440))
 STREAM_CACHE = {}
 STREAM_CACHE_LOCK = threading.Lock()
+PEER_CODEC_CAPABILITIES = {}
+
+
+CODEC_FIELDS = ("codec_experimental", "encoder_backend", "decoder_backend", "encoder_hardware",
+                "decoder_hardware", "gop_frames", "decode_in_flight", "max_au_bytes", "bitrate_mbps", "max_bitrate_mbps")
 
 
 def stream_implementation_errors(capture):
-    return (["H.264/H.265 编解码后端尚未接入，也未验证两端硬件能力；当前仅可运行 raw NV12。"]
-            if capture["codec"] != "raw" else [])
+    if capture["codec"] == "raw": return []
+    errors = []
+    if not capture.get("codec_experimental") or not capture.get("encoder_backend") or not capture.get("decoder_backend"):
+        errors.append("编码链路为开发功能：须明确启用，并选择两端 MFT 后端；不会自动选择或回退。")
+    if _is_int(capture["max_bitrate_mbps"], 2001, 10000): errors.append("当前 MF 后端最大码率参数上限为 2000 Mbps。")
+    if (_is_int(capture["mtu"], 1500, 9000) and _is_int(capture["max_au_bytes"], 1024, 16777216) and
+            (capture["max_au_bytes"] + capture["mtu"] - 43) // (capture["mtu"] - 42) > 65535):
+        errors.append("编码访问单元上限超过冻结包头允许的分片数。")
+    return errors
+
+
+def codec_cli(capture, kind):
+    side = "encoder" if kind == "sender" else "decoder"
+    values = {"codec": capture["codec"], "codec-backend": capture[side + "_backend"],
+              "codec-hardware": int(capture[side + "_hardware"]), "bitrate": capture["bitrate_mbps"] * 1000000,
+              "max-bitrate": capture["max_bitrate_mbps"] * 1000000, "gop": capture["gop_frames"],
+              "decode-in-flight": capture["decode_in_flight"], "max-au-bytes": capture["max_au_bytes"]}
+    return [part for key, value in values.items() for part in ("--" + key, str(value))]
+
+
+CODEC_CACHE = {}
+CODEC_CACHE_LOCK = threading.Lock()
+
+
+def native_codec_request(kind, capture=None):
+    """Bounded native subprocess; enumeration/type setup is not a frame/quality acceptance test."""
+    executable = exe_path(kind)
+    try:
+        identity = (os.path.abspath(executable), os.stat(executable).st_mtime_ns, os.stat(executable).st_size)
+        args = (["--codec-backends"] if capture is None else ["--codec-check", "--width", str(capture["width"]),
+                "--height", str(capture["height"]), "--fps", str(capture["fps"]), "--mtu", str(capture["mtu"]), *codec_cli(capture, kind)])
+        key = (identity, tuple(args))
+        with CODEC_CACHE_LOCK:
+            cached = CODEC_CACHE.get(key)
+            if cached and time.monotonic() - cached[0] < 10: return cached[1]
+        result = subprocess.run([executable, *args], capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                timeout=12, cwd=ROOT, **({"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}))
+        report = json.loads(result.stdout) if result.returncode == 0 else {"error": (result.stderr or result.stdout)[-2048:]}
+        if not isinstance(report, dict) or report.get("revision") != 1:
+            report = {"error": report.get("error", "缺少匹配的原生编码能力。") if isinstance(report, dict) else "原生编码响应无效。"}
+        with CODEC_CACHE_LOCK:
+            if len(CODEC_CACHE) > 32: CODEC_CACHE.clear()
+            CODEC_CACHE[key] = (time.monotonic(), report)
+        return report
+    except Exception as error:
+        return {"error": str(error)}
+
+
+def codec_check_request(args):
+    if not isinstance(args.get("capture"), dict): return 400, {"error": "capture 必须是对象。"}
+    config = _merge(CONFIG_DEFAULT, {"capture": args["capture"]})
+    errors = validate_config(config) + stream_implementation_errors(config["capture"])
+    if config["capture"]["codec"] == "raw": errors.append("codec-check 只接受编码模式。")
+    if errors: return 409, {"error": "；".join(errors)}
+    kind = "sender" if deployment_role() == "capture" else "receiver"
+    report = native_codec_request(kind, config["capture"])
+    return (200 if report.get("configured") is True else 409), report
 
 
 NATIVE_STREAM_CACHE = {}
@@ -1059,7 +1135,7 @@ def native_stream_capabilities(kind):
             caps = json.loads(result.stdout) if result.returncode == 0 else {}
             if (not isinstance(caps, dict) or caps.get("stream_revision") != 2 or
                     caps.get("shm_version") != 3 or caps.get("variable_resolution") is not True or
-                    caps.get("dda_fps_limit") is not True or caps.get("codecs") != ["raw"]):
+                    caps.get("dda_fps_limit") is not True or not isinstance(caps.get("codecs"), list) or "raw" not in caps["codecs"]):
                 return {"error": "%s 缺少 P6-2 原生能力；请构建匹配版本，不会沿用旧的固定格式。" % kind}
             if len(NATIVE_STREAM_CACHE) >= 32: NATIVE_STREAM_CACHE.clear()
             NATIVE_STREAM_CACHE[key] = caps
@@ -1080,10 +1156,13 @@ def stream_capabilities(controller_ip=None):
     kind = "sender" if deployment_role() == "capture" else "receiver"
     errors = stream_native_errors(kind)
     result = {"revision": 2, "presets": [{"width": w, "height": h} for w, h in STREAM_PRESETS],
-              "native": {"codecs": ["raw"] if not errors else [], "transforms": ["crop", "fit", "fill", "stretch"],
+              "native": {"codecs": native_stream_capabilities(kind).get("codecs", []) if not errors else [], "transforms": ["crop", "fit", "fill", "stretch"],
+                         "codec_revision": native_stream_capabilities(kind).get("codec_revision", 0),
                          "variable_resolution": not errors, "dda_fps_limit": not errors, "shm_version": 3,
                          "errors": errors},
               "hardware": {"encoder": "unprobed", "decoder": "unprobed"}, "adapter": None}
+    if result["native"]["codec_revision"] == 1:
+        result["hardware"]["encoder" if kind == "sender" else "decoder"] = native_codec_request(kind)
     if deployment_role() == "capture" and controller_ip:
         code, adapter = _choose_capture_adapter(controller_ip)
         if code == 200: result["adapter"] = adapter
@@ -1095,13 +1174,15 @@ def stream_session(capture):
     token = uuid.uuid4().hex[:10]
     return {"revision": 2, "pixel_format": "nv12", "codec": capture["codec"],
             **{key: capture[key] for key in ("width", "height", "fps", "mtu", "transform")},
+            **({"codec_revision": 1, **{key: capture[key] for key in CODEC_FIELDS}} if capture["codec"] != "raw" else {}),
             "source_mac": "02:" + ":".join(token[i:i+2] for i in range(0, 10, 2))}
 
 
 def validate_stream_session(session, capture):
     if not isinstance(session, dict): return ["缺少显式 P6-2 流会话；拒绝使用旧格式启动。"]
-    expected = {"revision": 2, "pixel_format": "nv12", "codec": "raw",
-                **{key: capture[key] for key in ("width", "height", "fps", "mtu", "transform")}}
+    expected = {"revision": 2, "pixel_format": "nv12", "codec": capture["codec"],
+                **{key: capture[key] for key in ("width", "height", "fps", "mtu", "transform")},
+                **({"codec_revision": 1, **{key: capture[key] for key in CODEC_FIELDS}} if capture["codec"] != "raw" else {})}
     if set(session) != set(expected) | {"source_mac"}: return ["流会话字段不完整或含未知字段。"]
     if any(type(session[key]) is not type(value) or session[key] != value for key, value in expected.items()):
         return ["两端流会话的尺寸/帧率/MTU/格式/变换不一致。"]
@@ -1110,17 +1191,23 @@ def validate_stream_session(session, capture):
 
 
 def low_level_stream_errors(kind, args):
-    fields = ("width", "height", "transform", "codec", "bitrate_mbps", "max_bitrate_mbps", "source_mac")
+    fields = ("width", "height", "transform", "codec", "source_mac", *CODEC_FIELDS)
     if not any(key in args for key in fields): return []
     if ("width" in args) != ("height" in args): return ["必须同时提供 width 和 height。"]
     capture = _merge(CONFIG_DEFAULT["capture"], {key: args[key] for key in (*fields, "fps", "mtu") if key in args and key != "source_mac"})
     config = _merge(CONFIG_DEFAULT, {"capture": capture})
     errors = validate_config(config) + stream_implementation_errors(capture)
-    if any(key in args for key in ("bitrate_mbps", "max_bitrate_mbps")): errors.append("Raw 不接受编码码率参数。")
+    if capture["codec"] == "raw" and any(key in args for key in CODEC_FIELDS): errors.append("Raw 不接受编码参数。")
     if kind == "receiver" and args.get("transform", "crop") != "crop": errors.append("接收端不能再次变换像素。")
     if "source_mac" in args and not _re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", str(args["source_mac"])):
         errors.append("source_mac 无效。")
     if not errors: errors.extend(stream_native_errors(kind))
+    if not errors and capture["codec"] != "raw":
+        caps = native_stream_capabilities(kind)
+        if caps.get("codec_revision") != 1 or capture["codec"] not in caps.get("codecs", []): errors.append("原生程序缺少编码传输能力。")
+        else:
+            report = native_codec_request(kind, capture)
+            if report.get("configured") is not True: errors.append("所选后端不支持请求参数：" + report.get("error", "协商失败。"))
     return errors
 
 
@@ -1152,7 +1239,7 @@ def calculate_stream_plan(config, host_adapter=None, capture_adapter=None, disco
     fps, payload = cp["fps"], cp["mtu"] - 42
     raw_bytes = cp["width"] * cp["height"] * 3 // 2
     encoded = cp["codec"] != "raw"
-    frame_bytes = ((cp["max_bitrate_mbps"] * 1000000 + 8 * fps - 1) // (8 * fps)
+    frame_bytes = (48 + (cp["max_bitrate_mbps"] * 1000000 + 8 * fps - 1) // (8 * fps)
                    if encoded else raw_bytes)
     packets = (frame_bytes + payload - 1) // payload
     last = frame_bytes - (packets - 1) * payload
@@ -1182,6 +1269,8 @@ def calculate_stream_plan(config, host_adapter=None, capture_adapter=None, disco
     if status == "margin": warnings.append("未超过物理线速，但侵入预留余量；建议降低分辨率/帧率或使用编码模式。")
     if encoded:
         warnings.append("编码预算按最大码率均摊估算，不约束 IDR 帧瞬时突发；不代表编码器吞吐或画质已达标。")
+        warnings.append("开发版编码：最多 %d 帧解码在途；HEVC 可能额外缓存一帧，静态画面末帧可能等待下次输入。" % cp["decode_in_flight"])
+        warnings.append("最大码率按访问单元发送起点的一秒滑窗限制（含48B封装，不含L2开销）；单帧仍可形成微突发。")
     if cp["mode"] == "dda":
         warnings.append("P6-2 DDA 只发送新桌面图像，按目标帧率限速；静态桌面不重复发送，实际帧率可能更低。")
     warnings.append("协商速率不是实测吞吐；源桌面尺寸、编解码吞吐与端到端效果未在本次计算中验证。")
@@ -1211,6 +1300,10 @@ def _stream_discovery(config, refresh=False):
         if config["peer_url"]:
             code, peer = peer_call("/stream/capabilities", timeout=35, url=config["peer_url"])
             native = peer.get("native", {}) if isinstance(peer, dict) else {}
+            if not isinstance(native, dict): native = {}
+            if isinstance(peer, dict):
+                if len(PEER_CODEC_CAPABILITIES) >= 16: PEER_CODEC_CAPABILITIES.clear()
+                PEER_CODEC_CAPABILITIES[(ROOT, config["peer_url"])] = peer
             if code != 200 or not isinstance(peer, dict) or peer.get("revision") != 2 or native.get("variable_resolution") is not True or native.get("dda_fps_limit") is not True:
                 errors.append("采集后台或原生 sender 缺少 P6-2 能力；旧后台不能忽略新会话参数。")
             if code == 200 and isinstance(peer, dict) and peer.get("revision") in (1, 2):
@@ -1240,6 +1333,23 @@ def stream_plan(patch=None, refresh=False):
             return 400, {"error": "被采集机地址必须是 IPv4，端口固定为 5143。"}
     result = calculate_stream_plan(config, *_stream_discovery(config, refresh))
     errors = stream_native_errors("receiver")
+    cp = config["capture"]
+    if cp["codec"] != "raw":
+        peer_caps = PEER_CODEC_CAPABILITIES.get((ROOT, config["peer_url"]), {})
+        local_backends = native_codec_request("receiver")
+        hardware = peer_caps.get("hardware", {})
+        encoder = hardware.get("encoder", {}) if isinstance(hardware, dict) else {}
+        native = peer_caps.get("native", {})
+        result["backends"] = {"decoder": local_backends.get("backends", []),
+                              "encoder": encoder.get("backends", []) if isinstance(encoder, dict) else []}
+        if not isinstance(native, dict) or native.get("codec_revision") != 1:
+            errors.append("采集后台缺少 P6-3 编码传输能力，请先使用匹配版本。")
+        if not result["implementation"]["reasons"] and not errors:
+            report = native_codec_request("receiver", cp)
+            if report.get("configured") is not True: errors.append("主机解码器协商失败：" + report.get("error", "无效响应。"))
+            code, report = peer_call("/stream/codec-check", {"capture": cp}, timeout=20, url=config["peer_url"])
+            if not isinstance(report, dict): report = {"error": "无效响应。"}
+            if code != 200 or report.get("configured") is not True: errors.append("采集编码器协商失败：" + report.get("error", "无效响应。"))
     if errors:
         result["implementation"]["reasons"].extend(errors)
         result["implementation"]["supported"] = result["can_start"] = False
@@ -1353,6 +1463,10 @@ def _product_local_start(args, controller_ip):
     if errors: return 400, {"error": "invalid capture config", "details": errors}
     errors = stream_implementation_errors(c["capture"])
     if deployment_role(): errors.extend(stream_native_errors("sender" if role == "capture" else "receiver"))
+    if not errors and c["capture"]["codec"] != "raw":
+        kind = "sender" if role == "capture" else "receiver"
+        report = native_codec_request(kind, c["capture"])
+        if report.get("configured") is not True: errors.append("所选编解码器协商失败：" + report.get("error", "无效响应。"))
     if role == "receive" and c["capture"]["mtu"] != c["receive"]["mtu"]: errors.append("两端 MTU 不一致。")
     descriptor = args.get("stream")
     if not deployment_role() and descriptor is None and any(c["capture"][key] != CONFIG_DEFAULT["capture"][key] for key in ("width", "height", "transform")):
@@ -1385,7 +1499,9 @@ def _product_local_start(args, controller_ip):
         try:
             sid, info = launch_product("receiver", {"adapter": c["adapter"], "mtu": rv["mtu"], "shm": rv["shm"], "timeout_s": 0,
                                                      **({"width": c["capture"]["width"], "height": c["capture"]["height"], "fps": c["capture"]["fps"],
-                                                         "source_mac": descriptor["source_mac"]} if descriptor else {})})
+                                                         "source_mac": descriptor["source_mac"]} if descriptor else {}),
+                                                     **({"codec": c["capture"]["codec"], **{key: c["capture"][key] for key in CODEC_FIELDS}}
+                                                        if c["capture"]["codec"] != "raw" else {})})
         except Exception as error:
             if state["vcam_managed"]: out["cleanup"] = vcam_unregister()[1]
             return 500, dict(out, error="接收程序启动失败：%s" % error)
@@ -1397,7 +1513,8 @@ def _product_local_start(args, controller_ip):
                                              "fps": cp["fps"], "frames": 0, "mtu": cp["mtu"], "batch": cp["batch"],
                                              "dst_mac": cp["dst_mac"], "gpu_convert": cp["gpu_convert"],
                                              **({"width": cp["width"], "height": cp["height"], "transform": cp["transform"],
-                                                 "source_mac": descriptor["source_mac"]} if descriptor else {})})
+                                                 "source_mac": descriptor["source_mac"]} if descriptor else {}),
+                                             **({"codec": cp["codec"], **{key: cp[key] for key in CODEC_FIELDS}} if cp["codec"] != "raw" else {})})
     except Exception as error:
         return 500, {"role": role, "error": str(error), "diagnostics": slot_stats("sender")}
     return 200, {"role": role, "session_id": sid, "args": info, "stream": descriptor}
@@ -1551,6 +1668,7 @@ def _p5_get(h):
 def _p5_post(h, args):
     routes = {"/config": lambda: save_config(args),
               "/stream/plan": lambda: stream_plan_request(args),
+              "/stream/codec-check": lambda: codec_check_request(args),
               "/vcam/register": vcam_register,
               "/product/start": product_start, "/product/stop": product_stop,
               "/product/local/start": lambda: product_local_start(args, h.client_address[0]),
@@ -1624,7 +1742,7 @@ UI_HTML = r'''<!doctype html>
 </div>
 <div class="analysis">
 <section class="panel"><div class="panel-head"><div><h2>分段延迟</h2><p>p99 · 最近 60 秒 · 毫秒</p></div><div class="legend"><span><i style="background:var(--blue)"></i>发送</span><span><i style="background:var(--green)"></i>重组</span><span><i style="background:var(--purple)"></i>虚拟卡</span></div></div><div class="chart"><canvas id="cv" aria-label="最近60秒各段p99延迟，详细数值见下方" role="img"></canvas><div id="chartEmpty" class="chart-empty">采集开始后显示延迟曲线</div></div><div class="latency-values"><div><small>发送段 p99</small><strong><b id="txLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="txLatencyRange">平均 — · 最大 —</em></div><div><small>重组段 p99</small><strong><b id="rxLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="rxLatencyRange">平均 — · 最大 —</em></div><div><small>虚拟卡交付 p99</small><strong><b id="vcLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="vcLatencyRange">平均 — · 最大 —</em></div></div></section>
-<section class="panel"><div class="panel-head"><h2>传输质量</h2><span id="qualityBadge" class="badge muted">等待数据</span></div><div class="quality-row"><span>丢失帧</span><strong id="dropped">—</strong></div><div class="quality-row"><span>哈希错误</span><strong id="hashErrors">—</strong></div><div class="quality-row"><span>丢失包</span><strong id="packetLoss">—</strong></div><div class="quality-row"><span>虚拟卡交付</span><strong id="vcDelivered">—</strong></div><div class="quality-row"><span>重复帧</span><strong id="vcRepeats">—</strong></div><div class="quality-foot">每帧 FNV-1a64 对账。<br>计数来自当前接收会话，缺失数据以 — 显示。</div></section>
+<section class="panel"><div class="panel-head"><h2>传输质量</h2><span id="qualityBadge" class="badge muted">等待数据</span></div><div class="quality-row"><span>丢失帧</span><strong id="dropped">—</strong></div><div class="quality-row"><span id="hashErrorLabel">Raw 像素哈希错误</span><strong id="hashErrors">—</strong></div><div class="quality-row"><span>丢失包</span><strong id="packetLoss">—</strong></div><div class="quality-row"><span>虚拟卡交付</span><strong id="vcDelivered">—</strong></div><div class="quality-row"><span>重复帧</span><strong id="vcRepeats">—</strong></div><div class="quality-foot" id="decodeInfo">Raw 无编解码</div><div class="quality-foot" id="qualityNote">Raw 每帧像素 FNV-1a64 对账；缺失数据以 — 显示。</div></section>
 </div>
 <section class="panel events"><div class="panel-head"><h2>操作记录 <span id="eventCount" class="muted"></span></h2><button id="bClear" class="btn quiet small">清空显示</button></div><div id="events" class="event-list" role="log" aria-label="操作记录"></div></section>
 </section>
@@ -1637,23 +1755,33 @@ UI_HTML = r'''<!doctype html>
 </div></div>
 <div class="form-section"><div class="form-heading"><span class="step">02</span><h2>采集设置</h2></div>
 <div class="field-grid">
-<div class="field full"><label for="c_resolution">输出分辨率预设</label><select id="c_resolution"><option value="416x416">416 × 416 · 方形</option><option value="640x640">640 × 640 · 当前已实现</option><option value="1280x720">720p · 1280 × 720</option><option value="1920x1080">1080p · 1920 × 1080</option><option value="2560x1440">1440p · 2560 × 1440</option><option value="custom">自定义宽高</option></select><p>这是传输及虚拟卡的目标 NV12 尺寸，不会修改桌面显示分辨率。非 640 尺寸目前仅用于配置与预算。</p></div>
+<div class="field full"><label for="c_resolution">输出分辨率预设</label><select id="c_resolution"><option value="416x416">416 × 416 · 方形</option><option value="640x640">640 × 640 · 默认</option><option value="1280x720">720p · 1280 × 720</option><option value="1920x1080">1080p · 1920 × 1080</option><option value="2560x1440">1440p · 2560 × 1440</option><option value="custom">自定义宽高</option></select><p>这是传输及虚拟卡的目标 NV12 尺寸，不会修改桌面显示分辨率。Raw 已支持这些尺寸；编码组合须通过所选后端协商。</p></div>
 <div class="field"><label for="c_width">输出宽度</label><input id="c_width" type="number" min="2" max="8192" step="2" required><p>2–8192 的偶数；直接输入可切换为自定义。</p></div>
 <div class="field"><label for="c_height">输出高度</label><input id="c_height" type="number" min="2" max="8192" step="2" required><p>NV12 色度采样要求宽高均为偶数。</p></div>
-<div class="field"><label for="c_fps">目标帧率</label><input id="c_fps" type="number" min="1" max="1000" step="1" required><p>当前 DDA 由桌面新帧驱动，尚不硬限速；此数值用于预算，不是已达成帧率。</p></div>
+<div class="field"><label for="c_fps">发送帧率上限</label><input id="c_fps" type="number" min="1" max="1000" step="1" required><p>严格限制发送间隔，不追赶补发；DDA 只发新桌面画面，实际帧率可能更低。</p></div>
 <div class="field"><label for="c_transform">裁切 / 缩放方式</label><select id="c_transform"><option value="crop">居中裁切 · 1:1 像素</option><option value="fit">完整画面 · 等比缩放 + 黑边</option><option value="fill">铺满输出 · 等比缩放 + 裁切</option><option value="stretch">拉伸填满 · 不保持比例</option></select><p>居中裁切不缩放；其他方式使用确定性的整数最近邻采样。裁切输出大于源桌面时拒绝启动。</p></div>
 </div></div>
 <div class="form-section"><div class="form-heading"><span class="step">03</span><h2>传输模式与预算</h2></div>
 <div class="field-grid">
-<div class="field full"><label for="c_codec">链路像素 / 编码模式</label><select id="c_codec"><option value="raw">Raw NV12 · 无压缩 / 当前可运行</option><option value="h264">H.264 · 低延迟有损编码（待接入）</option><option value="hevc">H.265 / HEVC · 低延迟有损编码（待接入）</option></select><p>编码只规划用于两机链路；主机解码后仍向虚拟卡提供 NV12。尚未探测两端编解码能力。</p></div>
-<div id="bitrateFields" class="field full" hidden><div class="field-grid"><div class="field"><label for="c_bitrate">目标码率 · Mbps</label><input id="c_bitrate" type="number" min="1" max="10000" step="1" required></div><div class="field"><label for="c_max_bitrate">最大码率 · Mbps</label><input id="c_max_bitrate" type="number" min="1" max="10000" step="1" required></div></div><p>按最大码率估算，不保证关键帧瞬时突发受限；当前不会拉起编码器。</p></div>
+<div class="field full"><label for="c_codec">链路像素 / 编码模式</label><select id="c_codec"><option value="raw">Raw NV12 · 无压缩</option><option value="h264">H.264 · 有损编码 / 开发版</option><option value="hevc">H.265 / HEVC · 有损编码 / 开发版</option></select><p>编码只用于两机链路，主机解码后仍提供 NV12；不使用有损前后像素相等来判定传输正确。</p></div>
+<div id="bitrateFields" class="field full" hidden><div class="field-grid">
+<div class="field full"><label for="c_experimental">编码功能授权</label><select id="c_experimental"><option value="0">仅保存草案，不启动编码</option><option value="1">明确启用开发版编码（未完成双机 / 长稳 / 画质验收）</option></select></div>
+<div class="field"><label for="c_encoder">采集机编码后端</label><input id="c_encoder" list="encoderBackends" maxlength="256" placeholder="明确选择 CLSID 或 name:精确名称" required><datalist id="encoderBackends"></datalist></div>
+<div class="field"><label for="c_encoder_hw">编码器枚举类别</label><select id="c_encoder_hw"><option value="1">硬件 MFT（失败不回退）</option><option value="0">系统 / 软件 MFT（显式选择）</option></select></div>
+<div class="field"><label for="c_decoder">主机解码后端</label><input id="c_decoder" list="decoderBackends" maxlength="256" placeholder="明确选择 CLSID 或 name:精确名称" required><datalist id="decoderBackends"></datalist></div>
+<div class="field"><label for="c_decoder_hw">解码器枚举类别</label><select id="c_decoder_hw"><option value="0">系统 / 软件 MFT（显式选择）</option><option value="1">硬件 MFT（失败不回退）</option></select></div>
+<div class="field"><label for="c_bitrate">目标码率 · Mbps</label><input id="c_bitrate" type="number" min="1" max="2000" step="1" required></div>
+<div class="field"><label for="c_max_bitrate">最大码率 · Mbps</label><input id="c_max_bitrate" type="number" min="1" max="2000" step="1" required></div>
+<div class="field"><label for="c_gop">强制 IDR 间隔 · 帧</label><input id="c_gop" type="number" min="1" max="1000" step="1" required></div>
+<div class="field"><label for="c_in_flight">解码在途帧上限</label><input id="c_in_flight" type="number" min="1" max="8" step="1" required></div>
+</div><p>候选不是兼容性保证；计算预算时实际协商媒体类型，启动后仍须观察帧到达。最大码率按发送起点的一秒滑窗限制，IDR 仍可能微突发。HEVC 本机后端需要额外缓存一帧，静态末帧可能等待下次输入；不静默增加队列。</p></div>
 <div class="field"><label for="c_headroom">链路预留余量 · %</label><input id="c_headroom" type="number" min="0" max="50" step="1" required><p>仅预算建议，不是修改历史性能验收门限。</p></div>
 </div>
 <div class="note-banner" id="streamPlan" role="status" aria-live="polite"><strong id="planTitle">等待计算链路预算</strong><p id="planSummary" class="inline-feedback">配置读取后自动计算，不保存草稿，也不启停采集。</p><p id="planDetails" class="inline-feedback"></p><p id="planWarnings" class="inline-feedback"></p></div>
 <button type="button" id="bPlan" class="btn small" style="margin-top:14px">重新检测两端链路</button>
 <div id="configError" class="field-error" role="alert" hidden></div></div>
 <div class="form-actions"><span id="saveState" role="status">配置读取中…</span><div class="actions"><button type="button" id="bReset" class="btn quiet" disabled>撤销修改</button><button type="submit" id="bSave" class="btn primary" disabled><svg aria-hidden="true"><use href="#i-check"/></svg>保存配置</button></div></div>
-</form><aside><div class="help-card"><h2>配置不等于能力已达标</h2><div class="help-step"><b>1</b><p>先选尺寸、画面处理与传输模式，再看两端链路预算。</p></div><div class="help-step"><b>2</b><p>预算、原生实现和实机验收分开显示，不会自动降低清晰度或切换编码。</p></div><div class="help-step"><b>3</b><p>当前可运行的仍为 640 × 640 居中裁切 / Raw NV12。其他组合可保存，但启动会明确拦截。</p></div><div class="help-note">开始接收自动注册虚拟采集卡，停止后回收。正在运行时不允许修改配置。</div></div><div class="note-banner">稳定版保持不动<br>H.264 / H.265 及可变尺寸管线分阶段接入，不将选项存在当成已支持。</div></aside></div>
+</form><aside><div class="help-card"><h2>配置不等于能力已达标</h2><div class="help-step"><b>1</b><p>先选尺寸、画面处理与传输模式，再看两端链路预算。</p></div><div class="help-step"><b>2</b><p>预算、原生实现和实机验收分开显示，不会自动降低清晰度或切换编码。</p></div><div class="help-step"><b>3</b><p>Raw 已支持可变尺寸和四种变换。编码须明确启用开发功能、选择两端后端，协商失败直接拒绝。</p></div><div class="help-note">开始接收自动注册虚拟采集卡，停止后回收。正在运行时不允许修改配置。</div></div><div class="note-banner">稳定版保持不动<br>H.264 / H.265 开发链路已接通；双机、长稳、画质与实际吞吐仍须单独验收。</div></aside></div>
 </section>
 <footer class="footer"><span>分段延迟在各自机器内测量，不代表跨机端到端延迟。</span><span id="footerStatus">自动刷新 · 约每秒一次</span></footer>
 </main></div>
@@ -1688,7 +1816,8 @@ function hasRunning(status) {
     (machine.sender && machine.sender.running || machine.receiver && machine.receiver.running));
 }
 function pendingPipeline(capture = {}) {
-  if ((capture.codec || 'raw') !== 'raw') return 'H.264/H.265 后端尚未接入，当前仅支持 Raw NV12。';
+  if ((capture.codec || 'raw') !== 'raw' && (!capture.codec_experimental || !capture.encoder_backend || !capture.decoder_backend))
+    return '编码为开发功能，须明确启用并选择两端后端；无自动回退。';
   return '';
 }
 function readiness(status, unsaved) {
@@ -1708,7 +1837,8 @@ function readiness(status, unsaved) {
   if (local.version && peer.version && local.version !== peer.version) return result('warn','两端版本不一致','本机 '+local.version+'，对端 '+peer.version+'。请统一版本后开始采集。');
   if (tx.note === 'stub-no-binary' && tx.running || rx.note === 'stub-no-binary' && rx.running) return result('warn','占位进程运行中 · 没有真实传输','缺少采集或接收程序，请先完成构建并停止占位进程。');
   if (tx.running && rx.running) {
-    if ((rx.dropped || 0) + (rx.hash_mismatch || 0) > 0) return result('warn','链路运行中 · 请检查传输质量','发现丢帧或哈希错误，详细计数见传输质量。');
+    if (rx.waiting_idr) return result('warn','等待下一个 IDR 恢复画面','解码状态已重置；依赖帧不会直接发布，等待带参数集的完整 IDR。');
+    if (qualityErrors(rx) > 0) return result('warn','链路运行中 · 请检查传输质量','发现丢帧、字节校验或解码异常，详细计数见传输质量。');
     if (!finite(rx.complete) || rx.complete <= 0) return result('warn','等待首个完整画面','两端进程已启动，尚未收到完整帧；请检查采集源与网卡链路。');
     return result('good','采集链路已启动','接收机将完整画面交给 VirtualCapture；实时帧率在下方更新。');
   }
@@ -1742,6 +1872,10 @@ function friendlyError(message) {
   if (/capture.batch/.test(text)) return '批大小必须为 1–1000 的整数。';
   if (/(capture|receive).mtu/.test(text)) return 'MTU 必须为 1500–9000 的整数。';
   return text;
+}
+function qualityErrors(rx) {
+  return (rx.dropped || 0)+(rx.packets_lost || 0)+(rx.hash_mismatch || 0)+(rx.transport_errors || 0)+
+    (rx.decode_errors || 0)+(rx.decode_queue_drops || 0)+(rx.decode_discarded || 0)+(rx.decode_resets || 0);
 }
 async function api(path, body, timeout = 10000) {
   const controller = new AbortController();
@@ -1830,14 +1964,19 @@ function render(status) {
   text('txFpsNote',tx.running ? txFps === null ? '正在建立采样基线' : '当前采集会话 · 每秒更新' : '等待采集会话');
   text('rxFpsNote',rx.running ? rxFps === null ? '正在建立采样基线' : rxFps > 0 ? '正在接收完整帧' : '暂未收到新的完整帧' : '等待接收完整帧');
   text('frameNote',rx.session_id || '当前接收会话累计');
-  [['dropped','dropped'],['hashErrors','hash_mismatch'],['packetLoss','packets_lost'],['vcDelivered','vcam_delivered'],['vcRepeats','vcam_repeats']].forEach(pair => {
+  const encoded = rx.codec && rx.codec !== 'raw', integrityKey = encoded ? 'transport_errors' : 'hash_mismatch';
+  text('hashErrorLabel',encoded ? '压缩字节校验错误' : 'Raw 像素哈希错误');
+  text('qualityNote',encoded ? '压缩访问单元 FNV-1a64 校验；解码后另记像素哈希，不做有损前后像素相等判定。' : 'Raw 每帧像素 FNV-1a64 对账；缺失数据以 — 显示。');
+  text('decodeInfo',encoded ? (rx.waiting_idr ? '等待 IDR' : '在途 '+count(rx.decode_pending))+
+    ' · 重置 '+count(rx.decode_resets)+' · 丢弃 '+count(rx.decode_discarded)+' · 错误 '+count(rx.decode_errors) : 'Raw 无编解码');
+  [['dropped','dropped'],['hashErrors',integrityKey],['packetLoss','packets_lost'],['vcDelivered','vcam_delivered'],['vcRepeats','vcam_repeats']].forEach(pair => {
     text(pair[0],count(rx[pair[1]]));
     $(pair[0]).className = ['dropped','hashErrors','packetLoss'].includes(pair[0]) && rx[pair[1]] > 0 ? 'warn' : '';
   });
-  const hasQuality = finite(rx.complete) && rx.complete > 0 && finite(rx.dropped) && finite(rx.hash_mismatch);
-  const errors = (rx.dropped || 0)+(rx.hash_mismatch || 0);
+  const hasQuality = finite(rx.complete) && rx.complete > 0 && finite(rx.dropped) && finite(rx[integrityKey]);
+  const errors = qualityErrors(rx);
   $('qualityBadge').className = 'badge '+(errors ? 'warn' : !hasQuality ? 'muted' : 'good');
-  text('qualityBadge',errors ? '需检查' : !hasQuality ? '等待数据' : '哈希对账正常');
+  text('qualityBadge',errors ? '需检查' : !hasQuality ? '等待数据' : encoded ? '压缩字节校验正常' : '哈希对账正常');
   [['tx',tx,'pc1_seg',2],['rx',rx,'rseg',2],['vc',rx,'vseg',3]].forEach(([id,stats,key,digits]) => {
     text(id+'Latency',fmt(stats[key+'_p99_ms'],digits));
     text(id+'LatencyRange','平均 '+fmt(stats[key+'_avg_ms'],digits)+' · 最大 '+fmt(stats[key+'_max_ms'],digits));
@@ -1905,6 +2044,13 @@ function readConfig() {
   if (config.capture.codec !== 'raw') {
     config.capture.bitrate_mbps = Number($('c_bitrate').value);
     config.capture.max_bitrate_mbps = Number($('c_max_bitrate').value);
+    config.capture.codec_experimental = $('c_experimental').value === '1';
+    config.capture.encoder_backend = $('c_encoder').value.trim();
+    config.capture.decoder_backend = $('c_decoder').value.trim();
+    config.capture.encoder_hardware = $('c_encoder_hw').value === '1';
+    config.capture.decoder_hardware = $('c_decoder_hw').value === '1';
+    config.capture.gop_frames = Number($('c_gop').value);
+    config.capture.decode_in_flight = Number($('c_in_flight').value);
   }
   config.transport.headroom_pct = Number($('c_headroom').value);
   return config;
@@ -1915,7 +2061,9 @@ function fillConfig(config) {
   const cp = config.capture;
   const values = {c_peer_ip:match ? match[1] : '',c_fps:cp.fps,c_width:cp.width,c_height:cp.height,
     c_transform:cp.transform,c_codec:cp.codec,c_bitrate:cp.bitrate_mbps,c_max_bitrate:cp.max_bitrate_mbps,
-    c_headroom:config.transport.headroom_pct};
+    c_headroom:config.transport.headroom_pct,c_experimental:cp.codec_experimental ? '1' : '0',
+    c_encoder:cp.encoder_backend || '',c_decoder:cp.decoder_backend || '',c_encoder_hw:cp.encoder_hardware === false ? '0' : '1',
+    c_decoder_hw:cp.decoder_hardware ? '1' : '0',c_gop:cp.gop_frames || 60,c_in_flight:cp.decode_in_flight || 2};
   Object.entries(values).forEach(([id,value]) => { $(id).value = value; });
   const preset = cp.width+'x'+cp.height;
   $('c_resolution').value = [...$('c_resolution').options].some(option => option.value === preset) ? preset : 'custom';
@@ -1942,7 +2090,9 @@ function markDirty(event) {
 function syncCodecFields() {
   const raw = $('c_codec').value === 'raw';
   $('bitrateFields').hidden = raw;
-  $('c_bitrate').disabled = raw; $('c_max_bitrate').disabled = raw;
+  ['c_bitrate','c_max_bitrate','c_experimental','c_encoder','c_decoder','c_encoder_hw','c_decoder_hw','c_gop','c_in_flight']
+    .forEach(id => { $(id).disabled = raw; });
+  ['c_encoder','c_decoder'].forEach(id => { $(id).required = !raw && $('c_experimental').value === '1'; });
 }
 function schedulePlan(refresh = false) {
   planGeneration++; planRefresh = planRefresh || refresh;
@@ -1962,9 +2112,18 @@ function renderStreamPlan(plan) {
     '\n'+(network.is_estimate ? '编码均摊估算' : 'NV12 线速需求')+' '+speed(network.wire_bps)+
     '（含 L2 / VC 包头、FCS、前导码、帧间隙）\n预留 '+network.headroom_pct+'% 后预算 '+speed(network.usable_bps)+
     (network.max_raw_fps !== null ? ' · 此尺寸理论上限 '+network.max_raw_fps+' fps' : ''));
-  text('planDetails',(implementation.reasons.length ? implementation.reasons.join('\n') : '当前软件已接通可变尺寸 / 四种变换 / Raw NV12；启动时仍须确认两端原生能力。')+
-    '\n本次未探测编解码硬件，也没有进行该参数组合的实机验收。');
+  text('planDetails',(implementation.reasons.length ? implementation.reasons.join('\n') : '原生路径与配置检查通过；不等于该参数组合的双机 / 长稳 / 画质验收。'));
   text('planWarnings',plan.warnings.join('\n'));
+  if (plan.backends) {
+    for (const side of ['encoder','decoder']) {
+      const list = $(side+'Backends'); list.replaceChildren();
+      for (const item of plan.backends[side] || []) {
+        if (item.codec !== $('c_codec').value) continue;
+        const option = document.createElement('option'); option.value = item.identity;
+        option.label = item.name+' · '+(item.hardware ? '硬件' : '系统/软件')+' · 候选未验收'; list.append(option);
+      }
+    }
+  }
 }
 async function updateStreamPlan() {
   if (planInFlight) { planPending = true; return; }

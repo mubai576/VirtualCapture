@@ -240,6 +240,27 @@ assert(!dirty && element('c_width').value === 640 && element('c_codec').value ==
 """)
 
 
+def test_codec_opt_in_backends_and_quality_are_explicit(client):
+    check(client, FORM + """
+assert(pendingPipeline({codec:'hevc'}).includes('明确启用'));
+element('c_codec').value='hevc'; element('c_experimental').value='1';
+syncCodecFields(); assert(element('c_encoder').required && element('c_decoder').required);
+element('c_experimental').value='0'; syncCodecFields();
+assert(!element('c_encoder').required && !element('c_decoder').required, 'drafts do not require backends');
+element('c_experimental').value='1';
+element('c_encoder').value='{00000001-0002-0003-0405-060708090a0b}';
+element('c_decoder').value='name:HEVCVideoExtension';
+element('c_encoder_hw').value='1'; element('c_decoder_hw').value='0';
+element('c_gop').value='30'; element('c_in_flight').value='2';
+const cp=readConfig().capture;
+assert(cp.codec_experimental && cp.encoder_hardware && !cp.decoder_hardware);
+assert(cp.gop_frames===30 && cp.decode_in_flight===2 && !pendingPipeline(cp));
+assert(qualityErrors({codec:'hevc',decode_errors:1,decode_queue_drops:2,transport_errors:3})===6);
+assert(qualityErrors({codec:'raw',hash_mismatch:2,dropped:1})===3);
+assert(qualityErrors({codec:'hevc',packets_lost:1,decode_resets:1})===2);
+""")
+
+
 def test_stale_budget_cannot_overwrite_newer_draft(client):
     check(client, FORM + """
 let respond;

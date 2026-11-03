@@ -22,7 +22,7 @@ inference side and exclusive-fullscreen hook are out of scope (PLAN D8).
 P6 is now authorized (PLAN D19): configurable output sizes/transforms, link budgeting and additional H.264/H.265
 lossy modes while retaining raw. Development P6-2 now implements variable-size Raw, four transforms, a real
 send-rate ceiling, SHM v3 and session-sized DShow. The stable deployment remains unchanged. H.264/H.265
-are still rejected by product startup pending P6-3. The 28 B packet header and historical raw test gates remain
+now have an explicitly opted-in development path through L2, decode, SHM and DShow; missing/unsupported backends are rejected. Dual-host, soak, quality and deployed-PC2 encoder validation remain pending. The 28 B packet header and historical raw test gates remain
 frozen. See `references/stream-config.md` and `docs/bringup/bringup-20261103-p6-raw.md` for local evidence.
 
 Repo map, commands, rules and multi-AI conventions: **root `AGENTS.md`** (single source; not repeated here).
@@ -41,6 +41,7 @@ early docs with dated SUPERSEDED notes). This skill holds the domain knowledge +
 | `references/test-matrix.md` | T0–T5 definitions, D1 gates, triage. |
 | `references/packaging.md` | One-command portable package, contents, output replacement and verification. |
 | `references/stream-config.md` | P6 configuration, capability/budget API and implemented versus pending modes. |
+| `references/encoded-stream.md` | P6-3 explicit backends, codec payload, bounded decode/recovery, APIs and separate integrity logs. |
 
 ## Topology (shared-NIC since 2026-10-21: data + control on the same 2.5G port; see docs/history/plan-history.md S11)
 

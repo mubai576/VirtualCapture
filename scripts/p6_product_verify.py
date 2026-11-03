@@ -1,5 +1,6 @@
-"""Isolated product HTTP -> native Raw -> SHM -> DShow test; registry operations are replaced."""
+"""Isolated product HTTP -> native Raw/codec -> SHM -> DShow test; registry operations are replaced."""
 from datetime import datetime
+import argparse
 import importlib.util
 import json
 from pathlib import Path
@@ -12,7 +13,14 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
-    output = ROOT / "run" / ("p6-product-" + datetime.now().strftime("%Y%m%d-%H%M%S"))
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--codec", choices=("raw", "h264", "hevc"), default="raw")
+    parser.add_argument("--encoder", default="")
+    parser.add_argument("--decoder", default="")
+    options = parser.parse_args()
+    if options.codec != "raw" and (not options.encoder or not options.decoder):
+        parser.error("encoded mode requires explicit --encoder and --decoder")
+    output = ROOT / "run" / ("p6-product-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + options.codec + "-" + uuid.uuid4().hex[:6])
     output.mkdir(parents=True)
     mapping = "Local\\VCP6Product-" + uuid.uuid4().hex
     modules, registration = {}, []
@@ -49,9 +57,12 @@ def main():
         kwargs["url"] = "http://127.0.0.1:%d" % capture_server.server_port
         return peer(path, body, **kwargs)
     host.peer_call = isolated_peer
+    codec_config = {} if options.codec == "raw" else {"codec": options.codec, "codec_experimental": True,
+        "encoder_backend": options.encoder, "decoder_backend": options.decoder, "encoder_hardware": True,
+        "decoder_hardware": False, "bitrate_mbps": 20, "max_bitrate_mbps": 80, "gop_frames": 15, "decode_in_flight": 2}
     assert host.save_config({"adapter": r"\Device\NPF_Loopback", "peer_url": "http://127.0.0.1:5143",
                              "capture": {"width": 418, "height": 282, "fps": 30, "mode": "pattern",
-                                         "pattern": "motion", "transform": "fill", "batch": 1}})[0] == 200
+                                         "pattern": "motion", "transform": "fill", "batch": 1, **codec_config}})[0] == 200
     verifier = None
     try:
         code, result = host.product_start()
@@ -73,12 +84,15 @@ def main():
             return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
         sent, received = rows(capture.state["sender"]["hashlog"]), rows(host.state["receiver"]["hashlog"])
         samples = rows(output / "vc.jsonl")
-        expected = {row["frame_id"]: row["hash"] for row in sent}
+        sent_key = "hash" if options.codec == "raw" else "transport_hash"
+        received_key = "hash" if options.codec == "raw" else "decoded_hash"
+        expected = {row["frame_id"]: row[sent_key] for row in sent}
         assert len(expected) >= 90
-        assert expected == {row["frame_id"]: row["hash"] for row in received}
-        assert samples and all(row["hash"] in set(expected.values()) for row in samples)
+        assert expected == {row["frame_id"]: row[sent_key] for row in received}
+        decoded = {row[received_key] for row in received}
+        assert samples and all(row["hash"] in decoded for row in samples)
         assert min(b["send_qpc_ns"] - a["send_qpc_ns"] for a, b in zip(sent, sent[1:])) >= 33333334
-        result = {"pass": True, "size": [418, 282], "fps_limit": 30, "mode": "pattern", "pattern": "motion",
+        result = {"pass": True, "codec": options.codec, "size": [418, 282], "fps_limit": 30, "mode": "pattern", "pattern": "motion",
                   "batch": 1, "adapter": "Loopback", "sent": len(sent), "received": len(received),
                   "vcam_samples": len(samples), "session": rx["stream"], "registry_operations": registration,
                   "boundary": "private roots/map/random HTTP port; registry replaced; real native children and DShow"}

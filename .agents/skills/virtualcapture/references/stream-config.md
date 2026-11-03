@@ -3,7 +3,7 @@
 ## 当前实现边界
 
 开发版 `stream_revision=2`：Raw NV12 可变尺寸、crop/fit/fill/stretch、发送帧率上限、SHM v3 与动态 DShow 已接通。
-稳定部署仍为封存的固定 640 管线，不自动更新。H.264/H.265 仍只可保存草案，不可启动；开发工具的 MFT 候选不等于后端已接通。
+稳定部署仍为封存的固定 640 管线，不自动更新。P6-3 编码/L2/解码/SHM/DShow已接通，默认仍只保存编码草案；明确启用开发功能并选择/协商两端后端后可运行。完整编码追加契约以 `encoded-stream.md` 为准；候选和类型协商不是实帧/双机/画质验收。
 
 - 预设：416×416、640×640、1280×720、1920×1080、2560×1440；默认保留 **640×640@240 / crop / raw**。
 - 自定义：偶数宽高 2..8192，整数 fps 1..1000；单帧包数不得超过 uint16。范围是软件参数校验，不是显存/吞吐/硬件认证。
@@ -40,7 +40,7 @@ DLL 由隔离 verifier 进程探测，不在 agent 内长时间加载；探测�
 
 capture 按 HTTP 来源控制路由精确选择网卡；host 不擅自选另一张快卡。`/adapters.items[]` 数值
 `receive_link_bps/transmit_link_bps` 单位 bit/s，另附 `hardware_interface/virtual`；0、缺失、回环或虚拟网卡不冒充物理速率。
-`hardware.encoder/decoder` 仍为 `unprobed`，不将开发机一次探测外推为部署两端的能力。`/health.stream_revision=2`，product_revision 仍为2。
+`hardware.encoder/decoder` 对新原生程序返回当前角色的候选清单（无帧验证），另一侧仍unprobed；编码时另实际协商类型，见encoded-stream.md，不把开发机结果外推到部署两端。`/health.stream_revision=2`，product_revision 仍为2。
 
 ### POST /stream/plan
 
@@ -118,7 +118,7 @@ receiver 按会话严格校验 total、seq、每包 payload_len、pattern 一致
 
 `python scripts/p6_raw_verify.py` 为开发专用 motion/batch1/Loopback 全链路矩阵，不随便携包交付，也不调用5143或注册DLL。
 `--dda` 要求真实变化桌面；测试不会自动启动动画源。实际报告见 `docs/bringup/bringup-20261103-p6-raw.md`。
-本机证明不替代双机、物理链路吞吐或长期使用验收；H.264/H.265 仍硬拒绝，不能套用 Raw 像素哈希门。
+本机证明不替代双机、物理链路吞吐或长期使用验收；编码开发模式按encoded-stream.md显式启用，不能套用 Raw 像素哈希门。
 
 ## P6-3 开发后端CLI（非产品支持）
 
@@ -131,5 +131,5 @@ vc-codec-roundtrip --codec h264|hevc --width W --height H --fps F --frames N --b
 默认640×640@240、30帧、20Mbps、in-flight=1；两侧身份各必须明确提供且唯一匹配，CLSID和name不能同时提供。
 `--selftest`独立验证NV12 aperture/stride/UV/容量，无需激活codec。非法参数退出2，MFT不支持/超时/帧序错误退出1。
 编码输出复制到新sample再解码，记录源/解码hash但不判两者相等；fps为媒体元数据，此工具不按墙钟送帧，不能据此宣称实时吞吐。
-真实候选与H.264/HEVC回环已在开发机验证，但产品仍不启用；HEVC需显式2帧in-flight，不能静默加深队列。
+历史原型的真实候选与H.264/HEVC回环已在开发机验证；新产品开发模式接线与明确的解码队列上限见encoded-stream.md，不能静默加深队列。
 工具不随便携包交付、不注册/调用agent/修改网卡。完整边界与证据：`docs/proposals/codec-backend-20261103.md`。

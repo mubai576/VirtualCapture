@@ -243,8 +243,10 @@ def test_capture_capabilities_use_control_route_without_starting(agent, monkeypa
         assert ip == "192.168.2.100"
         return 200, nic()
     monkeypatch.setattr(agent, "_choose_capture_adapter", choose)
+    monkeypatch.setattr(agent, "native_stream_capabilities", lambda kind: {"codecs": ["raw", "h264", "hevc"], "codec_revision": 1})
+    monkeypatch.setattr(agent, "native_codec_request", lambda kind: {"status": "candidates_only", "backends": []})
     capabilities = agent.stream_capabilities("192.168.2.100")
     assert capabilities["adapter"]["transmit_link_bps"] == 2500000000
-    assert capabilities["native"]["codecs"] == ["raw"]
+    assert capabilities["native"]["codecs"] == ["raw", "h264", "hevc"]
     assert capabilities["native"]["variable_resolution"]
-    assert capabilities["hardware"] == {"encoder": "unprobed", "decoder": "unprobed"}
+    assert capabilities["hardware"] == {"encoder": {"status": "candidates_only", "backends": []}, "decoder": "unprobed"}

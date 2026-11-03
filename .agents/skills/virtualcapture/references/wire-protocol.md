@@ -35,6 +35,10 @@ EtherType：`0x88B5`（实验段，无标准冲突，头内另有 magic 双保�
 `qpc_ns`保留同机含义；sender hashlog另有send_qpc_ns，用于验证发送开始间隔≥ceil(1e9/fps)，无追赶突发。
 DDA只发新桌面图像，静态/鼠标更新不重放。旧低层默认640仍可诊断，新产品会话须双方stream_revision=2。
 
+## P6-3 编码载荷
+
+28B包头、EtherType、pattern/flags语义完全不变。显式codec会话在普通载荷内发送48B VCAU封装+Annex-B访问单元，按实际长度分片。Raw仍按固定会话NV12字节数严格检查，绝不尝试猜测或自动切换编码。封装/上限/整体hash/EOS/IDR恢复完整契约见 `encoded-stream.md`。
+
 ## 发送 pacing（T4 定默认）
 
 69 个 9K 包背靠背是 ~620 KB 微突发，直连网卡 Buffer 未必全吃。
@@ -44,4 +48,5 @@ DDA只发新桌面图像，静态/鼠标更新不重放。旧低层默认640仍�
 - sender --batch N: N=1 per-packet sendpacket; N>1 accumulates N packets in a sendqueue, one transmit per N, remainder flushed at frame end. N=69 means one full frame per transmit.
 - Dual-host result (2400 motion frames, mtu9000, 0.3.7): batch1 ~205fps, 3 -> 230fps, 23/69 -> 240fps target cadence. Gains converge after 23 (~1/3 frame).
 - Npcap pcap_sendqueue_transmit returns positive on success (not 0): send_errors must test <0 (fixed 2026-10-21 after a !=0 false-positive run).
+- P6-3 encoded sender additionally requires the returned byte count to equal sendqueue.len; zero/short sends fail explicitly, without a batch fallback. The historical Raw path is unchanged. Installed Loopback batch69 returns a short send; local encoded verification therefore uses explicitly requested batch1, not a production NIC conclusion.
 - Batching changes submission only; wire format untouched (proto/ frozen).

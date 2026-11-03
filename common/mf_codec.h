@@ -143,6 +143,7 @@ public:
     events.Reset();transform.Reset();if(activation) activation->ShutdownObject();
   }
   bool asynchronous() const{return async;}
+  void set_gop(unsigned frames){property(CODECAPI_AVEncMPVGOPSize,frames,"explicit GOP");}
   void open(REFGUID codec,const VCStream& config,bool encoder,bool hardware,REFGUID clsid,UINT32 bitrate,
             std::function<void(IMFSample*)> callback,const std::wstring& exact_name=L"") {
     if(transform || !config.valid() || !bitrate) throw std::runtime_error("invalid/repeated transform configuration");

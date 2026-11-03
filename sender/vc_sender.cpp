@@ -30,6 +30,7 @@
 #include "dda.h"
 #include "fnv1a.h"
 #include "crc32.h"
+#include "../common/codec_session.h"
 
 // 64小图镜像（对账用）
 // 须与pattern_ref.py小图函数一致
@@ -219,6 +220,7 @@ struct PcapDev { std::string name, desc; };
 
 struct Args {
   VCStream stream;
+  VCCodec codec;
   std::string source_mac="02:00:00:00:00:01";
   std::string adapter="";
   std::string mode="pattern";
@@ -228,6 +230,8 @@ struct Args {
   uint8_t dstmac[6]={0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
   std::string session="manual", stats="", hashlog="", file="";
   bool loop=false, list_adapters=false, selftest=false, gpu_convert=false;
+  bool codec_check=false;
+  long long test_drop_frame=-1;
 };
 
 static bool parse_mac(const std::string&s,uint8_t m[6]){
@@ -259,6 +263,9 @@ static void usage(){
     "  --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest]\n"
     "  [--width 640 --height 640 --transform crop|fit|fill|stretch --source-mac <session MAC>] [--capabilities]\n"
     "  [--gpu-convert: DDA走GPU转换，失败显式报错不回退]\n");
+  puts("  codec: --codec h264|hevc --codec-backend <CLSID|name:exact> --codec-hardware 0|1\n"
+       "  --bitrate 20000000 --max-bitrate 80000000 --gop 60 --decode-in-flight 2 --max-au-bytes 8388608\n"
+       "  --codec-backends | --codec-check <codec options> | --au-selftest; diagnostic only: --test-drop-frame N");
 }
 
 static void ensure_parent(const std::string&path){
@@ -427,13 +434,19 @@ static int run_list_adapters(){
 }
 #endif
 
+#include "encoded_sender.h"
+
 int main(int argc,char**argv){
   qpc_init();
   Args a;
   for(int i=1;i<argc;i++){
     std::string k=argv[i];
     auto need=[&](std::string&out){ if(i+1>=argc){fprintf(stderr,"missing value for %s\n",k.c_str());exit(2);} out=argv[++i]; };
-    if(k=="--capabilities"){ puts(vc_stream_capabilities()); return 0; }
+    if(k=="--capabilities"){ puts(vc_codec_capabilities()); return 0; }
+    else if(k=="--codec-backends"){return vc_codec_backends(true);}
+    else if(k=="--codec-check"){a.codec_check=true;}
+    else if(k=="--au-selftest"){return vcau::selftest();}
+    else if(k=="--test-drop-frame"){std::string v;need(v);a.test_drop_frame=vc_cli_number(v);if(a.test_drop_frame<0)return 2;}
     else if(k=="--width"){ std::string v; need(v); a.stream.width=vc_cli_int(v); }
     else if(k=="--height"){ std::string v; need(v); a.stream.height=vc_cli_int(v); }
     else if(k=="--transform"){ need(a.stream.transform); }
@@ -457,7 +470,7 @@ int main(int argc,char**argv){
     else if(k=="--selftest"){a.selftest=true;}
     else if(k=="--gpu-convert"){a.gpu_convert=true;}
     else if(k=="--help"||k=="-h"){usage();return 0;}
-    else {fprintf(stderr,"unknown arg %s\n",k.c_str());usage();return 2;}
+    else {std::string v;need(v);if(!a.codec.option(k,v)){fprintf(stderr,"unknown arg %s\n",k.c_str());usage();return 2;}}
   }
 #ifdef _WIN32
   SetConsoleCtrlHandler(chandler, TRUE);
@@ -473,7 +486,8 @@ int main(int argc,char**argv){
   if(a.mode!="pattern"&&a.mode!="file"&&a.mode!="dda"){fprintf(stderr,"--mode must be pattern|file|dda\n");return 2;}
   a.stream.fps=a.fps;
   uint8_t source_mac[6];
-  if(!a.stream.valid() || !vc_parse_mac(a.source_mac,source_mac)){ fprintf(stderr,"invalid stream configuration\n"); return 2; }
+  if(!a.stream.valid() || !vc_parse_mac(a.source_mac,source_mac) || !a.codec.valid(a.mtu) || a.mtu<=42 || a.mtu>9042 || (!a.codec.encoded() && a.test_drop_frame>=0)){ fprintf(stderr,"invalid stream/explicit codec configuration\n"); return 2; }
+  if(a.codec_check){if(!a.codec.encoded())return 2;return vc_codec_check(a.codec,a.stream,true);}
   const size_t y_bytes=a.stream.y_bytes(), uv_bytes=a.stream.uv_bytes(), frame_bytes=a.stream.frame_bytes();
   int pid=pat_id(a.pattern);
   if(a.mtu<=42 || a.mtu>9042){ fprintf(stderr,"bad mtu\n"); return 2; }
@@ -481,7 +495,7 @@ int main(int argc,char**argv){
   if(payload==0||payload>9000){fprintf(stderr,"bad mtu\n");return 2;}
   size_t total=(frame_bytes+payload-1)/payload;
   if(a.batch<1 || a.batch>10000 || a.frames<0 || a.pacing_us<0){fprintf(stderr,"bad --batch\n");return 2;}
-  if(total>65535){fprintf(stderr,"mtu too small\n");return 2;}
+  if(!a.codec.encoded() && total>65535){fprintf(stderr,"mtu too small\n");return 2;}
 #ifdef _WIN32
   timeBeginPeriod(1); // 1ms精度，否则240Hz会睡成64Hz
 #endif
@@ -541,6 +555,7 @@ int main(int argc,char**argv){
   if(a.gpu_convert){fprintf(stderr,"--gpu-convert is Windows-only\n");return 2;}
 #endif
   std::vector<uint8_t> eth(14+28+payload);
+  if(a.codec.encoded()){int result=run_encoded_sender(a,d,h,dda_cap);d.closeh(h);timeEndPeriod(1);return result;}
   // 组以太网头
   memcpy(eth.data(),a.dstmac,6);
   uint8_t srcmac[6]={0x02,0x00,0x00,0x00,0x00,0x01};

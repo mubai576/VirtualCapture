@@ -50,17 +50,19 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 
 上述 2026-10-29 的精简 UI 已被本轮新增配置要求扩展；仍隐藏测试源/GPU/batch/MTU。
 新增五档分辨率预设 + 自定义、crop/fit/fill/stretch、raw/h264/hevc、码率及预留余量。
-开发版 Raw 可变尺寸与四种变换已接通；H.264/H.265 仍为草案，产品启动在任何注册/拉起前409拒绝。
+开发版 Raw 可变尺寸与四种变换已接通；H.264/H.265 默认草案，明确启用开发功能、选择并协商两端后端后可运行。完整追加API/配置/descriptor/日志契约见 `encoded-stream.md`，双机与画质验收未完成。
 
 | 方法 | 路径 | 请求 | 返回 |
 |---|---|---|---|
-| GET | `/stream/capabilities` | — | `{revision:2,presets[],native,hardware,adapter,adapter_error?}`；capture 按 HTTP 来源路由选择网卡并附数值收发速率；本阶段 hardware 均 unprobed，不启动采集 |
+| GET | `/stream/capabilities` | — | `{revision:2,presets[],native,hardware,adapter,adapter_error?}`；capture 按 HTTP 来源路由选择网卡并附数值收发速率；新原生程序返回当前角色MFT候选，另一侧unprobed；候选不代表实帧支持，不启动采集 |
 | POST | `/stream/plan` | `{config:{...部分配置...},refresh:false}` | 200 `{revision:2,video,network,implementation,can_start,warnings[]}`；校验失败400，capture角色403；不写配置、不启停、不注册。详情、预算数学与缓存见 stream-config.md |
 
 产品主机启动额外做新鲜链路预算；已知超线速、断开网卡、MTU 不一致在注册前拒绝，
 速率未知只警告，但旧后台缺显式会话能力必须拒绝。低层接口支持成对 width/height、fps、source_mac；sender支持transform，显式新字段先探测原生能力再停旧进程。
 Raw码率参数、不支持codec、收端缩放及错误几何拒绝。主机生成descriptor、收端先起、capture逐键确认并回显，不一致回滚双端。
 两端stats追加 width/height/frame_bytes/fps_limit/codec，sender另有transform/source_skipped。28B包头与历史raw判据未变；SHM已升级v3，下游须重新打开，完整契约见stream-config.md。
+
+P6-3追加只读 `POST /stream/codec-check {capture:{...}}`，实际激活/媒体类型协商，仍frames_tested=0；失败409。编码plan含backends清单并核对双端codec_revision=1；必须显式开发授权和后端，校验在停旧槽/注册之前。GUI区分压缩字节完整性与解码像素hash，详情以encoded-stream.md为准。
 
 ## /exec policy (added 0.2.0, allowlist-bound, NOT a general shell)
 

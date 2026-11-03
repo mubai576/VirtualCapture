@@ -11,7 +11,7 @@ raw L2 EtherType `0x88B5`（Npcap）发到主机重组，逐帧 FNV-1a64 对账�
 2026-11-02 owner 确认约三天实际使用满意；封存与未验收边界见 `PLAN.md`、`docs/bringup/bringup-20261102.md`。
 同日 owner 批准进入 P6：可变分辨率、裁切/缩放、链路预算及 H.264/H.265（保留 raw）；
 开发版 P6-2 已接通可变尺寸 Raw、四种裁切/缩放、真正发送限速、SHM v3 和动态 DShow；稳定部署仍为上述固定格式。
-H.264/H.265 进入 P6-3，未接通的组合仍拒绝启动。本机验证见 `docs/bringup/bringup-20261103-p6-raw.md`。设计见 `docs/proposals/configurable-stream-20261102.md`。
+H.264/H.265 开发链路已接通编码/L2/解码/SHM/DShow与显式GUI后端选择；须明确启用开发功能，未通过后端协商的组合拒绝启动。双机/长稳/画质仍待验收，见 `docs/bringup/bringup-20261103-p6-codec.md`。本机验证见 `docs/bringup/bringup-20261103-p6-raw.md`。设计见 `docs/proposals/configurable-stream-20261102.md`。
 **范围：只管采集与传输；推理端不在本项目范围**（PLAN D8）。
 
 ## 读什么（按任务）
@@ -33,7 +33,7 @@ H.264/H.265 进入 P6-3，未接通的组合仍拒绝启动。本机验证见 `d
 | 路径 | 内容 | 归属/规则 |
 |---|---|---|
 | `CMakeLists.txt` + `cmake/` | 根构建编排、统一编译/输出规则、Npcap SDK 查找、long-path manifest | 从根目录配置；产物跟随 `-B` |
-| `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mf_codec.h` MF后端原型（`vc-common` CMake target） | 算法只保留一份 |
+| `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mf_codec.h` MF后端、`access_unit.h`/`codec_session.h` 编码载荷与会话（`vc-common` CMake target） | 算法只保留一份 |
 | `proto/vc_wire.h` | 28B 包头，**冻结** | 仅 owner 可改 |
 | `sender/` | `vc-sender.exe`（pattern/file/dda，`--batch`，`pattern.h` 整数测试源，`dda.h` 桌面采集） | C++17 |
 | `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，会话 NV12 尺寸/fps，SHM v3，motion 仅显式 bring-up） | C++17 |

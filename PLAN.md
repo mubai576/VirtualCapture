@@ -11,7 +11,7 @@ P4 历史测试结论保留；2026-11-02 已只读封存当前部署，不新增
 
 封存后 owner 已批准继续开发（D19）：分辨率预设 `416×416 / 640×640 / 720p / 1080p / 1440p` + 自定义，
 裁切/缩放、双端链路预算、H.264/H.265。P6-1 与 P6-2 开发版已接通，原生 Raw/四种变换/发送限速/动态 SHM 与虚拟卡完成本机隔离验证。
-P6-3 编解码后端开始开发；尚未开放产品编码模式。现有部署不替换，双机新模式验收留在 P6-4。
+P6-3 开发版已接通明确后端选择、编码/L2/有界解码/IDR恢复/SHM/DShow与GUI；编码默认不启用，须明确开发授权。部署PC2 encoder、双机/长稳/画质仍待验收，不替换现有部署。
 
 | 维度 | 状态 |
 |---|---|
@@ -55,6 +55,8 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
   [--width 640 --height 640 --fps 240 --source-mac <MAC>] [--capabilities]
 ```
 
+P6-3共同CLI追加：`--codec h264|hevc --codec-backend <CLSID|name:exact> --codec-hardware 0|1 --bitrate <bps> --max-bitrate <bps> --gop N --decode-in-flight N --max-au-bytes N`；另有`--codec-backends/--codec-check/--au-selftest`。压缩载荷/API/日志契约见skill `references/encoded-stream.md`，28B包头不变；Raw CLI和判据不变。
+
 P6-3开发工具（不在产品载荷）：`vc-codec-probe --width W --height H --fps F`只探测候选；`vc-codec-roundtrip`要求显式encoder/decoder CLSID或精确name，支持codec/几何/fps/frames/bitrate/硬件类别/max-in-flight/hashlog及无硬件selftest。完整CLI见skill `references/stream-config.md`；不是生产codec能力或吞吐保证。
 
 ### 1.4 文件型 IPC
@@ -76,6 +78,8 @@ P6-3开发工具（不在产品载荷）：`vc-codec-probe --width W --height H 
 - P6-1（D19）：配置新增输出宽高、crop/fit/fill/stretch、raw/h264/hevc、目标/最大码率与链路预留余量；旧配置仍为 640×640 / crop / raw。新增只读 `GET /stream/capabilities` 与草稿 `POST /stream/plan`，`/adapters` 追加数值型收/发链路速率，`/health.stream_revision=1`（历史，现已由P6-2的2替代）。该阶段的非640/缩放拒绝由P6-2解锁；编码模式仍在注册/启动前409拒绝；禁止低层接口静默忽略新流参数。预算使用 mtu-42 和完整 L2 线速开销，不是实测吞吐或帧率保证；速率未知不冒充可行。完整契约见 skill `references/stream-config.md`。
 - P6-2（D19）：`stream_revision=2`、显式 descriptor 双端回显、实际原生能力探测与源 MAC 会话过滤；旧后台/二进制拒绝。可变尺寸 Raw、整数 crop/fit/fill/stretch、发送帧率上限已接通。SHM v3（VCA3，header offset32/36/40=width/height/fps，动态12槽步长）；新读端兼容固定v2，旧读端拒绝v3，writer拒绝已有同名映射。DShow 创建时固定一档真实会话格式，改尺寸先关下游再重新开始/打开；D12不变。详情与低层API见 skill `references/stream-config.md`。
 - 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 B 字节（旧默认614400B）。
+
+- P6-3开发编码：原生codec_revision=1；控制面显式backend/硬件类别/码率/GOP/队列/内存上限及开发授权。48B VCAU只在载荷内，压缩长度动态分片，CRC+整体压缩hash；独立有界MF解码、断档等待IDR、EOS/drain，解码NV12继续SHM v3。sender记source_hash/transport_hash，receiver另记transport与decoded_hash，不套用Raw reconcile。只读codec-check与GUI能力、状态及完整契约见skill `references/encoded-stream.md`。
 
 ### 1.5 全局禁止
 1. 不改包头尺寸/字段顺序。 2. 像素生成禁用浮点。 3. 原有 raw 模式禁止压缩；D19 单独批准新增 H.264/H.265 有损模式，不得复用 raw 逐像素哈希门来声称有损正确性。
@@ -166,7 +170,7 @@ P6-3开发工具（不在产品载荷）：`vc-codec-probe --width W --height H 
 
 ### P6-3 编解码能力与后端 — IN PROGRESS（2026-11-03）
 
-已实现Windows MF同步/异步后端原型，H.264/HEVC六种尺寸共12组/360帧实际编码→字节复制→解码通过；显式后端、不回退、强制IDR、精确display aperture。H.264单帧in-flight可用；本机HEVC解码需显式2帧，不能冒充Raw延迟。编码分包/丢包恢复/解码后SHM、PC2实际encoder与产品启用仍待完成，H.264/H.265启动继续409。证据及命令：`docs/proposals/codec-backend-20261103.md`。
+Windows MF同步/异步后端已接入编码分包/压缩hash/IDR恢复/有界解码/SHM/DShow及显式GUI开发模式；motion/batch1/Loopback两种codec六档共12组720帧完整解码与DShow核验，丢包恢复/严格拒绝/1Mbps滑窗及产品HTTP编排通过，Raw七组1665帧回归零错；verify 186 passed / 4 skipped。本机HEVC解码需显式2帧，不能冒充Raw延迟；Loopback batch69短发送明确失败、不自动回退。本机证据见 `docs/bringup/bringup-20261103-p6-codec.md`。仍未核验部署PC2 encoder、双机/编码DDA实景/长稳/画质/色彩/高帧率，卡保持IN PROGRESS，不把开发可运行当正式验收。后端背景：`docs/proposals/codec-backend-20261103.md`。
 
 ### P6-4 组合验收与交付 — TODO
 

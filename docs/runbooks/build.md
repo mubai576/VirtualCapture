@@ -84,6 +84,7 @@ python scripts/verify.py --no-build --live Loopback
 未指定 `VC_ADAPTER` 时 pytest 跳过 live 用例，T3 默认跳过；这些跳过不等于双机验收通过。
 P6-2 开发专项：`python scripts/p6_raw_verify.py`（motion/batch1/Loopback/真实DShow）；`--dda`需变化桌面。
 `python scripts/p6_product_verify.py`验证隔离HTTP产品编排，只有注册操作被替换，使用随机端口/私有映射，不触碰稳定5143或注册表。
+P6-3 开发专项：`python scripts/p6_codec_verify.py --codec h264|hevc --encoder <身份> --decoder <身份>`；支持 `--matrix`、`--loss`、`--decode-in-flight`、`--max-au-bytes` 与码率参数。`p6_product_verify.py` 同样可显式选择编码及后端；身份和实际证据见 `../bringup/bringup-20261103-p6-codec.md`。本机 Loopback 正向测试使用 batch1，batch69短发送明确失败，不自动回退。
 这些脚本不随成品交付；DLL隔离加载不注册。工具与专项验收入口见 `development-tools.md`，双机判据见 skill `references/test-matrix.md`。
 
 ## Agent 打包

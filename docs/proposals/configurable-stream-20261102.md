@@ -14,7 +14,7 @@ owner 已允许 H.264/H.265 有损链路与可变分辨率会话/SHM/虚拟卡�
 
 ## 分阶段执行
 
-### P6-1：配置与预算（本轮）
+### P6-1：配置与预算（首轮历史，后续进度见文末）
 
 在现有单文件 agent / 内置 Web UI 上扩展，不引入 Python 运行依赖，不改原生程序：
 
@@ -99,5 +99,5 @@ Python pattern_ref 与 C++ 向量对账全部通过；pytest **122 passed / 4 sk
 
 P6-2开发与本机垂直验证已完成：可变尺寸Raw、四种整数变换、真正发送上限、显式会话、SHM v3和动态DShow。
 原P6-1对非640/缩放的拒绝已被开发版解锁，稳定成品不替换。证据：`docs/bringup/bringup-20261103-p6-raw.md`。
-P6-3已有实际MF H.264/HEVC回环原型，但压缩传输/恢复和产品接线未完成，编码模式仍硬拒绝。
+P6-3已有实际MF H.264/HEVC后端，后续已接通压缩传输/IDR恢复/有界解码/SHM/DShow与显式GUI开发模式；默认不启用。新证据见 `docs/bringup/bringup-20261103-p6-codec.md`；部署PC2 encoder及双机/长稳/画质未验收。
 本机HEVC额外缓存一帧的发现不能隐藏；后续边界见 `docs/proposals/codec-backend-20261103.md`。
