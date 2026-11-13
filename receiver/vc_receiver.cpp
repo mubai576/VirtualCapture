@@ -90,8 +90,9 @@ static void usage(){
     "  [--width 640 --height 640 --fps 240 --source-mac <session MAC>] [--capabilities]\n"
     "  --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]\n");
   puts("  codec: --codec mjpeg --codec-backend turbojpeg:cpu --codec-hardware 0 --gop 1\n"
+       "         --codec pyrowave --codec-backend pyrowave:vulkan --codec-hardware 0 --gop 1\n"
        "  --bitrate 20000000 --max-bitrate 80000000 --decode-in-flight 2 --max-au-bytes 8388608 --jpeg-quality 1..100 (default 80)\n"
-       "  --codec-backends | --codec-check <codec options> | --au-selftest | --mjpeg-selftest");
+       "  --codec-backends | --codec-check <codec options> | --au-selftest | --mjpeg-selftest | --pyrowave-selftest");
 }
 static void ensure_parent(const std::string&path){
   // 建父目录
@@ -572,6 +573,9 @@ int main(int argc,char**argv){
     else if(k=="--au-selftest"){return vcau::selftest();}
 #ifdef VC_HAS_MJPEG
     else if(k=="--mjpeg-selftest"){return vcjpeg::selftest();}
+#endif
+#ifdef VC_HAS_PYROWAVE
+    else if(k=="--pyrowave-selftest"){return vcpyro::selftest();}
 #endif
     else if(k=="--width"){ std::string v; need(v); a.stream.width=vc_cli_int(v); }
     else if(k=="--height"){ std::string v; need(v); a.stream.height=vc_cli_int(v); }

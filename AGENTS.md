@@ -17,6 +17,9 @@ raw L2 EtherType `0x88B5`（Npcap）发到主机重组，逐帧 FNV-1a64 对账�
 `vc-codec-probe`/`vc-codec-roundtrip`：这种编解码方式不适合当前项目。当前只有 Raw 与可选开发版 MJPEG；
 MJPEG 开发链路已接通 L2/解码/SHM/DShow 与显式 GUI 后端选择，须明确启用，未通过协商的组合拒绝启动。
 双机/长稳/画质仍待验收。设计背景见 `docs/proposals/configurable-stream-20261102.md`。
+**同日 owner 批准（D24）接入 PyroWave**（Vulkan 计算小波 intra-only，MIT）：开发版显式后端
+`pyrowave:vulkan`，阶段一 CPU 上传/回读，两端需 Vulkan 1.3；构建/限制见 `docs/runbooks/pyrowave.md`，
+本机证据见 `docs/bringup/bringup-20261113-pyrowave.md`。不自动替换部署，未双机/长稳/画质验收。
 **范围：只管采集与传输；推理端不在本项目范围**（PLAN D8）。
 
 ## 读什么（按任务）
@@ -37,8 +40,8 @@ MJPEG 开发链路已接通 L2/解码/SHM/DShow 与显式 GUI 后端选择，须
 
 | 路径 | 内容 | 归属/规则 |
 |---|---|---|
-| `CMakeLists.txt` + `cmake/` | 根构建编排、统一编译/输出规则、Npcap SDK 查找、long-path manifest | 从根目录配置；产物跟随 `-B` |
-| `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mjpeg_codec.h`、`access_unit.h`/`codec_session.h` MJPEG载荷与会话（`vc-common` CMake target） | 算法只保留一份；MJPEG依赖/许可证见`docs/runbooks/mjpeg.md` |
+| `CMakeLists.txt` + `cmake/` | 根构建编排、统一编译/输出规则、Npcap SDK 查找、long-path manifest、MJPEG/PyroWave 固定依赖 ExternalProject | 从根目录配置；产物跟随 `-B` |
+| `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mjpeg_codec.h`、`pyrowave_codec.h`、`access_unit.h`/`codec_session.h` 编码载荷与会话（`vc-common` CMake target） | 算法只保留一份；MJPEG依赖/许可证见`docs/runbooks/mjpeg.md`，PyroWave见`docs/runbooks/pyrowave.md` |
 | `proto/vc_wire.h` | 28B 包头，**冻结** | 仅 owner 可改 |
 | `sender/` | `vc-sender.exe`（pattern/file/dda/wgc，`--batch`，`pattern.h` 整数测试源，`dda.h`/`wgc.h` 桌面采集） | C++17 |
 | `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，会话 NV12 尺寸/fps，SHM v3，motion 仅显式 bring-up） | C++17 |

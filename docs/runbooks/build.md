@@ -32,6 +32,8 @@ Python 用于 agent、控制脚本与 pytest；agent 打包另需 PyInstaller。
 H.264/H.265（Media Foundation 与原生 NVENC）已于 2026-11-13 按 D23 移除，不再需要 NVENC 声明头、CUDA 或 FFmpeg。
 MJPEG静态链接libjpeg-turbo 3.1.2 CPU/SIMD；构建时下载并核验固定源码/NASM档案，缺SIMD即失败，无新增运行时DLL。
 离线缓存、固定摘要及随包必须携带的IJG/BSD许可证见`mjpeg.md`。
+PyroWave（D24）由`cmake/Pyrowave.cmake`以ExternalProject构建固定提交的`libpyrowave-shared-1.dll`，
+新增运行时DLL与MIT许可证明细、离线缓存见`pyrowave.md`；运行需目标机Vulkan 1.3驱动，构建不需要系统Vulkan SDK。
 Npcap SDK 查找顺序：有效的 `NPCAP_SDK/Include/pcap.h` → `thirdparty/npcap-sdk` → 无 SDK 的动态加载构建。
 Npcap 运行时仅在实际收发时需要。
 
@@ -86,6 +88,7 @@ python scripts/verify.py --no-build --live Loopback
 P6-2 开发专项：`python scripts/p6_raw_verify.py`（motion/batch1/Loopback/真实DShow）；`--dda`需变化桌面。
 `python scripts/p6_product_verify.py`验证隔离HTTP产品编排，只有注册操作被替换，使用随机端口/私有映射，不触碰稳定5143或注册表。
 P6-3 开发专项：`python scripts/p6_codec_verify.py --codec mjpeg --encoder turbojpeg:cpu --decoder turbojpeg:cpu`；支持 `--matrix`、`--loss`、`--decode-in-flight`、`--max-au-bytes` 与码率参数；自定义尺寸/fps/变换/CPU转换/时长见`development-tools.md`。`p6_product_verify.py` 同样可显式选择编码；MJPEG固定双端`turbojpeg:cpu`，质量与限流说明见`mjpeg.md`，实现证据见`../bringup/bringup-20261103-mjpeg.md`。本机 Loopback 正向测试使用 batch1，batch69短发送明确失败，不自动回退。
+`p6_codec_verify.py` 另接受 `--codec pyrowave --encoder pyrowave:vulkan --decoder pyrowave:vulkan`（无`--jpeg-quality`），证据见`../bringup/bringup-20261113-pyrowave.md`。
 这些脚本不随成品交付；DLL隔离加载不注册。工具与专项验收入口见 `development-tools.md`，双机判据见 skill `references/test-matrix.md`。
 H.264/H.265 及其专项脚本参数已于 2026-11-13 按 D23 移除；MJPEG 缓冲优化对照见 `../bringup/bringup-20261103-mjpeg-opt.md`，不是正式稳定版替换。
 

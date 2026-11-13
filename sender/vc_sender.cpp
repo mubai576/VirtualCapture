@@ -269,8 +269,9 @@ static void usage(){
     "  [--output 0: 显示器序号（dda/wgc）] [--wgc-window <标题子串> --wgc-no-cursor]\n"
     "  [--gpu-convert: dda/wgc 走GPU转换，失败显式报错不回退]\n");
   puts("  codec: --codec mjpeg --codec-backend turbojpeg:cpu --codec-hardware 0 --gop 1\n"
+       "         --codec pyrowave --codec-backend pyrowave:vulkan --codec-hardware 0 --gop 1\n"
        "  --bitrate 20000000 --max-bitrate 80000000 --decode-in-flight 2 --max-au-bytes 8388608 --jpeg-quality 1..100 (default 80)\n"
-       "  --codec-backends | --codec-check <codec options> | --au-selftest | --mjpeg-selftest; diagnostic only: --test-drop-frame N");
+       "  --codec-backends | --codec-check <codec options> | --au-selftest | --mjpeg-selftest | --pyrowave-selftest; diagnostic only: --test-drop-frame N");
 }
 
 static void ensure_parent(const std::string&path){
@@ -398,6 +399,9 @@ static int run_selftest(){
   { int ddr=dda_selftest(); if(ddr==1){printf("FAIL dda selftest\n");ok=false;} }
   { int dgr=dda_gpu_selftest(); if(dgr==1){printf("FAIL dda gpu selftest\n");ok=false;} }
   { int wgr=wgc_selftest(); if(wgr==1){printf("FAIL wgc selftest\n");ok=false;} }
+#ifdef VC_HAS_PYROWAVE
+  { int pwr=vcpyro::selftest(); if(pwr==1){printf("FAIL pyrowave selftest\n");ok=false;} }
+#endif
   for(auto size : {std::pair<int,int>{2,2},{418,282},{416,416},{1280,720}}){
     std::vector<uint8_t> y((size_t)size.first*size.second),uv(y.size()/2);
     for(int pid=0;pid<5;pid++) for(uint32_t fid=0;fid<2;fid++){
@@ -454,6 +458,9 @@ int main(int argc,char**argv){
     else if(k=="--au-selftest"){return vcau::selftest();}
 #ifdef VC_HAS_MJPEG
     else if(k=="--mjpeg-selftest"){return vcjpeg::selftest();}
+#endif
+#ifdef VC_HAS_PYROWAVE
+    else if(k=="--pyrowave-selftest"){return vcpyro::selftest();}
 #endif
     else if(k=="--test-drop-frame"){std::string v;need(v);a.test_drop_frame=vc_cli_number(v);if(a.test_drop_frame<0)return 2;}
     else if(k=="--width"){ std::string v; need(v); a.stream.width=vc_cli_int(v); }

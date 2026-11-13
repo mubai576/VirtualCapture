@@ -998,20 +998,25 @@ def validate_config(c):
             e.append("capture.%s 必须是 2..8192 的偶数整数。" % key)
     if cp.get("transform") not in ("crop", "fit", "fill", "stretch"):
         e.append("capture.transform 必须是 crop|fit|fill|stretch。")
-    if cp.get("codec") not in ("raw", "mjpeg"):
-        e.append("capture.codec 必须是 raw|mjpeg（H.264/H.265 已于 2026-11-13 移除）。")
+    if cp.get("codec") not in ("raw", "mjpeg", "pyrowave"):
+        e.append("capture.codec 必须是 raw|mjpeg|pyrowave（H.264/H.265 已于 2026-11-13 移除）。")
     for key in ("codec_experimental", "encoder_hardware", "decoder_hardware"):
         if not isinstance(cp.get(key), bool): e.append("capture.%s 必须是布尔值。" % key)
     for key in ("encoder_backend", "decoder_backend"):
         value = cp.get(key)
-        if not isinstance(value, str) or len(value) > 256 or value not in ("", "turbojpeg:cpu"):
-            e.append("capture.%s 必须是空值或 turbojpeg:cpu；已移除其他编解码后端。" % key)
+        if not isinstance(value, str) or len(value) > 256 or value not in ("", "turbojpeg:cpu", "pyrowave:vulkan"):
+            e.append("capture.%s 必须是空值、turbojpeg:cpu 或 pyrowave:vulkan；已移除其他编解码后端。" % key)
+    expected_backend = {"mjpeg": "turbojpeg:cpu", "pyrowave": "pyrowave:vulkan"}.get(cp.get("codec"))
+    if expected_backend:
+        for key in ("encoder_backend", "decoder_backend"):
+            if cp.get(key) and cp[key] != expected_backend:
+                e.append("capture.%s 与 codec=%s 不匹配，必须为 %s。" % (key, cp.get("codec"), expected_backend))
     for key, lo, hi in (("gop_frames", 1, 1000), ("decode_in_flight", 1, 8), ("max_au_bytes", 1024, 16777216)):
         if not _is_int(cp.get(key), lo, hi): e.append("capture.%s 必须是 %d..%d 的整数。" % (key, lo, hi))
     if not _is_int(cp.get("jpeg_quality"), 1, 100): e.append("capture.jpeg_quality 必须是 1..100 的整数。")
     if cp.get("encoder_hardware") is not False or cp.get("decoder_hardware") is not False:
-        e.append("MJPEG 使用 CPU/SIMD 后端，不可冒充硬件编码或解码。")
-    if cp.get("gop_frames") != 1: e.append("MJPEG 每帧独立，gop_frames 必须为 1。")
+        e.append("当前编码后端不是厂商硬件编码器，不可冒充硬件编码或解码。")
+    if cp.get("gop_frames") != 1: e.append("当前编码均为每帧独立，gop_frames 必须为 1。")
     for key in ("bitrate_mbps", "max_bitrate_mbps"):
         if not _is_int(cp.get(key), 1, 10000): e.append("capture.%s 必须是 1..10000 的整数。" % key)
     if (_is_int(cp.get("bitrate_mbps"), 1, 10000) and _is_int(cp.get("max_bitrate_mbps"), 1, 10000)
@@ -1067,12 +1072,17 @@ MJPEG_FIELDS = ("jpeg_quality",)
 
 def codec_config(capture):
     if capture["codec"] == "raw": return {}
-    return {"codec_revision": 1, **{key: capture[key] for key in CODEC_FIELDS},
-            "mjpeg_revision": 1, "jpeg_quality": capture["jpeg_quality"]}
+    config = {"codec_revision": 1, **{key: capture[key] for key in CODEC_FIELDS}}
+    if capture["codec"] == "mjpeg":
+        config.update(mjpeg_revision=1, jpeg_quality=capture["jpeg_quality"])
+    elif capture["codec"] == "pyrowave":
+        config["pyrowave_revision"] = 1
+    return config
 
 
 def codec_payload(capture):
-    return {key: value for key, value in codec_config(capture).items() if key not in ("codec_revision", "mjpeg_revision")}
+    return {key: value for key, value in codec_config(capture).items()
+            if key not in ("codec_revision", "mjpeg_revision", "pyrowave_revision")}
 
 
 def stream_implementation_errors(capture):
@@ -1092,8 +1102,9 @@ def codec_cli(capture, kind):
     values = {"codec": capture["codec"], "codec-backend": capture[side + "_backend"],
               "codec-hardware": int(capture[side + "_hardware"]), "bitrate": capture["bitrate_mbps"] * 1000000,
               "max-bitrate": capture["max_bitrate_mbps"] * 1000000, "gop": capture["gop_frames"],
-              "decode-in-flight": capture["decode_in_flight"], "max-au-bytes": capture["max_au_bytes"],
-              "jpeg-quality": capture["jpeg_quality"]}
+              "decode-in-flight": capture["decode_in_flight"], "max-au-bytes": capture["max_au_bytes"]}
+    if capture["codec"] == "mjpeg":
+        values["jpeg-quality"] = capture["jpeg_quality"]
     return [part for key, value in values.items() for part in ("--" + key, str(value))]
 
 
@@ -1120,6 +1131,9 @@ def native_codec_request(kind, capture=None):
         if capture is not None and capture["codec"] == "mjpeg" and report.get("configured") is True:
             if not mjpeg_configuration_matches(report, capture):
                 report = {"error": "MJPEG 响应未确认完整请求参数；拒绝回退或忽略。"}
+        if capture is not None and capture["codec"] == "pyrowave" and report.get("configured") is True:
+            if not pyrowave_configuration_matches(report, capture, encoder=(kind == "sender")):
+                report = {"error": "PyroWave 响应未确认完整请求参数；拒绝回退或忽略。"}
         with CODEC_CACHE_LOCK:
             if len(CODEC_CACHE) > 32: CODEC_CACHE.clear()
             CODEC_CACHE[key] = (time.monotonic(), report)
@@ -1136,6 +1150,24 @@ def mjpeg_configuration_matches(report, capture):
                 "quality": capture["jpeg_quality"], "width": capture["width"], "height": capture["height"], "fps": capture["fps"],
                 "subsampling": "420", "dct": "fast_integer", "rate_control": "constant_quality",
                 "target_bitrate_applied": False, "encoder_in_flight": 1, "config_submitted": True}
+    return isinstance(settings, dict) and all(type(settings.get(key)) is type(value) and settings[key] == value
+                                              for key, value in expected.items())
+
+
+def pyrowave_frame_budget(capture):
+    per_frame = capture["max_bitrate_mbps"] * 1000000 // 8 // max(1, capture["fps"])
+    return min(per_frame, capture["max_au_bytes"] - 48, capture["width"] * capture["height"] * 3 // 2)
+
+
+def pyrowave_configuration_matches(report, capture, encoder=True):
+    if not isinstance(report, dict) or type(report.get("pyrowave_revision")) is not int or report["pyrowave_revision"] != 1:
+        return False
+    settings = report.get("encoder_configuration")
+    expected = {"family": "pyrowave", "identity": "pyrowave:vulkan", "revision": 1,
+                "width": capture["width"], "height": capture["height"], "subsampling": "420",
+                "upload_path": "cpu_nv12", "decode_path": "cpu_yuv420p"}
+    if encoder:
+        expected["max_bytes_per_frame"] = pyrowave_frame_budget(capture)
     return isinstance(settings, dict) and all(type(settings.get(key)) is type(value) and settings[key] == value
                                               for key, value in expected.items())
 
@@ -1205,6 +1237,7 @@ def stream_capabilities(controller_ip=None):
     if result["native"]["codec_revision"] == 1:
         result["hardware"]["encoder" if kind == "sender" else "decoder"] = native_codec_request(kind)
     result["native"]["mjpeg_revision"] = native_stream_capabilities(kind).get("mjpeg_revision", 0)
+    result["native"]["pyrowave_revision"] = native_stream_capabilities(kind).get("pyrowave_revision", 0)
     if deployment_role() == "capture" and controller_ip:
         code, adapter = _choose_capture_adapter(controller_ip)
         if code == 200: result["adapter"] = adapter
@@ -1248,6 +1281,7 @@ def low_level_stream_errors(kind, args):
     if not errors and capture["codec"] != "raw":
         caps = native_stream_capabilities(kind)
         if capture["codec"] == "mjpeg" and caps.get("mjpeg_revision") != 1: errors.append("原生程序缺少 MJPEG 能力，拒绝回退。")
+        if capture["codec"] == "pyrowave" and caps.get("pyrowave_revision") != 1: errors.append("原生程序缺少 PyroWave 能力，拒绝回退。")
         if errors: return errors
         if caps.get("codec_revision") != 1 or capture["codec"] not in caps.get("codecs", []): errors.append("原生程序缺少编码传输能力。")
         else:
@@ -1314,10 +1348,13 @@ def calculate_stream_plan(config, host_adapter=None, capture_adapter=None, disco
     if status == "margin": warnings.append("未超过物理线速，但侵入预留余量；建议降低分辨率/帧率或使用编码模式。")
     if encoded:
         warnings.append("编码预算按最大码率均摊估算，不约束单帧瞬时突发；不代表编码器吞吐或画质已达标。")
-        warnings.append("开发版 MJPEG：最多 %d 帧解码在途；每帧独立，无 GOP 等待。" % cp["decode_in_flight"])
+        warnings.append("开发版编码：最多 %d 帧解码在途；每帧独立，无 GOP 等待。" % cp["decode_in_flight"])
         warnings.append("最大码率按访问单元发送起点的一秒滑窗限制（含48B封装，不含L2开销）；单帧仍可形成微突发。")
         if cp["codec"] == "mjpeg":
             warnings.append("MJPEG 使用 JPEG 质量 %d，不应用目标码率；最大码率仅限流，触顶会降低实际 fps，不自动降低质量。" % cp["jpeg_quality"])
+        elif cp["codec"] == "pyrowave":
+            warnings.append("PyroWave 为 Vulkan 计算着色器后端，需两端 GPU/驱动支持 Vulkan 1.3；最大码率按 最大码率÷fps 作为每帧字节上限，"
+                            "不应用目标码率；未达到上限即按内容停在其自身码率，画质与吞吐未在本次计算中验证。")
     if cp["mode"] == "dda":
         warnings.append("P6-2 DDA 只发送新桌面图像，按目标帧率限速；静态桌面不重复发送，实际帧率可能更低。")
     if cp["mode"] == "wgc":
@@ -1399,6 +1436,12 @@ def stream_plan(patch=None, refresh=False):
             local = native_stream_capabilities("receiver")
             if local.get("mjpeg_revision") != 1 or "mjpeg" not in local.get("codecs", []):
                 errors.append("主机缺少 MJPEG 解码能力。")
+        elif cp["codec"] == "pyrowave":
+            if not isinstance(native, dict) or native.get("pyrowave_revision") != 1 or "pyrowave" not in native.get("codecs", []):
+                errors.append("采集后台缺少 PyroWave 能力，不会自动切换编码。")
+            local = native_stream_capabilities("receiver")
+            if local.get("pyrowave_revision") != 1 or "pyrowave" not in local.get("codecs", []):
+                errors.append("主机缺少 PyroWave 解码能力。")
         if not result["implementation"]["reasons"] and not errors:
             report = native_codec_request("receiver", cp)
             if report.get("configured") is not True: errors.append("主机解码器协商失败：" + report.get("error", "无效响应。"))
@@ -1407,6 +1450,8 @@ def stream_plan(patch=None, refresh=False):
             if code != 200 or report.get("configured") is not True: errors.append("采集编码器协商失败：" + report.get("error", "无效响应。"))
             elif cp["codec"] == "mjpeg" and not mjpeg_configuration_matches(report, cp):
                 errors.append("采集编码器未确认完整 MJPEG 请求参数；拒绝忽略或回退。")
+            elif cp["codec"] == "pyrowave" and not pyrowave_configuration_matches(report, cp, encoder=True):
+                errors.append("采集编码器未确认完整 PyroWave 请求参数；拒绝忽略或回退。")
     if errors:
         result["implementation"]["reasons"].extend(errors)
         result["implementation"]["supported"] = result["can_start"] = False
@@ -1524,6 +1569,10 @@ def _product_local_start(args, controller_ip):
         kind = "sender" if role == "capture" else "receiver"
         report = native_codec_request(kind, c["capture"])
         if report.get("configured") is not True: errors.append("所选编解码器协商失败：" + report.get("error", "无效响应。"))
+        elif c["capture"]["codec"] == "mjpeg" and not mjpeg_configuration_matches(report, c["capture"]):
+            errors.append("编解码器未确认完整 MJPEG 请求参数；拒绝忽略或回退。")
+        elif c["capture"]["codec"] == "pyrowave" and not pyrowave_configuration_matches(report, c["capture"], encoder=(kind == "sender")):
+            errors.append("编解码器未确认完整 PyroWave 请求参数；拒绝忽略或回退。")
     if role == "receive" and c["capture"]["mtu"] != c["receive"]["mtu"]: errors.append("两端 MTU 不一致。")
     descriptor = args.get("stream")
     if not deployment_role() and descriptor is None and any(c["capture"][key] != CONFIG_DEFAULT["capture"][key] for key in ("width", "height", "transform")):
@@ -1822,7 +1871,7 @@ UI_HTML = r'''<!doctype html>
 </div></div>
 <div class="form-section"><div class="form-heading"><span class="step">03</span><h2>传输模式与预算</h2></div>
 <div class="field-grid">
-<div class="field full"><label for="c_codec">链路像素 / 编码模式</label><select id="c_codec"><option value="raw">Raw NV12 · 无压缩</option><option value="mjpeg">MJPEG · 每帧独立 / CPU SIMD / 开发版</option></select><p>H.264/H.265 已于 2026-11-13 移除。编码只用于两机链路，主机解码后仍提供 NV12；不使用有损前后像素相等来判定传输正确。</p></div>
+<div class="field full"><label for="c_codec">链路像素 / 编码模式</label><select id="c_codec"><option value="raw">Raw NV12 · 无压缩</option><option value="mjpeg">MJPEG · 每帧独立 / CPU SIMD / 开发版</option><option value="pyrowave">PyroWave · 每帧独立 / Vulkan 计算 / 开发版</option></select><p>H.264/H.265 已于 2026-11-13 移除。编码只用于两机链路，主机解码后仍提供 NV12；不使用有损前后像素相等来判定传输正确。</p></div>
 <div id="bitrateFields" class="field full" hidden><div class="field-grid">
 <div class="field full"><label for="c_experimental">编码功能授权</label><select id="c_experimental"><option value="0">仅保存草案，不启动编码</option><option value="1">明确启用开发版编码（未完成双机 / 长稳 / 画质验收）</option></select></div>
 <div class="field"><label for="c_encoder">采集机编码后端</label><input id="c_encoder" list="encoderBackends" maxlength="256" placeholder="turbojpeg:cpu" required><datalist id="encoderBackends"></datalist></div>
@@ -1900,6 +1949,7 @@ function readiness(status, unsaved) {
   if (tx.note === 'stub-no-binary' && tx.running || rx.note === 'stub-no-binary' && rx.running) return result('warn','占位进程运行中 · 没有真实传输','缺少采集或接收程序，请先完成构建并停止占位进程。');
   if (tx.running && rx.running) {
     if (rx.waiting_idr && rx.codec === 'mjpeg') return result('warn','等待下一帧 JPEG 恢复画面','每帧独立；收到下一个完整有效 JPEG 即可恢复，不需要等待 GOP。');
+    if (rx.waiting_idr && rx.codec === 'pyrowave') return result('warn','等待下一帧 PyroWave 画面','每帧独立；收到下一个完整有效帧即可恢复，不需要等待 GOP。');
     if (rx.waiting_idr) return result('warn','等待下一个 IDR 恢复画面','解码状态已重置；依赖帧不会直接发布，等待带参数集的完整 IDR。');
     if (qualityErrors(rx) > 0) return result('warn','链路运行中 · 请检查传输质量','发现丢帧、字节校验或解码异常，详细计数见传输质量。');
     if (!finite(rx.complete) || rx.complete <= 0) return result('warn','等待首个完整画面','两端进程已启动，尚未收到完整帧；请检查采集源与网卡链路。');
@@ -2030,7 +2080,7 @@ function render(status) {
   const encoded = rx.codec && rx.codec !== 'raw', integrityKey = encoded ? 'transport_errors' : 'hash_mismatch';
   text('hashErrorLabel',encoded ? '压缩字节校验错误' : 'Raw 像素哈希错误');
   text('qualityNote',encoded ? '压缩访问单元 FNV-1a64 校验；解码后另记像素哈希，不做有损前后像素相等判定。' : 'Raw 每帧像素 FNV-1a64 对账；缺失数据以 — 显示。');
-  text('decodeInfo',encoded ? (rx.waiting_idr ? rx.codec === 'mjpeg' ? '等待下一帧 JPEG' : '等待 IDR' : '在途 '+count(rx.decode_pending))+
+  text('decodeInfo',encoded ? (rx.waiting_idr ? rx.codec === 'mjpeg' ? '等待下一帧 JPEG' : rx.codec === 'pyrowave' ? '等待下一帧 PyroWave' : '等待 IDR' : '在途 '+count(rx.decode_pending))+
     ' · 重置 '+count(rx.decode_resets)+' · 丢弃 '+count(rx.decode_discarded)+' · 错误 '+count(rx.decode_errors) : 'Raw 无编解码');
   [['dropped','dropped'],['hashErrors',integrityKey],['packetLoss','packets_lost'],['vcDelivered','vcam_delivered'],['vcRepeats','vcam_repeats']].forEach(pair => {
     text(pair[0],count(rx[pair[1]]));
@@ -2147,6 +2197,10 @@ function markDirty(event) {
     $('c_encoder').value = $('c_decoder').value = 'turbojpeg:cpu';
     $('c_encoder_hw').value = $('c_decoder_hw').value = '0';
     $('c_gop').value = '1'; $('c_in_flight').value = '1';
+  } else if (id === 'c_codec' && $('c_codec').value === 'pyrowave') {
+    $('c_encoder').value = $('c_decoder').value = 'pyrowave:vulkan';
+    $('c_encoder_hw').value = $('c_decoder_hw').value = '0';
+    $('c_gop').value = '1'; $('c_in_flight').value = '1';
   }
   if (id === 'c_resolution' && $('c_resolution').value !== 'custom') {
     const [width,height] = $('c_resolution').value.split('x');
@@ -2166,8 +2220,9 @@ function syncCodecFields() {
   ['c_encoder','c_decoder'].forEach(id => { $(id).required = !raw && $('c_experimental').value === '1'; });
   $('mjpegFields').hidden = !mjpeg;
   $('c_jpeg_quality').disabled = !mjpeg;
-  $('c_bitrate').disabled = raw || mjpeg;
-  $('c_gop').disabled = raw || mjpeg;
+  // 现有编码后端（MJPEG/PyroWave）都不应用目标码率，且强制每帧独立；仅最大码率可调。
+  $('c_bitrate').disabled = true;
+  $('c_gop').disabled = true;
 }
 function schedulePlan(refresh = false) {
   planGeneration++; planRefresh = planRefresh || refresh;

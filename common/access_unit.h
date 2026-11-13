@@ -15,7 +15,10 @@ constexpr uint32_t magic=0x55414356; // VCAU, little endian
 inline uint64_t get(const uint8_t* p,int n){uint64_t v=0;for(int i=0;i<n;i++)v|=(uint64_t)p[i]<<(8*i);return v;}
 inline void put(uint8_t* p,uint64_t v,int n){for(int i=0;i<n;i++)p[i]=(uint8_t)(v>>(8*i));}
 inline bool random_access(const uint8_t* bytes,size_t size,int codec){
-  return codec==3 && size>=4 && bytes[0]==0xff && bytes[1]==0xd8 && bytes[size-2]==0xff && bytes[size-1]==0xd9;
+  if(codec==3)return size>=4 && bytes[0]==0xff && bytes[1]==0xd8 && bytes[size-2]==0xff && bytes[size-1]==0xd9;
+  // PyroWave is intra-only; per-block headers are validated by the decoder itself.
+  if(codec==4)return size>=8;
+  return false;
 }
 inline bool random_access(const std::vector<uint8_t>& bytes,int codec){return random_access(bytes.data(),bytes.size(),codec);}
 struct Unit {
@@ -43,7 +46,7 @@ inline bool unpack(const std::vector<uint8_t>& data,uint32_t fid,const VCStream&
     get(data.data()+24,4)!=fid || get(data.data()+28,4) || get(data.data()+40,8)) return false;
   u.fid=fid;u.key=data[6]==1;u.eos=data[6]==2;u.hash=get(data.data()+32,8);
   if(u.eos!=(data.size()==header_bytes))return false;
-  if(codec==3 && !u.eos && !u.key)return false;
+  if((codec==3 || codec==4) && !u.eos && !u.key)return false;
   u.bytes.assign(data.begin()+header_bytes,data.end());
   return u.hash==vc_fnv1a64(u.bytes.data(),u.bytes.size());
 }
@@ -91,7 +94,7 @@ inline int selftest(){
   try{
     auto require=[](bool good){if(!good)throw std::runtime_error("access-unit selftest failed");};
     VCStream stream;stream.width=418;stream.height=282;
-    for(int codec:{3})for(size_t size:{0u,1u,37u,1459u,8959u,27001u}){
+    for(int codec:{3,4})for(size_t size:{0u,1u,37u,1459u,8959u,27001u}){
       Unit unit;unit.fid=7;unit.eos=size==0;unit.key=size!=0;unit.bytes.resize(size);
       for(size_t i=0;i<size;i++)unit.bytes[i]=(uint8_t)(i*17);
       auto data=pack(unit,stream,codec);Unit restored;

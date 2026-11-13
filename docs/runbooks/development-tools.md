@@ -14,7 +14,9 @@
 | 主机/后台与虚拟卡生命周期 | `python -m pytest ctrl/tests/test_gui_host.py -q`；使用进程与注册替身，不操作真实注册表 |
 | P6 Raw尺寸/发送上限/真实DShow | `python scripts/p6_raw_verify.py`；`--dda`需变化桌面，私有映射，不注册 |
 | P6 MJPEG传输/解码/真实DShow | `python scripts/p6_codec_verify.py --codec mjpeg --encoder turbojpeg:cpu --decoder turbojpeg:cpu`；`--matrix`尺寸矩阵、`--loss`丢包恢复；自定义尺寸/fps/变换/DDA/CPU及较长测试见下文；本机隔离，不注册 |
+| P6 PyroWave传输/解码/真实DShow | `python scripts/p6_codec_verify.py --codec pyrowave --encoder pyrowave:vulkan --decoder pyrowave:vulkan --width 640 --height 640 --fps 120 --frames 120 --max-bitrate 200 --decode-in-flight 2`；`--loss`同样要求帧21起恢复；需 Vulkan 1.3，见 `pyrowave.md` |
 | P6 产品控制端到原生链路 | `python scripts/p6_product_verify.py`；编码加显式 `--codec/--encoder/--decoder`，隔离ROOT/随机HTTP端口，注册替身，其余实际执行 |
+| PyroWave 编解码自检 | `build\vc-sender.exe --pyrowave-selftest`（或 vc-receiver）；无 Vulkan 1.3 报 SKIP，不计通过；构建/限制见 `pyrowave.md` |
 | 本机回环 live | `python scripts/verify.py --no-build --live Loopback` |
 | 查看构建产物时间 | `python scripts/check_bins.py` |
 | Python 测试源自检 | `python ctrl/pattern_ref.py` |

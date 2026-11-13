@@ -29,6 +29,9 @@ historical raw test gates remain frozen. See `references/stream-config.md` and
 Owner D21 additionally authorizes MJPEG: explicit `turbojpeg:cpu` on both sides, libjpeg-turbo CPU/SIMD,
 per-frame independent JPEG at configured quality, the same bounded L2/SHM/DShow path. No fallback,
 no default/deployment switch; see `docs/runbooks/mjpeg.md` and the encoded-stream contract.
+Owner D24 (same day) adds PyroWave as a second explicit dev codec: `pyrowave:vulkan`, Vulkan 1.3 compute
+wavelet, intra-only, phase-1 CPU NV12 upload/YUV420P readback, per-frame byte budget instead of a quality knob.
+Both ends need a Vulkan 1.3 device; no fallback or deployment switch; see `docs/runbooks/pyrowave.md`.
 
 Repo map, commands, rules and multi-AI conventions: **root `AGENTS.md`** (single source; not repeated here).
 Progress and open decisions: `PLAN.md`. Specs: `docs/spec/` (requirements / test-plan / deployment,
@@ -46,7 +49,7 @@ early docs with dated SUPERSEDED notes). This skill holds the domain knowledge +
 | `references/test-matrix.md` | T0–T5 definitions, D1 gates, triage. |
 | `references/packaging.md` | One-command portable package, contents, output replacement and verification. |
 | `references/stream-config.md` | P6 configuration, capability/budget API and implemented versus pending modes. |
-| `references/encoded-stream.md` | P6-3 MJPEG payload, bounded decode/recovery, APIs and separate integrity logs. |
+| `references/encoded-stream.md` | P6-3 MJPEG/PyroWave payload, bounded decode/recovery, APIs and separate integrity logs. |
 | `references/longrun-diagnostics.md` | PC1 Raw read-only six-hour recorder, optional VC_DIAG timing, isolated lifecycle/blocking regression. |
 
 ## Topology (shared-NIC since 2026-10-21: data + control on the same 2.5G port; see docs/history/plan-history.md S11)

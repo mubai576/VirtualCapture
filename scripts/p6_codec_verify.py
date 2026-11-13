@@ -1,4 +1,4 @@
-"""Explicit MJPEG -> L2 -> decode -> SHM/DShow loopback; no registration or deployment."""
+"""Explicit MJPEG/PyroWave -> L2 -> decode -> SHM/DShow loopback; no registration or deployment."""
 import argparse
 from datetime import datetime
 import json
@@ -19,7 +19,7 @@ def validate_case(width, height, fps, frames, seconds, loss, bitrate=20, max_bit
     if not 3 <= seconds <= 122 or frames / fps >= seconds - 2:
         raise ValueError("test-seconds must be 3..122 and leave more than two seconds after frames/fps")
     if loss and frames < 45:
-        raise ValueError("loss recovery requires at least 45 frames to observe the next IDR")
+        raise ValueError("loss recovery requires at least 45 frames to observe the next independent frame")
     if not 1 <= bitrate <= max_bitrate <= 2000:
         raise ValueError("bitrate must be 1..max-bitrate, max-bitrate must be <=2000 Mbps")
     if not 1 <= batch <= 10000 or not 1 <= decode_in_flight <= 8:
@@ -27,7 +27,7 @@ def validate_case(width, height, fps, frames, seconds, loss, bitrate=20, max_bit
     if not 1024 <= max_au_bytes <= 16777216:
         raise ValueError("max-au-bytes must be 1024..16777216")
     if type(gop) is not int or gop != 1:
-        raise ValueError("MJPEG frames are independent; gop must be 1")
+        raise ValueError("encoded frames are independent; gop must be 1")
 
 
 def distribution(values):
@@ -106,7 +106,7 @@ def run_case(output, codec, encoder, decoder, width=416, height=416, fps=30, fra
              transform="fit", seconds=8, encoder_hardware=False, decoder_hardware=False, gpu_convert=True, gop=1,
              jpeg_quality=None):
     validate_case(width, height, fps, frames, seconds, loss, bitrate, max_bitrate, batch, decode_in_flight, max_au_bytes, gop)
-    jpeg = mjpeg_options(codec, encoder, decoder, encoder_hardware, decoder_hardware, gop, jpeg_quality)
+    jpeg = codec_options(codec, encoder, decoder, encoder_hardware, decoder_hardware, gop, jpeg_quality)
     case = output / f"{codec}-{width}x{height}-{fps}-{mode}-{transform}-{'gpu' if gpu_convert and mode == 'dda' else 'cpu'}-{'loss' if loss else 'clean'}"
     case.mkdir()
     processes, logs = [], []
@@ -172,7 +172,7 @@ def run_case(output, codec, encoder, decoder, width=416, height=416, fps=30, fra
         actual = {row["frame_id"]: row["transport_hash"] for row in received}
         if loss:
             assert all(expected[fid] == value for fid, value in actual.items())
-            recovered = 21 if codec == "mjpeg" else 30
+            recovered = 21 if codec in ("mjpeg", "pyrowave") else 30
             assert set(range(recovered, frames)) <= actual.keys()
             assert not set(range(20, recovered)) & actual.keys()
         else:
@@ -194,9 +194,18 @@ def run_case(output, codec, encoder, decoder, width=416, height=416, fps=30, fra
         sender_stats = json.loads((case / "tx.json").read_text())
         quality = sender_stats.get("encoder_quality")
         encoder_config = sender_stats.get("encoder_configuration")
-        assert quality is None and encoder_config["family"] == "turbojpeg"
-        assert encoder_config["quality"] == jpeg and encoder_config["identity"] == "turbojpeg:cpu"
-        assert encoder_config["target_bitrate_applied"] is False and all(row["keyframe"] for row in sent)
+        if codec == "mjpeg":
+            assert quality is None and encoder_config["family"] == "turbojpeg"
+            assert encoder_config["quality"] == jpeg and encoder_config["identity"] == "turbojpeg:cpu"
+            assert encoder_config["target_bitrate_applied"] is False
+        else:
+            budget = min(max_bitrate * 10**6 // 8 // fps, max_au_bytes - 48, width * height * 3 // 2)
+            assert quality is None and encoder_config == {
+                "family": "pyrowave", "identity": "pyrowave:vulkan", "revision": 1,
+                "width": width, "height": height, "subsampling": "420",
+                "max_bytes_per_frame": budget, "upload_path": "cpu_nv12", "decode_path": "cpu_yuv420p"}
+            assert all(row["encoded_bytes"] <= budget for row in sent)
+        assert all(row["keyframe"] for row in sent)
         assert stats["complete"] == len(actual) == len(received)
         assert stats["decode_pending"] == 0 and stats["failed"] is False
         if loss:
@@ -230,14 +239,21 @@ def run_case(output, codec, encoder, decoder, width=416, height=416, fps=30, fra
             handle.close()
 
 
-def mjpeg_options(codec, encoder, decoder, encoder_hardware, decoder_hardware, gop, quality):
-    if codec != "mjpeg":
+def codec_options(codec, encoder, decoder, encoder_hardware, decoder_hardware, gop, quality):
+    if codec not in ("mjpeg", "pyrowave"):
         if quality is not None: raise ValueError("JPEG quality is only valid for MJPEG")
-        raise ValueError("only MJPEG remains; H.264/H.265 were removed")
-    if encoder != "turbojpeg:cpu" or decoder != "turbojpeg:cpu" or encoder_hardware or decoder_hardware:
-        raise ValueError("MJPEG requires explicit turbojpeg:cpu on both sides and hardware=0")
+        raise ValueError("only MJPEG and PyroWave remain; H.264/H.265 were removed")
     if gop != 1:
-        raise ValueError("MJPEG uses JPEG quality and gop=1")
+        raise ValueError(f"{codec} frames are independent; gop must be 1")
+    if encoder_hardware or decoder_hardware:
+        raise ValueError(f"{codec} is not a vendor hardware codec; hardware must be 0")
+    if codec == "pyrowave":
+        if quality is not None: raise ValueError("JPEG quality is only valid for MJPEG")
+        if encoder != "pyrowave:vulkan" or decoder != "pyrowave:vulkan":
+            raise ValueError("PyroWave requires explicit pyrowave:vulkan on both sides")
+        return None
+    if encoder != "turbojpeg:cpu" or decoder != "turbojpeg:cpu":
+        raise ValueError("MJPEG requires explicit turbojpeg:cpu on both sides")
     quality = 80 if quality is None else quality
     if type(quality) is not int or not 1 <= quality <= 100:
         raise ValueError("JPEG quality must be an integer in 1..100")
@@ -246,7 +262,7 @@ def mjpeg_options(codec, encoder, decoder, encoder_hardware, decoder_hardware, g
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--codec", choices=("mjpeg",), required=True)
+    parser.add_argument("--codec", choices=("mjpeg", "pyrowave"), required=True)
     parser.add_argument("--encoder", required=True)
     parser.add_argument("--decoder", required=True)
     parser.add_argument("--matrix", action="store_true")
@@ -266,7 +282,7 @@ def main():
     parser.add_argument("--batch", type=int, default=1)
     parser.add_argument("--decode-in-flight", type=int, default=2)
     parser.add_argument("--max-au-bytes", type=int, default=8388608)
-    parser.add_argument("--gop", type=int, default=1, help="MJPEG requires 1")
+    parser.add_argument("--gop", type=int, default=1, help="encoded frames are independent; must be 1")
     parser.add_argument("--jpeg-quality", type=int, help="MJPEG quality 1..100; default 80")
     args = parser.parse_args()
     if args.loss and args.frames < 45: parser.error("loss diagnostic requires at least 45 frames")
@@ -275,7 +291,7 @@ def main():
     cases = ([(416, 416), (640, 640), (1280, 720), (1920, 1080), (2560, 1440), (418, 282)]
              if args.matrix else [(416 if args.width is None else args.width, 416 if args.height is None else args.height)])
     try:
-        mjpeg_options(args.codec, args.encoder, args.decoder, bool(args.encoder_hardware), bool(args.decoder_hardware),
+        codec_options(args.codec, args.encoder, args.decoder, bool(args.encoder_hardware), bool(args.decoder_hardware),
                       args.gop, args.jpeg_quality)
         for width, height in cases:
             validate_case(width, height, args.fps, args.frames, args.test_seconds, args.loss,

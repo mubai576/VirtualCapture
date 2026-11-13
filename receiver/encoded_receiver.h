@@ -21,10 +21,8 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
       std::ofstream log(a.hashlog,std::ios::binary|std::ios::trunc);
       if(!log)throw std::runtime_error("cannot open decoded hashlog");
       int decoding_slot=-1;
-      auto reopen=[&]{
-        if(decoding_slot>=0){pool.abandon(decoding_slot);decoding_slot=-1;}
-        decoder.reset();discarded+=pending.size();pending.clear();pending_count=0;
-        decoder=std::make_unique<VCDecoder>();waiting=true;
+      auto open_decoder=[&]{
+        decoder=std::make_unique<VCDecoder>();
         decoder->open(a.codec,a.stream,[&](const uint8_t* bytes,size_t size,LONGLONG timestamp){
           const LONGLONG duration=10000000LL/a.stream.fps;
           if(timestamp<0 || timestamp%duration || (uint64_t)(timestamp/duration)>UINT32_MAX)throw std::runtime_error("invalid decoded timestamp");
@@ -49,21 +47,29 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
           return pool.data(decoding_slot);
         });
       };
-      reopen();ready=true;bool have_last=false;uint32_t last=0;
+      // Stream discontinuities only need codec state cleared; recreating a Vulkan device
+      // costs longer than a frame period and would starve the bounded receive queue.
+      auto reopen=[&](bool recreate){
+        if(decoding_slot>=0){pool.abandon(decoding_slot);decoding_slot=-1;}
+        discarded+=pending.size();pending.clear();pending_count=0;
+        if(recreate || !decoder)open_decoder(); else decoder->reset();
+        waiting=true;
+      };
+      reopen(true);ready=true;bool have_last=false;uint32_t last=0;
       for(;;){
         Work work;
         {std::unique_lock<std::mutex> lock(mutex);cv.wait_for(lock,std::chrono::milliseconds(2),[&]{return stopping || !queue.empty();});
           if(queue.empty()){if(stopping)break;lock.unlock();decoder->pump();continue;}
           work=std::move(queue.front());queue.pop_front();}
         auto& unit=work.unit;
-        if(work.discontinuity || (have_last && unit.fid!=last+1)){reopen();resets++;}
+        if(work.discontinuity || (have_last && unit.fid!=last+1)){reopen(false);resets++;}
         have_last=true;last=unit.fid;
         if(unit.eos){decoder->drain();if(!pending.empty())throw std::runtime_error("EOS drain left undecoded frames");continue;}
         if(waiting && !unit.key){discarded++;continue;}
         if(waiting)waiting=false;
         pending.emplace(unit.fid,Metadata{unit.hash,unit.first_ns});pending_count=pending.size();
         try{decoder->submit(unit.bytes.data(),unit.bytes.size(),(LONGLONG)unit.fid*(10000000LL/a.stream.fps),10000000LL/a.stream.fps,unit.key);decoder->pump();}
-        catch(const std::exception& failure){fprintf(stderr,"decode failure, waiting for next IDR: %s\n",failure.what());decode_errors++;reopen();resets++;continue;}
+        catch(const std::exception& failure){fprintf(stderr,"decode failure, waiting for next independent frame: %s\n",failure.what());decode_errors++;reopen(true);resets++;continue;}
         uint64_t deadline=qpc_ns_now()+5000000000ull;
         while(pending.size()>=(size_t)a.codec.in_flight){
           decoder->pump();if(pending.size()<(size_t)a.codec.in_flight)break;

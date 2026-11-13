@@ -8,25 +8,26 @@ import subprocess
 import threading
 import time
 import uuid
-from p6_codec_verify import mjpeg_options
+from p6_codec_verify import codec_options
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--codec", choices=("raw", "mjpeg"), default="raw")
+    parser.add_argument("--codec", choices=("raw", "mjpeg", "pyrowave"), default="raw")
     parser.add_argument("--encoder", default="")
     parser.add_argument("--decoder", default="")
     parser.add_argument("--jpeg-quality", type=int)
     options = parser.parse_args()
     if options.codec != "raw" and (not options.encoder or not options.decoder):
         parser.error("encoded mode requires explicit --encoder and --decoder")
-    try:
-        jpeg = mjpeg_options(options.codec, options.encoder, options.decoder, options.codec != "mjpeg", False,
-                             1 if options.codec == "mjpeg" else 1, options.jpeg_quality)
-    except ValueError as error:
-        parser.error(str(error))
+    jpeg = None
+    if options.codec != "raw":
+        try:
+            jpeg = codec_options(options.codec, options.encoder, options.decoder, False, False, 1, options.jpeg_quality)
+        except ValueError as error:
+            parser.error(str(error))
     output = ROOT / "run" / ("p6-product-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + options.codec + "-" + uuid.uuid4().hex[:6])
     output.mkdir(parents=True)
     mapping = "Local\\VCP6Product-" + uuid.uuid4().hex
@@ -92,9 +93,12 @@ def main():
             return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
         sent, received = rows(capture.state["sender"]["hashlog"]), rows(host.state["receiver"]["hashlog"])
         sender_stats = json.loads(Path(capture.state["sender"]["stats"]).read_text(encoding="utf-8"))
-        if jpeg is not None:
+        if options.codec == "mjpeg":
             assert host.mjpeg_configuration_matches({"mjpeg_revision": 1,
                 "encoder_configuration": sender_stats["encoder_configuration"]}, host.load_config()["capture"])
+        elif options.codec == "pyrowave":
+            assert host.pyrowave_configuration_matches({"pyrowave_revision": 1,
+                "encoder_configuration": sender_stats["encoder_configuration"]}, host.load_config()["capture"], encoder=True)
         samples = rows(output / "vc.jsonl")
         sent_key = "hash" if options.codec == "raw" else "transport_hash"
         received_key = "hash" if options.codec == "raw" else "decoded_hash"

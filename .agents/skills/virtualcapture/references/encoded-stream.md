@@ -1,9 +1,10 @@
-# P6-3 编码链路开发契约（MJPEG；2026-11-13 移除 H.264/H.265）
+# P6-3 编码链路开发契约（MJPEG / PyroWave；2026-11-13 移除 H.264/H.265）
 
 本文件补充 stream-config/agent-api/wire-protocol：Raw 的格式、判据和对账均不变。
-owner 于 2026-11-13 决定移除 H.264/H.265（含 Media Foundation 与原生 NVENC）及其测试结果，只保留
-每帧独立的 MJPEG 开发链路；不代表 PC2 后端、双机、长稳、画质或实时吞吐验收完成。
-GUI 默认仍为 Raw；MJPEG 必须明确选择两端 `turbojpeg:cpu` 并启用开发功能，不能自动回退。
+owner 于 2026-11-13 决定移除 H.264/H.265（含 Media Foundation 与原生 NVENC）及其测试结果，
+只保留每帧独立的开发编码：D21 的 MJPEG 与 D24 的 PyroWave（Vulkan 计算小波，intra-only）。
+两者都不代表 PC2 后端、双机、长稳、画质或实时吞吐验收完成。
+GUI 默认仍为 Raw；二者都必须明确选择匹配的两端后端并启用开发功能，不能自动回退。
 
 ## 显式配置与能力
 
@@ -11,33 +12,36 @@ GUI 默认仍为 Raw；MJPEG 必须明确选择两端 `turbojpeg:cpu` 并启用�
 
 | 字段 | 缺省 | 含义 |
 |---|---|---|
-| codec_experimental | false | 明确允许开发版 MJPEG；false 只保存草案 |
-| encoder_backend / decoder_backend | 空 | 编码时必须精确为 `turbojpeg:cpu`；其他身份拒绝 |
-| encoder_hardware / decoder_hardware | false | MJPEG 固定 CPU/SIMD，true 拒绝，不冒充硬件编解码 |
-| gop_frames | 60 | MJPEG 必须为 1；每帧独立 |
+| codec_experimental | false | 明确允许开发版编码；false 只保存草案 |
+| encoder_backend / decoder_backend | 空 | 必须与 codec 匹配：MJPEG 精确 `turbojpeg:cpu`，PyroWave 精确 `pyrowave:vulkan`；其他身份拒绝 |
+| encoder_hardware / decoder_hardware | false | 现有后端都不是厂商硬件编解码器，true 拒绝，不冒充硬件 |
+| gop_frames | 60 | 现有编码必须为 1；每帧独立 |
 | decode_in_flight | 2 | 1..8，解码在途上限；不能因超时自动加深 |
 | max_au_bytes | 8388608 | 1024..16777216，含48B封装的访问单元内存上限；还须满足 uint16 分片数 |
-| jpeg_quality | 80 | MJPEG 整数质量1..100，固定420/快速整数DCT |
+| jpeg_quality | 80 | 仅 MJPEG：整数质量1..100，固定420/快速整数DCT |
 
 原 bitrate_mbps / max_bitrate_mbps 保留；编码实现只接受 target<=max<=2000 Mbps。
-目标码率不用于 JPEG（恒定质量）；最大值由 sender 按访问单元发送起点的一秒滑窗限制（计48B封装，不计L2开销）。
+目标码率不对现有后端生效：MJPEG 用恒定质量，PyroWave 只把 `max_bitrate÷fps` 当每帧字节上限；
+最大值由 sender 按访问单元发送起点的一秒滑窗限制（计48B封装，不计L2开销）。
 整个访问单元超过一秒预算或 max_au_bytes 时失败，不豁免、不降质量/尺寸/fps。
 滑窗可能降低实际输出频率，也不消除单帧包的微突发；界面预算仍只是均摊估算。
 
 - `/health.stream_revision=2` 保留；sender/receiver `--capabilities` 另报 `codec_revision=1`，
-  codecs 只含 `raw` 与编入的 `mjpeg`；MJPEG 另有 `mjpeg_revision=1`。
-- `GET /stream/capabilities` 的 native 另含 codec_revision/mjpeg_revision；当前角色的
+  codecs 只含 `raw` 与编入的 `mjpeg`/`pyrowave`；另有 `mjpeg_revision=1`、`pyrowave_revision=1`。
+- `GET /stream/capabilities` 的 native 另含 codec_revision/mjpeg_revision/pyrowave_revision；当前角色的
   `hardware.encoder|decoder` 为 `{revision:1,status:candidates_only,backends:[{codec:"mjpeg",
-  identity:"turbojpeg:cpu",name,frames_tested:0}]}`。这是枚举，不代表成功激活/媒体类型/帧验证。
-- `POST /stream/codec-check {capture:{...}}`：当前角色实际初始化 MJPEG 编码器或解码器。
-  返回200 `{revision:1,configured:true,frames_tested:0,stream_validated:false,mjpeg_revision:1,encoder_configuration:{...}}`，
+  identity:"turbojpeg:cpu",name,frames_tested:0},{codec:"pyrowave",identity:"pyrowave:vulkan",...}]}`。
+  这是枚举，不代表成功激活/媒体类型/帧验证。
+- `POST /stream/codec-check {capture:{...}}`：当前角色实际初始化所选编码器或解码器。
+  返回200 `{revision:1,configured:true,frames_tested:0,stream_validated:false,mjpeg_revision:1|pyrowave_revision:1,encoder_configuration:{...}}`，
   失败409及明确错误。无网卡收发、无配置写入、无注册、不停旧进程；原生子进程12秒总超时。
-- `/stream/plan` 编码时核对 peer codec_revision/mjpeg_revision，实际检查两侧所选 turbojpeg:cpu。
+- `/stream/plan` 编码时核对 peer codec_revision 与对应 revision，实际检查两侧所选后端身份。
   `hardware_verified` 仍 false：类型协商不是实帧验证；可开始也不意味着验收通过。
 - 原生结果以绝对路径/mtime/size/参数缓存10秒，最多33项；原生进程真正启动仍会重新初始化，失败可见并回滚。
 
-编码 descriptor 保留 revision2 及原会话字段，追加 `codec_revision:1`、`mjpeg_revision:1`、
-`jpeg_quality` 及上述全部编码字段与两种码率。字段集合、类型、值双端逐项确认；
+编码 descriptor 保留 revision2 及原会话字段，追加 `codec_revision:1` 与上述全部编码字段与两种码率；
+MJPEG 另加 `mjpeg_revision:1`、`jpeg_quality`，PyroWave 另加 `pyrowave_revision:1`（不带 jpeg_quality）。
+字段集合、类型、值双端逐项确认；
 Raw descriptor 不追加编码字段，继续兼容 P6-2。低层 `/sender/start`、`/receiver/start` 编码调用
 也须明确提供开发开关、两端身份及参数；先校验/探测再停旧槽。Raw 显式提供编码参数仍拒绝。
 
@@ -72,23 +76,59 @@ CPU 编码在 pump 执行，encode_wait_ns 包含同步 CPU 压缩，不是 GPU/
 构建/固定依赖摘要/许可证见 `docs/runbooks/mjpeg.md`；selftest 见 `--mjpeg-selftest`。
 JPEG 质量 100 仍非无损，画质/色彩须另验收。
 
+## PyroWave 扩展（D24；pyrowave_revision=1）
+
+owner 于 2026-11-13 批准接入 PyroWave（Themaister/PyroWave，MIT；Granite 运行时子集，MIT）：
+Vulkan 1.3 计算着色器的 CDF 9/7 小波 intra-only 编码，无熵编码，无 GOP、无参考帧。
+sender/receiver 的 capabilities 及 agent native 追加 `pyrowave_revision:1`、codecs 中的 `pyrowave`，
+候选为两端 `pyrowave:vulkan`、hardware=false、family=pyrowave。未编入 `VC_HAS_PYROWAVE` 的原生程序
+不得声明该能力；缺能力时明确拒绝，不回退 MJPEG/Raw。
+
+PyroWave descriptor 在原编码字段上追加 `pyrowave_revision:1`，不带 `jpeg_quality`；
+非 PyroWave 显式提供该 revision 或 PyroWave 显式提供 jpeg_quality 均拒绝。
+双端 identity 必须精确为 `pyrowave:vulkan`、硬件类别 false、GOP 1，且两端 backend 与 codec 匹配。
+
+阶段一（当前）只走 PyroWave 的 CPU 缓冲路径：sender 以 NV12 上传（`upload_path=cpu_nv12`），
+receiver 同步解码到 YUV420P（`decode_path=cpu_yuv420p`）后再交错为 NV12；没有 D3D11/Vulkan
+外部内存互操作，也没有 GPU 侧缩放或帧池。解码输出仍是完整 NV12 帧，SHM v3/DShow 契约不变。
+占用一个 Vulkan 逻辑设备；两端各自创建默认设备，不跨进程共享。
+
+每帧预算是 `min(max_bitrate_mbps×10^6÷8÷fps, max_au_bytes−48, 一帧 NV12 字节数)`，在会话建立时固定并
+双端回显（`max_bytes_per_frame`）；它只是 PyroWave 的每帧输出上限（超限时编码器在该帧内降低精度），
+不是恒定码率、不保证画质，也不替代发送端一秒滑窗限流。目标码率不生效；没有质量旋钮。
+单帧 bitstream 作为一个 PyroWave packet 输出，仍整体套 48B VCAU 封装再由传输层分片；
+`compute_num_packets` 必须返回 1，否则明确失败。
+
+PyroWave 会话配置回显：family=pyrowave、identity=pyrowave:vulkan、revision=1、width/height、
+subsampling=420、max_bytes_per_frame、upload_path=cpu_nv12、decode_path=cpu_yuv420p。
+解码端回显 max_bytes_per_frame 为 0（未设置编码预算），其余同构；双端逐项确认才 configured。
+
+Vulkan 1.3 设备不可用（如无合适 GPU/驱动）时创建失败：`--pyrowave-selftest` 报 SKIP 且不冒充通过，
+产品启动在协商阶段明确失败，不自动换后端。GPU 型号/驱动版本属于部署前提，不是本项目验收结论。
+构建/固定提交摘要/许可证见 `docs/runbooks/pyrowave.md`；本机功能边界见
+`docs/bringup/bringup-20261113-pyrowave.md`。
+
 ## 原生 CLI
 
 两端共同追加（Raw 旧 CLI 不变）：
 
 ```text
 --codec mjpeg --codec-backend turbojpeg:cpu --codec-hardware 0 --gop 1
+--codec pyrowave --codec-backend pyrowave:vulkan --codec-hardware 0 --gop 1
 --bitrate 20000000 --max-bitrate 80000000 --decode-in-flight 2 --max-au-bytes 8388608
---jpeg-quality 1..100
+--jpeg-quality 1..100          # 仅 MJPEG；PyroWave 提供即拒绝
 --codec-backends
 --codec-check <会话尺寸/fps/MTU与codec参数>
 --au-selftest
 --mjpeg-selftest
+--pyrowave-selftest
 ```
 
-缺省仍 raw；选择 MJPEG 必须给后端，其他数值缺省如例（bitrate 单位 bit/s）。
+缺省仍 raw；选择编码必须给匹配后端，其他数值缺省如例（bitrate 单位 bit/s）。
 `--codec h264|hevc` 及其他编码名在打开网卡前以退出码2拒绝；不提供任何替代后端。
-`--codec-backends` 仅列 MJPEG 候选；`--codec-check` 实际初始化但不送帧；错误参数退出2，后端或运行失败退出1。
+`--codec-backends` 列出编入的 MJPEG/PyroWave 候选；`--codec-check` 实际初始化但不送帧；
+错误参数退出2，后端或运行失败退出1。`--pyrowave-selftest` 无 Vulkan 1.3 时报 SKIP（退出2），
+不得计为通过。
 sender 额外原生诊断 `--test-drop-frame N`：只在显式编码模式丢弃第N帧的第0个分片，hashlog 标 fault_injected，
 不暴露到产品配置/API；测试必须写明注入，不能将其计入正常零丢包证据。
 
@@ -103,7 +143,7 @@ sender 额外原生诊断 `--test-drop-frame N`：只在显式编码模式丢弃
 | offset | 长度 | 小端内容 |
 |---|---|---|
 | 0 | 4 | VCAU magic 0x55414356 |
-| 4/5/6/7 | 各1 | revision=1 / codec(3=mjpeg) / kind(1=独立帧,2=EOS) / header_bytes=48 |
+| 4/5/6/7 | 各1 | revision=1 / codec(3=mjpeg,4=pyrowave) / kind(1=独立帧,2=EOS) / header_bytes=48 |
 | 8/12/16 | 各4 | width / height / fps，必须与控制会话完全相同 |
 | 20/24 | 各4 | 编码字节数 / frame_id（必须与外层相同） |
 | 28 | 4 | 保留0 |
@@ -113,7 +153,9 @@ sender 额外原生诊断 `--test-drop-frame N`：只在显式编码模式丢弃
 EOS 无编码字节且 kind=2，使用下一个 frame_id；有数据的 kind=2 或空图像帧拒绝。
 bit0 仍只按原始 frame_id=0 设置，不作为编码关键帧；完整性由载荷内完整 JPEG 保证。
 MJPEG 每个非 EOS 单元必须 kind1，载荷为完整 SOI..EOI JPEG，不能发送 kind0。
-完整解码时继续验证 JPEG 头及精确 NV12 尺寸；封装布局和 28B 包头不变。
+PyroWave 每个非 EOS 单元同样必须 kind1，载荷是完整单 packet bitstream（非空且至少 8 字节），
+解码器自行校验其头部/尺寸/image count；封装布局和 28B 包头不变。
+完整解码时继续验证 JPEG 头及精确 NV12 尺寸；PyroWave 输出尺寸由会话 w/h 校验。
 编解码历史值 1/2（H.264/HEVC）已移除，遇到时按无效单元拒绝，不尝试兼容或回退。
 
 重组最多 2 个未完成单元，每个分配不超过 max_au_bytes；严格检查 seq/total/长度/CRC 和同帧 pattern/flags/qpc 一致。
@@ -122,9 +164,13 @@ MJPEG 每个非 EOS 单元必须 kind1，载荷为完整 SOI..EOI JPEG，不能�
 
 ## 有界解码与恢复
 
-Npcap 线程只重组/校验；独立工作线程运行 MJPEG 解码，等待队列最多 2 个访问单元，不等于 2 帧额外必需延迟。
+Npcap 线程只重组/校验；独立工作线程运行所选编码的解码，等待队列最多 2 个访问单元，不等于 2 帧额外必需延迟。
 排队溢出丢弃待处理队列、下一单元触发重置；frame_id 断档/无效完整单元也重置解码器。
-MJPEG 每帧独立：断档重建后立即可解码下一个完整 JPEG，不等待下一个 GOP，也不需要 IDR。
+MJPEG/PyroWave 每帧独立：断档重建后立即可解码下一个完整帧，不等待 GOP，也不需要 IDR。
+PyroWave 解码是同步 Vulkan 提交+CPU 回读并转 NV12；不会为追帧加深队列或在途上限，
+GPU 忙/设备丢失按解码错误处理并重置，不静默换设备。
+流断档/队列丢弃只清解码器状态并重建解码器对象（保留 Vulkan 设备）；只有解码失败才整体重建编解码器。
+这样才能避免设备创建时间长于帧周期、接收队列反复溢出形成重置死循环（2026-11-13 实测并修复）。
 gop_frames 固定为 1；源静止时没有恢复墙钟上限。
 解码 pending 上限由 decode_in_flight 明确指定；5 秒无法输出则失败，不自动增加队列。
 解码报错会记录并重置；不能偷偷换 codec/设备/尺寸。输出严格验证时间戳、顺序、NV12 尺寸/stride/aperture。
@@ -145,7 +191,8 @@ gop_frames 固定为 1；源静止时没有恢复墙钟上限。
   transport_errors 包含坏分片/CRC 与无效完整 AU；packets_lost 计入已丢不完整 AU 的缺片及坏包，不声称能数出完全未到达的 AU。
   frame_id 断档由解码 reset/discard 显式反映。
 - sender 追加 encoded_bytes/keyframes/bitrate/max_bitrate/max_au_bytes/gop/rate_wait_ms，encoder 仅 1 帧 in-flight。
-  encoder_quality=null；encoder_configuration 为 MJPEG 会话参数。两侧 codec/宽高/fps_limit 与真实会话一致。
+  encoder_quality=null；encoder_configuration 为所选编码的会话参数（MJPEG 或 PyroWave 回显）。两侧 codec/宽高/fps_limit 与真实会话一致。
+  PyroWave 的 encode_wait_ns 含 CPU 上传、Vulkan 提交等待与 packetize，不是纯 GPU 时间；也不含解码端。
   GUI 区分 Raw 像素对账与压缩字节校验，并显示解码等待/重置/丢弃/错误。
 - sender `timing_ms` 为最近10000个已发送帧的各段 `{samples,avg,p99,max}`（单位ms，window_frames=10000）：
   prepare_wait（采集前等待）、source（生成/采集）、sample_submit（sample 创建拷贝+提交）、
@@ -182,3 +229,8 @@ DDA 的 pattern=null，不冒充 motion。ROI 静止时即使解码 hash 因有�
 `decode_pipeline_ms` 只统计 receiver 首包到解码输出的同机段，不含编码/跨机时延/DShow 出口，不是端到端延迟。
 `scripts/p6_product_verify.py` 支持 `--codec raw|mjpeg` 的产品编排诊断。仅本机隔离、无注册、不部署。
 MJPEG 诊断需明确两端 turbojpeg:cpu 且 hardware=0；原 H.264/HEVC 参数、GOP15/帧30 恢复规则及相关报告已移除。
+`scripts/p6_codec_verify.py` 也接受 `--codec pyrowave --encoder pyrowave:vulkan --decoder pyrowave:vulkan`
+（无 `--jpeg-quality`，GOP1，hardware0；`--loss` 同样要求帧20丢失后从帧21起恢复），
+额外核对 `encoder_configuration` 的全部字段与每帧字节上限。`scripts/p6_product_verify.py` 也已接受
+`--codec pyrowave --encoder/--decoder pyrowave:vulkan`（隔离 HTTP/真实原生/DShow，注册为替身）。
+两者都只是本机功能证据，不得据此声称产品级/双机验收。

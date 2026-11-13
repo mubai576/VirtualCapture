@@ -40,3 +40,9 @@ Rest unchanged: dropped==0 and hash_mismatch==0 and complete==sent, senderCPU be
 ## P6-3 开发验证（不替代上述门限）
 
 `scripts/p6_codec_verify.py`要求`--codec mjpeg`与双端`turbojpeg:cpu`，验证压缩字节hash、真实解码NV12到SHM/DShow、发送最小间隔和一秒最大载荷窗口；`--loss`注入frame20缺片，要求frame21的完整JPEG后恢复。使用motion/batch1/Loopback，仅本机功能测试。`scripts/p6_product_verify.py`验证隔离HTTP编排，注册操作为替身，不冒充真实注册验收。画质/色彩、物理链路、长稳和实时吞吐另验收，不能套Raw像素相等门。契约见`encoded-stream.md`，证据见`docs/bringup/bringup-20261103-mjpeg.md`。
+PyroWave（D24）可用`scripts/p6_codec_verify.py --codec pyrowave --encoder pyrowave:vulkan --decoder pyrowave:vulkan`
+做同样的压缩hash/真实解码/DShow/间隔/一秒窗口检查，`--loss`要求帧21起恢复；另有`--pyrowave-selftest`。
+`p6_product_verify.py --codec pyrowave --encoder pyrowave:vulkan --decoder pyrowave:vulkan`
+验证隔离HTTP→真实原生→SHM/DShow（注册为替身）。
+这些仍是本机功能证据，不计入任何Raw门限或既有PASS；无Vulkan 1.3时selftest报SKIP。
+证据见`docs/bringup/bringup-20261113-pyrowave.md`。

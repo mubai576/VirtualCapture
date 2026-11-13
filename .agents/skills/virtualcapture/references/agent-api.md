@@ -49,8 +49,9 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 ## P6 配置、预算与显式会话（D19；P6-2，2026-11-03）
 
 上述 2026-10-29 的精简 UI 已被本轮新增配置要求扩展；仍隐藏测试源/GPU/batch/MTU。
-新增五档分辨率预设 + 自定义、crop/fit/fill/stretch、raw/mjpeg、码率及预留余量。
-开发版 Raw 可变尺寸与四种变换已接通；MJPEG 须明确启用开发功能并选择两端 `turbojpeg:cpu` 后才能运行。
+新增五档分辨率预设 + 自定义、crop/fit/fill/stretch、raw/mjpeg/pyrowave、码率及预留余量。
+开发版 Raw 可变尺寸与四种变换已接通；MJPEG 须明确启用开发功能并选择两端 `turbojpeg:cpu`，
+PyroWave 须两端 `pyrowave:vulkan`（Vulkan 1.3）后才能运行。
 H.264/H.265 已于 2026-11-13 移除。完整追加API/配置/descriptor/日志契约见 `encoded-stream.md`，双机与画质验收未完成。
 
 | 方法 | 路径 | 请求 | 返回 |
@@ -63,7 +64,7 @@ H.264/H.265 已于 2026-11-13 移除。完整追加API/配置/descriptor/日志�
 Raw码率参数、不支持codec、收端缩放及错误几何拒绝。主机生成descriptor、收端先起、capture逐键确认并回显，不一致回滚双端。
 两端stats追加 width/height/frame_bytes/fps_limit/codec，sender另有transform/source_skipped。28B包头与历史raw判据未变；SHM已升级v3，下游须重新打开，完整契约见stream-config.md。
 
-P6-3追加只读 `POST /stream/codec-check {capture:{...}}`，实际初始化 MJPEG 编码器/解码器，仍frames_tested=0；失败409。编码plan含backends清单并核对双端codec_revision=1与mjpeg_revision=1；必须显式开发授权和 turbojpeg:cpu，校验在停旧槽/注册之前。GUI区分压缩字节完整性与解码像素hash，详情以encoded-stream.md为准。
+P6-3追加只读 `POST /stream/codec-check {capture:{...}}`，实际初始化所选编码器/解码器（MJPEG 或 PyroWave），仍frames_tested=0；失败409。编码plan含backends清单并核对双端codec_revision=1与对应revision（mjpeg_revision=1 / pyrowave_revision=1）；必须显式开发授权和与codec匹配的后端身份，校验在停旧槽/注册之前。GUI区分压缩字节完整性与解码像素hash，详情以encoded-stream.md为准。
 
 ## /exec policy (added 0.2.0, allowlist-bound, NOT a general shell)
 

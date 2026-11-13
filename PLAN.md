@@ -14,6 +14,8 @@ P4 历史测试结论保留；2026-11-02 已只读封存当前部署，不新增
 **2026-11-13 owner 决定（D23）移除 H.264/H.265**（含 Media Foundation 与原生 NVENC）及其测试结果和
 `vc-codec-probe`/`vc-codec-roundtrip`；当前编码只保留 D21 批准的 MJPEG。P6-3 MJPEG 开发版已接通
 L2/有界解码/每帧恢复/SHM/DShow 与 GUI，默认不启用，须明确开发授权。双机/长稳/画质仍待验收，不替换现有部署。
+**同日 owner 批准（D24）接入 PyroWave**（Vulkan 计算小波 intra-only）：开发版后端 `pyrowave:vulkan`，
+阶段一 CPU 上传/回读，两端需 Vulkan 1.3；本机 Loopback 功能验证通过，未双机/长稳/画质验收。
 
 | 维度 | 状态 |
 |---|---|
@@ -128,6 +130,7 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 | D21 | 优先转向MJPEG | ✅owner（2026-11-03）：“先转为 mjpeg 吧”。新增可选MJPEG与质量配置、先做640本机验证；保留Raw/H.264/H.265（其中H.264/H.265后由D23移除），不自动替换稳定部署。每帧独立，不套用H.264 GOP恢复或有损像素相等门 | P6-3 MJPEG |
 | D22 | PC1 Raw 数小时后卡顿排查 | ✅owner（2026-11-08）：批准独立采样、生命周期修复候选、分项阻塞计时和隔离回归；不自动换已用DLL/部署、不改网卡或下游业务逻辑。六小时现场关联与整机根因仍待实用复现 | P5-LR |
 | D23 | 移除 H.264/H.265 | ✅owner（2026-11-13）：这种编解码方式不适合当前项目。移除 Media Foundation H.264/HEVC、原生 NVENC、`vc-codec-probe`/`vc-codec-roundtrip` 及全部相关测试结果/报告/开发包；保留 Raw 与 D21 的 MJPEG。不自动替换稳定部署；契约与 PLAN/AGENTS/skill 同批更新 | P6-3/P6-4 |
+| D24 | 接入 PyroWave | ✅owner（2026-11-13）：“开始 PyroWave 接入”。新增显式开发编码 `pyrowave:vulkan`（MIT，Vulkan 1.3 计算小波，intra-only），保留 Raw/MJPEG；阶段一只做 CPU 上传/回读，不做 D3D11 互操作；每帧预算=min(max_bitrate÷8÷fps, max_au−48, NV12 帧字节)，无质量旋钮；不自动回退/替换部署；双机/长稳/画质未验收。构建与限制见 `docs/runbooks/pyrowave.md` | P6-3 |
 
 ## 3. 任务卡
 
@@ -185,14 +188,25 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 
 显式会话/真实原生能力、可变尺寸Raw、四种整数变换、发送上限、SHM v3及动态DShow已打通；motion回环七组1665帧、DDA/GPU三组300帧全量对账零错，产品HTTP→真实原生→DShow 121/121一致。双机与交付留P6-4。证据：`docs/bringup/bringup-20261103-p6-raw.md`（含总闸与生命周期负例）。
 
-### P6-3 编码能力与后端（仅 MJPEG） — IN PROGRESS（2026-11-03）
+### P6-3 编码能力与后端（MJPEG / PyroWave） — IN PROGRESS（2026-11-03；2026-11-13 更新）
 
 H.264/H.265（Media Foundation 与原生 NVENC）于 2026-11-13 按 D23 从源码、构建、契约与测试中移除，
-相关报告、提案与开发包一并删除；不再提供 `vc-codec-probe`/`vc-codec-roundtrip`。当前编码只有 D21 的 MJPEG。
+相关报告、提案与开发包一并删除；不再提供 `vc-codec-probe`/`vc-codec-roundtrip`。当前编码为 D21 的 MJPEG
+与 D24 的 PyroWave（均为开发版、每帧独立）。
 
 MJPEG开发实现与本机专项 — DONE（D21）：libjpeg-turbo CPU/SIMD、独立帧恢复、质量配置及GUI/产品贯通；总闸含Loopback401 passed / 2 skipped。640² motion/batch1/Loopback两轮7200帧，239.86～239.97fps、生成至DShow首次交付avg1.67～1.73ms/P99约2.0～2.2ms，Q80约141Mbps（显式800Mbps上限）；真实本机DDA仅34.5fps，未证明PC2/DDA240或双机延迟。完整证据与独立测试包入口见`docs/bringup/bringup-20261103-mjpeg.md`；不自动替换部署，P6-3总体仍IN PROGRESS。
 
 MJPEG缓冲优化 — DONE（本机实现/验证，2026-11-03）：去掉发送临时JPEG复制与接收整帧复制、复用缓冲及压缩hash；403 passed / 2 skipped含Loopback。交叉31200帧全部收发/首次交付且新旧压缩输出与解码像素一致；240档avg1.67～1.69→1.64ms、60档1.80→1.73～1.74ms，P99区间重叠、总CPU收益未证实，不宣称大幅提速。11项专项及真实sender/receiver的无网卡故障注入通过；证据/独立包结果见`docs/bringup/bringup-20261103-mjpeg-opt.md`，不切换部署。
+
+PyroWave（D24）— 开发实现与本机功能验证 DONE（2026-11-13）：固定提交构建 `libpyrowave-shared-1.dll`，
+capabilities/codec-check/descriptor、48B VCAU（codec=4）、有界解码与 GUI 后端选择接通；`verify.py` ALL PASS。
+640² motion/batch1/Loopback 120fps 120/120、30fps 60/60 解码，零丢包/零传输错/零解码错，压缩 hash 与 sender 全量一致；
+`p6_codec_verify.py --codec pyrowave` 含 DShow 全对账与 `--loss` 帧21恢复均 PASS；
+`p6_product_verify.py --codec pyrowave` 隔离HTTP→真实原生→DShow（418×282）117/117 通过（同时修复该脚本 raw 分支被误拒）。
+期间发现并修复：流断档不再重建 Vulkan 设备（只重建解码器对象），否则设备创建慢于帧周期会触发队列丢弃死循环。
+240fps 同机双端因发送线程抢占出现解码队列丢弃（114），不据此判定编解码吞吐，也不放宽队列。
+未做 PC2 部署/双机/长稳/画质；证据与探针数字见`docs/bringup/bringup-20261113-pyrowave.md`，
+构建/限制见`docs/runbooks/pyrowave.md`。
 
 ### P6-4 组合验收与交付 — TODO
 

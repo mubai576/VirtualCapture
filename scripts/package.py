@@ -25,8 +25,9 @@ NATIVE_FILES = (
     "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "vc-testwin.exe",
     "vc-monitor.exe", "vc-monitor-diag.exe", "vc-vcam-verify.exe",
 )
-RUNTIME_FILES = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
-LICENSE_FILES = ("licenses/libjpeg-turbo-LICENSE.md", "licenses/libjpeg-turbo-README.ijg")
+RUNTIME_FILES = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll", "libpyrowave-shared-1.dll")
+LICENSE_FILES = ("licenses/libjpeg-turbo-LICENSE.md", "licenses/libjpeg-turbo-README.ijg",
+                 "licenses/pyrowave-LICENSE.txt", "licenses/granite-LICENSE.txt")
 BUILD_ONLY_SCRIPTS = {"verify.py", "package.py", "p6_raw_verify.py", "p6_product_verify.py", "p6_codec_verify.py"}
 
 

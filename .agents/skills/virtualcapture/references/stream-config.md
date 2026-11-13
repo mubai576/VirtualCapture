@@ -9,7 +9,7 @@
 - 自定义：偶数宽高 2..8192，整数 fps 1..1000；单帧包数不得超过 uint16。范围是软件参数校验，不是显存/吞吐/硬件认证。
 - `capture`：`width,height,fps,transform,codec,bitrate_mbps,max_bitrate_mbps`，其余 GPU/batch/MTU 等隐藏值保留。
 - 采集后端：`capture.mode=dda|wgc|pattern`；`capture.output`（0..15，默认0）选择显示器；`capture.wgc_window`（<=128 字符标题子串，空=显示器）仅 WGC 使用。WGC 仍经 DWM 合成，窗口模式包含光标，独占全屏不可采集；切换后端必须显式配置，不自动回退。
-- `codec=raw|mjpeg`；H.264/H.265 已于 2026-11-13 移除。码率整数 1..10000 Mbps，max>=target。MJPEG质量配置及能力/精确会话追加见encoded-stream；目标码率不适用，最大码率仍限流。Raw 不压缩、不静默切编码或降尺寸/帧率。
+- `codec=raw|mjpeg|pyrowave`；H.264/H.265 已于 2026-11-13 移除。码率整数 1..10000 Mbps，max>=target。MJPEG/PyroWave 的质量或每帧预算、能力与精确会话追加见encoded-stream；目标码率均不适用，最大码率仍限流。Raw 不压缩、不静默切编码或降尺寸/帧率。
 - `transport.headroom_pct`：0..50，默认20，仅预算建议，不修改历史验收门限。
 
 ## 变换与限速
@@ -73,8 +73,9 @@ max_raw_fps = floor(usable_bps / (wire_frame_bytes * 8))
 66 = 以太头14 + VC头28 + FCS4 + preamble/SFD8 + IFG12；很小的尾包补到最小以太帧。
 不计 VLAN、隧道及其他业务流量；连接速率也不等于可持续吞吐，预留余量只提供工程建议。
 
-MJPEG 用最大码率均摊成每帧字节数，再估计分包开销；`is_estimate=true`，
-`max_raw_fps=null`。码率窗口不保证单个 IDR 帧大小或瞬时突发，更不能证明编码器吞吐/画质。
+MJPEG/PyroWave 用最大码率均摊成每帧字节数，再估计分包开销；`is_estimate=true`，
+`max_raw_fps=null`。码率窗口不保证单帧大小或瞬时突发，更不能证明编码器吞吐/画质。
+PyroWave 的每帧字节上限另受 `max_au_bytes−48` 与原始 NV12 帧大小限制，见 encoded-stream.md。
 
 ## 显式产品会话与低层兼容
 
@@ -128,3 +129,8 @@ MJPEG 只通过 sender/receiver 的 `--codec mjpeg --codec-backend turbojpeg:cpu
 显式启用；能力/精确会话/载荷/日志契约见 encoded-stream.md。
 验证脚本 `scripts/p6_codec_verify.py` 只接受 `--codec mjpeg`，不注册 DLL、不调用 5143；结果不代表双机、
 长稳、画质或实时吞吐验收。
+
+PyroWave（D24）同样只通过 sender/receiver
+`--codec pyrowave --codec-backend pyrowave:vulkan --codec-hardware 0 --gop 1` 显式启用，
+需要两端 Vulkan 1.3；`--pyrowave-selftest` 可单独验证编解码，无 Vulkan 报 SKIP 而不是通过。
+构建与运行前提见 `docs/runbooks/pyrowave.md`，本机证据见 `docs/bringup/bringup-20261113-pyrowave.md`。

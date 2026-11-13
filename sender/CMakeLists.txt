@@ -9,6 +9,8 @@ target_link_libraries(vc-sender PRIVATE vc-common vc-pattern vc-npcap)
 if(WIN32)
   include("${PROJECT_SOURCE_DIR}/cmake/Mjpeg.cmake")
   vc_enable_mjpeg(vc-sender)
+  include("${PROJECT_SOURCE_DIR}/cmake/Pyrowave.cmake")
+  vc_enable_pyrowave(vc-sender)
   # C++/WinRT headers ship inside the Windows SDK; the VS generator does not
   # always put cppwinrt on INCLUDE, so resolve it from the target platform version.
   find_path(VC_CPPWINRT_INCLUDE winrt/base.h

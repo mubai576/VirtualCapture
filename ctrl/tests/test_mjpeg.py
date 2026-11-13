@@ -151,10 +151,16 @@ def test_mjpeg_diagnostic_options_are_not_silently_ignored():
     spec = importlib.util.spec_from_file_location("mjpeg_diagnostic", ROOT / "scripts/p6_codec_verify.py")
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
-    assert module.mjpeg_options("mjpeg", IDENTITY, IDENTITY, False, False, 1, None) == 80
+    assert module.codec_options("mjpeg", IDENTITY, IDENTITY, False, False, 1, None) == 80
     for args in [("av1", IDENTITY, IDENTITY, False, False, 1, 80),
                  ("mjpeg", IDENTITY, IDENTITY, True, False, 1, 80),
                  ("mjpeg", IDENTITY, IDENTITY, False, False, 15, 80),
                  ("mjpeg", IDENTITY, IDENTITY, False, False, 0, 1),
                  ("mjpeg", IDENTITY, IDENTITY, False, False, 1, 101)]:
-        with pytest.raises(ValueError): module.mjpeg_options(*args)
+        with pytest.raises(ValueError): module.codec_options(*args)
+    assert module.codec_options("pyrowave", "pyrowave:vulkan", "pyrowave:vulkan", False, False, 1, None) is None
+    for args in [("pyrowave", "turbojpeg:cpu", "pyrowave:vulkan", False, False, 1, None),
+                 ("pyrowave", "pyrowave:vulkan", "pyrowave:vulkan", False, False, 15, None),
+                 ("pyrowave", "pyrowave:vulkan", "pyrowave:vulkan", True, False, 1, None),
+                 ("pyrowave", "pyrowave:vulkan", "pyrowave:vulkan", False, False, 1, 80)]:
+        with pytest.raises(ValueError): module.codec_options(*args)
