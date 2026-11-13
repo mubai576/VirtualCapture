@@ -1,6 +1,7 @@
 #pragma once
 #include <memory>
 #include "decoder_backend.h"
+#include "../common/latency_window.h"
 
 static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
   FramePool pool(a.stream);
@@ -10,7 +11,7 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
   std::mutex mutex;std::condition_variable cv;std::deque<Work> queue;
   bool stopping=false,discontinuity=false;std::atomic<bool> failed{false},ready{false},waiting{true};
   std::atomic<uint64_t> decoded{0},resets{0},discarded{0},decode_errors{0},queue_drops{0},pending_count{0};
-  std::string error,network_error;
+  std::string error,network_error,decoder_configuration="null";
   ensure_parent(a.hashlog);
   std::ofstream transport(a.hashlog+".transport.jsonl",std::ios::binary|std::ios::trunc);
   if(!transport){fprintf(stderr,"cannot open transport log\n");return 1;}
@@ -46,6 +47,7 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
           if(decoding_slot<0)throw std::runtime_error("decoded frame pool exhausted");
           return pool.data(decoding_slot);
         });
+        {std::lock_guard<std::mutex> lock(mutex);decoder_configuration=decoder->settings();}
       };
       // Stream discontinuities only need codec state cleared; recreating a Vulkan device
       // costs longer than a frame period and would starve the bounded receive queue.
@@ -81,6 +83,7 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
     }catch(const std::exception& failure){error=failure.what();failed=true;ready=true;cv.notify_all();}
   });
   uint64_t started=qpc_ns_now(),last_stats=0;vcau::Assembler assembler(a.mtu-42,a.codec.max_au);
+  VCLatencyWindow reassembly;
   uint64_t invalid_au=0,valid_units=0;std::vector<uint8_t> complete;bool received_eos=false;
   auto stats=[&](bool running){
     double seconds=std::max(.001,(qpc_ns_now()-started)/1e9);char text[2048];
@@ -93,7 +96,9 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
       (unsigned long long)(invalid_au+assembler.bad),(unsigned long long)decode_errors.load(),(unsigned long long)resets.load(),(unsigned long long)discarded.load(),
       (unsigned long long)queue_drops.load(),(unsigned long long)pending_count.load(),a.codec.in_flight,waiting?"true":"false",assembler.bytes*8/seconds,assembler.packets/seconds,seconds,
       (unsigned long long)(a.shm.empty()?0:decoded.load()),failed?"true":"false");
-    vst.poll();std::string output=text;output.pop_back();output+=","+vseg_json(vst,0)+"}";
+    vst.poll();std::string output=text;output.pop_back();
+    std::string configuration;{std::lock_guard<std::mutex> lock(mutex);configuration=decoder_configuration;}
+    output+=","+reassembly.fields("rseg","first_fragment_to_complete_au")+",\"decoder_configuration\":"+configuration+","+vseg_json(vst,0)+"}";
     atomic_write(a.stats,output);last_stats=qpc_ns_now();
   };
   uint8_t mac[6]={};vc_parse_mac(a.source_mac,mac);
@@ -117,7 +122,7 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
           else{
             unit.first_ns=first;char hash[17];vc_fnv1a64_hex(unit.hash,hash);
             if(received_eos){invalid_au++;discontinuity=true;continue;}
-            if(!unit.eos){valid_units++;transport<<"{\"frame_id\":"<<unit.fid<<",\"transport_hash\":\""<<hash<<"\",\"encoded_bytes\":"<<unit.bytes.size()<<",\"keyframe\":"<<(unit.key?"true":"false")<<"}\n";transport.flush();}
+            if(!unit.eos){reassembly.add(received_ns>=first?received_ns-first:0);valid_units++;transport<<"{\"frame_id\":"<<unit.fid<<",\"transport_hash\":\""<<hash<<"\",\"encoded_bytes\":"<<unit.bytes.size()<<",\"keyframe\":"<<(unit.key?"true":"false")<<"}\n";transport.flush();}
             if(unit.eos)received_eos=true;
             {std::lock_guard<std::mutex> lock(mutex);
               if(queue.size()>=2){queue_drops+=queue.size();queue.clear();discontinuity=true;}

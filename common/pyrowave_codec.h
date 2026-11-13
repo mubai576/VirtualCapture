@@ -14,6 +14,14 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+#include <sstream>
+#include <windows.h>
+#ifdef min
+#undef min
+#endif
+#ifdef max
+#undef max
+#endif
 
 namespace vcpyro {
 
@@ -36,6 +44,42 @@ inline void check(pyrowave_result r, const char* what) {
   if (r != PYROWAVE_SUCCESS) throw std::runtime_error(std::string("PyroWave ") + what + ": " + result_text(r));
 }
 
+inline std::string json_string(const char* value) {
+  std::string out="\"";
+  for(const unsigned char* p=(const unsigned char*)value;*p;p++) {
+    if(*p=='"' || *p=='\\') {out+='\\';out+=(char)*p;}
+    else if(*p<32) {char escape[7];snprintf(escape,sizeof(escape),"\\u%04x",*p);out+=escape;}
+    else out+=(char)*p;
+  }
+  return out+'"';
+}
+
+// Inspect the device already selected by PyroWave, never select a second probe device.
+inline std::string device_settings(pyrowave_device device) {
+  VkInstance instance=VK_NULL_HANDLE;VkPhysicalDevice physical=VK_NULL_HANDLE;
+  pyrowave_device_get_vk_device_handles(device,&instance,&physical,nullptr);
+  HMODULE loader=LoadLibraryW(L"vulkan-1.dll");
+  if(!loader)return "{\"status\":\"unavailable\"}";
+  auto get=(PFN_vkGetInstanceProcAddr)GetProcAddress(loader,"vkGetInstanceProcAddr");
+  auto props_fn=get?(PFN_vkGetPhysicalDeviceProperties2)get(instance,"vkGetPhysicalDeviceProperties2"):nullptr;
+  if(!props_fn || !physical){FreeLibrary(loader);return "{\"status\":\"unavailable\"}";}
+  VkPhysicalDeviceIDProperties ids={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
+  VkPhysicalDeviceProperties2 props={VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2,&ids};
+  props_fn(physical,&props);FreeLibrary(loader);
+  const auto& p=props.properties;
+  const char* type=p.deviceType==VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU?"discrete_gpu":
+    p.deviceType==VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU?"integrated_gpu":
+    p.deviceType==VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU?"virtual_gpu":
+    p.deviceType==VK_PHYSICAL_DEVICE_TYPE_CPU?"cpu":"other";
+  auto hex=[](const uint8_t* bytes,size_t count){std::string value;char pair[3];for(size_t i=0;i<count;i++){snprintf(pair,3,"%02x",bytes[i]);value+=pair;}return value;};
+  std::ostringstream out;
+  out<<"{\"status\":\"selected\",\"name\":"<<json_string(p.deviceName)<<",\"type\":"<<json_string(type)
+     <<",\"vendor_id\":"<<p.vendorID<<",\"device_id\":"<<p.deviceID<<",\"api_version\":"<<p.apiVersion
+     <<",\"driver_version\":"<<p.driverVersion<<",\"uuid\":"<<json_string(hex(ids.deviceUUID,VK_UUID_SIZE).c_str())
+     <<",\"luid\":"<<(ids.deviceLUIDValid?json_string(hex(ids.deviceLUID,VK_LUID_SIZE).c_str()):"null")<<"}";
+  return out.str();
+}
+
 class Codec {
   pyrowave_device device = nullptr;
   pyrowave_encoder encoder = nullptr;
@@ -46,6 +90,7 @@ class Codec {
   std::vector<pyrowave_packet> packets;
   std::vector<uint8_t> plane_cb, plane_cr;
   VCOperationDeadline operation_deadline;
+  std::string selected_device="null";
 
   void release() {
     if (decoder) { pyrowave_decoder_destroy(decoder); decoder = nullptr; }
@@ -72,6 +117,7 @@ class Codec {
     frame_bytes = stream.frame_bytes();
     pyrowave_result r = pyrowave_create_default_device(&device);
     check(r, "device creation");
+    selected_device=device_settings(device);
     if (encode) {
       if (max_bytes < 1024) throw std::runtime_error("PyroWave frame budget below 1024 bytes");
       max_frame_bytes = std::min(max_bytes, frame_bytes);
@@ -171,7 +217,8 @@ class Codec {
              "\"width\":%d,\"height\":%d,\"subsampling\":\"420\",\"max_bytes_per_frame\":%zu,"
              "\"upload_path\":\"cpu_nv12\",\"decode_path\":\"cpu_yuv420p\"}",
              width, height, max_frame_bytes);
-    return buf;
+    std::string out=buf;out.pop_back();
+    return out+",\"compute\":\"vulkan\",\"zero_copy\":false,\"device\":"+selected_device+"}";
   }
 };
 

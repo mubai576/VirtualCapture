@@ -15,6 +15,9 @@ extern "C" {
 pyrowave_result pyrowave_create_default_device(pyrowave_device* d) {
   stage("create"); *d = reinterpret_cast<pyrowave_device>(1); return PYROWAVE_SUCCESS;
 }
+void pyrowave_device_get_vk_device_handles(pyrowave_device, VkInstance* instance, VkPhysicalDevice* physical, VkDevice*) {
+  if(instance)*instance=VK_NULL_HANDLE;if(physical)*physical=VK_NULL_HANDLE;
+}
 void pyrowave_device_destroy(pyrowave_device) { stage("destroy"); }
 pyrowave_result pyrowave_encoder_create(const pyrowave_encoder_create_info*, pyrowave_encoder* e) {
   *e = reinterpret_cast<pyrowave_encoder>(1); return PYROWAVE_SUCCESS;
@@ -49,6 +52,11 @@ int main(int argc, char** argv) {
   if (blocked == "reset") codec.reset_decoder();
   else if (decode) codec.decode(frame.data(), 16, frame.data(), frame.size());
   else { size_t size = 0; codec.encode(frame.data(), frame.size(), size); }
+  if(blocked=="normal") {
+    printf("%s\n",codec.settings().c_str());
+    const char quoted[] = {'G','P','U','"',char(92),char(10),0};
+    printf("%s\n",vcpyro::json_string(quoted).c_str());
+  }
   codec.close();
   return blocked == "normal" ? 0 : 1;
 }

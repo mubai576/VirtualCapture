@@ -3,6 +3,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+import json
 
 import pytest
 
@@ -52,6 +53,11 @@ target_include_directories(pyrowave-deadline PRIVATE "{headers.as_posix()}" "{he
 def test_pyrowave_actual_wrapper_normal_calls(pyro_deadline_exe):
     result = subprocess.run([str(pyro_deadline_exe), "normal"], capture_output=True, timeout=5)
     assert result.returncode == 0, result.stdout + result.stderr
+    settings, escaped = result.stdout.decode().splitlines()
+    report = json.loads(settings)
+    assert report["compute"] == "vulkan" and report["zero_copy"] is False
+    assert report["device"]["status"] == "unavailable"
+    assert json.loads(escaped) == 'GPU"' + chr(92) + chr(10)
 
 
 @pytest.mark.parametrize("operation", ["create", "encode", "packets", "decode", "reset", "destroy"])

@@ -106,6 +106,26 @@ PyroWave 会话配置回显：family=pyrowave、identity=pyrowave:vulkan、revis
 subsampling=420、max_bytes_per_frame、upload_path=cpu_nv12、decode_path=cpu_yuv420p。
 解码端回显 max_bytes_per_frame 为 0（未设置编码预算），其余同构；双端逐项确认才 configured。
 
+配置追加 `compute:"vulkan"`、`zero_copy:false`、`device`：读取**已选中的同一设备**，不另建探测设备。
+`device.status=selected` 时含 name、type（discrete_gpu/integrated_gpu/virtual_gpu/cpu/other）、
+vendor_id/device_id、api_version/driver_version（Vulkan原始整数）、uuid（32位小写hex）、luid（16位hex或null）。
+无法查询时明确 status=unavailable，不伪造GPU身份、不改变设备选择。CPU类型的Vulkan设备不能标成物理GPU。
+运行中 sender.stats.encoder_configuration 与 receiver.stats.decoder_configuration 同样报告实际配置。
+`hardware=false` 仅指非厂商固定功能视频引擎，不代表不使用GPU；GUI类别由codec确定、只读，
+PyroWave明确显示Vulkan计算/CPU上传回读/非零拷贝，MJPEG显示CPU SIMD。
+
+### 编码分段计时（2026-11-13追加）
+
+- sender `pc1_seg_{samples,scope,avg_ms,p50_ms,p99_ms,max_ms}`：
+  `scope=source_ready_to_transmit_complete`，源帧准备完成到末包Npcap提交返回，含编码、封装、限速等待、发包，
+  不含采集等待/审计hash/log。与Raw发送段边界一致；原timing_ms.capture_to_send仍是采集开始到发送开始，不改名替代。
+- receiver `rseg_{samples,scope,avg_ms,p50_ms,p99_ms,max_ms}`：
+  `scope=first_fragment_to_complete_au`，首片接收到末片接收（AU完整），仅通过封装/hash校验的非EOS单元；
+  不含后续队列、解码和SHM发布，不能冒充解码耗时或跨机网络延迟。
+- 两项为最新10000帧窗口、同机QPC、百分位索引沿用Raw实现；0样本时延迟为null而不伪造0ms。
+  GUI显示相同字段，旧原生程序缺字段继续显示未知；60秒只是趋势采样历史，不是统计窗口。
+  历史Raw字段与判据、28B头、IPC布局不变。
+
 Vulkan 1.3 设备不可用（如无合适 GPU/驱动）时创建失败：`--pyrowave-selftest` 报 SKIP 且不冒充通过，
 产品启动在协商阶段明确失败，不自动换后端。GPU 型号/驱动版本属于部署前提，不是本项目验收结论。
 构建/固定提交摘要/许可证见 `docs/runbooks/pyrowave.md`；本机功能边界见

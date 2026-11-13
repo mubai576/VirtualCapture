@@ -66,6 +66,11 @@ Raw码率参数、不支持codec、收端缩放及错误几何拒绝。主机生
 
 P6-3追加只读 `POST /stream/codec-check {capture:{...}}`，实际初始化所选编码器/解码器（MJPEG 或 PyroWave），仍frames_tested=0；失败409。编码plan含backends清单并核对双端codec_revision=1与对应revision（mjpeg_revision=1 / pyrowave_revision=1）；必须显式开发授权和与codec匹配的后端身份，校验在停旧槽/注册之前。GUI区分压缩字节完整性与解码像素hash，详情以encoded-stream.md为准。
 
+编码会话统计追加pc1_seg/rseg的samples/scope及分布，零样本null；sender.encoder_configuration和
+receiver.decoder_configuration上报实际PyroWave Vulkan设备（名称/类型/ID/UUID/LUID/原始API与驱动版本），
+compute=vulkan、zero_copy=false。GUI不再把PyroWave显示为CPU SIMD，hardware=false保留为非固定功能视频引擎语义；
+旧原生缺统计/设备信息显示未知，不以候选替代实际设备。完整边界见encoded-stream.md“编码分段计时”。
+
 ## /exec policy (added 0.2.0, allowlist-bound, NOT a general shell)
 
 - `python` only runs script files under agent ROOT (no `-c`); frozen exe falls back to PATH python.

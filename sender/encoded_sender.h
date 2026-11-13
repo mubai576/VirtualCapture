@@ -3,6 +3,7 @@
 #include <memory>
 #include <sstream>
 #include "encoder_backend.h"
+#include "../common/latency_window.h"
 
 struct VCEncodedTimings {
   enum Stage { PrepareWait, Source, Submit, EncodeWait, Pack, RateWait, Transmit, Audit, Log, CaptureToSend, Count };
@@ -98,6 +99,7 @@ static int run_encoded_sender(const Args& a,DynPcap& d,pcap_t* handle,CaptureHan
     uint32_t fid=0;uint64_t capture_ns=0;bool clean=false;
     std::deque<std::pair<uint64_t,size_t>> rate_window;size_t window_bytes=0;
     VCEncodedTimings timing;
+    VCLatencyWindow send_segment;
     VCEncodePreparation preparation;
     VCFrameLimit limit(a.fps);
     ensure_parent(a.hashlog);std::ofstream hashlog(a.hashlog,std::ios::binary|std::ios::trunc);
@@ -158,7 +160,7 @@ static int run_encoded_sender(const Args& a,DynPcap& d,pcap_t* handle,CaptureHan
         running?"true":"false",a.codec.codec.c_str(),a.stream.width,a.stream.height,a.fps,
         (unsigned long long)frames,(unsigned long long)packets,(unsigned long long)encoded_bytes,(unsigned long long)keyframes,
         wire_bytes*8/seconds,packets/seconds,frames/seconds,seconds,rate_wait_ns/1e6,a.codec.bitrate,a.codec.max_bitrate,a.codec.max_au,a.codec.gop,(unsigned long long)cap.source_skipped());
-      atomic_write(a.stats,std::string(text)+",\"encoder_quality\":"+encoder.quality_json()+",\"encoder_configuration\":"+encoder.settings()+",\"preparation\":"+preparation.json(limit.period)+",\"timing_ms\":"+timing.json()+"}");last_stats=qpc_ns_now();
+      atomic_write(a.stats,std::string(text)+","+send_segment.fields("pc1_seg","source_ready_to_transmit_complete")+",\"encoder_quality\":"+encoder.quality_json()+",\"encoder_configuration\":"+encoder.settings()+",\"preparation\":"+preparation.json(limit.period)+",\"timing_ms\":"+timing.json()+"}");last_stats=qpc_ns_now();
     };
     stats(true);
     size_t file_index=0;
@@ -218,6 +220,7 @@ static int run_encoded_sender(const Args& a,DynPcap& d,pcap_t* handle,CaptureHan
       rate_wait_ns+=qpc_ns_now()-wait_start;
       uint64_t send_ns=qpc_ns_now();limit.sent(send_ns);transmit(bytes,fid,capture_ns);
       uint64_t transmitted_ns=qpc_ns_now();
+      send_segment.add(transmitted_ns-generated_ns);
       rate_window.emplace_back(send_ns,bytes.size());window_bytes+=bytes.size();
       char source_hash[17],transport_hash[17];vc_fnv1a64_hex(vc_fnv1a64(raw.data(),raw.size()),source_hash);
       vc_fnv1a64_hex(packed_hash,transport_hash);

@@ -14,6 +14,13 @@ PyroWave 需要两端匹配的新 agent 和原生程序；缺能力直接拒绝�
 ## 设置
 
 - 双端后端 `pyrowave:vulkan`，`encoder_hardware=false` / `decoder_hardware=false`，`gop_frames=1`。
+  false仅表示非厂商固定功能视频引擎，**不是CPU编码开关**；GUI类别只读显示Vulkan计算。
+  核心在Vulkan计算设备上执行，CPU承担上传/回读、UV交错与封装传输，不是全GPU零拷贝。
+  活动sender.encoder_configuration / receiver.decoder_configuration含device名称、类型、vendor/device ID、
+  UUID/LUID、原始API/driver版本和compute=vulkan、zero_copy=false；CPU Vulkan设备明确标CPU，不冒充物理GPU。
+  数据取自实际已选设备；查询失败标unavailable，不自动换设备。
+- 编码发送段pc1_seg为源帧准备完成→末包提交返回（含编码/限速/发送，不含采集等待）；
+  重组段rseg为首片→AU齐片，不含解码/队列；最近10000帧，零样本null。GUI的60秒为趋势，不是百分位窗口。
 - 没有质量旋钮。每帧预算 `min(max_bitrate_mbps×10^6÷8÷fps, max_au_bytes−48, 一帧 NV12 字节数)`
   在会话建立时固定并双端回显；PyroWave 用它限制单帧输出（超限时在该帧内降低精度），
   不保证达到、也不是恒定码率或画质。目标 `bitrate_mbps` 不生效，界面在编码模式下禁用。

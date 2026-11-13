@@ -60,6 +60,16 @@ public:
     if(pyro_open){pyro.reset_decoder();return;}
 #endif
   }
+  std::string settings() const {
+#ifdef VC_HAS_PYROWAVE
+    if(pyro_open)return pyro.settings();
+#endif
+#ifdef VC_HAS_MJPEG
+    return jpeg.settings();
+#else
+    return "null";
+#endif
+  }
   void pump(){}
   void drain(){}
 };

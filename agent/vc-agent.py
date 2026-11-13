@@ -1956,12 +1956,12 @@ UI_HTML = r'''<!doctype html>
 </div>
 <div class="section-heading"><h2>设备与链路</h2><span>采集 → 接收 → 虚拟采集卡</span></div>
 <div class="topology">
-<article id="capCard" class="device"><div class="device-head"><span class="device-icon"><svg aria-hidden="true"><use href="#i-capture"/></svg></span><div><h3>被采集机</h3><small data-device="location">发端</small></div><span class="device-state muted" data-device="state"><i class="dot"></i><span>等待配置</span></span></div><dl><dt>控制地址</dt><dd class="mono" data-device="url">—</dd><dt>网络适配器</dt><dd data-device="adapter">—</dd><dt>采集方式</dt><dd data-device="output">桌面采集 · NV12</dd></dl><div class="device-bottom"><span data-device="session">尚无会话</span><span data-device="version">—</span></div></article>
+<article id="capCard" class="device"><div class="device-head"><span class="device-icon"><svg aria-hidden="true"><use href="#i-capture"/></svg></span><div><h3>被采集机</h3><small data-device="location">发端</small></div><span class="device-state muted" data-device="state"><i class="dot"></i><span>等待配置</span></span></div><dl><dt>控制地址</dt><dd class="mono" data-device="url">—</dd><dt>网络适配器</dt><dd data-device="adapter">—</dd><dt>采集方式</dt><dd data-device="output">桌面采集 · NV12</dd><dt>编码计算设备</dt><dd data-device="codec">等待会话</dd></dl><div class="device-bottom"><span data-device="session">尚无会话</span><span data-device="version">—</span></div></article>
 <div id="wire" class="wire"><div class="wire-line"><svg aria-hidden="true"><use href="#i-arrow"/></svg></div><span>Raw L2</span><span>0x88B5</span></div>
-<article id="rxCard" class="device"><div class="device-head"><span class="device-icon"><svg aria-hidden="true"><use href="#i-monitor"/></svg></span><div><h3>主机</h3><small data-device="location">收端</small></div><span class="device-state muted" data-device="state"><i class="dot"></i><span>等待配置</span></span></div><dl><dt>控制地址</dt><dd class="mono" data-device="url">—</dd><dt>网络适配器</dt><dd data-device="adapter">—</dd><dt>虚拟采集卡</dt><dd data-device="output">等待读取注册状态</dd></dl><div class="device-bottom"><span data-device="session">尚无会话</span><span data-device="version">—</span></div></article>
+<article id="rxCard" class="device"><div class="device-head"><span class="device-icon"><svg aria-hidden="true"><use href="#i-monitor"/></svg></span><div><h3>主机</h3><small data-device="location">收端</small></div><span class="device-state muted" data-device="state"><i class="dot"></i><span>等待配置</span></span></div><dl><dt>控制地址</dt><dd class="mono" data-device="url">—</dd><dt>网络适配器</dt><dd data-device="adapter">—</dd><dt>虚拟采集卡</dt><dd data-device="output">等待读取注册状态</dd><dt>解码计算设备</dt><dd data-device="codec">等待会话</dd></dl><div class="device-bottom"><span data-device="session">尚无会话</span><span data-device="version">—</span></div></article>
 </div>
 <div class="analysis">
-<section class="panel"><div class="panel-head"><div><h2>分段延迟</h2><p>p99 · 最近 60 秒 · 毫秒</p></div><div class="legend"><span><i style="background:var(--blue)"></i>发送</span><span><i style="background:var(--green)"></i>重组</span><span><i style="background:var(--purple)"></i>虚拟卡</span></div></div><div class="chart"><canvas id="cv" aria-label="最近60秒各段p99延迟，详细数值见下方" role="img"></canvas><div id="chartEmpty" class="chart-empty">采集开始后显示延迟曲线</div></div><div class="latency-values"><div><small>发送段 p99</small><strong><b id="txLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="txLatencyRange">平均 — · 最大 —</em></div><div><small>重组段 p99</small><strong><b id="rxLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="rxLatencyRange">平均 — · 最大 —</em></div><div><small>虚拟卡交付 p99</small><strong><b id="vcLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="vcLatencyRange">平均 — · 最大 —</em></div></div></section>
+<section class="panel"><div class="panel-head"><div><h2>分段延迟</h2><p>p99 · 最近 10000 帧统计 · 60 秒趋势 · 毫秒</p></div><div class="legend"><span><i style="background:var(--blue)"></i>发送</span><span><i style="background:var(--green)"></i>重组</span><span><i style="background:var(--purple)"></i>虚拟卡</span></div></div><div class="chart"><canvas id="cv" aria-label="最近60秒各段p99延迟，详细数值见下方" role="img"></canvas><div id="chartEmpty" class="chart-empty">采集开始后显示延迟曲线</div></div><div class="latency-values"><div><small>发送段 p99</small><strong><b id="txLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="txLatencyRange">平均 — · 最大 —</em></div><div><small>重组段 p99</small><strong><b id="rxLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="rxLatencyRange">平均 — · 最大 —</em></div><div><small>虚拟卡交付 p99</small><strong><b id="vcLatency" style="font-weight:inherit">—</b><span>ms</span></strong><em id="vcLatencyRange">平均 — · 最大 —</em></div></div></section>
 <section class="panel"><div class="panel-head"><h2>传输质量</h2><span id="qualityBadge" class="badge muted">等待数据</span></div><div class="quality-row"><span>丢失帧</span><strong id="dropped">—</strong></div><div class="quality-row"><span id="hashErrorLabel">Raw 像素哈希错误</span><strong id="hashErrors">—</strong></div><div class="quality-row"><span>丢失包</span><strong id="packetLoss">—</strong></div><div class="quality-row"><span>虚拟卡交付</span><strong id="vcDelivered">—</strong></div><div class="quality-row"><span>重复帧</span><strong id="vcRepeats">—</strong></div><div class="quality-foot" id="decodeInfo">Raw 无编解码</div><div class="quality-foot" id="qualityNote">Raw 每帧像素 FNV-1a64 对账；缺失数据以 — 显示。</div></section>
 </div>
 <section class="panel events"><div class="panel-head"><h2>操作记录 <span id="eventCount" class="muted"></span></h2><button id="bClear" class="btn quiet small">清空显示</button></div><div id="events" class="event-list" role="log" aria-label="操作记录"></div></section>
@@ -1987,13 +1987,14 @@ UI_HTML = r'''<!doctype html>
 <div id="bitrateFields" class="field full" hidden><div class="field-grid">
 <div class="field full"><label for="c_experimental">编码功能授权</label><select id="c_experimental"><option value="0">仅保存草案，不启动编码</option><option value="1">明确启用开发版编码（未完成双机 / 长稳 / 画质验收）</option></select></div>
 <div class="field"><label for="c_encoder">采集机编码后端</label><input id="c_encoder" list="encoderBackends" maxlength="256" placeholder="turbojpeg:cpu" required><datalist id="encoderBackends"></datalist></div>
-<div class="field"><label for="c_encoder_hw">编码器类别</label><select id="c_encoder_hw"><option value="0">CPU / SIMD（turbojpeg）</option></select></div>
+<div class="field"><label for="c_encoder_hw">编码器类别</label><select id="c_encoder_hw"><option value="0">由所选后端决定</option></select></div>
 <div class="field"><label for="c_decoder">主机解码后端</label><input id="c_decoder" list="decoderBackends" maxlength="256" placeholder="turbojpeg:cpu" required><datalist id="decoderBackends"></datalist></div>
-<div class="field"><label for="c_decoder_hw">解码器类别</label><select id="c_decoder_hw"><option value="0">CPU / SIMD（turbojpeg）</option></select></div>
+<div class="field"><label for="c_decoder_hw">解码器类别</label><select id="c_decoder_hw"><option value="0">由所选后端决定</option></select></div>
 <div class="field"><label for="c_bitrate">目标码率 · Mbps</label><input id="c_bitrate" type="number" min="1" max="2000" step="1" required></div>
 <div class="field"><label for="c_max_bitrate">最大码率 · Mbps</label><input id="c_max_bitrate" type="number" min="1" max="2000" step="1" required></div>
-<div class="field"><label for="c_gop">GOP · MJPEG 固定 1（每帧独立）</label><input id="c_gop" type="number" min="1" max="1" step="1" required></div>
+<div class="field"><label for="c_gop">GOP · 固定 1（每帧独立）</label><input id="c_gop" type="number" min="1" max="1" step="1" required></div>
 <div class="field"><label for="c_in_flight">解码在途帧上限</label><input id="c_in_flight" type="number" min="1" max="8" step="1" required></div>
+<p id="codecPath" class="field full"></p>
 <div id="mjpegFields" class="field full" hidden><div class="field-grid">
 <div class="field"><label for="c_jpeg_quality">JPEG 质量 · 1–100</label><input id="c_jpeg_quality" type="number" min="1" max="100" step="1" required><p>默认 80；值越高通常越清晰，带宽和开销也越高。</p></div>
 </div><p>libjpeg-turbo CPU/SIMD，固定 4:2:0 / 快速整数 DCT，每帧独立。目标码率不适用，以 JPEG 质量编码；最大码率仍限流，触顶可能降低实际 fps，不自动降质量。每帧均可独立恢复，无需等待下一帧或 GOP。</p></div>
@@ -2154,6 +2155,25 @@ function captureSource(stats, config) {
   const source = stats.mode ? stats : config.capture || {};
   return source.mode === 'pattern' ? '测试图案 · '+source.pattern : (source.mode === 'wgc' ? 'WGC 采集 · NV12' : '桌面采集 · NV12');
 }
+function codecCategory(codec) {
+  return codec === 'pyrowave' ? 'Vulkan 计算（非固定功能视频引擎）' : codec === 'mjpeg' ? 'CPU / SIMD（turbojpeg）' : 'Raw · 无编解码';
+}
+function codecDevice(stats, kind) {
+  if (stats.codec === 'raw') return 'Raw · 无编解码';
+  const config = stats[kind === 'sender' ? 'encoder_configuration' : 'decoder_configuration'];
+  if (!config) return '设备信息未上报（需更新原生程序）';
+  if (config.family === 'turbojpeg') return 'CPU / SIMD · libjpeg-turbo';
+  if (config.family !== 'pyrowave') return '未知后端';
+  const device = config.device;
+  const types = {discrete_gpu:'独立 GPU',integrated_gpu:'集成 GPU',virtual_gpu:'虚拟 GPU',cpu:'CPU Vulkan 设备',other:'其他 Vulkan 设备'};
+  const identity = device && device.status === 'selected' ? device.name+' · '+(types[device.type] || '未知设备类型')+
+    ' · vendor/device '+device.vendor_id+'/'+device.device_id+' · UUID '+device.uuid : '实际设备信息不可用';
+  return 'Vulkan · '+identity+' · CPU 上传/回读，非零拷贝';
+}
+function segmentMetrics(stats, prefix) {
+  if (stats[prefix+'_samples'] === 0) return {avg:null,p99:null,max:null};
+  return {avg:stats[prefix+'_avg_ms'],p99:stats[prefix+'_p99_ms'],max:stats[prefix+'_max_ms']};
+}
 function renderMachine(id, machine, kind, local) {
   const card = $(id), set = (key,value) => { card.querySelector('[data-device="'+key+'"]').textContent = value; };
   const online = !!machine && machine.online !== false;
@@ -2166,6 +2186,7 @@ function renderMachine(id, machine, kind, local) {
   set('adapter',stats.adapter || config.adapter || (kind === 'sender' ? '按控制连接自动选择' : '未选择'));
   set('version',online && machine.version ? 'v'+machine.version : '—');
   set('session',online && stats.session_id ? stats.session_id+' · '+fmt(stats.uptime_s,0)+'s' : '尚无活动会话');
+  set('codec',online && stats.running ? codecDevice(stats,kind) : '等待活动会话');
   if (kind === 'sender') set('output',!online ? '等待连接' : captureSource(stats,config));
   else set('output',!online ? '等待连接' : !machine.vcam ? '未读取到注册状态' : machine.vcam.match ? 'VirtualCapture · 已注册' : machine.vcam.registered ? '注册路径不符' : '接收时自动注册');
 }
@@ -2203,11 +2224,13 @@ function render(status) {
   $('qualityBadge').className = 'badge '+(errors ? 'warn' : !hasQuality ? 'muted' : 'good');
   text('qualityBadge',errors ? '需检查' : !hasQuality ? '等待数据' : encoded ? '压缩字节校验正常' : '哈希对账正常');
   [['tx',tx,'pc1_seg',2],['rx',rx,'rseg',2],['vc',rx,'vseg',3]].forEach(([id,stats,key,digits]) => {
-    text(id+'Latency',fmt(stats[key+'_p99_ms'],digits));
-    text(id+'LatencyRange','平均 '+fmt(stats[key+'_avg_ms'],digits)+' · 最大 '+fmt(stats[key+'_max_ms'],digits));
+    const metric = segmentMetrics(stats,key);
+    text(id+'Latency',fmt(metric.p99,digits));
+    text(id+'LatencyRange','平均 '+fmt(metric.avg,digits)+' · 最大 '+fmt(metric.max,digits));
+    $(id+'Latency').title = key === 'pc1_seg' ? '源帧准备完成 → 末包提交完成；含编码/限速/发包，不含采集等待' : key === 'rseg' ? '首片到达 → 完整访问单元到齐；不含解码/排队' : '发布 → 虚拟卡交付';
   });
   $('wire').className = 'wire'+(rxFps > 0 ? ' live' : '');
-  history.push({time:Date.now()/1000,values:[tx.pc1_seg_p99_ms,rx.rseg_p99_ms,rx.vseg_p99_ms]});
+  history.push({time:Date.now()/1000,values:[segmentMetrics(tx,'pc1_seg').p99,segmentMetrics(rx,'rseg').p99,rx.vseg_p99_ms]});
   draw();
   const online = !!status.local && status.local.online !== false;
   $('connectionBadge').className = 'badge '+(!online ? 'bad' : status.peer && status.peer.online ? 'good' : 'muted');
@@ -2330,6 +2353,12 @@ function syncCodecFields() {
   ['c_bitrate','c_max_bitrate','c_experimental','c_encoder','c_decoder','c_encoder_hw','c_decoder_hw','c_gop','c_in_flight']
     .forEach(id => { $(id).disabled = raw; });
   ['c_encoder','c_decoder'].forEach(id => { $(id).required = !raw && $('c_experimental').value === '1'; });
+  const codec = $('c_codec').value;
+  ['c_encoder_hw','c_decoder_hw'].forEach(id => {
+    const option = $(id).options[0]; if (option) option.textContent = codecCategory(codec);
+    $(id).disabled = true;
+  });
+  text('codecPath',codec === 'pyrowave' ? 'Vulkan 编解码核心；CPU NV12 上传、解码回读并交错 UV，非全 GPU / 非零拷贝。类别标志 false 仅表示非厂商固定功能视频引擎；实际设备以活动会话上报为准。' : mjpeg ? 'libjpeg-turbo CPU/SIMD 编解码；不使用 Vulkan。' : 'Raw 无编解码。');
   $('mjpegFields').hidden = !mjpeg;
   $('c_jpeg_quality').disabled = !mjpeg;
   // 现有编码后端（MJPEG/PyroWave）都不应用目标码率，且强制每帧独立；仅最大码率可调。

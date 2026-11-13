@@ -75,6 +75,7 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 - receiver hashlog `qpc_ns` = 重组完成时刻（原为当次循环起点，差 <1 包）；sender PC1 段不再含整帧哈希（哈希移到末包之后）。历史 D15 的 DDA 不限速由 P6-2 替代：发送开始间隔至少 ceil(1e9/fps) ns、不补发追赶；timeout/鼠标更新/重复 LastPresentTime 不发送或递增frame_id。
 - sender stats 新增 `gpu_dispatch_ms`（D3D11 timestamp 包住 CopyResource 的真 GPU 时间均值）+ `gpu_dispatch_samples`（有效样本数）；`gpu_ms` 仍为 capture() wall-clock，待 P4-1 实测分布后按 D10 决定是否切换口径。
 - sender stats 新增 `gpu_convert`（0/1，采集走 CPU 还是 GPU compute shader；GPU 失败显式报错，不静默回退）。
+- P6-R2（2026-11-13）：编码路径补齐pc1_seg（源帧准备完→末包提交返回）/rseg（首片→AU齐片），最新10000帧、零样本null，不含跨机QPC或解码混算；PyroWave配置/双端stats追加实际Vulkan设备name/type/ID/UUID/LUID/API/driver与compute/zero_copy，GUI类别只读按codec显示，false不等于CPU后端。详情见skill encoded-stream.md；Raw/包头/判据不变。
 - P4-2步骤1（免协议改动）：receiver stats 新增 `rseg_avg_ms/rseg_p50_ms/rseg_p99_ms/rseg_max_ms`（R(N)=首包到达→重组完成，同机QPC）；sender stats 新增 `pc1_seg_avg_ms/pc1_seg_p99_ms/pc1_seg_max_ms`（PC1段=采集/生成完成→末包发出，同机QPC）；确认包（flags bit1）仍待 owner 终审后做步骤2。
 - P5 GUI（D16）：agent 新增 `/ui`、`/config`（ROOT/vc-config.json）、`/vcam/status|register`、`/product/{start,stop,status}`、`/product/local/{start,stop}`；`/sender/start` 可选 `gpu_convert`。详见 agent-api.md。
 - P5-U2（D17）：仅主机（默认 `--role host`）提供 UI，收端角色固定；被采集机 `--role capture` 仅后台。产品控制端口 5143，UI 只填 IPv4，网卡自动枚举后下拉选择；主机下发采集参数，对端按控制路由匹配网卡。默认 SHM 固定隐藏，接收前注册 vcam，停止/失败/子进程退出时回收；开始/停止采集合为一个按钮。API 追加能力标记、网卡详情与生命周期语义，详见 agent-api.md；数据面与判据不变。
@@ -215,6 +216,10 @@ capabilities/codec-check/descriptor、48B VCAU（codec=4）、有界解码与 GU
 ### P6-R1 采集与编解码 review 修正 — DONE（本机回归，2026-11-13）
 
 8项修复提交62e37cd；总闸301 passed / 4 skipped、WGC CPU/GPU私有窗口resize/close通过、PyroWave阻塞注入与640²@240回环480/480通过。0.5.0已打包并启动本机host，PC2错误角色阻塞远端部署。证据：[修复回归](docs/bringup/bringup-20261113-review-fixes.md)、[发布/部署状态](docs/bringup/bringup-20261113-release-0.5.0.md)。
+
+### P6-R2 编码指标与设备身份 — DONE（本机回归，2026-11-13）
+
+补编码pc1_seg/rseg、PyroWave只读Vulkan类别与实际设备身份；总闸303 passed / 6 skipped，本机motion/Loopback/batch1的MJPEG、PyroWave及显式丢片恢复通过，实测编解码设备RTX 4070。未提交/打包/部署。证据：[修复记录](docs/bringup/bringup-20261113-pyrowave-metrics.md)。
 
 ### P6-4 组合验收与交付 — TODO
 

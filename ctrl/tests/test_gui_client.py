@@ -334,3 +334,42 @@ updateStreamPlan().then(() => {
   assert(!planRefresh);
 });
 """)
+
+
+def test_pyrowave_category_tracks_codec_without_changing_legacy_flag(client):
+    check(client, FORM + """
+element('c_encoder_hw').options = [{value:'0'}];
+element('c_decoder_hw').options = [{value:'0'}];
+element('c_codec').value='pyrowave'; markDirty({target:element('c_codec')});
+assert(element('c_encoder_hw').options[0].textContent.includes('Vulkan'));
+assert(!element('c_encoder_hw').options[0].textContent.includes('turbojpeg'));
+assert(element('c_encoder_hw').disabled && element('c_decoder_hw').disabled);
+assert(element('codecPath').textContent.includes('非全 GPU'));
+assert.equal(readConfig().capture.encoder_backend,'pyrowave:vulkan');
+assert.equal(readConfig().capture.encoder_hardware,false);
+element('c_codec').value='mjpeg'; markDirty({target:element('c_codec')});
+assert(element('c_encoder_hw').options[0].textContent.includes('CPU / SIMD'));
+assert(element('codecPath').textContent.includes('不使用 Vulkan'));
+""")
+
+
+def test_device_reporting_distinguishes_cpu_vulkan_and_missing_metadata(client):
+    check(client, """
+const config={family:'pyrowave',device:{status:'selected',name:'Example GPU',type:'discrete_gpu',vendor_id:1,device_id:2,uuid:'a'.repeat(32)}};
+assert(codecDevice({codec:'pyrowave',encoder_configuration:config},'sender').includes('独立 GPU'));
+config.device.type='cpu';
+assert(codecDevice({codec:'pyrowave',decoder_configuration:config},'receiver').includes('CPU Vulkan 设备'));
+assert(codecDevice({codec:'pyrowave'},'sender').includes('未上报'));
+assert(codecDevice({codec:'raw'},'sender').includes('无编解码'));
+assert(codecDevice({codec:'mjpeg',decoder_configuration:{family:'turbojpeg'}},'receiver').includes('CPU / SIMD'));
+assert(codecDevice({codec:'pyrowave',decoder_configuration:{family:'pyrowave',device:{status:'unavailable'}}},'receiver').includes('不可用'));
+""")
+
+
+def test_latency_empty_samples_unknown_but_real_zero_valid(client):
+    check(client, """
+assert.equal(segmentMetrics({rseg_samples:0,rseg_p99_ms:0},'rseg').p99,null);
+assert.equal(segmentMetrics({rseg_samples:1,rseg_p99_ms:0},'rseg').p99,0);
+assert.equal(segmentMetrics({pc1_seg_p99_ms:2.5},'pc1_seg').p99,2.5);
+assert.equal(segmentMetrics({},'pc1_seg').p99,undefined);
+""")

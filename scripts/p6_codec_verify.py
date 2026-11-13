@@ -209,12 +209,26 @@ def run_case(output, codec, encoder, decoder, width=416, height=416, fps=30, fra
             assert encoder_config["target_bitrate_applied"] is False
         else:
             budget = min(max_bitrate * 10**6 // 8 // fps, max_au_bytes - 48, width * height * 3 // 2)
-            assert quality is None and encoder_config == {
+            assert quality is None
+            expected = {
                 "family": "pyrowave", "identity": "pyrowave:vulkan", "revision": 1,
                 "width": width, "height": height, "subsampling": "420",
                 "max_bytes_per_frame": budget, "upload_path": "cpu_nv12", "decode_path": "cpu_yuv420p"}
+            assert all(encoder_config.get(key) == value for key, value in expected.items())
+            for configuration in (encoder_config, stats["decoder_configuration"]):
+                assert configuration["compute"] == "vulkan" and configuration["zero_copy"] is False
+                device = configuration["device"]
+                assert device["status"] == "selected" and device["name"]
+                assert device["type"] in ("discrete_gpu", "integrated_gpu", "virtual_gpu", "cpu", "other")
+                assert len(device["uuid"]) == 32
             assert all(row["encoded_bytes"] <= budget for row in sent)
         assert all(row["keyframe"] for row in sent)
+        assert sender_stats["pc1_seg_samples"] == min(10000, len(sent))
+        assert stats["rseg_samples"] == min(10000, len(transported))
+        for report, prefix in ((sender_stats, "pc1_seg"), (stats, "rseg")):
+            assert 0 <= report[prefix + "_p99_ms"] <= report[prefix + "_max_ms"]
+        assert sender_stats["pc1_seg_scope"] == "source_ready_to_transmit_complete"
+        assert stats["rseg_scope"] == "first_fragment_to_complete_au"
         assert stats["complete"] == len(actual) == len(received)
         assert stats["decode_pending"] == 0 and stats["failed"] is False
         if loss:
@@ -236,6 +250,9 @@ def run_case(output, codec, encoder, decoder, width=416, height=416, fps=30, fra
                   "sender_timing_ms": sender_stats.get("timing_ms"),
                   "sender_preparation": preparation_metrics(sent, fps, gop),
                   "encoder_configuration": encoder_config,
+                  "decoder_configuration": stats["decoder_configuration"],
+                  "sender_segment": {k: v for k, v in sender_stats.items() if k.startswith("pc1_seg_")},
+                  "reassembly_segment": {k: v for k, v in stats.items() if k.startswith("rseg_")},
                   "gop_frames": gop,
                   "pixel_equality_gate": False, "dual_host": False}
         (case / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
