@@ -133,7 +133,7 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 | D22 | PC1 Raw 数小时后卡顿排查 | ✅owner（2026-11-08）：批准独立采样、生命周期修复候选、分项阻塞计时和隔离回归；不自动换已用DLL/部署、不改网卡或下游业务逻辑。六小时现场关联与整机根因仍待实用复现 | P5-LR |
 | D23 | 移除 H.264/H.265 | ✅owner（2026-11-13）：这种编解码方式不适合当前项目。移除 Media Foundation H.264/HEVC、原生 NVENC、`vc-codec-probe`/`vc-codec-roundtrip` 及全部相关测试结果/报告/开发包；保留 Raw 与 D21 的 MJPEG。不自动替换稳定部署；契约与 PLAN/AGENTS/skill 同批更新 | P6-3/P6-4 |
 | D24 | 接入 PyroWave | ✅owner（2026-11-13）：“开始 PyroWave 接入”。新增显式开发编码 `pyrowave:vulkan`（MIT，Vulkan 1.3 计算小波，intra-only），保留 Raw/MJPEG；阶段一只做 CPU 上传/回读，不做 D3D11 互操作；每帧预算=min(max_bitrate÷8÷fps, max_au−48, NV12 帧字节)，无质量旋钮；不自动回退/替换部署；双机/长稳/画质未验收。构建与限制见 `docs/runbooks/pyrowave.md` | P6-3 |
-| D25 | P6 review修正版提交/打包/部署 | ✅owner（2026-11-13）：“提交 打包 部署”。批准本轮修复提交、生成0.5.0便携包并切换双端；保留旧目录、配置与运行证据，编码仍须显式启用。执行前PC2可ping但5143拒绝连接，远端未恢复控制通道不得冒充部署完成；双机/长稳/画质仍未验收 | P6-R1发布 |
+| D25 | P6 review修正版提交/打包/部署 | ✅owner（2026-11-13）：“提交 打包 部署”。批准本轮修复提交、生成0.5.0便携包并切换双端；保留旧目录、配置与运行证据，编码仍须显式启用。0.5.0已提交/打包并在本机host启动；PC2预检为0.4.1 host/receive错误角色，按切换门禁未执行远端部署；最终发现本轮之外已将PC2更新为0.5.0 capture，并将双端改为活动PyroWave，停止进一步部署操作，不覆盖并发状态；远端包manifest未核验。证据见[发布记录](docs/bringup/bringup-20261113-release-0.5.0.md)；双机/长稳/画质仍未验收 | P6-R1发布 |
 
 ## 3. 任务卡
 
@@ -214,7 +214,7 @@ capabilities/codec-check/descriptor、48B VCAU（codec=4）、有界解码与 GU
 
 ### P6-R1 采集与编解码 review 修正 — DONE（本机回归，2026-11-13）
 
-8项修复、总闸301 passed / 4 skipped、WGC CPU/GPU私有窗口resize/close通过、PyroWave阻塞注入与640²@240回环480/480通过；未提交/打包/部署。证据：`docs/bringup/bringup-20261113-review-fixes.md`。
+8项修复提交62e37cd；总闸301 passed / 4 skipped、WGC CPU/GPU私有窗口resize/close通过、PyroWave阻塞注入与640²@240回环480/480通过。0.5.0已打包并启动本机host，PC2错误角色阻塞远端部署。证据：[修复回归](docs/bringup/bringup-20261113-review-fixes.md)、[发布/部署状态](docs/bringup/bringup-20261113-release-0.5.0.md)。
 
 ### P6-4 组合验收与交付 — TODO
 
