@@ -18,6 +18,7 @@ struct DDACap {
   Err err_code = E_NODDA;
   std::string err_msg = "uninitialized";
   int out_w = 0, out_h = 0;
+  int output_index = 0; // DXGI 输出序号（多显示器）；0=默认
   VCStream stream;
   uint64_t last_image_qpc=0, source_skipped=0;
 #ifdef _WIN32
@@ -65,7 +66,7 @@ bool DDACap::init(std::string& detail){
   if(FAILED(hr)||!dxgi_dev){ shutdown(); err_msg = "no DXGI device"; return false; }
   hr = dxgi_dev->GetAdapter(&adapter); dxgi_dev->Release();
   if(FAILED(hr)||!adapter){ shutdown(); err_msg = "no DXGI adapter"; return false; }
-  hr = adapter->EnumOutputs(0, &output); adapter->Release();
+  hr = adapter->EnumOutputs((UINT)output_index, &output); adapter->Release();
   if(FAILED(hr)||!output){ shutdown(); err_code = E_NOOUTPUT; err_msg = "no outputs headless"; return false; }
   DXGI_OUTPUT_DESC od; output->GetDesc(&od); out_w = (int)od.DesktopCoordinates.right - (int)od.DesktopCoordinates.left;
   out_h = (int)od.DesktopCoordinates.bottom - (int)od.DesktopCoordinates.top;

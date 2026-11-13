@@ -13,7 +13,9 @@
 #include <string>
 #include <memory>
 #include <vector>
+#include <mutex>
 #include "../common/stream.h"
+#include "../common/diagnostic_timing.h"
 #include <timeapi.h>  // timeBeginPeriod(1) for 240Hz pacing
 #include "../sender/pattern.h"  // vc_gen_motion (integer-only)
 #include "vcam_shm.h"  // receiver -> vcam latest-frame handoff (canonical layout)
@@ -193,7 +195,8 @@ class CEnumMT : public IEnumMediaTypes {
   LONG m_cRef = 1; BOOL m_done = FALSE;
 public:
   VCStream m_stream;
-  explicit CEnumMT(const VCStream& stream=VCStream()):m_stream(stream) {}
+  explicit CEnumMT(const VCStream& stream=VCStream()):m_stream(stream) { InterlockedIncrement(&g_objs); }
+  ~CEnumMT(){ InterlockedDecrement(&g_objs); }
   STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
     if (riid == IID_IUnknown || riid == IID_IEnumMediaTypes) { *ppv = (IEnumMediaTypes*)this; AddRef(); return S_OK; }
@@ -234,6 +237,7 @@ class CVCamFilter : public IBaseFilter, public IAMFilterMiscFlags {
   friend class CVCamPin;
   LONG m_cRef = 1;
   CRITICAL_SECTION m_cs;
+  std::recursive_mutex m_control; // Serialize Run/Stop/Disconnect while joining outside m_cs.
   FILTER_STATE m_state = State_Stopped;
   IFilterGraph* m_pGraph = nullptr;
   IReferenceClock* m_pClock = nullptr;
@@ -609,48 +613,54 @@ STDMETHODIMP CVCamFilter::QueryFilterInfo(FILTER_INFO* p) {
   Unlock(); return S_OK;
 }
 HRESULT CVCamFilter::Activate() {
+  std::lock_guard<std::recursive_mutex> control(m_control);
   Lock();
   if (m_hThread) { Unlock(); return S_OK; }
   IMemAllocator* alloc = m_pPin ? m_pPin->m_pAlloc : nullptr;
-  if (alloc) alloc->Commit();
+  if (alloc) { HRESULT hr=alloc->Commit(); if(FAILED(hr)){Unlock();return hr;} }
   m_hStop = CreateEvent(nullptr, TRUE, FALSE, nullptr);
-  if (!m_hStop) { Unlock(); return E_FAIL; }
+  if (!m_hStop) { if(alloc)alloc->Decommit(); Unlock(); return E_FAIL; }
   DWORD tid = 0;
   m_hThread = CreateThread(nullptr, 0, ThreadProc, this, 0, &tid);
   if (!m_hThread) { CloseHandle(m_hStop); m_hStop = nullptr; if (alloc) alloc->Decommit(); Unlock(); return E_FAIL; }
   Unlock(); return S_OK;
 }
 void CVCamFilter::Deactivate() {
+  std::lock_guard<std::recursive_mutex> control(m_control);
   HANDLE th = nullptr, ev = nullptr;
   IMemAllocator* alloc = nullptr;
-  IMemInputPin* input = nullptr;
+  IPin* peer = nullptr;
   Lock();
-  th = m_hThread; m_hThread = nullptr;
+  th = m_hThread;
   ev = m_hStop;
   if (m_pPin && m_pPin->m_pAlloc) { alloc = m_pPin->m_pAlloc; alloc->AddRef(); }
-  if (m_pPin && m_pPin->m_pInput) { input = m_pPin->m_pInput; input->AddRef(); }
+  if (th && m_pPin && m_pPin->m_pPeer) { peer = m_pPin->m_pPeer; peer->AddRef(); }
   Unlock();
-  if(input){IPin* pin=nullptr;if(SUCCEEDED(input->QueryInterface(IID_IPin,(void**)&pin))){pin->BeginFlush();pin->Release();}}
+  if (ev) SetEvent(ev);
+  if (peer) peer->BeginFlush();
   // Decommit unblocks GetBuffer; keep the stop event and buffers alive until the worker exits.
   if (alloc) { alloc->Decommit(); alloc->Release(); }
-  if (ev) SetEvent(ev);
   if (th) { WaitForSingleObject(th, INFINITE); CloseHandle(th); }
-  if(input){IPin* pin=nullptr;if(SUCCEEDED(input->QueryInterface(IID_IPin,(void**)&pin))){pin->EndFlush();pin->Release();}input->Release();}
+  if (peer) { peer->EndFlush(); peer->Release(); }
   if (ev) CloseHandle(ev);
+  m_hThread = nullptr;
   m_hStop = nullptr;
   ShmClose();  // worker joined: drop receiver mapping (re-resolves on next Run)
   m_hasLastGood = false;  // D12: reset per-session last-frame state
 }
 STDMETHODIMP CVCamFilter::Stop() {
+  std::lock_guard<std::recursive_mutex> control(m_control);
   Deactivate();
   Lock(); m_state = State_Stopped; Unlock(); return S_OK;
 }
 STDMETHODIMP CVCamFilter::Pause() {
+  std::lock_guard<std::recursive_mutex> control(m_control);
   HRESULT hr = Activate();
   if (FAILED(hr)) return hr;
   Lock(); m_state = State_Paused; Unlock(); return S_OK;
 }
 STDMETHODIMP CVCamFilter::Run(REFERENCE_TIME tStart) {
+  std::lock_guard<std::recursive_mutex> control(m_control);
   HRESULT hr = Activate();
   if (FAILED(hr)) return hr;
   Lock(); m_tStart = tStart; m_state = State_Running; Unlock(); return S_OK;
@@ -692,6 +702,8 @@ void CVCamFilter::VstatPush(uint32_t fid, uint64_t pub, uint64_t del, uint32_t f
   MemoryBarrier(); e->n = (uint32_t)k + 1;
 }
 DWORD CVCamFilter::Worker() {
+  vcdiag::Session diagnostics;
+  vcdiag::Channel allocation(diagnostics,vcdiag::GetBuffer), delivery(diagnostics,vcdiag::Receive);
   const size_t VCAM_FRAME_BYTES=stream.frame_bytes(), VC_Y_BYTES_LOCAL=stream.y_bytes(), VC_UV_BYTES_LOCAL=stream.uv_bytes();
   const LONGLONG VCAM_FRAME_100NS=10000000LL/stream.fps;
   std::vector<uint8_t> Y(VC_Y_BYTES_LOCAL), UV(VC_UV_BYTES_LOCAL);
@@ -759,7 +771,9 @@ DWORD CVCamFilter::Worker() {
     Unlock();
     if (!input || !alloc) { if (input) input->Release(); if (alloc) alloc->Release(); if (clk) clk->Release(); break; }
     IMediaSample* s = nullptr;
+    vcdiag::Scope allocation_time(&allocation);
     HRESULT hr = alloc->GetBuffer(&s, nullptr, nullptr, 0);
+    allocation_time.finish(SUCCEEDED(hr));
     alloc->Release();
     if (FAILED(hr) || !s) { input->Release(); if (clk) clk->Release(); break; }  // decommitted / stopping
     BYTE* buf = nullptr;
@@ -797,7 +811,9 @@ DWORD CVCamFilter::Worker() {
     if (discont) { s->SetDiscontinuity(TRUE); discont = FALSE; }
     lastStart = ts; tcount = te;
     uint64_t del = VCamQpcNs(freq);
+    vcdiag::Scope receive_time(&delivery);
     hr = input->Receive(s);
+    receive_time.finish(SUCCEEDED(hr));
     s->Release(); input->Release();
     VstatPush(outFid, outPub, del, (uint32_t)flags);
     uint64_t n = VCamQpcNs(freq);
@@ -813,6 +829,7 @@ DWORD CVCamFilter::Worker() {
 
 // ---------- pin impl ----------
 STDMETHODIMP CVCamPin::Connect(IPin* pPeer, const AM_MEDIA_TYPE* pmt) {
+  std::lock_guard<std::recursive_mutex> control(m_pFilter->m_control);
   if (!pPeer) return E_POINTER;
   m_pFilter->Lock();
   if (m_connected || m_pPeer) { m_pFilter->Unlock(); return VFW_E_ALREADY_CONNECTED; }
@@ -859,6 +876,9 @@ STDMETHODIMP CVCamPin::Connect(IPin* pPeer, const AM_MEDIA_TYPE* pmt) {
   m_pFilter->Unlock(); return S_OK;
 }
 STDMETHODIMP CVCamPin::Disconnect() {
+  std::lock_guard<std::recursive_mutex> control(m_pFilter->m_control);
+  // Keep allocator/input attached until flush/decommit has released the worker.
+  m_pFilter->Deactivate();
   // Snapshot under lock, join/decommit outside the lock: the worker briefly takes
   // the filter lock each tick, so joining while holding it could stall the join.
   m_pFilter->Lock();
@@ -869,7 +889,6 @@ STDMETHODIMP CVCamPin::Disconnect() {
   VCamClearType(&m_mt);
   m_connected = FALSE;
   m_pFilter->Unlock();
-  m_pFilter->Deactivate();
   if (alloc) alloc->Release();
   if (input) input->Release();
   if (peer) peer->Release();
@@ -880,6 +899,8 @@ STDMETHODIMP CVCamPin::Disconnect() {
 class CVCamFactory : public IClassFactory {
   LONG m_cRef = 1;
 public:
+  CVCamFactory(){ InterlockedIncrement(&g_objs); }
+  ~CVCamFactory(){ InterlockedDecrement(&g_objs); }
   STDMETHODIMP QueryInterface(REFIID riid, void** ppv) {
     if (!ppv) return E_POINTER;
     if (riid == IID_IUnknown || riid == IID_IClassFactory) { *ppv = (IClassFactory*)this; AddRef(); return S_OK; }

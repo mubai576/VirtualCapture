@@ -15,6 +15,8 @@ GUI 内置于 agent，不另拷网页资源。
 只打包 ctrl/scripts 顶层运行脚本和 docs 下 Markdown；排除 tests、缓存、构建入口、历史取证脚本、机器配置与运行证据。
 Python 控制/分析脚本是可选工具，需目标机 Python；TUI 另需 rich。主 agent / GUI / C++ 程序不依赖目标机 Python。
 Npcap 驱动不随目录复制，目标机实际收发前需安装 Npcap。
+MJPEG静态链接libjpeg-turbo，Runtime install另带`licenses/libjpeg-turbo-LICENSE.md`和`licenses/libjpeg-turbo-README.ijg`；缺任一原文打包失败。
+源文档`docs/runbooks/mjpeg.md`包含IJG归属声明、依赖版本/固定摘要及离线缓存操作，无新增运行时DLL。
 
 主机入口调用 `scripts/start-host.ps1`，采集后台入口调用 `scripts/start-capture-worker.ps1`；两者共用 `start-agent.ps1`，隐藏启动，默认端口 5143，等待健康检查。同目录同角色服务复用；角色、目录或能力冲突则拒绝。源码目录可使用相同脚本启动 Python agent，主机支持 `-NoBrowser`。日志写入运行目录的 `run/agent-*.stdout.log|stderr.log`。
 冻结成品冒烟同时验证主机 GUI 和采集后台：校验 `/health` 角色、版本与 root，后台的 `/`、`/ui`、`/ui/` 必须返回 404。

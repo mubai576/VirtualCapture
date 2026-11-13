@@ -33,6 +33,7 @@
 #include "fnv1a.h"
 #include "crc32.h"
 #include "../common/stream.h"
+#include "../common/diagnostic_timing.h"
 #include "../common/codec_session.h"
 
 #ifdef _WIN32
@@ -88,9 +89,9 @@ static void usage(){
   printf("vc-receiver.exe --adapter <substr> --ethertype 0x88B5 --mtu 9000\n"
     "  [--width 640 --height 640 --fps 240 --source-mac <session MAC>] [--capabilities]\n"
     "  --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]\n");
-  puts("  codec: --codec h264|hevc --codec-backend <CLSID|name:exact> --codec-hardware 0|1\n"
-       "  --bitrate 20000000 --max-bitrate 80000000 --gop 60 --decode-in-flight 2 --max-au-bytes 8388608\n"
-       "  --codec-backends | --codec-check <codec options> | --au-selftest");
+  puts("  codec: --codec mjpeg --codec-backend turbojpeg:cpu --codec-hardware 0 --gop 1\n"
+       "  --bitrate 20000000 --max-bitrate 80000000 --decode-in-flight 2 --max-au-bytes 8388608 --jpeg-quality 1..100 (default 80)\n"
+       "  --codec-backends | --codec-check <codec options> | --au-selftest | --mjpeg-selftest");
 }
 static void ensure_parent(const std::string&path){
   // 建父目录
@@ -102,17 +103,20 @@ static void ensure_parent(const std::string&path){
   CreateDirectoryA(dir.c_str(),NULL);
 #endif
 }
-static void atomic_write(const std::string&path,const std::string&data){
+static void atomic_write(const std::string&path,const std::string&data,vcdiag::Channel* timing=nullptr){
   // 原子写文件
   if(path.empty()) return;
+  vcdiag::Scope elapsed(timing);
   ensure_parent(path);
   std::string tmp=path+".tmp";
-  { std::ofstream f(tmp,std::ios::binary|std::ios::trunc); f.write(data.data(),(std::streamsize)data.size()); }
+  bool written=false;
+  { std::ofstream f(tmp,std::ios::binary|std::ios::trunc); f.write(data.data(),(std::streamsize)data.size()); f.close(); written=!!f; }
 #ifdef _WIN32
-  MoveFileExA(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
+  bool moved=!!MoveFileExA(tmp.c_str(),path.c_str(),MOVEFILE_REPLACE_EXISTING|MOVEFILE_WRITE_THROUGH);
 #else
-  rename(tmp.c_str(),path.c_str());
+  bool moved=rename(tmp.c_str(),path.c_str())==0;
 #endif
+  elapsed.finish(written && moved);
 }
 
 // 重组器（可单测，不依赖抓包）
@@ -566,6 +570,9 @@ int main(int argc,char**argv){
     else if(k=="--codec-backends"){return vc_codec_backends(false);}
     else if(k=="--codec-check"){a.codec_check=true;}
     else if(k=="--au-selftest"){return vcau::selftest();}
+#ifdef VC_HAS_MJPEG
+    else if(k=="--mjpeg-selftest"){return vcjpeg::selftest();}
+#endif
     else if(k=="--width"){ std::string v; need(v); a.stream.width=vc_cli_int(v); }
     else if(k=="--height"){ std::string v; need(v); a.stream.height=vc_cli_int(v); }
     else if(k=="--fps"){ std::string v; need(v); a.stream.fps=vc_cli_int(v); }
@@ -588,7 +595,7 @@ int main(int argc,char**argv){
 #endif
   if(a.selftest) return run_selftest();
   uint8_t source_mac[6];
-  if(!a.stream.valid() || !a.codec.valid(a.mtu) || a.mtu<=42 || a.mtu>9042 || (!a.codec.encoded() && (a.stream.frame_bytes()+(a.mtu-43))/(a.mtu-42)>65535) ||
+  if(!a.stream.valid() || !a.codec.valid(a.mtu,false) || a.mtu<=42 || a.mtu>9042 || (!a.codec.encoded() && (a.stream.frame_bytes()+(a.mtu-43))/(a.mtu-42)>65535) ||
       (!a.source_mac.empty() && !vc_parse_mac(a.source_mac,source_mac))){ fprintf(stderr,"invalid stream configuration\n"); return 2; }
   if(a.codec_check){if(!a.codec.encoded())return 2;return vc_codec_check(a.codec,a.stream,false);}
   if(a.stats.empty()) a.stats="run/"+a.session+".receiver.stats.json";
@@ -663,6 +670,8 @@ int main(int argc,char**argv){
   fprintf(stderr,"live capture only on Windows/Npcap\n"); return 1;
 #endif
   if(a.codec.encoded()){int result=run_encoded_receiver(a,d,h);d.closeh(h);return result;}
+  vcdiag::Session diagnostics;
+  vcdiag::Channel stats_write(diagnostics,vcdiag::StatsWrite), stats_prepare(diagnostics,vcdiag::StatsPrepare);
   FramePool pool(a.stream);
   Reassembler R(a.mtu,&pool,a.stream);
   R.inline_verify=false;   // 哈希/比对/hashlog 移出关键路径（哈希线程）
@@ -682,6 +691,7 @@ int main(int argc,char**argv){
   // 哈希线程：FIFO 消费已发布帧 -> 哈希 -> 比对 -> 写 slot.hash / hashlog -> 释放槽
   std::mutex hq_mu; std::condition_variable hq_cv; std::deque<DoneFrame> hq; bool hq_stop=false;
   std::thread hasher([&]{
+    vcdiag::Channel hash_write(diagnostics,vcdiag::HashWrite);
     std::vector<uint8_t> eY,eUV; size_t nflush=0;
     for(;;){
       DoneFrame f;
@@ -693,10 +703,14 @@ int main(int argc,char**argv){
       if(!rx_verify(pool.data(f.buf),f.fid,f.pattern,fh,eY,eUV,a.stream)) R.st.hash_mismatch++;
       pool.hashed(f.buf,f.fid,fh);
       char hx[17]; vc_fnv1a64_hex(fh,hx);
+      vcdiag::Scope hash_time(&hash_write);
       hashlog << "{\"frame_id\":" << f.fid << ",\"hash\":\"" << hx << "\",\"qpc_ns\":" << f.done_ns << "}\n";
       if(++nflush%8==0) hashlog.flush();
+      hash_time.finish(!!hashlog);
     }
+    vcdiag::Scope final_flush(&hash_write);
     hashlog.flush();
+    final_flush.finish(!!hashlog);
   });
   std::atomic<uint64_t> hq_max{0};
   uint64_t t_start=qpc_ns_now(), t_last_stats=0;
@@ -733,6 +747,7 @@ int main(int argc,char**argv){
     }
 #endif
     if(now-t_last_stats>500*1000000ull){
+      vcdiag::Scope prepare_time(&stats_prepare);
       t_last_stats=now;
       uint64_t shm_n=pool.shm?pool.published:0;
 #ifdef _WIN32
@@ -758,7 +773,8 @@ int main(int argc,char**argv){
       { std::string stats=buf; stats.pop_back();
         stats+=",\"width\":"+std::to_string(a.stream.width)+",\"height\":"+std::to_string(a.stream.height)+
           ",\"frame_bytes\":"+std::to_string(a.stream.frame_bytes())+",\"fps_limit\":"+std::to_string(a.stream.fps)+",\"codec\":\"raw\"}";
-        atomic_write(a.stats,stats); }
+        prepare_time.finish();
+        atomic_write(a.stats,stats,&stats_write); }
     }
   }
   { std::lock_guard<std::mutex> lk(hq_mu); hq_stop=true; }
@@ -788,7 +804,7 @@ int main(int argc,char**argv){
     { std::string stats=buf; stats.pop_back();
         stats+=",\"width\":"+std::to_string(a.stream.width)+",\"height\":"+std::to_string(a.stream.height)+
           ",\"frame_bytes\":"+std::to_string(a.stream.frame_bytes())+",\"fps_limit\":"+std::to_string(a.stream.fps)+",\"codec\":\"raw\"}";
-        atomic_write(a.stats,stats); } }
+        atomic_write(a.stats,stats,&stats_write); } }
 #ifdef _WIN32
   d.closeh(h);
 #endif

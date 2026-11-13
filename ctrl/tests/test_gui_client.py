@@ -162,9 +162,19 @@ assert(captureSource({mode:'dda'},{capture:{mode:'pattern'}}) === '桌面采集 
 """)
 
 
+def test_mjpeg_waits_for_next_jpeg_not_next_gop(client):
+    check(client, READY + """
+status.peer.sender = {running:true};
+status.local.receiver = {running:true,codec:'mjpeg',waiting_idr:true};
+const state=readiness(status,false);
+assert(state.title.includes('JPEG') && !state.title.includes('IDR'));
+assert(state.detail.includes('不需要等待 GOP'));
+""")
+
+
 def test_pending_pipeline_blocks_start_not_stop(client):
     check(client, READY + """
-for (const capture of [{codec:'h264'}, {codec:'hevc'}]) {
+for (const capture of [{codec:'mjpeg'}]) {
   status.local.config.capture = capture;
   assert(!readiness(status,false).canStart);
   assert(readiness(status,false).title.includes('尚不可运行'));
@@ -228,10 +238,10 @@ def test_codec_controls_preserve_inactive_bitrates(client):
 assert(element('bitrateFields').hidden && element('c_bitrate').disabled);
 element('c_bitrate').value = ''; element('c_max_bitrate').value = 'bad';
 assert.equal(readConfig().capture.bitrate_mbps,50, 'hidden raw fields must not corrupt saved settings');
-element('c_codec').value = 'hevc'; element('c_bitrate').value = '90'; element('c_max_bitrate').value = '120';
+element('c_codec').value = 'mjpeg'; element('c_bitrate').value = '90'; element('c_max_bitrate').value = '120';
 markDirty({target:element('c_codec')});
-assert(!element('bitrateFields').hidden && !element('c_bitrate').disabled);
-assert.equal(readConfig().capture.codec,'hevc');
+assert(!element('bitrateFields').hidden && element('c_bitrate').disabled);
+assert.equal(readConfig().capture.codec,'mjpeg');
 assert.equal(readConfig().capture.max_bitrate_mbps,120);
 element('c_headroom').value = '25';
 assert.equal(readConfig().transport.headroom_pct,25);
@@ -240,24 +250,42 @@ assert(!dirty && element('c_width').value === 640 && element('c_codec').value ==
 """)
 
 
+def test_mjpeg_selection_exposes_quality_and_explicit_cpu_backend(client):
+    check(client, FORM + """
+element('c_codec').value='mjpeg'; markDirty({target:element('c_codec')});
+assert.equal(element('c_encoder').value,'turbojpeg:cpu');
+assert.equal(element('c_decoder').value,'turbojpeg:cpu');
+assert.equal(element('c_gop').value,'1');
+assert.equal(element('c_encoder_hw').value,'0');
+assert(!element('mjpegFields').hidden && !element('c_jpeg_quality').disabled);
+assert(element('c_bitrate').disabled && element('c_gop').disabled);
+element('c_jpeg_quality').value='86';
+const cp=readConfig().capture;
+assert.equal(cp.jpeg_quality,86); assert.equal(cp.gop_frames,1);
+assert(!cp.encoder_hardware && !cp.decoder_hardware);
+assert.equal(cp.max_bitrate_mbps,80);
+element('c_codec').value='raw'; syncCodecFields();
+assert(element('mjpegFields').hidden && element('c_jpeg_quality').disabled);
+""")
+
+
 def test_codec_opt_in_backends_and_quality_are_explicit(client):
     check(client, FORM + """
-assert(pendingPipeline({codec:'hevc'}).includes('明确启用'));
-element('c_codec').value='hevc'; element('c_experimental').value='1';
+assert(pendingPipeline({codec:'mjpeg'}).includes('明确启用'));
+element('c_codec').value='mjpeg'; element('c_experimental').value='1';
 syncCodecFields(); assert(element('c_encoder').required && element('c_decoder').required);
 element('c_experimental').value='0'; syncCodecFields();
 assert(!element('c_encoder').required && !element('c_decoder').required, 'drafts do not require backends');
 element('c_experimental').value='1';
-element('c_encoder').value='{00000001-0002-0003-0405-060708090a0b}';
-element('c_decoder').value='name:HEVCVideoExtension';
-element('c_encoder_hw').value='1'; element('c_decoder_hw').value='0';
-element('c_gop').value='30'; element('c_in_flight').value='2';
+element('c_encoder').value='turbojpeg:cpu'; element('c_decoder').value='turbojpeg:cpu';
+element('c_encoder_hw').value='0'; element('c_decoder_hw').value='0';
+element('c_jpeg_quality').value='86';
 const cp=readConfig().capture;
-assert(cp.codec_experimental && cp.encoder_hardware && !cp.decoder_hardware);
-assert(cp.gop_frames===30 && cp.decode_in_flight===2 && !pendingPipeline(cp));
-assert(qualityErrors({codec:'hevc',decode_errors:1,decode_queue_drops:2,transport_errors:3})===6);
+assert(cp.codec_experimental && !cp.encoder_hardware && !cp.decoder_hardware);
+assert(cp.jpeg_quality===86 && cp.decode_in_flight===2 && !pendingPipeline(cp));
+assert(qualityErrors({codec:'mjpeg',decode_errors:1,decode_queue_drops:2,transport_errors:3})===6);
 assert(qualityErrors({codec:'raw',hash_mismatch:2,dropped:1})===3);
-assert(qualityErrors({codec:'hevc',packets_lost:1,decode_resets:1})===2);
+assert(qualityErrors({codec:'mjpeg',packets_lost:1,decode_resets:1})===2);
 """)
 
 
@@ -275,6 +303,9 @@ request.then(() => {
   assert(!planInFlight && !element('bPlan').disabled);
 });
 """)
+
+
+
 
 
 def test_budget_requests_do_not_save_or_start_and_can_force_refresh(client):

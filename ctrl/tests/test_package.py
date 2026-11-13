@@ -46,13 +46,14 @@ def test_package_refuses_unmanaged_output_without_touching_it(tmp_path):
 def test_package_support_files_exclude_caches_tests_and_build_scripts(tmp_path):
     root, stage = tmp_path / "repo", tmp_path / "payload"
     stage.mkdir()
-    for name in ("version.json", "packaging/Start-VirtualCapture.cmd", "packaging/Start-Capture-Worker.cmd", "docs/runbooks/package-quickstart.md",
+    for name in ("version.json", "packaging/Start-VirtualCapture.cmd", "packaging/Start-Capture-Worker.cmd", "docs/runbooks/package-quickstart.md", "docs/runbooks/mjpeg.md",
                  "ctrl/run_remote.py", "ctrl/tests/test_private.py", "ctrl/__pycache__/x.pyc",
                  "scripts/runtime-paths.ps1", "scripts/verify.py", "scripts/package.py", "scripts/p6_raw_verify.py", "scripts/p6_product_verify.py",
                  "vc-config.json", "run/customer.hash.jsonl"):
         put(root, name)
     package.copy_support_files(root, stage)
     assert (stage / "ctrl/run_remote.py").is_file()
+    assert (stage / "docs/runbooks/mjpeg.md").is_file(), "Static MJPEG attribution must ship with the portable package"
     assert (stage / "scripts/runtime-paths.ps1").is_file()
     # A BOM is required for Windows PowerShell 5.1 to parse non-ASCII scripts.
     assert (stage / "scripts/runtime-paths.ps1").read_bytes().startswith(b"\xef\xbb\xbf")
@@ -68,6 +69,18 @@ def test_package_rejects_incomplete_payload(tmp_path):
             put(tmp_path, name)
     with pytest.raises(package.PackageError, match="vc-vcam.dll"):
         package.require_payload(tmp_path)
+
+
+def test_package_requires_static_mjpeg_license_notices(tmp_path):
+    for name in (*package.NATIVE_FILES, *package.RUNTIME_FILES, "vc-agent.exe", "version.json",
+                 "Start-VirtualCapture.cmd", "Start-Capture-Worker.cmd", "README.md",
+                 "scripts/start-agent.ps1", "scripts/start-host.ps1", "scripts/start-capture-worker.ps1"):
+        put(tmp_path, name)
+    with pytest.raises(package.PackageError, match="libjpeg-turbo"):
+        package.require_payload(tmp_path)
+    for name in package.LICENSE_FILES:
+        put(tmp_path, name)
+    package.require_payload(tmp_path)
 
 
 def test_package_manifest_records_content_and_dirty_source(tmp_path):

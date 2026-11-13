@@ -14,29 +14,27 @@ constexpr size_t header_bytes=48;
 constexpr uint32_t magic=0x55414356; // VCAU, little endian
 inline uint64_t get(const uint8_t* p,int n){uint64_t v=0;for(int i=0;i<n;i++)v|=(uint64_t)p[i]<<(8*i);return v;}
 inline void put(uint8_t* p,uint64_t v,int n){for(int i=0;i<n;i++)p[i]=(uint8_t)(v>>(8*i));}
-inline bool random_access(const std::vector<uint8_t>& bytes,int codec){
-  bool idr=false;unsigned parameters=0;
-  for(size_t i=0;i+4<bytes.size();i++){
-    if(bytes[i] || bytes[i+1])continue;
-    size_t n=bytes[i+2]==1?i+3:(bytes[i+2]==0 && bytes[i+3]==1?i+4:bytes.size());
-    if(n>=bytes.size())continue;
-    unsigned type=codec==1?bytes[n]&31:(bytes[n]>>1)&63;
-    if(codec==1){idr|=type==5;if(type==7)parameters|=1;if(type==8)parameters|=2;}
-    else {idr|=type==19 || type==20;if(type==32)parameters|=1;if(type==33)parameters|=2;if(type==34)parameters|=4;}
-  }
-  return idr && parameters==(codec==1?3u:7u);
+inline bool random_access(const uint8_t* bytes,size_t size,int codec){
+  return codec==3 && size>=4 && bytes[0]==0xff && bytes[1]==0xd8 && bytes[size-2]==0xff && bytes[size-1]==0xd9;
 }
+inline bool random_access(const std::vector<uint8_t>& bytes,int codec){return random_access(bytes.data(),bytes.size(),codec);}
 struct Unit {
   uint32_t fid=0; uint64_t first_ns=0,hash=0; bool key=false,eos=false;
   std::vector<uint8_t> bytes;
 };
-inline std::vector<uint8_t> pack(const Unit& u,const VCStream& s,int codec){
-  std::vector<uint8_t> out(header_bytes+u.bytes.size(),0);
-  put(out.data(),magic,4);out[4]=1;out[5]=(uint8_t)codec;out[6]=u.key?1:(u.eos?2:0);out[7]=header_bytes;
+// Input is borrowed until return and must not alias out. Reuse capacity, not old header bytes.
+inline uint64_t pack_into(std::vector<uint8_t>& out,const uint8_t* bytes,size_t size,
+                          uint32_t fid,bool key,bool eos,const VCStream& s,int codec){
+  out.resize(header_bytes+size);std::fill_n(out.data(),header_bytes,0);
+  put(out.data(),magic,4);out[4]=1;out[5]=(uint8_t)codec;out[6]=key?1:(eos?2:0);out[7]=header_bytes;
   put(out.data()+8,s.width,4);put(out.data()+12,s.height,4);put(out.data()+16,s.fps,4);
-  put(out.data()+20,u.bytes.size(),4);put(out.data()+24,u.fid,4);
-  put(out.data()+32,vc_fnv1a64(u.bytes.data(),u.bytes.size()),8);
-  std::copy(u.bytes.begin(),u.bytes.end(),out.begin()+header_bytes);return out;
+  put(out.data()+20,size,4);put(out.data()+24,fid,4);
+  uint64_t hash=vc_fnv1a64(bytes,size);put(out.data()+32,hash,8);
+  if(size)memcpy(out.data()+header_bytes,bytes,size);
+  return hash;
+}
+inline std::vector<uint8_t> pack(const Unit& u,const VCStream& s,int codec){
+  std::vector<uint8_t> out;pack_into(out,u.bytes.data(),u.bytes.size(),u.fid,u.key,u.eos,s,codec);return out;
 }
 inline bool unpack(const std::vector<uint8_t>& data,uint32_t fid,const VCStream& s,int codec,size_t cap,Unit& u){
   if(data.size()<header_bytes || data.size()>cap || get(data.data(),4)!=magic || data[4]!=1 || data[5]!=codec ||
@@ -45,6 +43,7 @@ inline bool unpack(const std::vector<uint8_t>& data,uint32_t fid,const VCStream&
     get(data.data()+24,4)!=fid || get(data.data()+28,4) || get(data.data()+40,8)) return false;
   u.fid=fid;u.key=data[6]==1;u.eos=data[6]==2;u.hash=get(data.data()+32,8);
   if(u.eos!=(data.size()==header_bytes))return false;
+  if(codec==3 && !u.eos && !u.key)return false;
   u.bytes.assign(data.begin()+header_bytes,data.end());
   return u.hash==vc_fnv1a64(u.bytes.data(),u.bytes.size());
 }
@@ -92,13 +91,18 @@ inline int selftest(){
   try{
     auto require=[](bool good){if(!good)throw std::runtime_error("access-unit selftest failed");};
     VCStream stream;stream.width=418;stream.height=282;
-    for(int codec:{1,2})for(size_t size:{0u,1u,37u,1459u,8959u,27001u}){
-      Unit unit;unit.fid=7;unit.eos=size==0;unit.bytes.resize(size);
+    for(int codec:{3})for(size_t size:{0u,1u,37u,1459u,8959u,27001u}){
+      Unit unit;unit.fid=7;unit.eos=size==0;unit.key=size!=0;unit.bytes.resize(size);
       for(size_t i=0;i<size;i++)unit.bytes[i]=(uint8_t)(i*17);
       auto data=pack(unit,stream,codec);Unit restored;
+      std::vector<uint8_t> reused;reused.reserve(data.size()+100);auto* storage=reused.data();
+      for(int repeat=0;repeat<3;repeat++){
+        reused.resize(data.size()+100);std::fill(reused.begin(),reused.end(),0xa5);
+        uint64_t hash=pack_into(reused,unit.bytes.data(),unit.bytes.size(),unit.fid,unit.key,unit.eos,stream,codec);
+        require(reused==data && reused.data()==storage && hash==vc_fnv1a64(unit.bytes.data(),unit.bytes.size()));
+      }
       require(unpack(data,7,stream,codec,data.size(),restored));require(restored.bytes==unit.bytes);
       require(!unpack(data,8,stream,codec,data.size(),restored));
-      require(!unpack(data,7,stream,codec==1?2:1,data.size(),restored));
       auto bad=data;bad[28]=1;require(!unpack(bad,7,stream,codec,bad.size(),restored));
       bad=data;bad.back()^=1;require(!unpack(bad,7,stream,codec,bad.size(),restored));
       for(size_t payload:{1458u,8958u}){
@@ -124,12 +128,11 @@ inline int selftest(){
       h.frame_id=1;require(!assembler.accept(h,bytes,4,output,first));h.frame_id=2;require(!assembler.accept(h,bytes,5,output,first));
       h.frame_id=3;require(!assembler.accept(h,bytes,6,output,first));require(assembler.dropped==2);
       assembler.finish();require(assembler.dropped==4 && assembler.lost==4);
-      require(random_access({0,0,1,0x67,0,0,1,0x68,0,0,1,0x65,1},1));
-      require(!random_access({0,0,1,0x65,1},1));
-      require(random_access({0,0,1,64,0,0,1,66,0,0,1,68,0,0,1,38,1},2));
-      require(!random_access({0,0,1,64,0,0,1,66,0,0,1,68,0,0,1,42,1},2));
+      require(random_access({0xff,0xd8,0xff,0xd9},3));
+      require(!random_access({0xff,0xd8,0xff},3));
+      require(!random_access({0xff,0xd8,0xff,0xd9},1));
     }
-    puts("PASS: codec envelope/hash/limits, reversed fragments, CRC, duplicates, bounded memory, Annex-B IDR and late-frame rejection");return 0;
+    puts("PASS: codec envelope/hash/limits, reversed fragments, CRC, duplicates, bounded memory, independent JPEG frame and late-frame rejection");return 0;
   }catch(const std::exception& e){fprintf(stderr,"%s\n",e.what());return 1;}
 }
 }

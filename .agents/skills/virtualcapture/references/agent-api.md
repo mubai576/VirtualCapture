@@ -28,7 +28,7 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 | 方法 | 路径 | 请求 | 返回 |
 |---|---|---|---|
 | GET | `/` `/ui` | — | 仅主机提供内置控制台（HTML，no-store）；采集后台返回 404，不渲染 UI |
-| GET | `/config` | — | `{role, peer_url, adapter, capture{mode,pattern,gpu_convert,fps,batch,mtu,dst_mac,width,height,transform,codec,bitrate_mbps,max_bitrate_mbps},transport{headroom_pct}, receive{shm,mtu,vcam_autoregister}}`（ROOT/vc-config.json，缺省值见 agent；新流配置与实现边界见 stream-config.md） |
+| GET | `/config` | — | `{role, peer_url, adapter, capture{mode,pattern,gpu_convert,fps,batch,mtu,dst_mac,output,wgc_window,width,height,transform,codec,bitrate_mbps,max_bitrate_mbps},transport{headroom_pct}, receive{shm,mtu,vcam_autoregister}}`（ROOT/vc-config.json，缺省值见 agent；新流配置与实现边界见 stream-config.md） |
 | POST | `/config` | 部分字段（未知键丢弃，子对象逐键合并） | `{saved, config}`；校验失败 400 `{error, details[]}`。产品角色由启动方式固定；主机 peer_url 只接受 `http://IPv4:5143`，UI 只填 IP。adapter 接受安全描述子串或完整 `\Device\NPF_{GUID}` / `\Device\NPF_Loopback`；运行时拒绝更改连接配置（409） |
 | GET | `/vcam/status` | — | `{dll, registered, match}`（HKCU InprocServer32 是否指向本机 ROOT 下 dll） |
 | POST | `/vcam/register` | — | regsvr32 /s 本机 dll；同步 FrameMap，Motion=0；200 需 exit=0 且 match。产品 UI 不提供手动注册入口 |
@@ -36,7 +36,7 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 | POST | `/product/start` | — | 主机发起：检查采集后台 product_revision=2、stream_revision=2、角色、版本与实际原生能力 → 注册并启动本机接收 → 0.5s → 下发采集设置；被采集机无需配置 peer_url/网卡。获取到主机选定网卡 MAC 时自动单播。发端失败先尽力停发端，再停止并回收收端。`{ok, steps[{side,code,result,rollback?}]}`；采集后台不接受此编排命令（403） |
 | POST | `/product/stop` | — | 先停发端再停收端并回收 vcam；对端失联也继续处理本机。`{ok, steps}`；部分失败时 ok=false |
 | GET | `/product/status` | — | `{ts, local{online,config,version,sender,receiver,vcam}, peer{online,url,version,config,sender,receiver,vcam}|null}`；对端只调固定 GET 端点（无通用反代） |
-- `/sender/start` 新增可选 `gpu_convert:true` → `--gpu-convert`。
+- `/sender/start` 新增可选 `gpu_convert:true` → `--gpu-convert`；`mode` 接受 `pattern|dda|wgc`，可选 `output:0..15` → `--output`、`wgc_window:"<标题子串>"` → `--wgc-window`（仅 WGC；空=显示器）。
 - 访问控制同既有端点（无鉴权，直连网段内使用）；对端调用只走 `peer_url` + 固定路径。
 - 控制台（P5-U2，2026-10-29，owner 批）：只有主机 UI；连接配置无角色/共享内存/注册选项/对端控制台链接，打开页面自动取网卡列表。开始/停止采集共用一个按钮；有残留 managed vcam 时仍可重试停止回收。离线/停止/桩进程不显示实时指标，换会话重建帧率基线。
 - 主机产品配置固定 `receive.shm=Local\VirtualCaptureVcamFrame`、`vcam_autoregister=true`；旧 peer_url 的 IPv4 在读取时迁移至 5143，保存时校验。接收启动前注册，正常停止、启动失败回滚、接收子进程退出（后台每秒检查）与主机正常退出时回收；只注销本目录匹配的 DLL，不碰其他目录注册。`vcam.managed` 表示待回收资源；回收失败保留状态并重试。强制终止进程不保证清理，下游已打开的 COM 实例也不会被强制关闭。
@@ -49,8 +49,9 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 ## P6 配置、预算与显式会话（D19；P6-2，2026-11-03）
 
 上述 2026-10-29 的精简 UI 已被本轮新增配置要求扩展；仍隐藏测试源/GPU/batch/MTU。
-新增五档分辨率预设 + 自定义、crop/fit/fill/stretch、raw/h264/hevc、码率及预留余量。
-开发版 Raw 可变尺寸与四种变换已接通；H.264/H.265 默认草案，明确启用开发功能、选择并协商两端后端后可运行。完整追加API/配置/descriptor/日志契约见 `encoded-stream.md`，双机与画质验收未完成。
+新增五档分辨率预设 + 自定义、crop/fit/fill/stretch、raw/mjpeg、码率及预留余量。
+开发版 Raw 可变尺寸与四种变换已接通；MJPEG 须明确启用开发功能并选择两端 `turbojpeg:cpu` 后才能运行。
+H.264/H.265 已于 2026-11-13 移除。完整追加API/配置/descriptor/日志契约见 `encoded-stream.md`，双机与画质验收未完成。
 
 | 方法 | 路径 | 请求 | 返回 |
 |---|---|---|---|
@@ -62,7 +63,7 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 Raw码率参数、不支持codec、收端缩放及错误几何拒绝。主机生成descriptor、收端先起、capture逐键确认并回显，不一致回滚双端。
 两端stats追加 width/height/frame_bytes/fps_limit/codec，sender另有transform/source_skipped。28B包头与历史raw判据未变；SHM已升级v3，下游须重新打开，完整契约见stream-config.md。
 
-P6-3追加只读 `POST /stream/codec-check {capture:{...}}`，实际激活/媒体类型协商，仍frames_tested=0；失败409。编码plan含backends清单并核对双端codec_revision=1；必须显式开发授权和后端，校验在停旧槽/注册之前。GUI区分压缩字节完整性与解码像素hash，详情以encoded-stream.md为准。
+P6-3追加只读 `POST /stream/codec-check {capture:{...}}`，实际初始化 MJPEG 编码器/解码器，仍frames_tested=0；失败409。编码plan含backends清单并核对双端codec_revision=1与mjpeg_revision=1；必须显式开发授权和 turbojpeg:cpu，校验在停旧槽/注册之前。GUI区分压缩字节完整性与解码像素hash，详情以encoded-stream.md为准。
 
 ## /exec policy (added 0.2.0, allowlist-bound, NOT a general shell)
 

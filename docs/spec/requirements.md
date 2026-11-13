@@ -10,6 +10,8 @@
 > SUPERSEDED-NOTE 2026-10-22: the no-IP rule in the line above is void (shared-NIC, PLAN S11). Budget numbers stand - measured ~1.18Gbps (S23).
 * 接收+虚拟卡：按frame_id/timestamp重组，缺包整帧丢等下一帧；环形只留最新1帧；虚拟端暴露`YUY2,NV12,RGB24,P010,MJPEG`中的NV12 640x640 AvgTimePerFrame 41666，不跟墙钟，因`doesn't handle reference clock correctly`；DShow/MF二选一，DShow虚拟对MF不可见`DirectShow-only invisible to Media Foundation`。
 * 弃用项：MJPEG`each frame is JPEG`且`JPEG is lossy`；NDI `~15:1 visually lossless`；Moonlight`H.264/H.265 feed`，均有损出局。
+> SUPERSEDED-NOTE 2026-11-13（PLAN D21/D23）：默认与验收路径仍为 Raw，无损判据不变；D21 另行批准开发版
+> 每帧独立 MJPEG，D23 则把 H.264/H.265 从项目移除。原文的有损出局结论只代表当时需求分析。
 
 ## Test Plan
 * 带宽/pps：9000下`69包/帧`持续240Hz无丢，`102k pps`仅作反例验证1500不可用。

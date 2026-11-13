@@ -8,12 +8,13 @@
 - 预设：416×416、640×640、1280×720、1920×1080、2560×1440；默认保留 **640×640@240 / crop / raw**。
 - 自定义：偶数宽高 2..8192，整数 fps 1..1000；单帧包数不得超过 uint16。范围是软件参数校验，不是显存/吞吐/硬件认证。
 - `capture`：`width,height,fps,transform,codec,bitrate_mbps,max_bitrate_mbps`，其余 GPU/batch/MTU 等隐藏值保留。
-- `codec=raw|h264|hevc`；码率整数 1..10000 Mbps，max>=target。Raw 不压缩、不静默切编码或降尺寸/帧率。
+- 采集后端：`capture.mode=dda|wgc|pattern`；`capture.output`（0..15，默认0）选择显示器；`capture.wgc_window`（<=128 字符标题子串，空=显示器）仅 WGC 使用。WGC 仍经 DWM 合成，窗口模式包含光标，独占全屏不可采集；切换后端必须显式配置，不自动回退。
+- `codec=raw|mjpeg`；H.264/H.265 已于 2026-11-13 移除。码率整数 1..10000 Mbps，max>=target。MJPEG质量配置及能力/精确会话追加见encoded-stream；目标码率不适用，最大码率仍限流。Raw 不压缩、不静默切编码或降尺寸/帧率。
 - `transport.headroom_pct`：0..50，默认20，仅预算建议，不修改历史验收门限。
 
 ## 变换与限速
 
-源为当前 DDA 默认输出，传输/虚拟卡尺寸与源桌面分辨率分离。不修改显示设置；旋转输出暂拒绝，不提供屏幕选择。
+源为 `capture.output` 指定的显示器（DDA/WGC，默认0）或 WGC 指定窗口，传输/虚拟卡尺寸与源桌面分辨率分离。不修改显示设置；DDA 旋转输出拒绝。
 
 - crop：居中 1:1，源必须不小于目标；偏移 `(source-output)/2` 下取整，保持历史 640 裁切逐字节结果。
 - stretch：源整幅映射至目标整幅。
@@ -72,7 +73,7 @@ max_raw_fps = floor(usable_bps / (wire_frame_bytes * 8))
 66 = 以太头14 + VC头28 + FCS4 + preamble/SFD8 + IFG12；很小的尾包补到最小以太帧。
 不计 VLAN、隧道及其他业务流量；连接速率也不等于可持续吞吐，预留余量只提供工程建议。
 
-H.264/H.265 用最大码率均摊成每帧字节数，再估计分包开销；`is_estimate=true`，
+MJPEG 用最大码率均摊成每帧字节数，再估计分包开销；`is_estimate=true`，
 `max_raw_fps=null`。码率窗口不保证单个 IDR 帧大小或瞬时突发，更不能证明编码器吞吐/画质。
 
 ## 显式产品会话与低层兼容
@@ -120,16 +121,10 @@ receiver 按会话严格校验 total、seq、每包 payload_len、pattern 一致
 `--dda` 要求真实变化桌面；测试不会自动启动动画源。实际报告见 `docs/bringup/bringup-20261103-p6-raw.md`。
 本机证明不替代双机、物理链路吞吐或长期使用验收；编码开发模式按encoded-stream.md显式启用，不能套用 Raw 像素哈希门。
 
-## P6-3 开发后端CLI（非产品支持）
+## P6-3 MJPEG 开发链路（非产品支持）
 
-`vc-codec-probe [--width W --height H --fps F]`仅枚举/激活/类型协商，固定frames_tested=0；打包MFT缺CLSID时输出null/clsid_hr。
-```text
-vc-codec-roundtrip --codec h264|hevc --width W --height H --fps F --frames N --bitrate <bit/s>
-  --encoder-clsid <GUID>|--encoder-name <exact> --decoder-clsid <GUID>|--decoder-name <exact>
-  [--hardware-encoder] [--hardware-decoder] [--max-in-flight 1..8] [--hashlog <path>]
-```
-默认640×640@240、30帧、20Mbps、in-flight=1；两侧身份各必须明确提供且唯一匹配，CLSID和name不能同时提供。
-`--selftest`独立验证NV12 aperture/stride/UV/容量，无需激活codec。非法参数退出2，MFT不支持/超时/帧序错误退出1。
-编码输出复制到新sample再解码，记录源/解码hash但不判两者相等；fps为媒体元数据，此工具不按墙钟送帧，不能据此宣称实时吞吐。
-历史原型的真实候选与H.264/HEVC回环已在开发机验证；新产品开发模式接线与明确的解码队列上限见encoded-stream.md，不能静默加深队列。
-工具不随便携包交付、不注册/调用agent/修改网卡。完整边界与证据：`docs/proposals/codec-backend-20261103.md`。
+`vc-codec-probe` 与 `vc-codec-roundtrip` 已随 H.264/H.265 在 2026-11-13 一并移除，不再构建或交付。
+MJPEG 只通过 sender/receiver 的 `--codec mjpeg --codec-backend turbojpeg:cpu --codec-hardware 0 --gop 1`
+显式启用；能力/精确会话/载荷/日志契约见 encoded-stream.md。
+验证脚本 `scripts/p6_codec_verify.py` 只接受 `--codec mjpeg`，不注册 DLL、不调用 5143；结果不代表双机、
+长稳、画质或实时吞吐验收。

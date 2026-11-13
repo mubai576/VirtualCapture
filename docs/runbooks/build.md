@@ -29,6 +29,9 @@ python scripts/package.py --allow-dirty --output "D:/Deliverables/VirtualCapture
 
 Windows + MSVC（C++17）+ Windows SDK，CMake 最低 3.20；本项目使用 Visual Studio 17 2022 生成器。
 Python 用于 agent、控制脚本与 pytest；agent 打包另需 PyInstaller。
+H.264/H.265（Media Foundation 与原生 NVENC）已于 2026-11-13 按 D23 移除，不再需要 NVENC 声明头、CUDA 或 FFmpeg。
+MJPEG静态链接libjpeg-turbo 3.1.2 CPU/SIMD；构建时下载并核验固定源码/NASM档案，缺SIMD即失败，无新增运行时DLL。
+离线缓存、固定摘要及随包必须携带的IJG/BSD许可证见`mjpeg.md`。
 Npcap SDK 查找顺序：有效的 `NPCAP_SDK/Include/pcap.h` → `thirdparty/npcap-sdk` → 无 SDK 的动态加载构建。
 Npcap 运行时仅在实际收发时需要。
 
@@ -66,8 +69,6 @@ cmake --build build/clean --config Release
 | `vc-testwin` | `build/Release/vc-testwin.exe` | DDA 动画测试源 |
 | `vc-monitor` | `build/Release/vc-monitor.exe` | NV12 预览仪表 |
 | `vc-monitor-diag` | `build/Release/vc-monitor-diag.exe` | D3D11 诊断 |
-| `vc-codec-roundtrip`（仅开发） | `build/Release/vc-codec-roundtrip.exe` | 显式MFT实际编码/解码原型与aperture自测；不交付，命令见codec-backend提案 |
-| `vc-codec-probe`（仅开发） | `build/Release/vc-codec-probe.exe` | MF候选/类型探测，不含在便携包中，不代表产品支持 |
 | `vc-vcam-verify` | `build/vcam_verify/Release/vc-vcam-verify.exe` | 保留原有验收工具输出路径 |
 
 Debug 对应 `Debug/`；单配置生成器不加配置子目录。辅助工具源码迁入 `tools/` 不改变上述 Release 路径。
@@ -84,8 +85,9 @@ python scripts/verify.py --no-build --live Loopback
 未指定 `VC_ADAPTER` 时 pytest 跳过 live 用例，T3 默认跳过；这些跳过不等于双机验收通过。
 P6-2 开发专项：`python scripts/p6_raw_verify.py`（motion/batch1/Loopback/真实DShow）；`--dda`需变化桌面。
 `python scripts/p6_product_verify.py`验证隔离HTTP产品编排，只有注册操作被替换，使用随机端口/私有映射，不触碰稳定5143或注册表。
-P6-3 开发专项：`python scripts/p6_codec_verify.py --codec h264|hevc --encoder <身份> --decoder <身份>`；支持 `--matrix`、`--loss`、`--decode-in-flight`、`--max-au-bytes` 与码率参数。`p6_product_verify.py` 同样可显式选择编码及后端；身份和实际证据见 `../bringup/bringup-20261103-p6-codec.md`。本机 Loopback 正向测试使用 batch1，batch69短发送明确失败，不自动回退。
+P6-3 开发专项：`python scripts/p6_codec_verify.py --codec mjpeg --encoder turbojpeg:cpu --decoder turbojpeg:cpu`；支持 `--matrix`、`--loss`、`--decode-in-flight`、`--max-au-bytes` 与码率参数；自定义尺寸/fps/变换/CPU转换/时长见`development-tools.md`。`p6_product_verify.py` 同样可显式选择编码；MJPEG固定双端`turbojpeg:cpu`，质量与限流说明见`mjpeg.md`，实现证据见`../bringup/bringup-20261103-mjpeg.md`。本机 Loopback 正向测试使用 batch1，batch69短发送明确失败，不自动回退。
 这些脚本不随成品交付；DLL隔离加载不注册。工具与专项验收入口见 `development-tools.md`，双机判据见 skill `references/test-matrix.md`。
+H.264/H.265 及其专项脚本参数已于 2026-11-13 按 D23 移除；MJPEG 缓冲优化对照见 `../bringup/bringup-20261103-mjpeg-opt.md`，不是正式稳定版替换。
 
 ## Agent 打包
 
@@ -101,7 +103,7 @@ python -m PyInstaller packaging/vc-agent.spec
 
 版本以 `version.json` 为准。包内包含 `vc-agent.exe`、`vc-sender.exe`、`vc-receiver.exe`、
 `vc-vcam.dll`、`version.json` 与所需 `scripts/*.ps1`；原生文件取上述 Release 产物。
-使用 `Compress-Archive` 生成 `release/vc-<ver>.zip`；部署/切换见 `pc2-cutover.md`。
+使用 `Compress-Archive` 生成 `release/vc-<ver>.zip`；`pc2-cutover.md`仅为历史0.3.7/18080割接，P6双机并存与实际切换须按`p6-cutover.md`重新批准，不直接照搬。
 完整便携目录包含白名单之外的工具与文档，不能直接整体压缩上传 `/update`；OTA zip 仍按本节选取允许的文件。
 构建验证本身不打包、不注册 DLL、不触发 OTA。
 

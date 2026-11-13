@@ -1,5 +1,6 @@
 #pragma once
 #include <memory>
+#include "decoder_backend.h"
 
 static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
   FramePool pool(a.stream);
@@ -15,29 +16,37 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
   if(!transport){fprintf(stderr,"cannot open transport log\n");return 1;}
   std::thread worker([&]{
     try{
-      VCMFRuntime mf;
-      std::unique_ptr<vcmf::Transform> decoder;
+      std::unique_ptr<VCDecoder> decoder;
       struct Metadata{uint64_t hash,first;};std::map<uint32_t,Metadata> pending;
       std::ofstream log(a.hashlog,std::ios::binary|std::ios::trunc);
       if(!log)throw std::runtime_error("cannot open decoded hashlog");
+      int decoding_slot=-1;
       auto reopen=[&]{
+        if(decoding_slot>=0){pool.abandon(decoding_slot);decoding_slot=-1;}
         decoder.reset();discarded+=pending.size();pending.clear();pending_count=0;
-        decoder=std::make_unique<vcmf::Transform>();waiting=true;
-        a.codec.open(*decoder,a.stream,false,[&](IMFSample* sample){
-          LONGLONG timestamp=0;vcmf::check(sample->GetSampleTime(&timestamp),"decoded timestamp");
+        decoder=std::make_unique<VCDecoder>();waiting=true;
+        decoder->open(a.codec,a.stream,[&](const uint8_t* bytes,size_t size,LONGLONG timestamp){
           const LONGLONG duration=10000000LL/a.stream.fps;
           if(timestamp<0 || timestamp%duration || (uint64_t)(timestamp/duration)>UINT32_MAX)throw std::runtime_error("invalid decoded timestamp");
           uint32_t fid=(uint32_t)(timestamp/duration);auto it=pending.find(fid);
           if(it==pending.end() || it!=pending.begin())throw std::runtime_error("decoded frame order/timestamp mismatch");
-          auto bytes=decoder->packed_nv12(sample);int slot=pool.acquire();
+          if(size!=a.stream.frame_bytes())throw std::runtime_error("decoded NV12 size mismatch");
+          int slot=decoding_slot;
           if(slot<0)throw std::runtime_error("decoded frame pool exhausted");
-          memcpy(pool.data(slot),bytes.data(),bytes.size());uint64_t now=qpc_ns_now();
+          if(bytes!=pool.data(slot))throw std::runtime_error("JPEG direct destination mismatch");
+          uint64_t now=qpc_ns_now();
           pool.publish(slot,fid,it->second.first,now);
-          uint64_t hash=vc_fnv1a64(bytes.data(),bytes.size());pool.hashed(slot,fid,hash);
+          decoding_slot=-1;
+          uint64_t hash=vc_fnv1a64(bytes,size);pool.hashed(slot,fid,hash);
           char hx[17],tx[17];vc_fnv1a64_hex(hash,hx);vc_fnv1a64_hex(it->second.hash,tx);
           log<<"{\"frame_id\":"<<fid<<",\"decoded_hash\":\""<<hx<<"\",\"transport_hash\":\""<<tx
             <<"\",\"qpc_ns\":"<<now<<",\"decode_pipeline_ms\":"<<(now-it->second.first)/1e6<<"}\n";log.flush();
           pending.erase(it);pending_count=pending.size();decoded++;
+        },[&](size_t size)->uint8_t*{
+          if(size!=a.stream.frame_bytes() || decoding_slot>=0)throw std::runtime_error("invalid JPEG destination request");
+          decoding_slot=pool.acquire();
+          if(decoding_slot<0)throw std::runtime_error("decoded frame pool exhausted");
+          return pool.data(decoding_slot);
         });
       };
       reopen();ready=true;bool have_last=false;uint32_t last=0;
@@ -53,9 +62,7 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
         if(waiting && !unit.key){discarded++;continue;}
         if(waiting)waiting=false;
         pending.emplace(unit.fid,Metadata{unit.hash,unit.first_ns});pending_count=pending.size();
-        auto input=vcmf::sample(unit.bytes.data(),unit.bytes.size(),(LONGLONG)unit.fid*(10000000LL/a.stream.fps),10000000LL/a.stream.fps);
-        if(unit.key)input->SetUINT32(MFSampleExtension_CleanPoint,TRUE);
-        try{decoder->submit(input.Get());decoder->pump();}
+        try{decoder->submit(unit.bytes.data(),unit.bytes.size(),(LONGLONG)unit.fid*(10000000LL/a.stream.fps),10000000LL/a.stream.fps,unit.key);decoder->pump();}
         catch(const std::exception& failure){fprintf(stderr,"decode failure, waiting for next IDR: %s\n",failure.what());decode_errors++;reopen();resets++;continue;}
         uint64_t deadline=qpc_ns_now()+5000000000ull;
         while(pending.size()>=(size_t)a.codec.in_flight){
@@ -96,7 +103,9 @@ static int run_encoded_receiver(const Args& a,DynPcapRx& d,void* handle){
       auto* hdr=(PcapHdr*)ph;auto* eth=(uint8_t*)pd;
       if(hdr->caplen>=42 && ((eth[12]<<8)|eth[13])==a.ethertype && (a.source_mac.empty() || !memcmp(eth+6,mac,6))){
         vc_pkt_hdr_t h;memcpy(&h,eth+14,sizeof(h));uint64_t first=0;
-        if(h.payload_len<=hdr->caplen-42 && assembler.accept(h,eth+42,now,complete,first)){
+        // nextex may block: timestamp the observed packet, not the start of that wait.
+        uint64_t received_ns=qpc_ns_now();
+        if(h.payload_len<=hdr->caplen-42 && assembler.accept(h,eth+42,received_ns,complete,first)){
           vcau::Unit unit;
           if(!vcau::unpack(complete,h.frame_id,a.stream,a.codec.id(),a.codec.max_au,unit) || (unit.key && !vcau::random_access(unit.bytes,a.codec.id()))){invalid_au++;discontinuity=true;}
           else{

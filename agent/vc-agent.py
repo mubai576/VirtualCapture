@@ -134,6 +134,13 @@ def launch(kind, args):
         if args.get("file"): cmd += ["--file", str(args["file"])]
         if args.get("loop"): cmd += ["--loop"]
         if args.get("gpu_convert") is True: cmd += ["--gpu-convert"]  # P5：产品模式 dda 默认走 GPU
+        if "output" in args:
+            try: _out = int(args["output"])
+            except Exception: _out = 0
+            if 0 <= _out <= 15: cmd += ["--output", str(_out)]
+        if args.get("mode") == "wgc" and args.get("wgc_window"):
+            _win = str(args["wgc_window"])
+            if len(_win) <= 128 and all(ord(ch) >= 32 for ch in _win): cmd += ["--wgc-window", _win]
         _b = args.get("batch", 69)
         try: _b = int(_b)
         except Exception: _b = 69
@@ -158,7 +165,7 @@ def launch(kind, args):
         if kind == "sender": cmd += ["--transform", str(args.get("transform", "crop"))]
         if args.get("source_mac"): cmd += ["--source-mac", args["source_mac"]]
     if args.get("codec", "raw") != "raw":
-        capture = _merge(CONFIG_DEFAULT["capture"], {key: args[key] for key in ("codec", *CODEC_FIELDS) if key in args})
+        capture = _merge(CONFIG_DEFAULT["capture"], {key: args[key] for key in ("codec", *CODEC_FIELDS, *MJPEG_FIELDS) if key in args})
         cmd += codec_cli(capture, kind)
     # 过滤空网卡参数
     cmd2 = []
@@ -914,11 +921,12 @@ CONFIG_DEFAULT = {
     "peer_url": "",      # 主机只填被采集机 IPv4，产品端口固定 5143
     "adapter": "",       # 本机 2.5G 网卡子串（--adapter）
     "capture": {"mode": "dda", "pattern": "motion", "gpu_convert": True, "fps": 240, "batch": 69,
+                "output": 0, "wgc_window": "",
                 "mtu": 9000, "dst_mac": "ff:ff:ff:ff:ff:ff", "width": 640, "height": 640,
                 "transform": "crop", "codec": "raw", "bitrate_mbps": 50, "max_bitrate_mbps": 80,
                 "codec_experimental": False, "encoder_backend": "", "decoder_backend": "",
-                "encoder_hardware": True, "decoder_hardware": False, "gop_frames": 60,
-                "decode_in_flight": 2, "max_au_bytes": 8388608},
+                "encoder_hardware": False, "decoder_hardware": False, "gop_frames": 1,
+                "decode_in_flight": 2, "max_au_bytes": 8388608, "jpeg_quality": 80},
     "transport": {"headroom_pct": 20},
     "receive": {"shm": "Local\\VirtualCaptureVcamFrame", "mtu": 9000, "vcam_autoregister": True},
 }
@@ -979,25 +987,31 @@ def validate_config(c):
     if not isinstance(c["adapter"], str) or not (_re.fullmatch(r"[A-Za-z0-9 _.()\-]{0,64}", c["adapter"])
             or _re.fullmatch(r"\\Device\\NPF_(?:\{[0-9A-Fa-f\-]{36}\}|Loopback)", c["adapter"])):
         e.append("adapter: up to 64 chars of [A-Za-z0-9 _.()-]")
-    if cp.get("mode") not in ("dda", "pattern"): e.append("capture.mode must be dda|pattern")
+    if cp.get("mode") not in ("dda", "pattern", "wgc"): e.append("capture.mode must be dda|pattern|wgc")
+    if "output" in cp and not _is_int(cp.get("output"), 0, 15): e.append("capture.output 必须是 0..15 的整数。")
+    if "wgc_window" in cp and (not isinstance(cp.get("wgc_window"), str) or len(cp["wgc_window"]) > 128
+                               or any(ord(ch) < 32 for ch in cp["wgc_window"])):
+        e.append("capture.wgc_window 必须是 <=128 字符的单行文本。")
     if cp.get("pattern") not in ("counter", "checker", "rings", "noise", "motion"): e.append("capture.pattern invalid")
     for key in ("width", "height"):
         if not _is_int(cp.get(key), 2, 8192) or cp[key] % 2:
             e.append("capture.%s 必须是 2..8192 的偶数整数。" % key)
     if cp.get("transform") not in ("crop", "fit", "fill", "stretch"):
         e.append("capture.transform 必须是 crop|fit|fill|stretch。")
-    if cp.get("codec") not in ("raw", "h264", "hevc"):
-        e.append("capture.codec 必须是 raw|h264|hevc。")
+    if cp.get("codec") not in ("raw", "mjpeg"):
+        e.append("capture.codec 必须是 raw|mjpeg（H.264/H.265 已于 2026-11-13 移除）。")
     for key in ("codec_experimental", "encoder_hardware", "decoder_hardware"):
         if not isinstance(cp.get(key), bool): e.append("capture.%s 必须是布尔值。" % key)
     for key in ("encoder_backend", "decoder_backend"):
         value = cp.get(key)
-        if not isinstance(value, str) or len(value) > 256 or (value and not (
-                _re.fullmatch(r"\{[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}\}", value)
-                or value.startswith("name:") and len(value) > 5 and all(ord(char) >= 32 for char in value))):
-            e.append("capture.%s 必须是明确的 MFT CLSID 或 name:精确名称。" % key)
+        if not isinstance(value, str) or len(value) > 256 or value not in ("", "turbojpeg:cpu"):
+            e.append("capture.%s 必须是空值或 turbojpeg:cpu；已移除其他编解码后端。" % key)
     for key, lo, hi in (("gop_frames", 1, 1000), ("decode_in_flight", 1, 8), ("max_au_bytes", 1024, 16777216)):
         if not _is_int(cp.get(key), lo, hi): e.append("capture.%s 必须是 %d..%d 的整数。" % (key, lo, hi))
+    if not _is_int(cp.get("jpeg_quality"), 1, 100): e.append("capture.jpeg_quality 必须是 1..100 的整数。")
+    if cp.get("encoder_hardware") is not False or cp.get("decoder_hardware") is not False:
+        e.append("MJPEG 使用 CPU/SIMD 后端，不可冒充硬件编码或解码。")
+    if cp.get("gop_frames") != 1: e.append("MJPEG 每帧独立，gop_frames 必须为 1。")
     for key in ("bitrate_mbps", "max_bitrate_mbps"):
         if not _is_int(cp.get(key), 1, 10000): e.append("capture.%s 必须是 1..10000 的整数。" % key)
     if (_is_int(cp.get("bitrate_mbps"), 1, 10000) and _is_int(cp.get("max_bitrate_mbps"), 1, 10000)
@@ -1048,14 +1062,25 @@ PEER_CODEC_CAPABILITIES = {}
 
 CODEC_FIELDS = ("codec_experimental", "encoder_backend", "decoder_backend", "encoder_hardware",
                 "decoder_hardware", "gop_frames", "decode_in_flight", "max_au_bytes", "bitrate_mbps", "max_bitrate_mbps")
+MJPEG_FIELDS = ("jpeg_quality",)
+
+
+def codec_config(capture):
+    if capture["codec"] == "raw": return {}
+    return {"codec_revision": 1, **{key: capture[key] for key in CODEC_FIELDS},
+            "mjpeg_revision": 1, "jpeg_quality": capture["jpeg_quality"]}
+
+
+def codec_payload(capture):
+    return {key: value for key, value in codec_config(capture).items() if key not in ("codec_revision", "mjpeg_revision")}
 
 
 def stream_implementation_errors(capture):
     if capture["codec"] == "raw": return []
     errors = []
     if not capture.get("codec_experimental") or not capture.get("encoder_backend") or not capture.get("decoder_backend"):
-        errors.append("编码链路为开发功能：须明确启用，并选择两端 MFT 后端；不会自动选择或回退。")
-    if _is_int(capture["max_bitrate_mbps"], 2001, 10000): errors.append("当前 MF 后端最大码率参数上限为 2000 Mbps。")
+        errors.append("编码链路为开发功能：须明确启用，并选择编码和解码后端；不会自动选择或回退。")
+    if _is_int(capture["max_bitrate_mbps"], 2001, 10000): errors.append("当前编码链路最大码率参数上限为 2000 Mbps。")
     if (_is_int(capture["mtu"], 1500, 9000) and _is_int(capture["max_au_bytes"], 1024, 16777216) and
             (capture["max_au_bytes"] + capture["mtu"] - 43) // (capture["mtu"] - 42) > 65535):
         errors.append("编码访问单元上限超过冻结包头允许的分片数。")
@@ -1067,7 +1092,8 @@ def codec_cli(capture, kind):
     values = {"codec": capture["codec"], "codec-backend": capture[side + "_backend"],
               "codec-hardware": int(capture[side + "_hardware"]), "bitrate": capture["bitrate_mbps"] * 1000000,
               "max-bitrate": capture["max_bitrate_mbps"] * 1000000, "gop": capture["gop_frames"],
-              "decode-in-flight": capture["decode_in_flight"], "max-au-bytes": capture["max_au_bytes"]}
+              "decode-in-flight": capture["decode_in_flight"], "max-au-bytes": capture["max_au_bytes"],
+              "jpeg-quality": capture["jpeg_quality"]}
     return [part for key, value in values.items() for part in ("--" + key, str(value))]
 
 
@@ -1091,12 +1117,27 @@ def native_codec_request(kind, capture=None):
         report = json.loads(result.stdout) if result.returncode == 0 else {"error": (result.stderr or result.stdout)[-2048:]}
         if not isinstance(report, dict) or report.get("revision") != 1:
             report = {"error": report.get("error", "缺少匹配的原生编码能力。") if isinstance(report, dict) else "原生编码响应无效。"}
+        if capture is not None and capture["codec"] == "mjpeg" and report.get("configured") is True:
+            if not mjpeg_configuration_matches(report, capture):
+                report = {"error": "MJPEG 响应未确认完整请求参数；拒绝回退或忽略。"}
         with CODEC_CACHE_LOCK:
             if len(CODEC_CACHE) > 32: CODEC_CACHE.clear()
             CODEC_CACHE[key] = (time.monotonic(), report)
         return report
     except Exception as error:
         return {"error": str(error)}
+
+
+def mjpeg_configuration_matches(report, capture):
+    if not isinstance(report, dict) or type(report.get("mjpeg_revision")) is not int or report["mjpeg_revision"] != 1:
+        return False
+    settings = report.get("encoder_configuration")
+    expected = {"family": "turbojpeg", "identity": "turbojpeg:cpu", "version": "3.1.2",
+                "quality": capture["jpeg_quality"], "width": capture["width"], "height": capture["height"], "fps": capture["fps"],
+                "subsampling": "420", "dct": "fast_integer", "rate_control": "constant_quality",
+                "target_bitrate_applied": False, "encoder_in_flight": 1, "config_submitted": True}
+    return isinstance(settings, dict) and all(type(settings.get(key)) is type(value) and settings[key] == value
+                                              for key, value in expected.items())
 
 
 def codec_check_request(args):
@@ -1163,6 +1204,7 @@ def stream_capabilities(controller_ip=None):
               "hardware": {"encoder": "unprobed", "decoder": "unprobed"}, "adapter": None}
     if result["native"]["codec_revision"] == 1:
         result["hardware"]["encoder" if kind == "sender" else "decoder"] = native_codec_request(kind)
+    result["native"]["mjpeg_revision"] = native_stream_capabilities(kind).get("mjpeg_revision", 0)
     if deployment_role() == "capture" and controller_ip:
         code, adapter = _choose_capture_adapter(controller_ip)
         if code == 200: result["adapter"] = adapter
@@ -1174,7 +1216,7 @@ def stream_session(capture):
     token = uuid.uuid4().hex[:10]
     return {"revision": 2, "pixel_format": "nv12", "codec": capture["codec"],
             **{key: capture[key] for key in ("width", "height", "fps", "mtu", "transform")},
-            **({"codec_revision": 1, **{key: capture[key] for key in CODEC_FIELDS}} if capture["codec"] != "raw" else {}),
+            **codec_config(capture),
             "source_mac": "02:" + ":".join(token[i:i+2] for i in range(0, 10, 2))}
 
 
@@ -1182,7 +1224,7 @@ def validate_stream_session(session, capture):
     if not isinstance(session, dict): return ["缺少显式 P6-2 流会话；拒绝使用旧格式启动。"]
     expected = {"revision": 2, "pixel_format": "nv12", "codec": capture["codec"],
                 **{key: capture[key] for key in ("width", "height", "fps", "mtu", "transform")},
-                **({"codec_revision": 1, **{key: capture[key] for key in CODEC_FIELDS}} if capture["codec"] != "raw" else {})}
+                **codec_config(capture)}
     if set(session) != set(expected) | {"source_mac"}: return ["流会话字段不完整或含未知字段。"]
     if any(type(session[key]) is not type(value) or session[key] != value for key, value in expected.items()):
         return ["两端流会话的尺寸/帧率/MTU/格式/变换不一致。"]
@@ -1191,19 +1233,22 @@ def validate_stream_session(session, capture):
 
 
 def low_level_stream_errors(kind, args):
-    fields = ("width", "height", "transform", "codec", "source_mac", *CODEC_FIELDS)
+    fields = ("width", "height", "transform", "codec", "source_mac", *CODEC_FIELDS, *MJPEG_FIELDS)
     if not any(key in args for key in fields): return []
     if ("width" in args) != ("height" in args): return ["必须同时提供 width 和 height。"]
     capture = _merge(CONFIG_DEFAULT["capture"], {key: args[key] for key in (*fields, "fps", "mtu") if key in args and key != "source_mac"})
     config = _merge(CONFIG_DEFAULT, {"capture": capture})
     errors = validate_config(config) + stream_implementation_errors(capture)
-    if capture["codec"] == "raw" and any(key in args for key in CODEC_FIELDS): errors.append("Raw 不接受编码参数。")
+    if capture["codec"] == "raw" and any(key in args for key in (*CODEC_FIELDS, *MJPEG_FIELDS)): errors.append("Raw 不接受编码参数。")
+    if capture["codec"] != "mjpeg" and any(key in args for key in MJPEG_FIELDS): errors.append("非 MJPEG 后端不接受 JPEG 质量参数。")
     if kind == "receiver" and args.get("transform", "crop") != "crop": errors.append("接收端不能再次变换像素。")
     if "source_mac" in args and not _re.fullmatch(r"(?:[0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}", str(args["source_mac"])):
         errors.append("source_mac 无效。")
     if not errors: errors.extend(stream_native_errors(kind))
     if not errors and capture["codec"] != "raw":
         caps = native_stream_capabilities(kind)
+        if capture["codec"] == "mjpeg" and caps.get("mjpeg_revision") != 1: errors.append("原生程序缺少 MJPEG 能力，拒绝回退。")
+        if errors: return errors
         if caps.get("codec_revision") != 1 or capture["codec"] not in caps.get("codecs", []): errors.append("原生程序缺少编码传输能力。")
         else:
             report = native_codec_request(kind, capture)
@@ -1268,11 +1313,15 @@ def calculate_stream_plan(config, host_adapter=None, capture_adapter=None, disco
     if status == "unknown": warnings.append("未取得两端实际网卡速率，不能确认链路预算可行。")
     if status == "margin": warnings.append("未超过物理线速，但侵入预留余量；建议降低分辨率/帧率或使用编码模式。")
     if encoded:
-        warnings.append("编码预算按最大码率均摊估算，不约束 IDR 帧瞬时突发；不代表编码器吞吐或画质已达标。")
-        warnings.append("开发版编码：最多 %d 帧解码在途；HEVC 可能额外缓存一帧，静态画面末帧可能等待下次输入。" % cp["decode_in_flight"])
+        warnings.append("编码预算按最大码率均摊估算，不约束单帧瞬时突发；不代表编码器吞吐或画质已达标。")
+        warnings.append("开发版 MJPEG：最多 %d 帧解码在途；每帧独立，无 GOP 等待。" % cp["decode_in_flight"])
         warnings.append("最大码率按访问单元发送起点的一秒滑窗限制（含48B封装，不含L2开销）；单帧仍可形成微突发。")
+        if cp["codec"] == "mjpeg":
+            warnings.append("MJPEG 使用 JPEG 质量 %d，不应用目标码率；最大码率仅限流，触顶会降低实际 fps，不自动降低质量。" % cp["jpeg_quality"])
     if cp["mode"] == "dda":
         warnings.append("P6-2 DDA 只发送新桌面图像，按目标帧率限速；静态桌面不重复发送，实际帧率可能更低。")
+    if cp["mode"] == "wgc":
+        warnings.append("WGC 仍经 DWM 合成，不消除合成延迟；窗口模式包含光标，独占全屏无法采集。")
     warnings.append("协商速率不是实测吞吐；源桌面尺寸、编解码吞吐与端到端效果未在本次计算中验证。")
     return {"revision": 2, "video": {"width": cp["width"], "height": cp["height"], "fps": fps,
             "codec": cp["codec"], "transform": cp["transform"], "raw_frame_bytes": raw_bytes},
@@ -1343,13 +1392,21 @@ def stream_plan(patch=None, refresh=False):
         result["backends"] = {"decoder": local_backends.get("backends", []),
                               "encoder": encoder.get("backends", []) if isinstance(encoder, dict) else []}
         if not isinstance(native, dict) or native.get("codec_revision") != 1:
-            errors.append("采集后台缺少 P6-3 编码传输能力，请先使用匹配版本。")
+            errors.append("采集后台缺少编码传输能力，请先使用匹配版本。")
+        if cp["codec"] == "mjpeg":
+            if not isinstance(native, dict) or native.get("mjpeg_revision") != 1 or "mjpeg" not in native.get("codecs", []):
+                errors.append("采集后台缺少 MJPEG 能力，不会自动切换编码。")
+            local = native_stream_capabilities("receiver")
+            if local.get("mjpeg_revision") != 1 or "mjpeg" not in local.get("codecs", []):
+                errors.append("主机缺少 MJPEG 解码能力。")
         if not result["implementation"]["reasons"] and not errors:
             report = native_codec_request("receiver", cp)
             if report.get("configured") is not True: errors.append("主机解码器协商失败：" + report.get("error", "无效响应。"))
             code, report = peer_call("/stream/codec-check", {"capture": cp}, timeout=20, url=config["peer_url"])
             if not isinstance(report, dict): report = {"error": "无效响应。"}
             if code != 200 or report.get("configured") is not True: errors.append("采集编码器协商失败：" + report.get("error", "无效响应。"))
+            elif cp["codec"] == "mjpeg" and not mjpeg_configuration_matches(report, cp):
+                errors.append("采集编码器未确认完整 MJPEG 请求参数；拒绝忽略或回退。")
     if errors:
         result["implementation"]["reasons"].extend(errors)
         result["implementation"]["supported"] = result["can_start"] = False
@@ -1500,7 +1557,7 @@ def _product_local_start(args, controller_ip):
             sid, info = launch_product("receiver", {"adapter": c["adapter"], "mtu": rv["mtu"], "shm": rv["shm"], "timeout_s": 0,
                                                      **({"width": c["capture"]["width"], "height": c["capture"]["height"], "fps": c["capture"]["fps"],
                                                          "source_mac": descriptor["source_mac"]} if descriptor else {}),
-                                                     **({"codec": c["capture"]["codec"], **{key: c["capture"][key] for key in CODEC_FIELDS}}
+                                                     **({"codec": c["capture"]["codec"], **codec_payload(c["capture"])}
                                                         if c["capture"]["codec"] != "raw" else {})})
         except Exception as error:
             if state["vcam_managed"]: out["cleanup"] = vcam_unregister()[1]
@@ -1512,9 +1569,11 @@ def _product_local_start(args, controller_ip):
         sid, info = launch_product("sender", {"adapter": c["adapter"], "mode": cp["mode"], "pattern": cp["pattern"],
                                              "fps": cp["fps"], "frames": 0, "mtu": cp["mtu"], "batch": cp["batch"],
                                              "dst_mac": cp["dst_mac"], "gpu_convert": cp["gpu_convert"],
+                                             **({"output": cp["output"]} if cp.get("output") not in (None, "") else {}),
+                                             **({"wgc_window": cp["wgc_window"]} if cp.get("wgc_window") else {}),
                                              **({"width": cp["width"], "height": cp["height"], "transform": cp["transform"],
                                                  "source_mac": descriptor["source_mac"]} if descriptor else {}),
-                                             **({"codec": cp["codec"], **{key: cp[key] for key in CODEC_FIELDS}} if cp["codec"] != "raw" else {})})
+                                             **({"codec": cp["codec"], **codec_payload(cp)} if cp["codec"] != "raw" else {})})
     except Exception as error:
         return 500, {"role": role, "error": str(error), "diagnostics": slot_stats("sender")}
     return 200, {"role": role, "session_id": sid, "args": info, "stream": descriptor}
@@ -1763,25 +1822,28 @@ UI_HTML = r'''<!doctype html>
 </div></div>
 <div class="form-section"><div class="form-heading"><span class="step">03</span><h2>传输模式与预算</h2></div>
 <div class="field-grid">
-<div class="field full"><label for="c_codec">链路像素 / 编码模式</label><select id="c_codec"><option value="raw">Raw NV12 · 无压缩</option><option value="h264">H.264 · 有损编码 / 开发版</option><option value="hevc">H.265 / HEVC · 有损编码 / 开发版</option></select><p>编码只用于两机链路，主机解码后仍提供 NV12；不使用有损前后像素相等来判定传输正确。</p></div>
+<div class="field full"><label for="c_codec">链路像素 / 编码模式</label><select id="c_codec"><option value="raw">Raw NV12 · 无压缩</option><option value="mjpeg">MJPEG · 每帧独立 / CPU SIMD / 开发版</option></select><p>H.264/H.265 已于 2026-11-13 移除。编码只用于两机链路，主机解码后仍提供 NV12；不使用有损前后像素相等来判定传输正确。</p></div>
 <div id="bitrateFields" class="field full" hidden><div class="field-grid">
 <div class="field full"><label for="c_experimental">编码功能授权</label><select id="c_experimental"><option value="0">仅保存草案，不启动编码</option><option value="1">明确启用开发版编码（未完成双机 / 长稳 / 画质验收）</option></select></div>
-<div class="field"><label for="c_encoder">采集机编码后端</label><input id="c_encoder" list="encoderBackends" maxlength="256" placeholder="明确选择 CLSID 或 name:精确名称" required><datalist id="encoderBackends"></datalist></div>
-<div class="field"><label for="c_encoder_hw">编码器枚举类别</label><select id="c_encoder_hw"><option value="1">硬件 MFT（失败不回退）</option><option value="0">系统 / 软件 MFT（显式选择）</option></select></div>
-<div class="field"><label for="c_decoder">主机解码后端</label><input id="c_decoder" list="decoderBackends" maxlength="256" placeholder="明确选择 CLSID 或 name:精确名称" required><datalist id="decoderBackends"></datalist></div>
-<div class="field"><label for="c_decoder_hw">解码器枚举类别</label><select id="c_decoder_hw"><option value="0">系统 / 软件 MFT（显式选择）</option><option value="1">硬件 MFT（失败不回退）</option></select></div>
+<div class="field"><label for="c_encoder">采集机编码后端</label><input id="c_encoder" list="encoderBackends" maxlength="256" placeholder="turbojpeg:cpu" required><datalist id="encoderBackends"></datalist></div>
+<div class="field"><label for="c_encoder_hw">编码器类别</label><select id="c_encoder_hw"><option value="0">CPU / SIMD（turbojpeg）</option></select></div>
+<div class="field"><label for="c_decoder">主机解码后端</label><input id="c_decoder" list="decoderBackends" maxlength="256" placeholder="turbojpeg:cpu" required><datalist id="decoderBackends"></datalist></div>
+<div class="field"><label for="c_decoder_hw">解码器类别</label><select id="c_decoder_hw"><option value="0">CPU / SIMD（turbojpeg）</option></select></div>
 <div class="field"><label for="c_bitrate">目标码率 · Mbps</label><input id="c_bitrate" type="number" min="1" max="2000" step="1" required></div>
 <div class="field"><label for="c_max_bitrate">最大码率 · Mbps</label><input id="c_max_bitrate" type="number" min="1" max="2000" step="1" required></div>
-<div class="field"><label for="c_gop">强制 IDR 间隔 · 帧</label><input id="c_gop" type="number" min="1" max="1000" step="1" required></div>
+<div class="field"><label for="c_gop">GOP · MJPEG 固定 1（每帧独立）</label><input id="c_gop" type="number" min="1" max="1" step="1" required></div>
 <div class="field"><label for="c_in_flight">解码在途帧上限</label><input id="c_in_flight" type="number" min="1" max="8" step="1" required></div>
-</div><p>候选不是兼容性保证；计算预算时实际协商媒体类型，启动后仍须观察帧到达。最大码率按发送起点的一秒滑窗限制，IDR 仍可能微突发。HEVC 本机后端需要额外缓存一帧，静态末帧可能等待下次输入；不静默增加队列。</p></div>
+<div id="mjpegFields" class="field full" hidden><div class="field-grid">
+<div class="field"><label for="c_jpeg_quality">JPEG 质量 · 1–100</label><input id="c_jpeg_quality" type="number" min="1" max="100" step="1" required><p>默认 80；值越高通常越清晰，带宽和开销也越高。</p></div>
+</div><p>libjpeg-turbo CPU/SIMD，固定 4:2:0 / 快速整数 DCT，每帧独立。目标码率不适用，以 JPEG 质量编码；最大码率仍限流，触顶可能降低实际 fps，不自动降质量。每帧均可独立恢复，无需等待下一帧或 GOP。</p></div>
+</div><p>候选不是兼容性保证；计算预算时实际协商媒体类型，启动后仍须观察帧到达。最大码率按发送起点的一秒滑窗限制，单帧仍可能微突发。</p></div>
 <div class="field"><label for="c_headroom">链路预留余量 · %</label><input id="c_headroom" type="number" min="0" max="50" step="1" required><p>仅预算建议，不是修改历史性能验收门限。</p></div>
 </div>
 <div class="note-banner" id="streamPlan" role="status" aria-live="polite"><strong id="planTitle">等待计算链路预算</strong><p id="planSummary" class="inline-feedback">配置读取后自动计算，不保存草稿，也不启停采集。</p><p id="planDetails" class="inline-feedback"></p><p id="planWarnings" class="inline-feedback"></p></div>
 <button type="button" id="bPlan" class="btn small" style="margin-top:14px">重新检测两端链路</button>
 <div id="configError" class="field-error" role="alert" hidden></div></div>
 <div class="form-actions"><span id="saveState" role="status">配置读取中…</span><div class="actions"><button type="button" id="bReset" class="btn quiet" disabled>撤销修改</button><button type="submit" id="bSave" class="btn primary" disabled><svg aria-hidden="true"><use href="#i-check"/></svg>保存配置</button></div></div>
-</form><aside><div class="help-card"><h2>配置不等于能力已达标</h2><div class="help-step"><b>1</b><p>先选尺寸、画面处理与传输模式，再看两端链路预算。</p></div><div class="help-step"><b>2</b><p>预算、原生实现和实机验收分开显示，不会自动降低清晰度或切换编码。</p></div><div class="help-step"><b>3</b><p>Raw 已支持可变尺寸和四种变换。编码须明确启用开发功能、选择两端后端，协商失败直接拒绝。</p></div><div class="help-note">开始接收自动注册虚拟采集卡，停止后回收。正在运行时不允许修改配置。</div></div><div class="note-banner">稳定版保持不动<br>H.264 / H.265 开发链路已接通；双机、长稳、画质与实际吞吐仍须单独验收。</div></aside></div>
+</form><aside><div class="help-card"><h2>配置不等于能力已达标</h2><div class="help-step"><b>1</b><p>先选尺寸、画面处理与传输模式，再看两端链路预算。</p></div><div class="help-step"><b>2</b><p>预算、原生实现和实机验收分开显示，不会自动降低清晰度或切换编码。</p></div><div class="help-step"><b>3</b><p>Raw 已支持可变尺寸和四种变换。MJPEG 须明确启用开发功能、选择两端 turbojpeg:cpu，协商失败直接拒绝。</p></div><div class="help-note">开始接收自动注册虚拟采集卡，停止后回收。正在运行时不允许修改配置。</div></div><div class="note-banner">稳定版保持不动<br>H.264/H.265 已移除；MJPEG 仍为开发链路，双机、长稳、画质与实际吞吐须单独验收。</div></aside></div>
 </section>
 <footer class="footer"><span>分段延迟在各自机器内测量，不代表跨机端到端延迟。</span><span id="footerStatus">自动刷新 · 约每秒一次</span></footer>
 </main></div>
@@ -1837,6 +1899,7 @@ function readiness(status, unsaved) {
   if (local.version && peer.version && local.version !== peer.version) return result('warn','两端版本不一致','本机 '+local.version+'，对端 '+peer.version+'。请统一版本后开始采集。');
   if (tx.note === 'stub-no-binary' && tx.running || rx.note === 'stub-no-binary' && rx.running) return result('warn','占位进程运行中 · 没有真实传输','缺少采集或接收程序，请先完成构建并停止占位进程。');
   if (tx.running && rx.running) {
+    if (rx.waiting_idr && rx.codec === 'mjpeg') return result('warn','等待下一帧 JPEG 恢复画面','每帧独立；收到下一个完整有效 JPEG 即可恢复，不需要等待 GOP。');
     if (rx.waiting_idr) return result('warn','等待下一个 IDR 恢复画面','解码状态已重置；依赖帧不会直接发布，等待带参数集的完整 IDR。');
     if (qualityErrors(rx) > 0) return result('warn','链路运行中 · 请检查传输质量','发现丢帧、字节校验或解码异常，详细计数见传输质量。');
     if (!finite(rx.complete) || rx.complete <= 0) return result('warn','等待首个完整画面','两端进程已启动，尚未收到完整帧；请检查采集源与网卡链路。');
@@ -1927,7 +1990,7 @@ function syncControls() {
 }
 function captureSource(stats, config) {
   const source = stats.mode ? stats : config.capture || {};
-  return source.mode === 'pattern' ? '测试图案 · '+source.pattern : '桌面采集 · NV12';
+  return source.mode === 'pattern' ? '测试图案 · '+source.pattern : (source.mode === 'wgc' ? 'WGC 采集 · NV12' : '桌面采集 · NV12');
 }
 function renderMachine(id, machine, kind, local) {
   const card = $(id), set = (key,value) => { card.querySelector('[data-device="'+key+'"]').textContent = value; };
@@ -1967,7 +2030,7 @@ function render(status) {
   const encoded = rx.codec && rx.codec !== 'raw', integrityKey = encoded ? 'transport_errors' : 'hash_mismatch';
   text('hashErrorLabel',encoded ? '压缩字节校验错误' : 'Raw 像素哈希错误');
   text('qualityNote',encoded ? '压缩访问单元 FNV-1a64 校验；解码后另记像素哈希，不做有损前后像素相等判定。' : 'Raw 每帧像素 FNV-1a64 对账；缺失数据以 — 显示。');
-  text('decodeInfo',encoded ? (rx.waiting_idr ? '等待 IDR' : '在途 '+count(rx.decode_pending))+
+  text('decodeInfo',encoded ? (rx.waiting_idr ? rx.codec === 'mjpeg' ? '等待下一帧 JPEG' : '等待 IDR' : '在途 '+count(rx.decode_pending))+
     ' · 重置 '+count(rx.decode_resets)+' · 丢弃 '+count(rx.decode_discarded)+' · 错误 '+count(rx.decode_errors) : 'Raw 无编解码');
   [['dropped','dropped'],['hashErrors',integrityKey],['packetLoss','packets_lost'],['vcDelivered','vcam_delivered'],['vcRepeats','vcam_repeats']].forEach(pair => {
     text(pair[0],count(rx[pair[1]]));
@@ -2051,6 +2114,7 @@ function readConfig() {
     config.capture.decoder_hardware = $('c_decoder_hw').value === '1';
     config.capture.gop_frames = Number($('c_gop').value);
     config.capture.decode_in_flight = Number($('c_in_flight').value);
+    if (config.capture.codec === 'mjpeg') config.capture.jpeg_quality = Number($('c_jpeg_quality').value);
   }
   config.transport.headroom_pct = Number($('c_headroom').value);
   return config;
@@ -2063,7 +2127,8 @@ function fillConfig(config) {
     c_transform:cp.transform,c_codec:cp.codec,c_bitrate:cp.bitrate_mbps,c_max_bitrate:cp.max_bitrate_mbps,
     c_headroom:config.transport.headroom_pct,c_experimental:cp.codec_experimental ? '1' : '0',
     c_encoder:cp.encoder_backend || '',c_decoder:cp.decoder_backend || '',c_encoder_hw:cp.encoder_hardware === false ? '0' : '1',
-    c_decoder_hw:cp.decoder_hardware ? '1' : '0',c_gop:cp.gop_frames || 60,c_in_flight:cp.decode_in_flight || 2};
+    c_decoder_hw:cp.decoder_hardware ? '1' : '0',c_gop:cp.gop_frames || 1,c_in_flight:cp.decode_in_flight || 2,
+    c_jpeg_quality:cp.jpeg_quality ?? 80};
   Object.entries(values).forEach(([id,value]) => { $(id).value = value; });
   const preset = cp.width+'x'+cp.height;
   $('c_resolution').value = [...$('c_resolution').options].some(option => option.value === preset) ? preset : 'custom';
@@ -2078,6 +2143,11 @@ function fillConfig(config) {
 }
 function markDirty(event) {
   const id = event && event.target && event.target.id;
+  if (id === 'c_codec' && $('c_codec').value === 'mjpeg') {
+    $('c_encoder').value = $('c_decoder').value = 'turbojpeg:cpu';
+    $('c_encoder_hw').value = $('c_decoder_hw').value = '0';
+    $('c_gop').value = '1'; $('c_in_flight').value = '1';
+  }
   if (id === 'c_resolution' && $('c_resolution').value !== 'custom') {
     const [width,height] = $('c_resolution').value.split('x');
     $('c_width').value = width; $('c_height').value = height;
@@ -2089,10 +2159,15 @@ function markDirty(event) {
 }
 function syncCodecFields() {
   const raw = $('c_codec').value === 'raw';
+  const mjpeg = $('c_codec').value === 'mjpeg';
   $('bitrateFields').hidden = raw;
   ['c_bitrate','c_max_bitrate','c_experimental','c_encoder','c_decoder','c_encoder_hw','c_decoder_hw','c_gop','c_in_flight']
     .forEach(id => { $(id).disabled = raw; });
   ['c_encoder','c_decoder'].forEach(id => { $(id).required = !raw && $('c_experimental').value === '1'; });
+  $('mjpegFields').hidden = !mjpeg;
+  $('c_jpeg_quality').disabled = !mjpeg;
+  $('c_bitrate').disabled = raw || mjpeg;
+  $('c_gop').disabled = raw || mjpeg;
 }
 function schedulePlan(refresh = false) {
   planGeneration++; planRefresh = planRefresh || refresh;

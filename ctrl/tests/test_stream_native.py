@@ -26,7 +26,7 @@ def test_sessions_are_explicit_exact_and_unique(agent):
     assert agent.stream_session(capture)["source_mac"] != descriptor["source_mac"]
     assert agent.validate_stream_session(None, capture)
     for field, value in (("width", 416), ("height", 416), ("fps", 60), ("mtu", 1500),
-                         ("codec", "h264"), ("pixel_format", "rgb24"), ("revision", True),
+                         ("codec", "mjpeg"), ("pixel_format", "rgb24"), ("revision", True),
                          ("transform", "fit"), ("source_mac", "ff:ff:ff:ff:ff:ff")):
         assert agent.validate_stream_session(dict(descriptor, **{field: value}), capture), field
     assert agent.validate_stream_session(dict(descriptor, unexpected=1), capture)
@@ -69,6 +69,7 @@ def test_new_options_forward_only_after_capability_confirmation(agent, monkeypat
     assert not agent.low_level_stream_errors("sender", {"width": 416, "height": 416, "transform": "fit"})
     assert agent.low_level_stream_errors("sender", {"width": 416})
     assert agent.low_level_stream_errors("receiver", {"width": 416, "height": 416, "transform": "fill"})
+    assert agent.low_level_stream_errors("sender", {"codec": "mjpeg"})
     assert agent.low_level_stream_errors("sender", {"codec": "h264"})
     exe = tmp_path / "native.exe"
     exe.touch()

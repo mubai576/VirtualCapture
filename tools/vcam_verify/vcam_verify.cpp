@@ -12,6 +12,9 @@
 #include <atomic>
 #include <fstream>
 #include <filesystem>
+#include <vector>
+#include <mutex>
+#include <chrono>
 #include "../../common/fnv1a.h"
 #include "../../common/stream.h"
 #pragma comment(lib,"strmiids.lib")
@@ -143,10 +146,13 @@ class VerifySink : public IPin, public IMemInputPin {
   std::ofstream hashes;
   HANDLE flushed=CreateEvent(nullptr,TRUE,FALSE,nullptr);
   bool block_receive=false;
+  bool hold_samples=false;
+  std::mutex held_mu;
+  std::vector<IMediaSample*> held;
 public:
   std::atomic<uint64_t> samples{0}, invalid{0};
-  VerifySink(const VCStream& s,const std::string& path,bool block):stream(s),block_receive(block){ if(!path.empty()) hashes.open(path,std::ios::binary); }
-  ~VerifySink(){if(flushed)CloseHandle(flushed);}
+  VerifySink(const VCStream& s,const std::string& path,bool block,bool hold):stream(s),block_receive(block),hold_samples(hold){ if(!path.empty()) hashes.open(path,std::ios::binary); }
+  ~VerifySink(){for(auto* sample:held)sample->Release();if(flushed)CloseHandle(flushed);}
   STDMETHODIMP QueryInterface(REFIID id,void** out){
     if(!out) return E_POINTER; *out=nullptr;
     if(id==IID_IUnknown || id==IID_IPin) *out=(IPin*)this;
@@ -173,8 +179,11 @@ public:
   STDMETHODIMP EnumMediaTypes(IEnumMediaTypes**){return E_NOTIMPL;}
   STDMETHODIMP QueryInternalConnections(IPin**,ULONG*){return E_NOTIMPL;}
   STDMETHODIMP EndOfStream(){return S_OK;}
-  STDMETHODIMP BeginFlush(){SetEvent(flushed);return S_OK;}
-  STDMETHODIMP EndFlush(){return S_OK;}
+  STDMETHODIMP BeginFlush(){
+    SetEvent(flushed); std::lock_guard<std::mutex> lock(held_mu);
+    for(auto* sample:held) sample->Release(); held.clear(); return S_OK;
+  }
+  STDMETHODIMP EndFlush(){ResetEvent(flushed);return S_OK;}
   STDMETHODIMP NewSegment(REFERENCE_TIME,REFERENCE_TIME,double){return S_OK;}
   STDMETHODIMP GetAllocator(IMemAllocator** p){return CoCreateInstance(CLSID_MemoryAllocator,nullptr,CLSCTX_INPROC_SERVER,IID_IMemAllocator,(void**)p);}
   STDMETHODIMP NotifyAllocator(IMemAllocator*,BOOL){return S_OK;}
@@ -187,6 +196,7 @@ public:
     if(end-start!=10000000LL/stream.fps) invalid++;
     char hex[17];vc_fnv1a64_hex(hash,hex);
     if(hashes) hashes<<"{\"sample\":"<<samples.load()<<",\"hash\":\""<<hex<<"\",\"start_100ns\":"<<start<<"}\n";
+    if(hold_samples){std::lock_guard<std::mutex> lock(held_mu);if(WaitForSingleObject(flushed,0)!=WAIT_OBJECT_0){sample->AddRef();held.push_back(sample);}}
     samples++;if(block_receive)WaitForSingleObject(flushed,INFINITE);return S_OK;
   }
   STDMETHODIMP ReceiveMultiple(IMediaSample** s,LONG n,LONG* done){*done=0;for(LONG i=0;i<n;i++){HRESULT h=Receive(s[i]);if(FAILED(h))return h;(*done)++;}return S_OK;}
@@ -194,7 +204,7 @@ public:
 };
 
 int main(int argc,char** argv){
-  VCStream stream; std::string dll,map,hashlog; int seconds=2; bool capabilities=false,allow_empty=false,block=false;
+  VCStream stream; std::string dll,map,hashlog; int seconds=2; bool capabilities=false,allow_empty=false,block=false,hold=false,disconnect_running=false;
   for(int i=1;i<argc;i++){
     std::string arg=argv[i];
     auto value=[&](){if(i+1>=argc){fprintf(stderr,"missing value\n");exit(2);}return std::string(argv[++i]);};
@@ -203,6 +213,8 @@ int main(int argc,char** argv){
     else if(arg=="--fps") stream.fps=vc_cli_int(value().c_str()); else if(arg=="--seconds") seconds=vc_cli_int(value().c_str());
     else if(arg=="--capabilities") capabilities=true; else if(arg=="--allow-empty") allow_empty=true;
     else if(arg=="--block-receive") block=true;
+    else if(arg=="--hold-samples") hold=true;
+    else if(arg=="--disconnect-running") disconnect_running=true;
     else {fprintf(stderr,"unknown arg %s\n",arg.c_str());return 2;}
   }
   if(!stream.valid() || seconds<1 || seconds>120) return 2;
@@ -223,12 +235,16 @@ int main(int argc,char** argv){
   if(SUCCEEDED(hr)) hr=CoCreateInstance(CLSID_FilterGraph,nullptr,CLSCTX_INPROC_SERVER,IID_IGraphBuilder,(void**)&graph);
   if(SUCCEEDED(hr)) hr=graph->AddFilter(filter,L"Isolated VirtualCapture");
   if(SUCCEEDED(hr)) hr=filter->FindPin(L"Capture",&pin);
-  VerifySink* sink=new VerifySink(stream,hashlog,block);
+  VerifySink* sink=new VerifySink(stream,hashlog,block,hold);
   if(SUCCEEDED(hr)) hr=pin->Connect(sink,nullptr);
   if(SUCCEEDED(hr)) hr=filter->Run(0);
   if(SUCCEEDED(hr)) Sleep((DWORD)seconds*1000);
+  auto stop_start=std::chrono::steady_clock::now();
+  if(disconnect_running && pin) pin->Disconnect();
   if(filter) filter->Stop();
-  bool pass=SUCCEEDED(hr) && sink->invalid==0 && (allow_empty || sink->samples>0);
+  double stop_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-stop_start).count();
+  bool pass=SUCCEEDED(hr) && sink->invalid==0 && (allow_empty || sink->samples>0) && stop_ms<2000;
+  printf("Stop/Disconnect %.3f ms block_receive=%d hold_samples=%d disconnect_running=%d\n",stop_ms,block,hold,disconnect_running);
   printf("DLL stream %dx%d@%d samples=%llu invalid=%llu hr=0x%08x %s\n",stream.width,stream.height,stream.fps,
     (unsigned long long)sink->samples.load(),(unsigned long long)sink->invalid.load(),(unsigned)hr,pass?"PASS":"FAIL");
   if(pin){pin->Disconnect();pin->Release();}

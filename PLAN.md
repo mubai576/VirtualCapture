@@ -10,8 +10,10 @@
 P4 历史测试结论保留；2026-11-02 已只读封存当前部署，不新增性能结论。owner 已反馈约三天实际使用满意，优先保住已用版本，不追加压力测试或扩展 G3/G4。详见 `docs/bringup/bringup-20261102.md`。
 
 封存后 owner 已批准继续开发（D19）：分辨率预设 `416×416 / 640×640 / 720p / 1080p / 1440p` + 自定义，
-裁切/缩放、双端链路预算、H.264/H.265。P6-1 与 P6-2 开发版已接通，原生 Raw/四种变换/发送限速/动态 SHM 与虚拟卡完成本机隔离验证。
-P6-3 开发版已接通明确后端选择、编码/L2/有界解码/IDR恢复/SHM/DShow与GUI；编码默认不启用，须明确开发授权。部署PC2 encoder、双机/长稳/画质仍待验收，不替换现有部署。
+裁切/缩放与双端链路预算。P6-1 与 P6-2 开发版已接通，原生 Raw/四种变换/发送限速/动态 SHM 与虚拟卡完成本机隔离验证。
+**2026-11-13 owner 决定（D23）移除 H.264/H.265**（含 Media Foundation 与原生 NVENC）及其测试结果和
+`vc-codec-probe`/`vc-codec-roundtrip`；当前编码只保留 D21 批准的 MJPEG。P6-3 MJPEG 开发版已接通
+L2/有界解码/每帧恢复/SHM/DShow 与 GUI，默认不启用，须明确开发授权。双机/长稳/画质仍待验收，不替换现有部署。
 
 | 维度 | 状态 |
 |---|---|
@@ -46,18 +48,19 @@ PC1=192.168.2.100 接收；历史报告中的 PC1 sender / PC2 receiver 不代�
 
 ### 1.3 CLI（动词级冻结；dda/batch 为已落地的追加，本次正式纳入）
 ```text
-vc-sender.exe --adapter <子串> --mode pattern|file|dda --pattern motion --fps 240
+vc-sender.exe --adapter <子串> --mode pattern|file|dda|wgc --pattern motion --fps 240
   --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff
   --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest] [--gpu-convert]
+  [--output 0 --wgc-window <标题子串> --wgc-no-cursor]
   [--width 640 --height 640 --transform crop|fit|fill|stretch --source-mac <MAC>] [--capabilities]
 vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
   --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]
   [--width 640 --height 640 --fps 240 --source-mac <MAC>] [--capabilities]
 ```
 
-P6-3共同CLI追加：`--codec h264|hevc --codec-backend <CLSID|name:exact> --codec-hardware 0|1 --bitrate <bps> --max-bitrate <bps> --gop N --decode-in-flight N --max-au-bytes N`；另有`--codec-backends/--codec-check/--au-selftest`。压缩载荷/API/日志契约见skill `references/encoded-stream.md`，28B包头不变；Raw CLI和判据不变。
+P6-3 MJPEG共同CLI追加：`--codec mjpeg --codec-backend turbojpeg:cpu --codec-hardware 0 --gop 1 --bitrate <bps> --max-bitrate <bps> --decode-in-flight N --max-au-bytes N --jpeg-quality 1..100`；另有`--codec-backends/--codec-check/--au-selftest/--mjpeg-selftest`。压缩载荷/API/日志契约见skill `references/encoded-stream.md`，28B包头不变；Raw CLI和判据不变。`--codec h264|hevc` 在打开网卡前以退出码2拒绝。
 
-P6-3开发工具（不在产品载荷）：`vc-codec-probe --width W --height H --fps F`只探测候选；`vc-codec-roundtrip`要求显式encoder/decoder CLSID或精确name，支持codec/几何/fps/frames/bitrate/硬件类别/max-in-flight/hashlog及无硬件selftest。完整CLI见skill `references/stream-config.md`；不是生产codec能力或吞吐保证。
+WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture 采集 `--output` 指定显示器（默认0），`--wgc-window <标题子串>` 改为按窗口采集；窗口模式默认包含光标，`--wgc-no-cursor` 关闭。WGC 仍经 DWM 合成，不消除合成延迟；独占全屏不可采集；失败显式报错，不回退 DDA。DDA 同样支持 `--output`。不改变 28B 包头、raw 逐像素判据与 `--gpu-convert` 语义。
 
 ### 1.4 文件型 IPC
 - stats ~500ms 原子覆写（tmp→rename）；hashlog 每帧 append 一行。
@@ -75,20 +78,28 @@ P6-3开发工具（不在产品载荷）：`vc-codec-probe --width W --height H 
 - P5-U2（D17）：仅主机（默认 `--role host`）提供 UI，收端角色固定；被采集机 `--role capture` 仅后台。产品控制端口 5143，UI 只填 IPv4，网卡自动枚举后下拉选择；主机下发采集参数，对端按控制路由匹配网卡。默认 SHM 固定隐藏，接收前注册 vcam，停止/失败/子进程退出时回收；开始/停止采集合为一个按钮。API 追加能力标记、网卡详情与生命周期语义，详见 agent-api.md；数据面与判据不变。
 - P5-U2 后续精简：连接配置仅显示 IP、网卡和目标帧率，移除画面来源、像素转换、发送批大小及 MTU；隐藏参数沿用后台配置，保存时保留原值，底层 API 与默认值不变。
 - P5-U3 后端整合：产品启动约 1 秒存活检查，提前退出失败并回滚；stats 追加进程诊断和实际采集方式，界面等待首帧。`/health.root` 支持启动器校验同目录/同角色复用；主机与采集后台各有便携启动入口。契约见 agent-api.md、packaging.md。
-- P6-1（D19）：配置新增输出宽高、crop/fit/fill/stretch、raw/h264/hevc、目标/最大码率与链路预留余量；旧配置仍为 640×640 / crop / raw。新增只读 `GET /stream/capabilities` 与草稿 `POST /stream/plan`，`/adapters` 追加数值型收/发链路速率，`/health.stream_revision=1`（历史，现已由P6-2的2替代）。该阶段的非640/缩放拒绝由P6-2解锁；编码模式仍在注册/启动前409拒绝；禁止低层接口静默忽略新流参数。预算使用 mtu-42 和完整 L2 线速开销，不是实测吞吐或帧率保证；速率未知不冒充可行。完整契约见 skill `references/stream-config.md`。
+- P6-1（D19）：配置新增输出宽高、crop/fit/fill/stretch、raw/mjpeg、目标/最大码率与链路预留余量；旧配置仍为 640×640 / crop / raw。新增只读 `GET /stream/capabilities` 与草稿 `POST /stream/plan`，`/adapters` 追加数值型收/发链路速率，`/health.stream_revision=1`（历史，现已由P6-2的2替代）。该阶段的非640/缩放拒绝由P6-2解锁；编码模式仍在注册/启动前409拒绝；禁止低层接口静默忽略新流参数。预算使用 mtu-42 和完整 L2 线速开销，不是实测吞吐或帧率保证；速率未知不冒充可行。完整契约见 skill `references/stream-config.md`。
 - P6-2（D19）：`stream_revision=2`、显式 descriptor 双端回显、实际原生能力探测与源 MAC 会话过滤；旧后台/二进制拒绝。可变尺寸 Raw、整数 crop/fit/fill/stretch、发送帧率上限已接通。SHM v3（VCA3，header offset32/36/40=width/height/fps，动态12槽步长）；新读端兼容固定v2，旧读端拒绝v3，writer拒绝已有同名映射。DShow 创建时固定一档真实会话格式，改尺寸先关下游再重新开始/打开；D12不变。详情与低层API见 skill `references/stream-config.md`。
 - 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 B 字节（旧默认614400B）。
 
-- P6-3开发编码：原生codec_revision=1；控制面显式backend/硬件类别/码率/GOP/队列/内存上限及开发授权。48B VCAU只在载荷内，压缩长度动态分片，CRC+整体压缩hash；独立有界MF解码、断档等待IDR、EOS/drain，解码NV12继续SHM v3。sender记source_hash/transport_hash，receiver另记transport与decoded_hash，不套用Raw reconcile。只读codec-check与GUI能力、状态及完整契约见skill `references/encoded-stream.md`。
+- P6-3开发编码（仅MJPEG）：codec_revision=1、mjpeg_revision=1；控制面显式`turbojpeg:cpu`/硬件类别false/GOP1/码率/队列/内存上限及开发授权。48B VCAU只在载荷内，压缩长度动态分片，CRC+整体压缩hash；独立有界CPU解码、每帧独立恢复、EOS/drain，解码NV12继续SHM v3。sender记source_hash/transport_hash，receiver另记transport与decoded_hash，不套用Raw reconcile。只读codec-check与GUI能力、状态及完整契约见skill `references/encoded-stream.md`。
+- P6-3后续诊断支持显式自定义尺寸/fps/变换、CPU/GPU及后端类别、有界测试时长，区分发送fps/源hash/解码hash/DShow重复；decoder另请求CODECAPI低延迟属性，但HEVC单帧上限仍失败，不自动加深。完整参数与同机计时范围见skill `references/encoded-stream.md`。
+- P6-3性能修正：严格截止限速、有界分型准备；追加最近10000帧timing_ms及逐帧encode_wait_ns，保持encoder1帧/decoder显式上限。编码sender沿用Raw发送线程调度设置（MMCSS Capture/TIME_CRITICAL、进程HIGH），不改系统全局/GPU优先级或编码参数。编码receiver首包改取Npcap返回后，修正旧decode_pipeline_ms含读取等待的偏差，不作为解码提速。指标/等待语义见skill `references/encoded-stream.md`；H.264/H.265相关实验报告已按D23删除。
+- P6-3帧龄优化：准备预测改为请求IDR/非IDR各最近64次nearest-rank p95+0.1ms、最多一个周期，原帧率/码率闸及队列上限不变；stats追加preparation，逐帧日志追加prepare_lead_ns/prepare_work_ns，专项脚本重放验证预测，完整口径见skill encoded-stream。不把低帧龄冒充无代价吞吐改善。
+- P6-3 MJPEG（D21）：显式turbojpeg:cpu CPU/SIMD、JPEG质量1..100（默认80）、GOP1、每帧独立；sender/receiver和descriptor追加mjpeg_revision=1与jpeg_quality，Raw会话字段不变。VCAU codec=3只扩展48B载荷语义，28B包头不变；原码率上限/队列与SHM/DShow不变。目标码率不应用于JPEG，不自动降质；精确能力/配置确认及帧21恢复规则见skill encoded-stream，构建依赖/许可证见docs/runbooks/mjpeg.md。
+- MJPEG内存优化只调整本地缓冲生命周期：本帧借用JPEG输出、复用封装/分片/按需增容sendqueue、压缩hash不重复扫描，直接解码到未发布帧槽；错误时abandon，成功才publish。CRC/全部逐帧哈希、固定质量与原队列/限速/载荷/IPC均保留；audit_hash指标语义与故障门见skill encoded-stream。
 
 ### 1.5 全局禁止
-1. 不改包头尺寸/字段顺序。 2. 像素生成禁用浮点。 3. 原有 raw 模式禁止压缩；D19 单独批准新增 H.264/H.265 有损模式，不得复用 raw 逐像素哈希门来声称有损正确性。
+1. 不改包头尺寸/字段顺序。 2. 像素生成禁用浮点。 3. 原有 raw 模式禁止压缩；D21 批准的 MJPEG 为开发有损模式（H.264/H.265 已按 D23 移除），不得复用 raw 逐像素哈希门来声称有损正确性。
 4. 性能宣称必须用 `motion` 并注明 pattern/batch/adapter。 5. 跨机不报 QPC 差值延迟，只报 inter-arrival。
 6. 不许拿回环数据冒充双机结论。 7. 不许放宽 test-matrix 判据（改判据只能经 D1）。
 注：UNORM 解码允许 float（B8G8R8A8_UNORM→float→floor(v*255+0.5) 属格式转换，非像素生成；结果必须和 CPU 参考逐字节一致，dda_gpu 自测已证）；不许拿它当先例去别处用 float。
 
 ### 1.6 目录
 以 `AGENTS.md` Repo map 为准；产物与运行数据全部 gitignore；任务只碰自己的目录。共享 CRC32/FNV 统一在 `common/`，原生辅助工具源码归 `tools/`；`proto/vc_wire.h`、`sender/pattern.h`、`vcam/vcam_shm.h` 的契约位置保留。
+
+### 1.7 PC1 Raw 长运行诊断（2026-11-08 增量）
+独立 `scripts/longrun_diagnostics.py` 默认每秒/6小时，只 GET 双端 stats、观察系统/下游资源并留全量样本；`--mark/--stop` 只标记/结束记录器。候选 Raw receiver/vcam 通过进程环境 `VC_DIAG=1` 提供固定有界 `Local\VirtualCapture.Diag.<pid>` 旁路计时（stats准备/写盘、hash写盘、GetBuffer、Receive）；不改现有 wire、帧 SHM、rseg/vseg 语义或验收门限。契约见 skill `references/longrun-diagnostics.md`，操作见 `docs/runbooks/longrun-diagnostics.md`。
 
 ## 2. 决策记录与待决事项
 
@@ -113,6 +124,10 @@ P6-3开发工具（不在产品载荷）：`vc-codec-probe --width W --height H 
 | D9 | 本机主 agent 换代到 0.4.0 | ✅被后续部署覆盖（2026-11-02 只读核对）：当前两端均为 0.4.1 / product_revision=2，不再为旧 0.4.0 事项重启。2026-10-23 的 activate 无应答记录保留为历史，不据此声称该竞争已修复 | — |
 | D18 | 实际使用反馈与本轮收口范围 | ✅owner（2026-11-02）：约三天实际使用、目前满意；按计划先封存已用版本、补准确状态、整理现有改动。使用反馈不代替 test-matrix 验收；不放宽门限、不改数据链路、不自动提交或发版。远端实际二进制封存仍需本地导出或可读共享 | P5-U4 |
 | D19 | 可配置采集与编解码扩展 | ✅owner（2026-11-02）：允许新增 H.264/H.265 有损链路，保留 raw；允许可变尺寸会话/SHM/虚拟卡契约扩展；预设 416、640、720p、1080p、1440p + 自定义宽高/帧率。28B 包头不因本授权自动解冻，历史 raw 判据不变，稳定部署不自动替换。按阶段落地，不把预算或选项存在当成原生能力/实测验收。设计见 docs/proposals/configurable-stream-20261102.md | P6 |
+| D20 | P6双机并存验证与正式切换 | 待owner确认：建议先批准PC2全新目录/备用诊断端口并存、后端实测和小规模物理链路，不停稳定5143；正式GUI/虚拟卡切换另定维护窗口。当前PC2仍是旧后台，不能核验新codec。门禁与回滚见 docs/runbooks/p6-cutover.md | P6-3/4双机验收 |
+| D21 | 优先转向MJPEG | ✅owner（2026-11-03）：“先转为 mjpeg 吧”。新增可选MJPEG与质量配置、先做640本机验证；保留Raw/H.264/H.265（其中H.264/H.265后由D23移除），不自动替换稳定部署。每帧独立，不套用H.264 GOP恢复或有损像素相等门 | P6-3 MJPEG |
+| D22 | PC1 Raw 数小时后卡顿排查 | ✅owner（2026-11-08）：批准独立采样、生命周期修复候选、分项阻塞计时和隔离回归；不自动换已用DLL/部署、不改网卡或下游业务逻辑。六小时现场关联与整机根因仍待实用复现 | P5-LR |
+| D23 | 移除 H.264/H.265 | ✅owner（2026-11-13）：这种编解码方式不适合当前项目。移除 Media Foundation H.264/HEVC、原生 NVENC、`vc-codec-probe`/`vc-codec-roundtrip` 及全部相关测试结果/报告/开发包；保留 Raw 与 D21 的 MJPEG。不自动替换稳定部署；契约与 PLAN/AGENTS/skill 同批更新 | P6-3/P6-4 |
 
 ## 3. 任务卡
 
@@ -129,6 +144,8 @@ P6-3开发工具（不在产品载荷）：`vc-codec-probe --width W --height H 
 | P3 OTA 0.4.0 | DONE | e01af52 / ac0e2b4 / ae44cbc；PC2 推→回滚→再推全绿 |
 
 ### 遗留观察 / 小改动（不阻塞 P4）
+
+- **P5-LR 实现/隔离验证 DONE（2026-11-08）**：PC1 Raw 独立每秒/6小时采样、可选旁路阻塞计时、候选生命周期/Stop/Disconnect 修正；最终 verify 含 Loopback 408 passed / 2 skipped，六组 motion 各 720 帧零缺失/错哈希。已用成品87项哈希未变；现场6小时记录已启动，实际长时卡顿根因**仍待复现关联**。证据：`docs/bringup/bringup-20261108-longrun.md`。
 
 - stop 记来源 IP：agent 侧已提交（d15287d，写 run/exec.log），随下个版本上 PC2。
 - /activate 应答与 execv 竞争导致 RST，调用方靠轮询 /version；可改为先回应答再 execv。
@@ -162,15 +179,20 @@ P6-3开发工具（不在产品载荷）：`vc-codec-probe --width W --height H 
 
 ### P6-1 GUI 配置与链路预算 — DONE（2026-11-03）
 
-五档预设 + 自定义、四种裁切/缩放草案、raw/H.264/H.265 规划、两端方向速率及 L2 线速预算；verify ALL PASS（122 passed / 4 skipped）+ Edge 隔离桌面/手机宽度 13 项检查通过。原生/包头/SHM/部署未修改，未实现组合拒绝启动；稳定成品 87/87 与封存 424/424 完整性复核通过。证据：`docs/proposals/configurable-stream-20261102.md`。
+五档预设 + 自定义、四种裁切/缩放草案、raw/MJPEG 规划、两端方向速率及 L2 线速预算；verify ALL PASS（122 passed / 4 skipped）+ Edge 隔离桌面/手机宽度 13 项检查通过。原生/包头/SHM/部署未修改，未实现组合拒绝启动；稳定成品 87/87 与封存 424/424 完整性复核通过。证据：`docs/proposals/configurable-stream-20261102.md`。
 
 ### P6-2 可变尺寸 raw 全链路 — DONE（开发实现与本机验证，2026-11-03）
 
 显式会话/真实原生能力、可变尺寸Raw、四种整数变换、发送上限、SHM v3及动态DShow已打通；motion回环七组1665帧、DDA/GPU三组300帧全量对账零错，产品HTTP→真实原生→DShow 121/121一致。双机与交付留P6-4。证据：`docs/bringup/bringup-20261103-p6-raw.md`（含总闸与生命周期负例）。
 
-### P6-3 编解码能力与后端 — IN PROGRESS（2026-11-03）
+### P6-3 编码能力与后端（仅 MJPEG） — IN PROGRESS（2026-11-03）
 
-Windows MF同步/异步后端已接入编码分包/压缩hash/IDR恢复/有界解码/SHM/DShow及显式GUI开发模式；motion/batch1/Loopback两种codec六档共12组720帧完整解码与DShow核验，丢包恢复/严格拒绝/1Mbps滑窗及产品HTTP编排通过，Raw七组1665帧回归零错；verify 186 passed / 4 skipped。本机HEVC解码需显式2帧，不能冒充Raw延迟；Loopback batch69短发送明确失败、不自动回退。本机证据见 `docs/bringup/bringup-20261103-p6-codec.md`。仍未核验部署PC2 encoder、双机/编码DDA实景/长稳/画质/色彩/高帧率，卡保持IN PROGRESS，不把开发可运行当正式验收。后端背景：`docs/proposals/codec-backend-20261103.md`。
+H.264/H.265（Media Foundation 与原生 NVENC）于 2026-11-13 按 D23 从源码、构建、契约与测试中移除，
+相关报告、提案与开发包一并删除；不再提供 `vc-codec-probe`/`vc-codec-roundtrip`。当前编码只有 D21 的 MJPEG。
+
+MJPEG开发实现与本机专项 — DONE（D21）：libjpeg-turbo CPU/SIMD、独立帧恢复、质量配置及GUI/产品贯通；总闸含Loopback401 passed / 2 skipped。640² motion/batch1/Loopback两轮7200帧，239.86～239.97fps、生成至DShow首次交付avg1.67～1.73ms/P99约2.0～2.2ms，Q80约141Mbps（显式800Mbps上限）；真实本机DDA仅34.5fps，未证明PC2/DDA240或双机延迟。完整证据与独立测试包入口见`docs/bringup/bringup-20261103-mjpeg.md`；不自动替换部署，P6-3总体仍IN PROGRESS。
+
+MJPEG缓冲优化 — DONE（本机实现/验证，2026-11-03）：去掉发送临时JPEG复制与接收整帧复制、复用缓冲及压缩hash；403 passed / 2 skipped含Loopback。交叉31200帧全部收发/首次交付且新旧压缩输出与解码像素一致；240档avg1.67～1.69→1.64ms、60档1.80→1.73～1.74ms，P99区间重叠、总CPU收益未证实，不宣称大幅提速。11项专项及真实sender/receiver的无网卡故障注入通过；证据/独立包结果见`docs/bringup/bringup-20261103-mjpeg-opt.md`，不切换部署。
 
 ### P6-4 组合验收与交付 — TODO
 

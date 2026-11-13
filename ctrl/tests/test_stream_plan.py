@@ -60,11 +60,13 @@ def test_invalid_headroom(agent, headroom):
 
 
 def test_pending_settings_persist_without_claiming_support(agent):
-    draft = {"capture": {"width": 1024, "height": 768, "codec": "hevc", "transform": "fit",
+    draft = {"capture": {"width": 1024, "height": 768, "codec": "mjpeg", "transform": "fit",
+                         "encoder_backend": "turbojpeg:cpu", "decoder_backend": "turbojpeg:cpu",
+                         "encoder_hardware": False, "decoder_hardware": False, "gop_frames": 1,
                          "bitrate_mbps": 80, "max_bitrate_mbps": 120}, "transport": {"headroom_pct": 25}}
     assert agent.save_config(draft)[0] == 200
     loaded = agent.load_config()
-    assert loaded["capture"]["width"] == 1024 and loaded["capture"]["codec"] == "hevc"
+    assert loaded["capture"]["width"] == 1024 and loaded["capture"]["codec"] == "mjpeg"
     assert loaded["capture"]["batch"] == 69 and loaded["capture"]["gpu_convert"] is True
     result = agent.calculate_stream_plan(loaded, nic(), nic())
     assert result["network"]["status"] == "fits"
@@ -72,7 +74,7 @@ def test_pending_settings_persist_without_claiming_support(agent):
     assert not result["implementation"]["supported"] and not result["can_start"]
     assert len(result["implementation"]["reasons"]) == 1
     assert result["implementation"]["hardware_verified"] is False
-    assert any("IDR" in message for message in result["warnings"])
+    assert any("MJPEG" in message for message in result["warnings"])
 
 
 def test_exact_640_l2_budget_and_baseline_support(agent):
@@ -198,7 +200,7 @@ def test_plan_url_validation_and_capture_role(agent, monkeypatch):
     assert agent.stream_plan()[0] == 403
 
 
-@pytest.mark.parametrize("capture", [{"codec": "h264"}, {"codec": "hevc"}])
+@pytest.mark.parametrize("capture", [{"codec": "mjpeg"}])
 def test_unimplemented_product_start_has_no_side_effects(agent, monkeypatch, capture):
     assert agent.save_config({"capture": capture})[0] == 200
     monkeypatch.setattr(agent, "peer_call", lambda *a, **k: pytest.fail("must reject before remote calls"))
@@ -208,6 +210,11 @@ def test_unimplemented_product_start_has_no_side_effects(agent, monkeypatch, cap
     assert agent.product_local_start()[0] == 409
     agent.state["role"] = "capture"
     assert agent.product_local_start({"capture": capture})[0] == 409
+
+
+@pytest.mark.parametrize("codec", ["h264", "hevc", "av1"])
+def test_removed_codecs_cannot_be_saved(agent, codec):
+    assert agent.save_config({"capture": {"codec": codec}})[0] == 400
 
 
 def test_physical_budget_rejection_precedes_registration(agent, monkeypatch):
@@ -243,10 +250,20 @@ def test_capture_capabilities_use_control_route_without_starting(agent, monkeypa
         assert ip == "192.168.2.100"
         return 200, nic()
     monkeypatch.setattr(agent, "_choose_capture_adapter", choose)
-    monkeypatch.setattr(agent, "native_stream_capabilities", lambda kind: {"codecs": ["raw", "h264", "hevc"], "codec_revision": 1})
+    monkeypatch.setattr(agent, "native_stream_capabilities", lambda kind: {"codecs": ["raw", "mjpeg"], "codec_revision": 1})
     monkeypatch.setattr(agent, "native_codec_request", lambda kind: {"status": "candidates_only", "backends": []})
     capabilities = agent.stream_capabilities("192.168.2.100")
     assert capabilities["adapter"]["transmit_link_bps"] == 2500000000
-    assert capabilities["native"]["codecs"] == ["raw", "h264", "hevc"]
+    assert capabilities["native"]["codecs"] == ["raw", "mjpeg"]
     assert capabilities["native"]["variable_resolution"]
     assert capabilities["hardware"] == {"encoder": {"status": "candidates_only", "backends": []}, "decoder": "unprobed"}
+
+
+def test_wgc_capture_mode_is_explicit_and_validated(agent):
+    cfg = config(agent, mode="wgc", output=1, wgc_window="Game Window")
+    assert agent.validate_config(cfg) == []
+    result = agent.calculate_stream_plan(cfg, nic(), nic())
+    assert result["can_start"]
+    assert any("WGC" in message for message in result["warnings"])
+    assert agent.validate_config(config(agent, mode="wgc", output=16)) != []
+    assert agent.validate_config(config(agent, mode="wgc", wgc_window="bad\nname")) != []

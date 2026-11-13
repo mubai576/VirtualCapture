@@ -8,18 +8,25 @@ import subprocess
 import threading
 import time
 import uuid
+from p6_codec_verify import mjpeg_options
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--codec", choices=("raw", "h264", "hevc"), default="raw")
+    parser.add_argument("--codec", choices=("raw", "mjpeg"), default="raw")
     parser.add_argument("--encoder", default="")
     parser.add_argument("--decoder", default="")
+    parser.add_argument("--jpeg-quality", type=int)
     options = parser.parse_args()
     if options.codec != "raw" and (not options.encoder or not options.decoder):
         parser.error("encoded mode requires explicit --encoder and --decoder")
+    try:
+        jpeg = mjpeg_options(options.codec, options.encoder, options.decoder, options.codec != "mjpeg", False,
+                             1 if options.codec == "mjpeg" else 1, options.jpeg_quality)
+    except ValueError as error:
+        parser.error(str(error))
     output = ROOT / "run" / ("p6-product-" + datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + options.codec + "-" + uuid.uuid4().hex[:6])
     output.mkdir(parents=True)
     mapping = "Local\\VCP6Product-" + uuid.uuid4().hex
@@ -58,8 +65,9 @@ def main():
         return peer(path, body, **kwargs)
     host.peer_call = isolated_peer
     codec_config = {} if options.codec == "raw" else {"codec": options.codec, "codec_experimental": True,
-        "encoder_backend": options.encoder, "decoder_backend": options.decoder, "encoder_hardware": True,
-        "decoder_hardware": False, "bitrate_mbps": 20, "max_bitrate_mbps": 80, "gop_frames": 15, "decode_in_flight": 2}
+        "encoder_backend": options.encoder, "decoder_backend": options.decoder, "encoder_hardware": False,
+        "decoder_hardware": False, "bitrate_mbps": 20, "max_bitrate_mbps": 800, "gop_frames": 1, "decode_in_flight": 1,
+        **({"jpeg_quality": jpeg} if jpeg is not None else {})}
     assert host.save_config({"adapter": r"\Device\NPF_Loopback", "peer_url": "http://127.0.0.1:5143",
                              "capture": {"width": 418, "height": 282, "fps": 30, "mode": "pattern",
                                          "pattern": "motion", "transform": "fill", "batch": 1, **codec_config}})[0] == 200
@@ -83,6 +91,10 @@ def main():
         def rows(path):
             return [json.loads(line) for line in Path(path).read_text(encoding="utf-8").splitlines()]
         sent, received = rows(capture.state["sender"]["hashlog"]), rows(host.state["receiver"]["hashlog"])
+        sender_stats = json.loads(Path(capture.state["sender"]["stats"]).read_text(encoding="utf-8"))
+        if jpeg is not None:
+            assert host.mjpeg_configuration_matches({"mjpeg_revision": 1,
+                "encoder_configuration": sender_stats["encoder_configuration"]}, host.load_config()["capture"])
         samples = rows(output / "vc.jsonl")
         sent_key = "hash" if options.codec == "raw" else "transport_hash"
         received_key = "hash" if options.codec == "raw" else "decoded_hash"
@@ -95,6 +107,7 @@ def main():
         result = {"pass": True, "codec": options.codec, "size": [418, 282], "fps_limit": 30, "mode": "pattern", "pattern": "motion",
                   "batch": 1, "adapter": "Loopback", "sent": len(sent), "received": len(received),
                   "vcam_samples": len(samples), "session": rx["stream"], "registry_operations": registration,
+                  "encoder_configuration": sender_stats.get("encoder_configuration"),
                   "boundary": "private roots/map/random HTTP port; registry replaced; real native children and DShow"}
         (output / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
         print(output)

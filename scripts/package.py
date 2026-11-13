@@ -26,6 +26,7 @@ NATIVE_FILES = (
     "vc-monitor.exe", "vc-monitor-diag.exe", "vc-vcam-verify.exe",
 )
 RUNTIME_FILES = ("msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+LICENSE_FILES = ("licenses/libjpeg-turbo-LICENSE.md", "licenses/libjpeg-turbo-README.ijg")
 BUILD_ONLY_SCRIPTS = {"verify.py", "package.py", "p6_raw_verify.py", "p6_product_verify.py", "p6_codec_verify.py"}
 
 
@@ -95,7 +96,7 @@ def copy_support_files(root, stage):
 
 
 def require_payload(stage):
-    required = (*NATIVE_FILES, *RUNTIME_FILES, "vc-agent.exe", "version.json",
+    required = (*NATIVE_FILES, *RUNTIME_FILES, *LICENSE_FILES, "vc-agent.exe", "version.json",
                 "Start-VirtualCapture.cmd", "Start-Capture-Worker.cmd", "README.md",
                 "scripts/start-agent.ps1", "scripts/start-host.ps1", "scripts/start-capture-worker.ps1")
     missing = [name for name in required if not (stage / name).is_file()]

@@ -2,4 +2,3 @@
 add_subdirectory(testwin "${CMAKE_BINARY_DIR}/testwin")
 add_subdirectory(vcam_verify "${CMAKE_BINARY_DIR}/vcam_verify")
 add_subdirectory(monitor "${CMAKE_BINARY_DIR}/monitor")
-add_subdirectory(codec_probe "${CMAKE_BINARY_DIR}/codec_probe")

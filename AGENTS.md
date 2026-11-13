@@ -9,9 +9,14 @@ raw L2 EtherType `0x88B5`（Npcap）发到主机重组，逐帧 FNV-1a64 对账�
 传输链路已双机验证（T0/T1/T2 全绿，T-06 已关），P4 链路已落地；稳定版保留 P5 实际使用状态，开发进入 P6 可配置采集与传输。
 当前部署为 PC2 192.168.2.59 采集 → PC1 192.168.2.100 接收/GUI/虚拟卡（:5143），不按历史报告固定角色。
 2026-11-02 owner 确认约三天实际使用满意；封存与未验收边界见 `PLAN.md`、`docs/bringup/bringup-20261102.md`。
-同日 owner 批准进入 P6：可变分辨率、裁切/缩放、链路预算及 H.264/H.265（保留 raw）；
+同日 owner 批准进入 P6：可变分辨率、裁切/缩放、链路预算与有损编码。
 开发版 P6-2 已接通可变尺寸 Raw、四种裁切/缩放、真正发送限速、SHM v3 和动态 DShow；稳定部署仍为上述固定格式。
-H.264/H.265 开发链路已接通编码/L2/解码/SHM/DShow与显式GUI后端选择；须明确启用开发功能，未通过后端协商的组合拒绝启动。双机/长稳/画质仍待验收，见 `docs/bringup/bringup-20261103-p6-codec.md`。本机验证见 `docs/bringup/bringup-20261103-p6-raw.md`。设计见 `docs/proposals/configurable-stream-20261102.md`。
+2026-11-03 owner 批准 MJPEG（D21）：显式libjpeg-turbo CPU/SIMD、每帧独立、JPEG质量配置；
+构建与边界见`docs/runbooks/mjpeg.md`，不自动替换部署。本机Raw验证见 `docs/bringup/bringup-20261103-p6-raw.md`。
+**2026-11-13 owner 决定（D23）移除 H.264/H.265**（含 Media Foundation 与原生 NVENC）及其测试结果、
+`vc-codec-probe`/`vc-codec-roundtrip`：这种编解码方式不适合当前项目。当前只有 Raw 与可选开发版 MJPEG；
+MJPEG 开发链路已接通 L2/解码/SHM/DShow 与显式 GUI 后端选择，须明确启用，未通过协商的组合拒绝启动。
+双机/长稳/画质仍待验收。设计背景见 `docs/proposals/configurable-stream-20261102.md`。
 **范围：只管采集与传输；推理端不在本项目范围**（PLAN D8）。
 
 ## 读什么（按任务）
@@ -33,12 +38,12 @@ H.264/H.265 开发链路已接通编码/L2/解码/SHM/DShow与显式GUI后端选
 | 路径 | 内容 | 归属/规则 |
 |---|---|---|
 | `CMakeLists.txt` + `cmake/` | 根构建编排、统一编译/输出规则、Npcap SDK 查找、long-path manifest | 从根目录配置；产物跟随 `-B` |
-| `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mf_codec.h` MF后端、`access_unit.h`/`codec_session.h` 编码载荷与会话（`vc-common` CMake target） | 算法只保留一份 |
+| `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mjpeg_codec.h`、`access_unit.h`/`codec_session.h` MJPEG载荷与会话（`vc-common` CMake target） | 算法只保留一份；MJPEG依赖/许可证见`docs/runbooks/mjpeg.md` |
 | `proto/vc_wire.h` | 28B 包头，**冻结** | 仅 owner 可改 |
-| `sender/` | `vc-sender.exe`（pattern/file/dda，`--batch`，`pattern.h` 整数测试源，`dda.h` 桌面采集） | C++17 |
+| `sender/` | `vc-sender.exe`（pattern/file/dda/wgc，`--batch`，`pattern.h` 整数测试源，`dda.h`/`wgc.h` 桌面采集） | C++17 |
 | `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，会话 NV12 尺寸/fps，SHM v3，motion 仅显式 bring-up） | C++17 |
 | `receiver/` | `vc-receiver.exe`（重组、hash、stats、hashlog 带 qpc_ns） | C++17 |
-| `tools/` | `monitor/` 预览与诊断、`testwin/` DDA 动画源、`vcam_verify/` DShow 枚举/隔离取帧、`codec_probe/` MF 候选与实际编解码回环（仅开发，不交付） | C++17；随根 CMake 一起构建，现有产物路径保留 |
+| `tools/` | `monitor/` 预览与诊断、`testwin/` DDA 动画源、`vcam_verify/` DShow 枚举/隔离取帧 | C++17；随根 CMake 一起构建，现有产物路径保留 |
 | `agent/vc-agent.py` | 主机 UI / 被采集机后台（REST :5143，/exec 白名单，/files 分页，stage/activate OTA） | 单文件零依赖 |
 | `ctrl/` | `vc-ctrl.py` 编排判分、`bringup.py` 联调报告、`reconcile.py` 对账、`run_remote.py` 远控/OTA、`vc-monitor-tui.py` 文本仪表、`pattern_ref.py` Python 镜像 | |
 | `ctrl/tests/` | pytest：matrix（向量/判据/live）、OTA、GUI、package（打包保护/回滚/路径） | |
@@ -68,8 +73,9 @@ python ctrl/run_remote.py --agent http://192.168.2.59:5143 --update release/vc-<
 ## 硬规则（违反即打回）
 
 1. 不改包头尺寸/字段顺序；proto 变更须 owner 批。
-2. 像素生成禁用浮点；原有 raw 模式禁止压缩。D19 已单独批准 P6 的 H.264/H.265 有损链路开发，
-   不得将其冒充 raw 逐像素哈希通过；不得静默切编码/降尺寸/降帧率，未实现或未支持的组合须明确拒绝。
+2. 像素生成禁用浮点；原有 raw 模式禁止压缩。D21 批准的 MJPEG 有损链路仍为开发功能
+   （H.264/H.265 已按 D23 移除），不得将其冒充 raw 逐像素哈希通过；不得静默切编码/降尺寸/降帧率，
+   未实现或未支持的组合须明确拒绝。
 3. 性能结论必须用 `motion`，注明 pattern/batch/adapter；回环数据不得冒充双机结论。
 4. 跨机不比 QPC 绝对值，只报同机时段（inter-arrival、单端分段）。
 5. 不放宽 `references/test-matrix.md` 判据；改判据只能经 owner 决策（记入 PLAN §2）。

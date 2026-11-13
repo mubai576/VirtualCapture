@@ -37,7 +37,7 @@ DDA只发新桌面图像，静态/鼠标更新不重放。旧低层默认640仍�
 
 ## P6-3 编码载荷
 
-28B包头、EtherType、pattern/flags语义完全不变。显式codec会话在普通载荷内发送48B VCAU封装+Annex-B访问单元，按实际长度分片。Raw仍按固定会话NV12字节数严格检查，绝不尝试猜测或自动切换编码。封装/上限/整体hash/EOS/IDR恢复完整契约见 `encoded-stream.md`。
+28B包头、EtherType、pattern/flags语义完全不变。显式编码会话在普通载荷内发送48B VCAU封装+MJPEG完整帧，按实际长度分片。Raw仍按固定会话NV12字节数严格检查，绝不尝试猜测或自动切换编码。封装/上限/整体hash/EOS/逐帧恢复完整契约见 `encoded-stream.md`。
 
 ## 发送 pacing（T4 定默认）
 

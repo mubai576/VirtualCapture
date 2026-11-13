@@ -28,6 +28,7 @@
 #include "../proto/vc_wire.h"
 #include "pattern.h"
 #include "dda.h"
+#include "capture.h"
 #include "fnv1a.h"
 #include "crc32.h"
 #include "../common/codec_session.h"
@@ -231,6 +232,9 @@ struct Args {
   std::string session="manual", stats="", hashlog="", file="";
   bool loop=false, list_adapters=false, selftest=false, gpu_convert=false;
   bool codec_check=false;
+  bool wgc_cursor=true;
+  int output=0;
+  std::string wgc_window;
   long long test_drop_frame=-1;
 };
 
@@ -258,14 +262,15 @@ static const char* pat_name(int id){
 
 static void usage(){
   // 打印用法
-  printf("vc-sender.exe --adapter <substr> --mode pattern|file|dda --pattern motion --fps 240\n"
+  printf("vc-sender.exe --adapter <substr> --mode pattern|file|dda|wgc --pattern motion --fps 240\n"
     "  --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff\n"
     "  --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest]\n"
     "  [--width 640 --height 640 --transform crop|fit|fill|stretch --source-mac <session MAC>] [--capabilities]\n"
-    "  [--gpu-convert: DDA走GPU转换，失败显式报错不回退]\n");
-  puts("  codec: --codec h264|hevc --codec-backend <CLSID|name:exact> --codec-hardware 0|1\n"
-       "  --bitrate 20000000 --max-bitrate 80000000 --gop 60 --decode-in-flight 2 --max-au-bytes 8388608\n"
-       "  --codec-backends | --codec-check <codec options> | --au-selftest; diagnostic only: --test-drop-frame N");
+    "  [--output 0: 显示器序号（dda/wgc）] [--wgc-window <标题子串> --wgc-no-cursor]\n"
+    "  [--gpu-convert: dda/wgc 走GPU转换，失败显式报错不回退]\n");
+  puts("  codec: --codec mjpeg --codec-backend turbojpeg:cpu --codec-hardware 0 --gop 1\n"
+       "  --bitrate 20000000 --max-bitrate 80000000 --decode-in-flight 2 --max-au-bytes 8388608 --jpeg-quality 1..100 (default 80)\n"
+       "  --codec-backends | --codec-check <codec options> | --au-selftest | --mjpeg-selftest; diagnostic only: --test-drop-frame N");
 }
 
 static void ensure_parent(const std::string&path){
@@ -392,6 +397,7 @@ static int run_selftest(){
     if(bad){printf("FAIL crc32 slice8 != ref (%d cases)\n",bad);ok=false;} else printf("crc32: slice-by-8 == bytewise ref (72 cases)\n"); }
   { int ddr=dda_selftest(); if(ddr==1){printf("FAIL dda selftest\n");ok=false;} }
   { int dgr=dda_gpu_selftest(); if(dgr==1){printf("FAIL dda gpu selftest\n");ok=false;} }
+  { int wgr=wgc_selftest(); if(wgr==1){printf("FAIL wgc selftest\n");ok=false;} }
   for(auto size : {std::pair<int,int>{2,2},{418,282},{416,416},{1280,720}}){
     std::vector<uint8_t> y((size_t)size.first*size.second),uv(y.size()/2);
     for(int pid=0;pid<5;pid++) for(uint32_t fid=0;fid<2;fid++){
@@ -446,6 +452,9 @@ int main(int argc,char**argv){
     else if(k=="--codec-backends"){return vc_codec_backends(true);}
     else if(k=="--codec-check"){a.codec_check=true;}
     else if(k=="--au-selftest"){return vcau::selftest();}
+#ifdef VC_HAS_MJPEG
+    else if(k=="--mjpeg-selftest"){return vcjpeg::selftest();}
+#endif
     else if(k=="--test-drop-frame"){std::string v;need(v);a.test_drop_frame=vc_cli_number(v);if(a.test_drop_frame<0)return 2;}
     else if(k=="--width"){ std::string v; need(v); a.stream.width=vc_cli_int(v); }
     else if(k=="--height"){ std::string v; need(v); a.stream.height=vc_cli_int(v); }
@@ -453,6 +462,10 @@ int main(int argc,char**argv){
     else if(k=="--source-mac"){ need(a.source_mac); }
     else if(k=="--adapter"){need(a.adapter);}
     else if(k=="--mode"){need(a.mode);}
+    else if(k=="--output"){std::string v; need(v); a.output=vc_cli_int(v);}
+    else if(k=="--wgc-window"){need(a.wgc_window);}
+    else if(k=="--wgc-no-cursor"){a.wgc_cursor=false;}
+    else if(k=="--wgc-selftest"){return wgc_selftest();}
     else if(k=="--pattern"){need(a.pattern);}
     else if(k=="--fps"){std::string v; need(v); a.fps=vc_cli_int(v);}
     else if(k=="--frames"){std::string v; need(v); a.frames=vc_cli_number(v);}
@@ -475,7 +488,11 @@ int main(int argc,char**argv){
 #ifdef _WIN32
   SetConsoleCtrlHandler(chandler, TRUE);
 #endif
-  if(a.selftest) return run_selftest();
+  if(a.selftest){
+    if(!encoded_timing_selftest()){fprintf(stderr,"FAIL: encoded rolling timings/preparation bounds\n");return 1;}
+    printf("PASS: encoded rolling timings/preparation bounds\n");
+    return run_selftest();
+  }
 #ifdef _WIN32
   if(a.list_adapters) return run_list_adapters();
 #else
@@ -483,10 +500,13 @@ int main(int argc,char**argv){
 #endif
   if(a.stats.empty()) a.stats="run/"+a.session+".sender.stats.json";
   if(a.hashlog.empty()) a.hashlog="run/"+a.session+".sender.hash.jsonl";
-  if(a.mode!="pattern"&&a.mode!="file"&&a.mode!="dda"){fprintf(stderr,"--mode must be pattern|file|dda\n");return 2;}
+  if(a.mode!="pattern"&&a.mode!="file"&&a.mode!="dda"&&a.mode!="wgc"){fprintf(stderr,"--mode must be pattern|file|dda|wgc\n");return 2;}
+  if(a.output<0||a.output>15){fprintf(stderr,"--output must be 0..15\n");return 2;}
+  if(!a.wgc_window.empty()&&a.mode!="wgc"){fprintf(stderr,"--wgc-window requires --mode wgc\n");return 2;}
   a.stream.fps=a.fps;
   uint8_t source_mac[6];
-  if(!a.stream.valid() || !vc_parse_mac(a.source_mac,source_mac) || !a.codec.valid(a.mtu) || a.mtu<=42 || a.mtu>9042 || (!a.codec.encoded() && a.test_drop_frame>=0)){ fprintf(stderr,"invalid stream/explicit codec configuration\n"); return 2; }
+  if(!a.stream.valid() || !vc_parse_mac(a.source_mac,source_mac) || !a.codec.valid(a.mtu) || a.mtu<=42 || a.mtu>9042 ||
+    (!a.codec.encoded() && a.test_drop_frame>=0)){ fprintf(stderr,"invalid stream/explicit codec configuration\n"); return 2; }
   if(a.codec_check){if(!a.codec.encoded())return 2;return vc_codec_check(a.codec,a.stream,true);}
   const size_t y_bytes=a.stream.y_bytes(), uv_bytes=a.stream.uv_bytes(), frame_bytes=a.stream.frame_bytes();
   int pid=pat_id(a.pattern);
@@ -547,15 +567,29 @@ int main(int argc,char**argv){
 #endif
 
   std::vector<uint8_t> Y(y_bytes),UV(uv_bytes);
-  DDACap dda_cap; dda_cap.stream=a.stream; double gpu_accum_ms=0;
-  if(a.mode=="dda"){ std::string dd; if(!dda_cap.init(dd)){fprintf(stderr,"dda init failed: %s\n",dda_cap.err());return 1;} printf("[sender] dda output=%s center640\n",dd.c_str()); }
+  DDACap dda_cap; dda_cap.stream=a.stream; dda_cap.output_index=a.output;
+  WGCCap wgc_cap; wgc_cap.stream=a.stream; wgc_cap.output=a.output;
+  wgc_cap.window_title=a.wgc_window; wgc_cap.include_cursor=a.wgc_cursor;
+  CaptureHandle cap;
+  double gpu_accum_ms=0;
+  if(a.mode=="dda"){
+    std::string dd; if(!dda_cap.init(dd)){fprintf(stderr,"dda init failed: %s\n",dda_cap.err());return 1;}
+    cap.dda=&dda_cap; printf("[sender] dda output=%s center640\n",dd.c_str());
+  } else if(a.mode=="wgc"){
+    std::string wd; if(!wgc_cap.init(wd)){fprintf(stderr,"wgc init failed: %s\n",wgc_cap.err());return 1;}
+    cap.wgc=&wgc_cap; printf("[sender] wgc output=%s center640\n",wd.c_str());
+  }
 #ifdef _WIN32
-  if(a.mode=="dda"&&a.gpu_convert){ std::string gd; if(!dda_cap.start_gpu(gd)){fprintf(stderr,"gpu-convert start failed: %s\n",gd.c_str());return 1;} printf("[sender] gpu-convert on (%s)\n",gd.c_str()); }
+  if(cap.active()&&a.gpu_convert){ std::string gd; if(!cap.start_gpu(gd)){fprintf(stderr,"gpu-convert start failed: %s\n",gd.c_str());return 1;} printf("[sender] gpu-convert on (%s)\n",gd.c_str()); }
 #else
   if(a.gpu_convert){fprintf(stderr,"--gpu-convert is Windows-only\n");return 2;}
 #endif
   std::vector<uint8_t> eth(14+28+payload);
-  if(a.codec.encoded()){int result=run_encoded_sender(a,d,h,dda_cap);d.closeh(h);timeEndPeriod(1);return result;}
+  if(a.codec.encoded()){
+    sender_boost_thread();
+    int result=run_encoded_sender(a,d,h,cap);
+    d.closeh(h);timeEndPeriod(1);return result;
+  }
   // 组以太网头
   memcpy(eth.data(),a.dstmac,6);
   uint8_t srcmac[6]={0x02,0x00,0x00,0x00,0x00,0x01};
@@ -606,14 +640,14 @@ int main(int argc,char**argv){
     uint8_t pat_field=255;
     bool new_image=true;
     if(a.mode=="pattern"){ gen_full(pid,fid,Y.data(),UV.data(),a.stream.width,a.stream.height); pat_field=(uint8_t)pid; }
-    else if(a.mode=="dda"){
+    else if(a.mode=="dda"||a.mode=="wgc"){
       uint64_t g0=qpc_ns_now();
-      if(!dda_cap.capture(Y.data(),UV.data())){
-        if(dda_cap.err_code!=DDACap::E_TIMEOUT){fprintf(stderr,"dda capture failed: %s\n",dda_cap.err());return 1;}
+      if(!cap.capture(Y.data(),UV.data())){
+        if(cap.err_code()!=DDACap::E_TIMEOUT){fprintf(stderr,"%s capture failed: %s\n",a.mode.c_str(),cap.err());return 1;}
         new_image=false;
       } else {
-        if(dda_cap.last_present_qpc){ // 采集滞后 = DWM present -> 转换完成（同机 QPC）
-          uint64_t pn=qpc_to_ns_raw(dda_cap.last_present_qpc), dn=qpc_ns_now();
+        if(cap.last_present_qpc()){ // 采集滞后 = 合成 present -> 转换完成（同机 QPC）
+          uint64_t pn=qpc_to_ns_raw(cap.last_present_qpc()), dn=qpc_ns_now();
           if(cap_lag_ns.size()>=10000) cap_lag_ns.pop_front(); cap_lag_ns.push_back(dn>=pn?dn-pn:0); }
         gpu_accum_ms+=(qpc_ns_now()-g0)/1e6;
       }
@@ -624,7 +658,7 @@ int main(int argc,char**argv){
     if(new_image){ // Idle DDA still reaches the stats heartbeat without publishing stale pixels.
     uint64_t t_gen_done=qpc_ns_now(); // 采集/生成完成（D8 PC1段起点；整帧哈希已移到末包之后）
     // Predict conversion only (not DDA's wait); the output guard is authoritative, never this estimate.
-    prepare_ns=std::min(tx_limit.period/2,a.mode=="dda"?qpc_to_ns_raw(dda_cap.last_convert_qpc):t_gen_done-f0);
+    prepare_ns=std::min(tx_limit.period/2,(a.mode=="dda"||a.mode=="wgc")?qpc_to_ns_raw(cap.last_convert_qpc()):t_gen_done-f0);
     // A blocking AcquireNextFrame can finish much later than f0. Bound output as well as acquisition.
     while(!tx_limit.ready(qpc_ns_now())) {
       uint64_t now=qpc_ns_now();
@@ -713,14 +747,14 @@ int main(int argc,char**argv){
         "\"pattern\":\"%s\",\"fps_target\":%d,\"mtu\":%d,\"ethertype\":\"0x%04x\",\"gpu_ms\":%.3f,\"gpu_dispatch_ms\":%.3f,\"gpu_dispatch_samples\":%llu,\"pc1_seg_avg_ms\":%.3f,\"pc1_seg_p99_ms\":%.3f,\"pc1_seg_max_ms\":%.3f,\"gpu_convert\":%d,\"cpu_pct\":%.1f,\"cap_lag_avg_ms\":%.3f,\"cap_lag_p99_ms\":%.3f,\"cap_lag_max_ms\":%.3f}",
         a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
         pps,bps,sent_frames/up,(unsigned long long)send_errors,up,
-        a.mode=="pattern"?pat_name(pid):(a.mode=="dda"?"dda":"file"),a.fps,a.mtu,a.ethertype,
+        a.mode=="pattern"?pat_name(pid):(a.mode=="dda"?"dda":(a.mode=="wgc"?"wgc":"file")),a.fps,a.mtu,a.ethertype,
         sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
-        dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
-        (unsigned long long)dda_cap.gpu_samples,pc1_a,pc1_p99,pc1_mx,(a.gpu_convert?1:0),cpu_pct,cl_a,cl_p99,cl_mx);
+        cap.gpu_samples()>0?cap.gpu_accum_ms()/(double)cap.gpu_samples():0,
+        (unsigned long long)cap.gpu_samples(),pc1_a,pc1_p99,pc1_mx,(a.gpu_convert?1:0),cpu_pct,cl_a,cl_p99,cl_mx);
       { std::string stats=buf; stats.pop_back();
         stats+=",\"width\":"+std::to_string(a.stream.width)+",\"height\":"+std::to_string(a.stream.height)+
           ",\"frame_bytes\":"+std::to_string(frame_bytes)+",\"fps_limit\":"+std::to_string(a.fps)+
-          ",\"transform\":\""+a.stream.transform+"\",\"codec\":\"raw\",\"source_skipped\":"+std::to_string(dda_cap.source_skipped)+"}";
+          ",\"transform\":\""+a.stream.transform+"\",\"codec\":\"raw\",\"source_skipped\":"+std::to_string(cap.source_skipped())+"}";
         atomic_write(a.stats,stats); }
     }
   }
@@ -738,12 +772,12 @@ int main(int argc,char**argv){
       a.session.c_str(),(unsigned long long)sent_frames,(unsigned long long)sent_packets,
       sent_packets/up,sent_bytes*8/up,(unsigned long long)send_errors,up,
       sent_frames>0?gpu_accum_ms/(double)sent_frames:0,
-      dda_cap.gpu_samples>0?dda_cap.gpu_accum_ms/(double)dda_cap.gpu_samples:0,
-      (unsigned long long)dda_cap.gpu_samples,pc1_fa,pc1_fp99,pc1_fmx,(a.gpu_convert?1:0),cpu_pct_fin,cl_fa,cl_fp99,cl_fmx);
+      cap.gpu_samples()>0?cap.gpu_accum_ms()/(double)cap.gpu_samples():0,
+      (unsigned long long)cap.gpu_samples(),pc1_fa,pc1_fp99,pc1_fmx,(a.gpu_convert?1:0),cpu_pct_fin,cl_fa,cl_fp99,cl_fmx);
     { std::string stats=buf; stats.pop_back();
         stats+=",\"width\":"+std::to_string(a.stream.width)+",\"height\":"+std::to_string(a.stream.height)+
           ",\"frame_bytes\":"+std::to_string(frame_bytes)+",\"fps_limit\":"+std::to_string(a.fps)+
-          ",\"transform\":\""+a.stream.transform+"\",\"codec\":\"raw\",\"source_skipped\":"+std::to_string(dda_cap.source_skipped)+"}";
+          ",\"transform\":\""+a.stream.transform+"\",\"codec\":\"raw\",\"source_skipped\":"+std::to_string(cap.source_skipped())+"}";
         atomic_write(a.stats,stats); } }
 #ifdef _WIN32
 #ifdef _WIN32

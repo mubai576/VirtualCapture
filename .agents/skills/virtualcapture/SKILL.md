@@ -19,11 +19,16 @@ Current phase is P5 real-use feedback and deployed-baseline preservation: owner 
 three days of satisfactory use on 2026-11-02. This is not a new zero-loss or continuous-72h acceptance result.
 Current product deployment is PC2 capture -> PC1 host; follow runtime roles, not historical PC labels. Scope = capture + transport only;
 inference side and exclusive-fullscreen hook are out of scope (PLAN D8).
-P6 is now authorized (PLAN D19): configurable output sizes/transforms, link budgeting and additional H.264/H.265
-lossy modes while retaining raw. Development P6-2 now implements variable-size Raw, four transforms, a real
-send-rate ceiling, SHM v3 and session-sized DShow. The stable deployment remains unchanged. H.264/H.265
-now have an explicitly opted-in development path through L2, decode, SHM and DShow; missing/unsupported backends are rejected. Dual-host, soak, quality and deployed-PC2 encoder validation remain pending. The 28 B packet header and historical raw test gates remain
-frozen. See `references/stream-config.md` and `docs/bringup/bringup-20261103-p6-raw.md` for local evidence.
+P6 is now authorized (PLAN D19): configurable output sizes/transforms, link budgeting and additional
+lossy modes while retaining raw. Development P6-2 implements variable-size Raw, four transforms, a real
+send-rate ceiling, SHM v3 and session-sized DShow. The stable deployment remains unchanged.
+H.264/H.265 (Media Foundation and native NVENC) were removed on 2026-11-13 as unsuitable for this project;
+`vc-codec-probe`/`vc-codec-roundtrip` and their reports were removed with them. The 28 B packet header and
+historical raw test gates remain frozen. See `references/stream-config.md` and
+`docs/bringup/bringup-20261103-p6-raw.md` for local evidence.
+Owner D21 additionally authorizes MJPEG: explicit `turbojpeg:cpu` on both sides, libjpeg-turbo CPU/SIMD,
+per-frame independent JPEG at configured quality, the same bounded L2/SHM/DShow path. No fallback,
+no default/deployment switch; see `docs/runbooks/mjpeg.md` and the encoded-stream contract.
 
 Repo map, commands, rules and multi-AI conventions: **root `AGENTS.md`** (single source; not repeated here).
 Progress and open decisions: `PLAN.md`. Specs: `docs/spec/` (requirements / test-plan / deployment,
@@ -41,7 +46,8 @@ early docs with dated SUPERSEDED notes). This skill holds the domain knowledge +
 | `references/test-matrix.md` | T0–T5 definitions, D1 gates, triage. |
 | `references/packaging.md` | One-command portable package, contents, output replacement and verification. |
 | `references/stream-config.md` | P6 configuration, capability/budget API and implemented versus pending modes. |
-| `references/encoded-stream.md` | P6-3 explicit backends, codec payload, bounded decode/recovery, APIs and separate integrity logs. |
+| `references/encoded-stream.md` | P6-3 MJPEG payload, bounded decode/recovery, APIs and separate integrity logs. |
+| `references/longrun-diagnostics.md` | PC1 Raw read-only six-hour recorder, optional VC_DIAG timing, isolated lifecycle/blocking regression. |
 
 ## Topology (shared-NIC since 2026-10-21: data + control on the same 2.5G port; see docs/history/plan-history.md S11)
 
