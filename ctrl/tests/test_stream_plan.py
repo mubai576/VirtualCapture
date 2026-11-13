@@ -59,6 +59,21 @@ def test_invalid_headroom(agent, headroom):
     assert agent.save_config({"transport": {"headroom_pct": headroom}})[0] == 400
 
 
+@pytest.mark.parametrize("codec", ["mjpeg", "pyrowave"])
+def test_encoded_target_is_unused_so_max_may_be_lower(agent, codec):
+    patch = {"codec": codec, "bitrate_mbps": 90, "max_bitrate_mbps": 60}
+    assert agent.save_config({"capture": patch})[0] == 200, agent.validate_config(
+        agent._merge(agent.CONFIG_DEFAULT, {"capture": patch}))
+    capture = agent.load_config()["capture"]
+    assert capture["bitrate_mbps"] == 90 and capture["max_bitrate_mbps"] == 60
+    command = agent.codec_cli(capture, "sender")
+    # Native bounds each value independently; the ignored target keeps its descriptor value.
+    assert command[command.index("--bitrate")+1] == "90000000"
+    assert command[command.index("--max-bitrate")+1] == "60000000"
+    # Raw keeps the historical max>=target validation.
+    assert agent.save_config({"capture": {"codec": "raw", "bitrate_mbps": 81, "max_bitrate_mbps": 80}})[0] == 400
+
+
 def test_pending_settings_persist_without_claiming_support(agent):
     draft = {"capture": {"width": 1024, "height": 768, "codec": "mjpeg", "transform": "fit",
                          "encoder_backend": "turbojpeg:cpu", "decoder_backend": "turbojpeg:cpu",

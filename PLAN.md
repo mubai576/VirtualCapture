@@ -91,6 +91,8 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 - P6-3 MJPEG（D21）：显式turbojpeg:cpu CPU/SIMD、JPEG质量1..100（默认80）、GOP1、每帧独立；sender/receiver和descriptor追加mjpeg_revision=1与jpeg_quality，Raw会话字段不变。VCAU codec=3只扩展48B载荷语义，28B包头不变；原码率上限/队列与SHM/DShow不变。目标码率不应用于JPEG，不自动降质；精确能力/配置确认及帧21恢复规则见skill encoded-stream，构建依赖/许可证见docs/runbooks/mjpeg.md。
 - MJPEG内存优化只调整本地缓冲生命周期：本帧借用JPEG输出、复用封装/分片/按需增容sendqueue、压缩hash不重复扫描，直接解码到未发布帧槽；错误时abandon，成功才publish。CRC/全部逐帧哈希、固定质量与原队列/限速/载荷/IPC均保留；audit_hash指标语义与故障门见skill encoded-stream。
 
+- P6 review修正（2026-11-13）：WGC按ContentSize处理窗口尺寸并显式上报关闭/回调错误；底层API源选择先校验、receiver独立转发fps；PyroWave必需DLL纳入OTA激活/备份/回滚。当前编码忽略的目标码率不约束最大码率；PyroWave同步操作5秒看门狗以原生退出码124结束挂起子进程，不在GPU挂起时阻塞清理。DShow诊断追加有序推进检查，D12停流重复允许、motion冻结不得PASS；详见skill各references。
+
 ### 1.5 全局禁止
 1. 不改包头尺寸/字段顺序。 2. 像素生成禁用浮点。 3. 原有 raw 模式禁止压缩；D21 批准的 MJPEG 为开发有损模式（H.264/H.265 已按 D23 移除），不得复用 raw 逐像素哈希门来声称有损正确性。
 4. 性能宣称必须用 `motion` 并注明 pattern/batch/adapter。 5. 跨机不报 QPC 差值延迟，只报 inter-arrival。
@@ -131,6 +133,7 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 | D22 | PC1 Raw 数小时后卡顿排查 | ✅owner（2026-11-08）：批准独立采样、生命周期修复候选、分项阻塞计时和隔离回归；不自动换已用DLL/部署、不改网卡或下游业务逻辑。六小时现场关联与整机根因仍待实用复现 | P5-LR |
 | D23 | 移除 H.264/H.265 | ✅owner（2026-11-13）：这种编解码方式不适合当前项目。移除 Media Foundation H.264/HEVC、原生 NVENC、`vc-codec-probe`/`vc-codec-roundtrip` 及全部相关测试结果/报告/开发包；保留 Raw 与 D21 的 MJPEG。不自动替换稳定部署；契约与 PLAN/AGENTS/skill 同批更新 | P6-3/P6-4 |
 | D24 | 接入 PyroWave | ✅owner（2026-11-13）：“开始 PyroWave 接入”。新增显式开发编码 `pyrowave:vulkan`（MIT，Vulkan 1.3 计算小波，intra-only），保留 Raw/MJPEG；阶段一只做 CPU 上传/回读，不做 D3D11 互操作；每帧预算=min(max_bitrate÷8÷fps, max_au−48, NV12 帧字节)，无质量旋钮；不自动回退/替换部署；双机/长稳/画质未验收。构建与限制见 `docs/runbooks/pyrowave.md` | P6-3 |
+| D25 | P6 review修正版提交/打包/部署 | ✅owner（2026-11-13）：“提交 打包 部署”。批准本轮修复提交、生成0.5.0便携包并切换双端；保留旧目录、配置与运行证据，编码仍须显式启用。执行前PC2可ping但5143拒绝连接，远端未恢复控制通道不得冒充部署完成；双机/长稳/画质仍未验收 | P6-R1发布 |
 
 ## 3. 任务卡
 
@@ -208,6 +211,10 @@ capabilities/codec-check/descriptor、48B VCAU（codec=4）、有界解码与 GU
 修复后 640²@240 回环 480/480 解码、480 个不同哈希、零丢弃（发送239.99/解码240.25 fps），不代表双机吞吐。
 未做 PC2 部署/双机/长稳/画质；证据与探针数字见`docs/bringup/bringup-20261113-pyrowave.md`，
 构建/限制见`docs/runbooks/pyrowave.md`。
+
+### P6-R1 采集与编解码 review 修正 — DONE（本机回归，2026-11-13）
+
+8项修复、总闸301 passed / 4 skipped、WGC CPU/GPU私有窗口resize/close通过、PyroWave阻塞注入与640²@240回环480/480通过；未提交/打包/部署。证据：`docs/bringup/bringup-20261113-review-fixes.md`。
 
 ### P6-4 组合验收与交付 — TODO
 

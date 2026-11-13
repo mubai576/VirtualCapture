@@ -37,7 +37,8 @@ struct VCCodec {
   bool valid(int mtu,bool encoder=true)const{
     (void)encoder;
     if(!encoded())return !specified;
-    const bool common=bitrate>=100000 && max_bitrate>=bitrate && max_bitrate<=2000000000 &&
+    // Both current codecs ignore the legacy target; only max_bitrate controls output.
+    const bool common=bitrate>=100000 && bitrate<=2000000000 && max_bitrate>=100000 && max_bitrate<=2000000000 &&
       in_flight>=1 && in_flight<=8 && max_au>=1024 && max_au<=16*1024*1024 && mtu>42 &&
       ((size_t)max_au+mtu-43)/(mtu-42)<=65535;
     if(mjpeg())return common && backend=="turbojpeg:cpu" && hardware==0 && gop==1 &&

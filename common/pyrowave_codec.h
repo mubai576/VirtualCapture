@@ -4,6 +4,7 @@
 // Header-only; only compiled into targets built with VC_HAS_PYROWAVE.
 #ifdef VC_HAS_PYROWAVE
 #include "stream.h"
+#include "operation_deadline.h"
 #include <vulkan/vulkan.h>
 #include "pyrowave.h"
 #include <algorithm>
@@ -44,6 +45,13 @@ class Codec {
   std::vector<uint8_t> bitstream;
   std::vector<pyrowave_packet> packets;
   std::vector<uint8_t> plane_cb, plane_cr;
+  VCOperationDeadline operation_deadline;
+
+  void release() {
+    if (decoder) { pyrowave_decoder_destroy(decoder); decoder = nullptr; }
+    if (encoder) { pyrowave_encoder_destroy(encoder); encoder = nullptr; }
+    if (device) { pyrowave_device_destroy(device); device = nullptr; }
+  }
 
  public:
   Codec() = default;
@@ -52,13 +60,14 @@ class Codec {
   ~Codec() { close(); }
 
   void close() {
-    if (decoder) { pyrowave_decoder_destroy(decoder); decoder = nullptr; }
-    if (encoder) { pyrowave_encoder_destroy(encoder); encoder = nullptr; }
-    if (device) { pyrowave_device_destroy(device); device = nullptr; }
+    if (!device && !encoder && !decoder) return;
+    VCOperationDeadline::Scope deadline(operation_deadline);
+    release();
   }
 
   void open(const VCStream& stream, bool encode, size_t max_bytes) {
-    close();
+    VCOperationDeadline::Scope deadline(operation_deadline);
+    release();
     width = stream.width; height = stream.height;
     frame_bytes = stream.frame_bytes();
     pyrowave_result r = pyrowave_create_default_device(&device);
@@ -84,6 +93,7 @@ class Codec {
   // Drop any pushed-but-undecoded packet without recreating the Vulkan device.
   // Frames are self-contained, so a stream discontinuity only needs a fresh decoder.
   void reset_decoder() {
+    VCOperationDeadline::Scope deadline(operation_deadline);
     if (!decoder) return;
     pyrowave_decoder_destroy(decoder); decoder = nullptr;
     pyrowave_decoder_create_info info = {};
@@ -98,6 +108,7 @@ class Codec {
 
   // NV12 in, one PyroWave packet out (the transport still owns L2 fragmentation).
   const uint8_t* encode(const uint8_t* nv12, size_t size, size_t& encoded_bytes) {
+    VCOperationDeadline::Scope deadline(operation_deadline);
     if (!encoder) throw std::runtime_error("PyroWave encoder is not open");
     if (size != frame_bytes) throw std::runtime_error("PyroWave encode expects a full NV12 frame");
     pyrowave_cpu_buffer src = {};
@@ -124,6 +135,7 @@ class Codec {
 
   // One access unit (one PyroWave packet) in, NV12 out.
   void decode(const uint8_t* data, size_t size, uint8_t* nv12, size_t nv12_bytes) {
+    VCOperationDeadline::Scope deadline(operation_deadline);
     if (!decoder) throw std::runtime_error("PyroWave decoder is not open");
     if (nv12_bytes != frame_bytes) throw std::runtime_error("PyroWave decode expects a full NV12 frame");
     check(pyrowave_decoder_push_packet(decoder, data, size), "push packet");

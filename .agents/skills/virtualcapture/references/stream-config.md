@@ -9,12 +9,17 @@
 - 自定义：偶数宽高 2..8192，整数 fps 1..1000；单帧包数不得超过 uint16。范围是软件参数校验，不是显存/吞吐/硬件认证。
 - `capture`：`width,height,fps,transform,codec,bitrate_mbps,max_bitrate_mbps`，其余 GPU/batch/MTU 等隐藏值保留。
 - 采集后端：`capture.mode=dda|wgc|pattern`；`capture.output`（0..15，默认0）选择显示器；`capture.wgc_window`（<=128 字符标题子串，空=显示器）仅 WGC 使用。WGC 仍经 DWM 合成，窗口模式包含光标，独占全屏不可采集；切换后端必须显式配置，不自动回退。
-- `codec=raw|mjpeg|pyrowave`；H.264/H.265 已于 2026-11-13 移除。码率整数 1..10000 Mbps，max>=target。MJPEG/PyroWave 的质量或每帧预算、能力与精确会话追加见encoded-stream；目标码率均不适用，最大码率仍限流。Raw 不压缩、不静默切编码或降尺寸/帧率。
+- `codec=raw|mjpeg|pyrowave`；H.264/H.265 已于 2026-11-13 移除。码率整数 1..10000 Mbps。Raw/非当前编码后端保留历史校验 max>=target；MJPEG/PyroWave 的目标码率不生效（GUI 中字段禁用），允许 max<target，原生分别独立限制每个值（100 kbps..2 Gbps）并保留描述符中的原值，最大码率仍限流。MJPEG/PyroWave 的质量或每帧预算、能力与精确会话追加见encoded-stream；Raw 不压缩、不静默切编码或降尺寸/帧率。
 - `transport.headroom_pct`：0..50，默认20，仅预算建议，不修改历史验收门限。
 
 ## 变换与限速
 
 源为 `capture.output` 指定的显示器（DDA/WGC，默认0）或 WGC 指定窗口，传输/虚拟卡尺寸与源桌面分辨率分离。不修改显示设置；DDA 旋转输出拒绝。
+WGC以帧ContentSize为有效源范围；源变大/变小先释放旧帧并按ContentSize重建帧池，丢弃过渡帧，
+不改变协商输出。crop变小到不足输出尺寸则明确失败；空/最小化暂不送帧。
+捕获项Closed、原始窗口句柄/进程身份失效和FrameArrived异常为终止错误，不再伪装成无新帧超时；
+窗口关闭不重新按标题寻找替代窗口。回调共享状态跨撤销/排队存活，
+重建与取帧串行，回调无法退出时明确失败，不回退DDA。
 
 - crop：居中 1:1，源必须不小于目标；偏移 `(source-output)/2` 下取整，保持历史 640 裁切逐字节结果。
 - stretch：源整幅映射至目标整幅。
@@ -98,6 +103,9 @@ sender 只改发出的以太帧 source，receiver 在解析 VC 包前精确过�
 CLI 追加 sender `--width/--height/--transform/--source-mac/--capabilities`，receiver
 `--width/--height/--fps/--source-mac/--capabilities`；旧无参数默认为640×640@240。
 低层 `/sender/start`、`/receiver/start` 接受成对 width/height、fps、source_mac（sender 另有 transform）；显式新字段必须先探测原生能力。
+receiver 可只给 fps（几何沿用640×640）；编码请求即使不带几何也会把默认尺寸/帧率显式下发，避免原生缺省漂移。
+sender 的 `output`（0..15）与 `wgc_window`（仅在 `mode=wgc`、<=128 单行文本）在此阶段严格校验，receiver 不接受采集选择字段；
+校验失败在停旧进程之前返回 409，坏值不会静默回退默认显示器/窗口。
 Raw 的码率参数、编码模式、收端缩放、错误几何等拒绝，不忽略。没有新字段的历史诊断调用保留原语义。
 receiver 按会话严格校验 total、seq、每包 payload_len、pattern 一致性与完整字节覆盖，迟到包不得重新发布已完成帧。
 

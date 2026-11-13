@@ -4,10 +4,13 @@ from datetime import datetime
 import json
 from pathlib import Path
 import subprocess
+import sys
 import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from dshow_sequence import verify_dshow_progression  # noqa: E402
 
 
 def validate_case(width, height, fps, frames, seconds, loss, bitrate=20, max_bitrate=80,
@@ -20,8 +23,10 @@ def validate_case(width, height, fps, frames, seconds, loss, bitrate=20, max_bit
         raise ValueError("test-seconds must be 3..122 and leave more than two seconds after frames/fps")
     if loss and frames < 45:
         raise ValueError("loss recovery requires at least 45 frames to observe the next independent frame")
-    if not 1 <= bitrate <= max_bitrate <= 2000:
-        raise ValueError("bitrate must be 1..max-bitrate, max-bitrate must be <=2000 Mbps")
+    if not 1 <= bitrate <= 2000:
+        raise ValueError("bitrate must be 1..2000 Mbps (legacy target is ignored by current backends)")
+    if not 1 <= max_bitrate <= 2000:
+        raise ValueError("max-bitrate must be 1..2000 Mbps")
     if not 1 <= batch <= 10000 or not 1 <= decode_in_flight <= 8:
         raise ValueError("batch must be 1..10000 and decode-in-flight must be 1..8")
     if not 1024 <= max_au_bytes <= 16777216:
@@ -178,10 +183,11 @@ def run_case(output, codec, encoder, decoder, width=416, height=416, fps=30, fra
         else:
             assert expected == actual
         decoded = {row["decoded_hash"] for row in received}
-        assert video and all(row["hash"] in decoded for row in video)
         if mode == "pattern":
             # Motion frames all differ; identical decoded pixels mean a plane was never written.
             assert len(decoded) == len(received), "decoded motion frames must be distinct"
+        dshow_progression = verify_dshow_progression(
+            received, video, decoded_hash_key="decoded_hash", require_motion=mode == "pattern", fps=fps)
         intervals = [b["send_qpc_ns"] - a["send_qpc_ns"] for a, b in zip(sent, sent[1:])]
         assert min(intervals) >= (10**9 + fps - 1) // fps
         window, window_bytes, peak = [], 0, 0
@@ -219,6 +225,7 @@ def run_case(output, codec, encoder, decoder, width=416, height=416, fps=30, fra
         result = {"pass": True, "codec": codec, "size": [width, height], "fps_limit": fps,
                   "frames": frames, "transport_hashes_matched": len(transported), "decoded_frames": len(received),
                   **frame_metrics(sent, received, video, mode, gpu_convert),
+                  "dshow_progression": dshow_progression,
                   "adapter": "Loopback", "batch": batch, "encoder": encoder, "decoder": decoder,
                   "encoder_hardware_category": encoder_hardware, "decoder_hardware_category": decoder_hardware,
                   "transform": transform, "test_seconds": seconds,

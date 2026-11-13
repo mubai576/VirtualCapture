@@ -226,3 +226,17 @@ def test_process_details_report_actual_capture_source(agent):
     details = agent.slot_stats("sender")
     assert details["mode"] == "pattern" and details["pattern"] == "motion"
     assert details["adapter"] == "Loopback"
+
+
+def test_process_details_report_codec_watchdog_timeout(agent, tmp_path):
+    log = tmp_path / "native.stdout.log"
+    log.write_text("codec stalled\n", encoding="utf-8")
+    class TimedOutProcess:
+        pid = 321
+        def poll(self): return 124
+    agent.state["receiver"].update(proc=TimedOutProcess(), stdout=str(log), session_id="timeout")
+    details = agent.process_details("receiver")
+    assert details["exit_code"] == 124
+    assert "5 秒" in details["error"] and "124" in details["error"]
+    assert "异常退出" not in details["error"]
+    assert details["log_tail"].strip() == "codec stalled"

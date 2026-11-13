@@ -42,7 +42,7 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 - 主机产品配置固定 `receive.shm=Local\VirtualCaptureVcamFrame`、`vcam_autoregister=true`；旧 peer_url 的 IPv4 在读取时迁移至 5143，保存时校验。接收启动前注册，正常停止、启动失败回滚、接收子进程退出（后台每秒检查）与主机正常退出时回收；只注销本目录匹配的 DLL，不碰其他目录注册。`vcam.managed` 表示待回收资源；回收失败保留状态并重试。强制终止进程不保证清理，下游已打开的 COM 实例也不会被强制关闭。
 - 产品模式缺少原生程序时直接失败，不起桩；原有低层诊断模式的桩语义保留。sender/receiver stats 可附 `adapter`（实际启动网卡）。未更改 raw L2 协议与性能判据。
 - P5-U3：产品启动检查原生进程约 1 秒内是否提前退出；提前退出返回 500，附限长原生日志，并执行已有回滚。这是启动存活检查，完整帧到达由 stats 判断；界面在 complete=0 时显示等待首帧。低层 `/sender/start`、`/receiver/start` 的启动语义不变。
-- stats 追加 `pid`、`exit_code`（运行中 null）；非零退出可附 `error`、ROOT 相对 `stdout` 与最多 2048 字符 `log_tail`。sender 附实际 `mode`、`pattern`，避免显示后台保存配置而非主机下发参数。
+- stats 追加 `pid`、`exit_code`（运行中 null）；非零退出可附 `error`、ROOT 相对 `stdout` 与最多 2048 字符 `log_tail`。`exit_code=124` 明确表示原生编解码操作超过 5 秒被看门狗强制终止（不等待可能挂起的 GPU 清理），不是普通异常退出。sender 附实际 `mode`、`pattern`，避免显示后台保存配置而非主机下发参数。
 - `auto_adapter` 在控制连接为本机回环时精确选择 `\\Device\\NPF_Loopback`，仅用于本机诊断。回环测试使用 batch=1；产品默认 batch=69、MTU=9000 不变，本机证据不能代替双机验收。
 - 控制台连接配置仅提供被采集机 IP、本机网卡和目标帧率；2026-10-29 按 owner 要求移除画面来源（含测试图案）、像素转换、发送批大小和 MTU 控件。保存时保留后台已有的隐藏参数，配置 API 与默认值不变。
 
@@ -60,7 +60,7 @@ H.264/H.265 已于 2026-11-13 移除。完整追加API/配置/descriptor/日志�
 | POST | `/stream/plan` | `{config:{...部分配置...},refresh:false}` | 200 `{revision:2,video,network,implementation,can_start,warnings[]}`；校验失败400，capture角色403；不写配置、不启停、不注册。详情、预算数学与缓存见 stream-config.md |
 
 产品主机启动额外做新鲜链路预算；已知超线速、断开网卡、MTU 不一致在注册前拒绝，
-速率未知只警告，但旧后台缺显式会话能力必须拒绝。低层接口支持成对 width/height、fps、source_mac；sender支持transform，显式新字段先探测原生能力再停旧进程。
+速率未知只警告，但旧后台缺显式会话能力必须拒绝。低层接口支持成对 width/height、fps、source_mac；sender支持transform，显式新字段先探测原生能力再停旧进程。receiver 可只给 fps（几何沿用640×640）并原样下发；sender 的 output/wgc_window 与 receiver 上的采集选择字段同样在停旧进程前严格校验，坏值或不适用的选择直接拒绝，不静默回退默认显示器/窗口。
 Raw码率参数、不支持codec、收端缩放及错误几何拒绝。主机生成descriptor、收端先起、capture逐键确认并回显，不一致回滚双端。
 两端stats追加 width/height/frame_bytes/fps_limit/codec，sender另有transform/source_skipped。28B包头与历史raw判据未变；SHM已升级v3，下游须重新打开，完整契约见stream-config.md。
 
@@ -83,10 +83,13 @@ P6-3追加只读 `POST /stream/codec-check {capture:{...}}`，实际初始化所
 - `POST /activate {version}`（缺省用已 stage 版本）或 `{rollback:true}`（用 prev）：拷贝适用条目到 live 位 →
   应答 `{activated, version, rollback, restart}`（`restart=execv`）→ 原地 `os.execv` 接管（同 argv；冻结模式切 `version.json` exe 指针到版本化 exe 并 GC 旧版）。
 - 交接期 `health/version` 短暂不可达，轮询确认；`run/updates.log` 记录每次 stage/apply/rollback。
-- Zip allowlist：顶层 `vc-agent.exe|vc-agent.py|vc-sender.exe|vc-receiver.exe|vc-vcam.dll|version.json` 加 `scripts/*.ps1`；`version.json` 必带；zip-slip（`..`/absolute）400。
+- Zip allowlist：顶层 `vc-agent.exe|vc-agent.py|vc-sender.exe|vc-receiver.exe|vc-vcam.dll|vc-testwin.exe|libpyrowave-shared-1.dll|version.json` 加 `scripts/*.ps1`；`version.json` 必带；zip-slip（`..`/absolute）400。`libpyrowave-shared-1.dll` 与 exe 同目录（开发布局 `build/`，便携包 ROOT），stage 前快照、activate 覆盖、rollback 一并恢复，避免升级后动态库与 exe 失配；仅替换运行 DLL（无 agent 自更新条目）时按非自更新包停旧会话后立即应用。
 - stage 包不含自更新条目时（只换 sender/receiver exe）直接 live 应用并返回 `{updated, version, restart:none}`（先停 sender/receiver 会话）。
 - 自更新条目（`vc-agent.exe|vc-agent.py`）若落不到 ROOT 下，整包 400 拒绝（不静默跳过）；冻结模式 ROOT 默认为 exe 所在目录，生产布局不受影响。
-- 回滚用 `prev/mirror` 走同一 activate 路径；空备份 → 409；stage 版本不符 → 409；staged agent.py 编译失败 → 500；中途失败一律 500 JSON（不断连接），轮询 `/version` 为准。
+- 回滚用 `prev/mirror` 走同一 activate 路径，恢复旧字节并移除旧快照不存在的新增受管文件。
+  activate前另存唯一的`prev/activate-live-<id>`事务快照；复制/回滚删除失败则恢复激活前状态，
+  未改变的锁定exe不重写，恢复也失败则保留事务快照供恢复，不在下一轮覆盖。
+  空备份 → 409；stage 版本不符 → 409；staged agent.py 编译失败 → 500；中途失败一律500 JSON，轮询 `/version` 为准。
 - 调用方：`scripts/update.ps1` 与 `ctrl/run_remote.py --update/--rollback` 做 stage→activate→poll `/version`；
   `health.updater` 非 ps-ok 拒绝（该处走 install-pc2.ps1）。同版本重复 stage 保留更旧的 prev 备份。
 - Windows 下 CPython execv 表现为子进程接管 + 父进程退出（非同 PID）；以 version 翻转 + 单监听 + updates.log 链为准，不以 PID 不变论。同版本冻结重装时目标即运行中镜像，apply 自动改用时间戳唯一文件名并更新指针（老文件下次启动 GC）。

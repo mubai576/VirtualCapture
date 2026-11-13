@@ -185,6 +185,86 @@ def test_update_roundtrip_and_rollback():
     finally:
         _ota_cleanup(proc, base, troot, seen)
 
+def test_stage_activate_rollback_preserves_pyrowave_runtime_dll():
+    """OTA 运行时 DLL 必须随 stage 快照、activate 覆盖和 rollback 恢复（隔离临时根）。"""
+    import pytest as _pt
+    if os.name != 'nt':
+        _pt.skip('execv flow is Windows-first')
+    troot = _ttf.mkdtemp(prefix='vc-dll-')
+    dll_live = os.path.join(troot, 'build', 'libpyrowave-shared-1.dll')
+    os.makedirs(os.path.dirname(dll_live), exist_ok=True)
+    old_dll = b'old-pyrowave-runtime'
+    new_dll = b'new-pyrowave-runtime-with-new-abi'
+    with open(dll_live, 'wb') as f:
+        f.write(old_dll)
+    proc, base, port = _ota_spawn(troot, '0.2.0')
+    seen = {proc.pid}
+    try:
+        src = os.path.join(ROOT, 'agent', 'vc-agent.py')
+        with open(src, encoding='utf-8') as f:
+            agent_source = f.read()
+        zp = os.path.join(troot, 'up-dll.zip')
+        with _tzf.ZipFile(zp, 'w', _tzf.ZIP_DEFLATED) as zf:
+            zf.writestr('version.json', json.dumps({'version': '9.9.98-dll'}))
+            zf.writestr('vc-agent.py', agent_source)
+            zf.writestr('libpyrowave-shared-1.dll', new_dll)
+        code, res = _ota_post_zip(base, zp)
+        assert code == 200 and res.get('staged') is True, (code, res)
+        with open(dll_live, 'rb') as f:
+            assert f.read() == old_dll, 'stage must not touch the live runtime DLL'
+        prev_dll = os.path.join(troot, 'prev', 'mirror', 'libpyrowave-shared-1.dll')
+        with open(prev_dll, 'rb') as f:
+            assert f.read() == old_dll, 'prev snapshot must include the managed runtime DLL'
+        _ota_activate(base, {'version': '9.9.98-dll'})
+        assert _wait_version(base, '9.9.98-dll', tries=45)
+        seen.add(_ota_health(base).get('pid'))
+        with open(dll_live, 'rb') as f:
+            assert f.read() == new_dll, 'activate must update the runtime DLL'
+        code, res = _post_start(base, '/activate', {'rollback': True})
+        assert code == 200, (code, res)
+        assert _wait_version(base, '0.2.0', tries=45)
+        seen.add(_ota_health(base).get('pid'))
+        with open(dll_live, 'rb') as f:
+            assert f.read() == old_dll, 'rollback must restore the pre-update runtime DLL'
+    finally:
+        _ota_cleanup(proc, base, troot, seen)
+
+
+def test_rollback_removes_runtime_dll_introduced_by_update():
+    """升级首次引入 DLL 时没有旧备份；rollback 必须删除它而不是留下新运行时。"""
+    import pytest as _pt
+    if os.name != 'nt':
+        _pt.skip('execv flow is Windows-first')
+    troot = _ttf.mkdtemp(prefix='vc-dlldel-')
+    dll_live = os.path.join(troot, 'build', 'libpyrowave-shared-1.dll')
+    proc, base, port = _ota_spawn(troot, '0.2.0')
+    seen = {proc.pid}
+    try:
+        assert not os.path.exists(dll_live)
+        src = os.path.join(ROOT, 'agent', 'vc-agent.py')
+        with open(src, encoding='utf-8') as f:
+            agent_source = f.read()
+        zp = os.path.join(troot, 'up-dll-new.zip')
+        with _tzf.ZipFile(zp, 'w', _tzf.ZIP_DEFLATED) as zf:
+            zf.writestr('version.json', json.dumps({'version': '9.9.98-newdll'}))
+            zf.writestr('vc-agent.py', agent_source)
+            zf.writestr('libpyrowave-shared-1.dll', b'first-introduced-runtime')
+        code, res = _ota_post_zip(base, zp)
+        assert code == 200 and res.get('staged') is True, (code, res)
+        assert not os.path.exists(os.path.join(troot, 'prev', 'mirror', 'libpyrowave-shared-1.dll'))
+        _ota_activate(base, {'version': '9.9.98-newdll'})
+        assert _wait_version(base, '9.9.98-newdll', tries=45)
+        seen.add(_ota_health(base).get('pid'))
+        assert os.path.isfile(dll_live)
+        code, res = _post_start(base, '/activate', {'rollback': True})
+        assert code == 200, (code, res)
+        assert _wait_version(base, '0.2.0', tries=45)
+        seen.add(_ota_health(base).get('pid'))
+        assert not os.path.isfile(dll_live), 'rollback must remove a runtime DLL that had no previous version'
+    finally:
+        _ota_cleanup(proc, base, troot, seen)
+
+
 def _fz_cleanup(proc, base, troot, seen):
     try:
         hp = _ota_health(base)

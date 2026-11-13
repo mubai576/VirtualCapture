@@ -40,6 +40,8 @@ python scripts/p6_codec_verify.py --codec mjpeg `
 - MJPEG两端`--encoder-hardware/--decoder-hardware`固定0；其他编码名在启动前拒绝。
 - `--test-seconds`范围3..122，DShow比receiver少观察两秒；frames/fps须严格小于剩余时长，实际较慢仍可能失败。
 - 记录源/解码/虚拟卡不同hash数、实际发送fps和receiver首包至解码的同机段；重复末帧不算新画面。
+  `dshow_progression`检查解码帧顺序关联与motion实际推进，允许D12启动/尾部重复和短停顿；
+  仅每个样本hash出现在解码集合不再算通过。静态DDA不套motion变化门，桌面A/B/A往返允许。
 - 性能排查另看发送间隔分布、真实解码fps、sender采集开始至发送开始及最近10000帧分段timing_ms；encode_wait_ns包含调度，不是纯GPU时长。
   编码receiver计时修正为Npcap返回后，旧报告的decode_pipeline_ms含读取阻塞，不能直接对比为解码收益；详见skill encoded-stream。
 - 脚本不创建/移动动画窗口，DDA测试须提供变化桌面，且crop区域确实包含变化内容；这不是画质/长稳或双机验收。
@@ -50,6 +52,13 @@ python scripts/p6_codec_verify.py --codec mjpeg `
   具体命令、SIMD依赖/许可证及本机合成源与DDA结果见`mjpeg.md`和`../bringup/bringup-20261103-mjpeg.md`。
 
 双机并存与切换门禁见`p6-cutover.md`，须owner确认，不直接套用历史18080割接脚本。
+
+## WGC 隔离回归
+
+`python -m pytest ctrl/tests/test_wgc_regression.py -q` 编译并运行纯几何/生命周期回归。
+显式设置环境变量 `VC_WGC_LIVE=1` 可加跑 CPU/GPU 私有窗口捕获：仅创建本轮窗口子进程，
+放大/缩小源并检查输出仍为640×640，关闭后要求明确E_CLOSED；不使用网卡、不注册虚拟卡、
+不触碰稳定agent。无交互桌面/硬件能力可SKIP，不计为通过。它是功能回归，不是motion性能测试。
 
 ## 原生辅助工具
 

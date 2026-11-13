@@ -250,6 +250,19 @@ assert(!dirty && element('c_width').value === 640 && element('c_codec').value ==
 """)
 
 
+def test_disabled_target_does_not_block_lower_max_for_encoded(client):
+    check(client, FORM + """
+element('c_codec').value = 'mjpeg';
+element('c_bitrate').value = '90';
+element('c_max_bitrate').value = '60';
+markDirty({target:element('c_codec')});
+assert(element('c_bitrate').disabled, 'target bitrate stays disabled for constant-quality MJPEG');
+const cp = readConfig().capture;
+assert.equal(cp.bitrate_mbps,90);
+assert.equal(cp.max_bitrate_mbps,60,'visible max must survive even when the unused target is higher');
+""")
+
+
 def test_mjpeg_selection_exposes_quality_and_explicit_cpu_backend(client):
     check(client, FORM + """
 element('c_codec').value='mjpeg'; markDirty({target:element('c_codec')});

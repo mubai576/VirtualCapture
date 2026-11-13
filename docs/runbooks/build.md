@@ -105,7 +105,9 @@ python -m PyInstaller packaging/vc-agent.spec
 ## Release zip
 
 版本以 `version.json` 为准。包内包含 `vc-agent.exe`、`vc-sender.exe`、`vc-receiver.exe`、
-`vc-vcam.dll`、`version.json` 与所需 `scripts/*.ps1`；原生文件取上述 Release 产物。
+`vc-vcam.dll`、`libpyrowave-shared-1.dll`、`version.json` 与所需 `scripts/*.ps1`；原生文件取上述 Release 产物。
+PyroWave DLL是sender/receiver的必需运行时（即便选择Raw），与exe同批更新并纳入备份/回滚。
+旧agent若不接受该DLL，先单独更新agent，再stage完整运行时；不要直接向旧白名单上传新完整包。
 使用 `Compress-Archive` 生成 `release/vc-<ver>.zip`；`pc2-cutover.md`仅为历史0.3.7/18080割接，P6双机并存与实际切换须按`p6-cutover.md`重新批准，不直接照搬。
 完整便携目录包含白名单之外的工具与文档，不能直接整体压缩上传 `/update`；OTA zip 仍按本节选取允许的文件。
 构建验证本身不打包、不注册 DLL、不触发 OTA。

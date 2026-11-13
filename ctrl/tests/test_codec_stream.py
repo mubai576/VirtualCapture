@@ -52,6 +52,8 @@ def test_drafts_require_opt_in_and_both_backend_identities(agent):
     for key, value in (("codec_experimental", False), ("encoder_backend", ""), ("decoder_backend", "")):
         assert agent.stream_implementation_errors(dict(capture, **{key: value}))
     assert agent.stream_implementation_errors(dict(capture, max_bitrate_mbps=2001))
+    assert agent.stream_implementation_errors(dict(capture, bitrate_mbps=2001, max_bitrate_mbps=60))
+    assert agent.stream_implementation_errors(dict(capture, bitrate_mbps=3000, max_bitrate_mbps=60))
 
 
 @pytest.mark.parametrize("patch", [{"encoder_hardware": True}, {"codec_experimental": "true"},

@@ -62,6 +62,15 @@ def exe_path(kind):
         if os.path.exists(cand): return cand
     return p  # return expected path so error message is clear
 
+def runtime_path(name):
+    # 运行 DLL 与 exe 同目录；开发布局在 build，便携包在 ROOT。
+    p = os.path.join(BUILD_DIR, name)
+    if os.path.exists(p): return p
+    for cand in [os.path.join(BUILD_DIR, "Release", name), os.path.join(BUILD_DIR, "Debug", name),
+                 os.path.join(ROOT, name)]:
+        if os.path.exists(cand): return cand
+    return os.path.join(ROOT if getattr(sys, "frozen", False) else BUILD_DIR, name)
+
 def kill_slot(slot):
     # 停槽位进程（优雅2s再杀）
     p = slot.get("proc")
@@ -135,12 +144,15 @@ def launch(kind, args):
         if args.get("loop"): cmd += ["--loop"]
         if args.get("gpu_convert") is True: cmd += ["--gpu-convert"]  # P5：产品模式 dda 默认走 GPU
         if "output" in args:
-            try: _out = int(args["output"])
-            except Exception: _out = 0
-            if 0 <= _out <= 15: cmd += ["--output", str(_out)]
+            _out = args["output"]
+            if not _is_int(_out, 0, 15):
+                raise ValueError("output 必须是 0..15 的整数，不能静默回退到 0。")
+            cmd += ["--output", str(_out)]
         if args.get("mode") == "wgc" and args.get("wgc_window"):
             _win = str(args["wgc_window"])
-            if len(_win) <= 128 and all(ord(ch) >= 32 for ch in _win): cmd += ["--wgc-window", _win]
+            if len(_win) > 128 or any(ord(ch) < 32 for ch in _win):
+                raise ValueError("wgc_window 必须是 <=128 字符的单行文本。")
+            cmd += ["--wgc-window", _win]
         _b = args.get("batch", 69)
         try: _b = int(_b)
         except Exception: _b = 69
@@ -159,7 +171,9 @@ def launch(kind, args):
         _shm = args.get("shm", None)
         if _shm:
             cmd += ["--shm", str(_shm)]
-    if any(key in args for key in ("width", "height", "source_mac", "transform")):
+    # 显式几何、fps-only 接收和编码会话都要把实际默认值下发明示，不能依赖原生缺省漂移。
+    if (any(key in args for key in ("width", "height", "source_mac", "transform"))
+            or (kind == "receiver" and "fps" in args) or args.get("codec", "raw") != "raw"):
         cmd += ["--width", str(args.get("width", 640)), "--height", str(args.get("height", 640))]
         if kind == "receiver": cmd += ["--fps", str(args.get("fps", 240))]
         if kind == "sender": cmd += ["--transform", str(args.get("transform", "crop"))]
@@ -304,14 +318,18 @@ def process_details(kind):
     code = proc.poll()
     out.update(pid=getattr(proc, "pid", None), exit_code=code)
     if code is not None and code != 0:
+        label = "采集" if kind == "sender" else "接收"
         path = slot.get("stdout", "")
         try:
             with open(path, "rb") as f:
                 f.seek(0, os.SEEK_END); size = f.tell(); f.seek(max(0, size - 4096))
                 out["log_tail"] = f.read().decode("utf-8", errors="replace")[-2048:]
         except OSError: pass
-        label = "采集" if kind == "sender" else "接收"
-        out["error"] = "%s程序异常退出（退出码 %s），请检查运行日志。" % (label, code)
+        if code == 124:
+            # 原生看门狗超时后直接 _Exit(124)，不等待可能挂死的 GPU/编解码清理。
+            out["error"] = "%s程序编码/解码操作超过 5 秒，看门狗强制终止（退出码 124）。" % label
+        else:
+            out["error"] = "%s程序异常退出（退出码 %s），请检查运行日志。" % (label, code)
         if path: out["stdout"] = os.path.relpath(path, ROOT).replace(os.sep, "/")
     return out
 
@@ -459,7 +477,8 @@ def run_exec(argv, timeout_s, client):
 UPDATE_LOCK = threading.RLock()
 UPDATE_MAX_ZIP = 100 * 1024 * 1024
 UPDATE_MAX_FILES = 1000
-UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "vc-testwin.exe", "version.json"}
+UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll",
+                       "vc-testwin.exe", "libpyrowave-shared-1.dll", "version.json"}
 
 
 FILES_MAX_BYTES = 262144
@@ -524,6 +543,8 @@ def _update_slots():
     m["vc-receiver.exe"] = os.path.join(BUILD_DIR, "vc-receiver.exe")
     m["vc-vcam.dll"] = os.path.join(BUILD_DIR, "vc-vcam.dll")
     m["vc-testwin.exe"] = os.path.join(BUILD_DIR, "vc-testwin.exe")
+    # PyroWave 运行时与 exe 同目录；必须纳入备份/回滚，否则升级后 DLL 与 exe 失配。
+    m["libpyrowave-shared-1.dll"] = runtime_path("libpyrowave-shared-1.dll")
     m["version.json"] = VERSION_FILE
     return m
 
@@ -558,7 +579,8 @@ def _safe_zip_entries(zf):
 
 def _live_for_rel(rel, slots):
     # 判运行文件绝对路径
-    if rel in ("vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "vc-testwin.exe", "version.json"):
+    if rel in ("vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll",
+               "vc-testwin.exe", "libpyrowave-shared-1.dll", "version.json"):
         return slots.get(rel)
     if rel.startswith("scripts/"):
         return os.path.join(ROOT, rel.replace("/", os.sep))
@@ -607,6 +629,44 @@ def _all_managed_files():
     except Exception:
         pass
     return _out
+
+def _managed_rel(rel):
+    return str(rel).replace(os.sep, "/")
+
+
+def _snapshot_live_managed(dest):
+    """记录 activate 前的受管文件；失败时据此恢复并删除本次首次新增的文件。"""
+    import shutil as _sh
+    if os.path.isdir(dest):
+        _sh.rmtree(dest, ignore_errors=True)
+    rels = set()
+    for _rel, _live in _all_managed_files():
+        _key = _managed_rel(_rel)
+        if os.path.isfile(_live):
+            rels.add(_key)
+            _dst = os.path.join(dest, _key)
+            os.makedirs(os.path.dirname(_dst), exist_ok=True)
+            _sh.copy2(_live, _dst)
+    return rels
+
+
+def _restore_live_managed(dest, before):
+    import shutil as _sh
+    import filecmp as _fc
+    for _rel, _live in _all_managed_files():
+        _key = _managed_rel(_rel)
+        _src = os.path.join(dest, _key)
+        if _key in before and os.path.isfile(_src):
+            # A frozen agent's own image is locked on Windows; do not rewrite
+            # unchanged files merely because a different payload failed to copy.
+            if os.path.isfile(_live) and _fc.cmp(_src, _live, shallow=False):
+                continue
+            os.makedirs(os.path.dirname(_live), exist_ok=True)
+            _sh.copy2(_src, _live)
+        elif _key not in before and os.path.isfile(_live):
+            # 升级首次引入的文件没有旧版本，失败恢复必须删除而不是留下半套运行时。
+            os.remove(_live)
+
 
 def _full_prev_snapshot():
     # 全量备份prev（回滚用）
@@ -756,7 +816,31 @@ def _do_activate(ver_or_none, is_rollback):
             code, cleanup = vcam_unregister()
             if code != 200: return code, {"error": "升级前虚拟采集卡回收失败", "vcam": cleanup}
         _vn = _want if isinstance(_want, str) and _want else "rollback"
-        _applied, _exe_live = _apply_staged_to_live(_target, _vn)
+        _live_snap = os.path.join(ROOT, "prev", "activate-live-" + uuid.uuid4().hex)
+        try:
+            _before = _snapshot_live_managed(_live_snap)
+        except Exception as failure:
+            return 500, {"error": "cannot snapshot live files before activate: %s" % failure}
+        try:
+            _applied, _exe_live = _apply_staged_to_live(_target, _vn)
+            if is_rollback:
+                # Restore absence as well as bytes, within the same failure-recovery transaction.
+                _prev_rels = {_managed_rel(os.path.relpath(os.path.join(dp, name), _target))
+                              for dp, _, names in os.walk(_target) for name in names}
+                for _rel, _live in _all_managed_files():
+                    if _managed_rel(_rel) not in _prev_rels and os.path.isfile(_live):
+                        os.remove(_live)
+        except Exception as _e:
+            try:
+                _restore_live_managed(_live_snap, _before)
+            except Exception as _e2:
+                # Preserve the recovery snapshot when restoration itself fails.
+                return 500, {"error": "activate failed: %s; live restore also failed: %s; snapshot retained" % (_e, _e2)}
+            import shutil as _sh
+            _sh.rmtree(_live_snap, ignore_errors=True)
+            return 500, {"error": "activate failed: %s; live files restored" % _e}
+        import shutil as _sh
+        _sh.rmtree(_live_snap, ignore_errors=True)
         if not _applied:
             return 500, {"error": "nothing applied"}
         if getattr(sys, "frozen", False) and isinstance(_want, str) and _want and _exe_live:
@@ -1019,9 +1103,10 @@ def validate_config(c):
     if cp.get("gop_frames") != 1: e.append("当前编码均为每帧独立，gop_frames 必须为 1。")
     for key in ("bitrate_mbps", "max_bitrate_mbps"):
         if not _is_int(cp.get(key), 1, 10000): e.append("capture.%s 必须是 1..10000 的整数。" % key)
-    if (_is_int(cp.get("bitrate_mbps"), 1, 10000) and _is_int(cp.get("max_bitrate_mbps"), 1, 10000)
+    if (cp.get("codec") not in ("mjpeg", "pyrowave")
+            and _is_int(cp.get("bitrate_mbps"), 1, 10000) and _is_int(cp.get("max_bitrate_mbps"), 1, 10000)
             and cp["max_bitrate_mbps"] < cp["bitrate_mbps"]):
-        e.append("最大码率不能低于目标码率。")
+        e.append("Raw/非当前编码后端仍要求最大码率不低于目标码率。")
     if not _is_int(c["transport"].get("headroom_pct"), 0, 50):
         e.append("transport.headroom_pct 必须是 0..50 的整数。")
     if not _is_int(cp.get("fps"), 1, 1000): e.append("capture.fps 1..1000")
@@ -1090,7 +1175,9 @@ def stream_implementation_errors(capture):
     errors = []
     if not capture.get("codec_experimental") or not capture.get("encoder_backend") or not capture.get("decoder_backend"):
         errors.append("编码链路为开发功能：须明确启用，并选择编码和解码后端；不会自动选择或回退。")
-    if _is_int(capture["max_bitrate_mbps"], 2001, 10000): errors.append("当前编码链路最大码率参数上限为 2000 Mbps。")
+    for key in ("bitrate_mbps", "max_bitrate_mbps"):
+        if _is_int(capture[key], 2001, 10000):
+            errors.append("当前编码链路 %s 参数上限为 2000 Mbps。" % key)
     if (_is_int(capture["mtu"], 1500, 9000) and _is_int(capture["max_au_bytes"], 1024, 16777216) and
             (capture["max_au_bytes"] + capture["mtu"] - 43) // (capture["mtu"] - 42) > 65535):
         errors.append("编码访问单元上限超过冻结包头允许的分片数。")
@@ -1265,13 +1352,38 @@ def validate_stream_session(session, capture):
     return []
 
 
+def low_level_selector_errors(kind, args):
+    """显式采集选择参数必须校验；不能把坏值静默替换成默认显示器/窗口。"""
+    errors = []
+    if kind == "receiver":
+        for key in ("output", "wgc_window"):
+            if key in args:
+                errors.append("接收端不接受采集选择参数 %s。" % key)
+        return errors
+    mode = args.get("mode", "pattern")
+    if "mode" in args and mode not in ("pattern", "file", "dda", "wgc"):
+        errors.append("mode 必须是 pattern|file|dda|wgc。")
+    if "output" in args and not _is_int(args.get("output"), 0, 15):
+        errors.append("output 必须是 0..15 的整数，不能静默回退到 0。")
+    if "wgc_window" in args:
+        window = args.get("wgc_window")
+        if not isinstance(window, str) or len(window) > 128 or any(ord(ch) < 32 for ch in window):
+            errors.append("wgc_window 必须是 <=128 字符的单行文本。")
+        elif window and mode != "wgc":
+            errors.append("wgc_window 仅在 mode=wgc 时有效，不能静默忽略。")
+    return errors
+
+
 def low_level_stream_errors(kind, args):
     fields = ("width", "height", "transform", "codec", "source_mac", *CODEC_FIELDS, *MJPEG_FIELDS)
-    if not any(key in args for key in fields): return []
+    selector_errors = low_level_selector_errors(kind, args)
+    # 只有显式流字段才需要 P6 原生探测；output/wgc_window 仍先校验，但不把旧诊断拉进能力协商。
+    trigger = fields + (("fps",) if kind == "receiver" else ())
+    if not any(key in args for key in trigger): return selector_errors
     if ("width" in args) != ("height" in args): return ["必须同时提供 width 和 height。"]
     capture = _merge(CONFIG_DEFAULT["capture"], {key: args[key] for key in (*fields, "fps", "mtu") if key in args and key != "source_mac"})
     config = _merge(CONFIG_DEFAULT, {"capture": capture})
-    errors = validate_config(config) + stream_implementation_errors(capture)
+    errors = validate_config(config) + stream_implementation_errors(capture) + selector_errors
     if capture["codec"] == "raw" and any(key in args for key in (*CODEC_FIELDS, *MJPEG_FIELDS)): errors.append("Raw 不接受编码参数。")
     if capture["codec"] != "mjpeg" and any(key in args for key in MJPEG_FIELDS): errors.append("非 MJPEG 后端不接受 JPEG 质量参数。")
     if kind == "receiver" and args.get("transform", "crop") != "crop": errors.append("接收端不能再次变换像素。")
@@ -1619,7 +1731,7 @@ def _product_local_start(args, controller_ip):
                                              "fps": cp["fps"], "frames": 0, "mtu": cp["mtu"], "batch": cp["batch"],
                                              "dst_mac": cp["dst_mac"], "gpu_convert": cp["gpu_convert"],
                                              **({"output": cp["output"]} if cp.get("output") not in (None, "") else {}),
-                                             **({"wgc_window": cp["wgc_window"]} if cp.get("wgc_window") else {}),
+                                             **({"wgc_window": cp["wgc_window"]} if cp.get("wgc_window") and cp.get("mode") == "wgc" else {}),
                                              **({"width": cp["width"], "height": cp["height"], "transform": cp["transform"],
                                                  "source_mac": descriptor["source_mac"]} if descriptor else {}),
                                              **({"codec": cp["codec"], **codec_payload(cp)} if cp["codec"] != "raw" else {})})

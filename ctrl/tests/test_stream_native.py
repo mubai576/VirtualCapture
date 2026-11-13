@@ -90,6 +90,105 @@ def test_new_options_forward_only_after_capability_confirmation(agent, monkeypat
             assert command[command.index(flag)+1] == value
 
 
+def _fake_native_launch(agent, monkeypatch, tmp_path):
+    exe = tmp_path / "native.exe"
+    exe.touch()
+    monkeypatch.setattr(agent, "exe_path", lambda kind: str(exe))
+    monkeypatch.setattr(agent, "RUN_DIR", str(tmp_path / "run"))
+    monkeypatch.setattr(agent, "stream_native_errors", lambda kind: [])
+    calls = []
+    class Process:
+        pid = 123
+    monkeypatch.setattr(agent.subprocess, "Popen", lambda cmd, **kwargs: (calls.append(cmd) or Process()))
+    return calls
+
+
+def test_receiver_fps_without_geometry_is_forwarded(agent, monkeypatch, tmp_path):
+    calls = _fake_native_launch(agent, monkeypatch, tmp_path)
+    args = {"adapter": "Loopback", "fps": 120}
+    assert agent.low_level_stream_errors("receiver", args) == []
+    assert agent.low_level_stream_errors("receiver", {"fps": 0}) != []
+    agent.launch("receiver", args)
+    command = calls[-1]
+    assert command[command.index("--fps")+1] == "120"
+    assert command[command.index("--width")+1] == "640"
+    assert command[command.index("--height")+1] == "640"
+
+
+def test_encoded_no_geometry_forwards_session_defaults_and_target_value(agent, monkeypatch, tmp_path):
+    calls = _fake_native_launch(agent, monkeypatch, tmp_path)
+    monkeypatch.setattr(agent, "native_stream_capabilities",
+                        lambda kind: {"codec_revision": 1, "codecs": ["mjpeg"], "mjpeg_revision": 1})
+    monkeypatch.setattr(agent, "native_codec_request", lambda kind, capture: {"configured": True})
+    args = {"adapter": "Loopback", "codec": "mjpeg", "codec_experimental": True,
+            "encoder_backend": "turbojpeg:cpu", "decoder_backend": "turbojpeg:cpu",
+            "bitrate_mbps": 90, "max_bitrate_mbps": 60}
+    for kind in ("sender", "receiver"):
+        assert agent.low_level_stream_errors(kind, args) == []
+        agent.launch(kind, args)
+        command = calls[-1]
+        assert command[command.index("--codec")+1] == "mjpeg"
+        assert command[command.index("--bitrate")+1] == "90000000"
+        assert command[command.index("--max-bitrate")+1] == "60000000"
+        assert command[command.index("--width")+1] == "640"
+        assert command[command.index("--height")+1] == "640"
+        if kind == "receiver":
+            assert command[command.index("--fps")+1] == "240"
+
+
+def test_invalid_capture_selectors_are_rejected_before_killing_old_process(agent, monkeypatch, tmp_path):
+    calls = _fake_native_launch(agent, monkeypatch, tmp_path)
+    old = object()
+    agent.state["sender"]["proc"] = old
+    killed = []
+    monkeypatch.setattr(agent, "kill_slot", lambda slot: killed.append(slot))
+    invalid = [
+        {"adapter": "Loopback", "mode": "bogus"},
+        {"adapter": "Loopback", "mode": "wgc", "output": 16},
+        {"adapter": "Loopback", "mode": "wgc", "output": "1"},
+        {"adapter": "Loopback", "mode": "wgc", "wgc_window": "bad\nname"},
+        {"adapter": "Loopback", "mode": "wgc", "wgc_window": "x" * 129},
+        {"adapter": "Loopback", "mode": "dda", "wgc_window": "Game Window"},
+        {"adapter": "Loopback", "wgc_window": "Game Window"},
+    ]
+    for args in invalid:
+        assert agent.low_level_stream_errors("sender", args)
+        with pytest.raises(ValueError):
+            agent.launch("sender", args)
+    assert agent.low_level_stream_errors("receiver", {"adapter": "Loopback", "output": 0})
+    with pytest.raises(ValueError):
+        agent.launch("receiver", {"adapter": "Loopback", "output": 0})
+    assert killed == [] and agent.state["sender"]["proc"] is old and not calls
+
+
+def test_valid_wgc_selectors_are_forwarded_not_fallen_back(agent, monkeypatch, tmp_path):
+    calls = _fake_native_launch(agent, monkeypatch, tmp_path)
+    args = {"adapter": "Loopback", "mode": "wgc", "output": 2, "wgc_window": "Game Window"}
+    assert agent.low_level_stream_errors("sender", args) == []
+    agent.launch("sender", args)
+    command = calls[-1]
+    assert command[command.index("--output")+1] == "2"
+    assert command[command.index("--wgc-window")+1] == "Game Window"
+
+
+def test_sender_absent_mode_defaults_to_pattern_without_window(agent, monkeypatch, tmp_path):
+    calls = _fake_native_launch(agent, monkeypatch, tmp_path)
+    assert agent.low_level_stream_errors("sender", {"adapter": "Loopback"}) == []
+    agent.launch("sender", {"adapter": "Loopback"})
+    command = calls[-1]
+    assert command[command.index("--mode")+1] == "pattern"
+    assert "--wgc-window" not in command
+
+
+def test_pyrowave_runtime_slot_tracks_packaged_root_layout(agent, monkeypatch, tmp_path):
+    monkeypatch.setattr(agent, "BUILD_DIR", str(tmp_path / "build"))
+    (tmp_path / "libpyrowave-shared-1.dll").write_bytes(b"packaged")
+    assert agent._update_slots()["libpyrowave-shared-1.dll"] == str(tmp_path / "libpyrowave-shared-1.dll")
+    (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "libpyrowave-shared-1.dll").write_bytes(b"dev")
+    assert agent._update_slots()["libpyrowave-shared-1.dll"] == str(tmp_path / "build" / "libpyrowave-shared-1.dll")
+
+
 def test_old_peer_is_rejected_before_registration(agent, monkeypatch):
     agent.save_config({"adapter": "Loopback", "peer_url": "http://192.168.2.59:5143"})
     monkeypatch.setattr(agent, "peer_call", lambda *a, **k: (200, {"product_revision": 2, "product_role": "capture"}))

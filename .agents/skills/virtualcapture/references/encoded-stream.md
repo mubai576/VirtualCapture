@@ -20,7 +20,9 @@ GUI 默认仍为 Raw；二者都必须明确选择匹配的两端后端并启用
 | max_au_bytes | 8388608 | 1024..16777216，含48B封装的访问单元内存上限；还须满足 uint16 分片数 |
 | jpeg_quality | 80 | 仅 MJPEG：整数质量1..100，固定420/快速整数DCT |
 
-原 bitrate_mbps / max_bitrate_mbps 保留；编码实现只接受 target<=max<=2000 Mbps。
+原 bitrate_mbps / max_bitrate_mbps 保留；编码实现分别校验两者范围，不要求 target<=max：
+当前后端不应用目标码率，禁用的旧目标值不得阻止有效最大码率配置。原生两项均为0.1..2000 Mbps，
+产品配置仍分别为1..10000 Mbps（编码启动最大值受原生2000 Mbps限制）。
 目标码率不对现有后端生效：MJPEG 用恒定质量，PyroWave 只把 `max_bitrate÷fps` 当每帧字节上限；
 最大值由 sender 按访问单元发送起点的一秒滑窗限制（计48B封装，不计L2开销）。
 整个访问单元超过一秒预算或 max_au_bytes 时失败，不豁免、不降质量/尺寸/fps。
@@ -174,6 +176,10 @@ GPU 忙/设备丢失按解码错误处理并重置，不静默换设备。
 这样才能避免设备创建时间长于帧周期、接收队列反复溢出形成重置死循环（2026-11-13 实测并修复）。
 gop_frames 固定为 1；源静止时没有恢复墙钟上限。
 解码 pending 上限由 decode_in_flight 明确指定；5 秒无法输出则失败，不自动增加队列。
+PyroWave 的创建、编码/取包、解码、重置和销毁各由独立看门狗覆盖整个同步调用，单次操作5秒未返回
+则以退出码124终止该原生子进程（agent按子进程退出报告失败）。不尝试在挂起的GPU调用上展开栈、
+销毁设备或join工作线程，不做进程内恢复/自动换设备；最新stats可能未刷新，以进程状态为准。
+正常静止/无输入时看门狗不计时；这不是驱动或整机故障恢复保证。
 解码报错会记录并重置；不能偷偷换 codec/设备/尺寸。输出严格验证时间戳、顺序、NV12 尺寸/stride/aperture。
 发布 SHM v3 与 DShow 契约不变；D12 只允许重复已验证的最后好帧，从无有效帧不造图。
 
@@ -235,4 +241,9 @@ MJPEG 诊断需明确两端 turbojpeg:cpu 且 hardware=0；原 H.264/HEVC 参数
 额外核对 `encoder_configuration` 的全部字段与每帧字节上限，并对 motion 源断言每个解码帧哈希互不相同
 （缺失亮度等"只更新色度"的缺陷会因此失败）。`scripts/p6_product_verify.py` 也已接受
 `--codec pyrowave --encoder/--decoder pyrowave:vulkan`（隔离 HTTP/真实原生/DShow，注册为替身）。
+两者追加`dshow_progression`：样本哈希关联到receiver解码序列，允许停流时重复最后好帧，
+不得倒退；motion必须观察到多个不同帧的实际推进，不能永远重复任意一个合法解码帧。
+codec脚本结束时须到达最后解码帧；product脚本先停止下游，允许至多四分之一秒（按fps折算）尾差。
+启动/尾部重复与短时内部停顿允许；DDA/WGC静态桌面不套用motion变化门。仅按序列与哈希检查，
+不比较跨机QPC，不声称有损source与decoded像素相等，不改变历史Raw test-matrix判据。
 两者都只是本机功能证据，不得据此声称产品级/双机验收。

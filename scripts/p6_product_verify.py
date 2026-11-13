@@ -5,12 +5,15 @@ import importlib.util
 import json
 from pathlib import Path
 import subprocess
+import sys
 import threading
 import time
 import uuid
-from p6_codec_verify import codec_options
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from p6_codec_verify import codec_options  # noqa: E402
+from dshow_sequence import verify_dshow_progression  # noqa: E402
 
 
 def main():
@@ -105,12 +108,14 @@ def main():
         expected = {row["frame_id"]: row[sent_key] for row in sent}
         assert len(expected) >= 90
         assert expected == {row["frame_id"]: row[sent_key] for row in received}
-        decoded = {row[received_key] for row in received}
-        assert samples and all(row["hash"] in decoded for row in samples)
+        dshow_progression = verify_dshow_progression(
+            received, samples, decoded_hash_key=received_key, require_motion=True, fps=30,
+            max_terminal_lag=max(1, 30 // 4))
         assert min(b["send_qpc_ns"] - a["send_qpc_ns"] for a, b in zip(sent, sent[1:])) >= 33333334
         result = {"pass": True, "codec": options.codec, "size": [418, 282], "fps_limit": 30, "mode": "pattern", "pattern": "motion",
                   "batch": 1, "adapter": "Loopback", "sent": len(sent), "received": len(received),
-                  "vcam_samples": len(samples), "session": rx["stream"], "registry_operations": registration,
+                  "vcam_samples": len(samples), "dshow_progression": dshow_progression,
+                  "session": rx["stream"], "registry_operations": registration,
                   "encoder_configuration": sender_stats.get("encoder_configuration"),
                   "boundary": "private roots/map/random HTTP port; registry replaced; real native children and DShow"}
         (output / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
