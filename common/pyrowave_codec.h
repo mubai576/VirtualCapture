@@ -43,7 +43,7 @@ class Codec {
   size_t frame_bytes = 0, max_frame_bytes = 0;
   std::vector<uint8_t> bitstream;
   std::vector<pyrowave_packet> packets;
-  std::vector<uint8_t> plane_y, plane_cb, plane_cr;
+  std::vector<uint8_t> plane_cb, plane_cr;
 
  public:
   Codec() = default;
@@ -76,7 +76,6 @@ class Codec {
       info.device = device; info.width = width; info.height = height;
       info.chroma = PYROWAVE_CHROMA_SUBSAMPLING_420;
       check(pyrowave_decoder_create(&info, &decoder), "decoder creation");
-      plane_y.resize((size_t)width * height);
       plane_cb.resize((size_t)(width / 2) * (height / 2));
       plane_cr.resize(plane_cb.size());
     }
@@ -130,12 +129,14 @@ class Codec {
     check(pyrowave_decoder_push_packet(decoder, data, size), "push packet");
     if (!pyrowave_decoder_decode_is_ready(decoder, false))
       throw std::runtime_error("PyroWave frame incomplete");
+    // Luma decodes straight into the caller's NV12 buffer; chroma goes to planes
+    // that are interleaved into NV12 UV below. Never leave Y as stale slot data.
     pyrowave_cpu_buffer dst = {};
-    dst.data[0] = plane_y.data(); dst.data[1] = plane_cb.data(); dst.data[2] = plane_cr.data();
+    dst.data[0] = nv12; dst.data[1] = plane_cb.data(); dst.data[2] = plane_cr.data();
     dst.row_stride_in_bytes[0] = (size_t)width;
     dst.row_stride_in_bytes[1] = (size_t)width / 2;
     dst.row_stride_in_bytes[2] = (size_t)width / 2;
-    dst.plane_size_in_bytes[0] = plane_y.size();
+    dst.plane_size_in_bytes[0] = (size_t)width * height;
     dst.plane_size_in_bytes[1] = plane_cb.size();
     dst.plane_size_in_bytes[2] = plane_cr.size();
     dst.width = width; dst.height = height;
@@ -174,9 +175,17 @@ inline int selftest() {
     size_t bytes = 0;
     const uint8_t* au = enc.encode(nv12.data(), nv12.size(), bytes);
     dec.decode(au, bytes, out.data(), out.size());
-    size_t nonzero = 0; for (size_t i = 0; i < out.size(); i++) nonzero += out[i] != 0;
-    if (!bytes || !nonzero) { printf("PYROWAVE: FAIL empty frame\n"); return 1; }
-    printf("PYROWAVE: PASS %dx%d bytes=%zu nonzero=%zu\n", stream.width, stream.height, bytes, nonzero);
+    const size_t y_bytes = (size_t)stream.width * stream.height;
+    size_t y_nonzero = 0, uv_nonzero = 0;
+    for (size_t i = 0; i < out.size(); i++) {
+      if (i < y_bytes) y_nonzero += out[i] != 0; else uv_nonzero += out[i] != 0;
+    }
+    if (!bytes || !y_nonzero || !uv_nonzero) {
+      printf("PYROWAVE: FAIL empty luma or chroma (%zu/%zu)\n", y_nonzero, uv_nonzero);
+      return 1;
+    }
+    printf("PYROWAVE: PASS %dx%d bytes=%zu y_nonzero=%zu uv_nonzero=%zu\n",
+           stream.width, stream.height, bytes, y_nonzero, uv_nonzero);
     return 0;
   } catch (const std::exception& e) {
     std::string what = e.what();

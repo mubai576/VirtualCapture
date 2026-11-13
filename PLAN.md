@@ -203,8 +203,9 @@ capabilities/codec-check/descriptor、48B VCAU（codec=4）、有界解码与 GU
 640² motion/batch1/Loopback 120fps 120/120、30fps 60/60 解码，零丢包/零传输错/零解码错，压缩 hash 与 sender 全量一致；
 `p6_codec_verify.py --codec pyrowave` 含 DShow 全对账与 `--loss` 帧21恢复均 PASS；
 `p6_product_verify.py --codec pyrowave` 隔离HTTP→真实原生→DShow（418×282）117/117 通过（同时修复该脚本 raw 分支被误拒）。
-期间发现并修复：流断档不再重建 Vulkan 设备（只重建解码器对象），否则设备创建慢于帧周期会触发队列丢弃死循环。
-240fps 同机双端因发送线程抢占出现解码队列丢弃（114），不据此判定编解码吞吐，也不放宽队列。
+期间发现并修复两个真实缺陷：①流断档不再重建 Vulkan 设备（只重建解码器对象），否则设备创建慢于帧周期会触发队列丢弃死循环；
+②解码亮度原先未写回 NV12 输出（只写了UV），240fps 480帧只有256个不同解码哈希；现亮度直写会话缓冲并加自检/断言。
+修复后 640²@240 回环 480/480 解码、480 个不同哈希、零丢弃（发送239.99/解码240.25 fps），不代表双机吞吐。
 未做 PC2 部署/双机/长稳/画质；证据与探针数字见`docs/bringup/bringup-20261113-pyrowave.md`，
 构建/限制见`docs/runbooks/pyrowave.md`。
 

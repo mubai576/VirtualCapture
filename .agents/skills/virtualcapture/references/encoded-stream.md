@@ -89,7 +89,8 @@ PyroWave descriptor 在原编码字段上追加 `pyrowave_revision:1`，不带 `
 双端 identity 必须精确为 `pyrowave:vulkan`、硬件类别 false、GOP 1，且两端 backend 与 codec 匹配。
 
 阶段一（当前）只走 PyroWave 的 CPU 缓冲路径：sender 以 NV12 上传（`upload_path=cpu_nv12`），
-receiver 同步解码到 YUV420P（`decode_path=cpu_yuv420p`）后再交错为 NV12；没有 D3D11/Vulkan
+receiver 同步解码：亮度直接写入会话 NV12 输出缓冲，色度平面（`decode_path=cpu_yuv420p`）解出后
+交错为 NV12 UV——任何情况下不得发布未写亮度或只有色度更新的帧；没有 D3D11/Vulkan
 外部内存互操作，也没有 GPU 侧缩放或帧池。解码输出仍是完整 NV12 帧，SHM v3/DShow 契约不变。
 占用一个 Vulkan 逻辑设备；两端各自创建默认设备，不跨进程共享。
 
@@ -231,6 +232,7 @@ DDA 的 pattern=null，不冒充 motion。ROI 静止时即使解码 hash 因有�
 MJPEG 诊断需明确两端 turbojpeg:cpu 且 hardware=0；原 H.264/HEVC 参数、GOP15/帧30 恢复规则及相关报告已移除。
 `scripts/p6_codec_verify.py` 也接受 `--codec pyrowave --encoder pyrowave:vulkan --decoder pyrowave:vulkan`
 （无 `--jpeg-quality`，GOP1，hardware0；`--loss` 同样要求帧20丢失后从帧21起恢复），
-额外核对 `encoder_configuration` 的全部字段与每帧字节上限。`scripts/p6_product_verify.py` 也已接受
+额外核对 `encoder_configuration` 的全部字段与每帧字节上限，并对 motion 源断言每个解码帧哈希互不相同
+（缺失亮度等"只更新色度"的缺陷会因此失败）。`scripts/p6_product_verify.py` 也已接受
 `--codec pyrowave --encoder/--decoder pyrowave:vulkan`（隔离 HTTP/真实原生/DShow，注册为替身）。
 两者都只是本机功能证据，不得据此声称产品级/双机验收。

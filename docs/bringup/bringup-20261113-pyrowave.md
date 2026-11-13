@@ -49,10 +49,10 @@ build/vc-sender.exe --capabilities    → codecs 含 pyrowave，pyrowave_revisio
   frame_id 连续无缺。sender encode_wait avg 0.454 / p99 0.674 ms，capture_to_send avg 1.21 / p99 2.38 ms；
   receiver decode_pipeline avg 0.792 / p99 1.025 ms（首包至解码完成，同机段）。
 - **30 fps，60 帧**：60/60 解码，1268 包，所有错误/丢弃计数为 0，平均 184656 B/帧。
-- **240 fps，120 帧（同一台机器同时跑两端）**：sender 实际 188.4 fps、120 帧全部发出；
+- **240 fps，120 帧（修复前，历史观察）**：sender 实际 188.4 fps、120 帧全部发出；
   receiver compressed_complete=120 但 complete 仅 6，`decode_queue_drops=114`、`decode_resets=6`。
-  这不是编解码器缺陷证据：同机 sender 以 HIGH_PRIORITY_CLASS/MMCSS 抢 CPU，receiver 解码工作线程被饿死，
-  队列按设计丢弃并重置；120 fps / 30 fps 同条件零丢弃。按既有规则不放宽队列/在途上限，也不把 240 当作通过。
+  当时误判为同机调度抢占；实际上主因是"断档即重建 Vulkan 设备"的重置死循环（见下文），
+  软重置修复后 240fps 已复测通过（见 2026-11-13 240fps 一节）。按既有规则未放宽任何队列/在途上限。
 
 证据为本机 `run/pwtx*.tx.json(l)`、`run/pwrx*.rx.json(l)`、`run/pwrx*.rx.jsonl.transport.jsonl`；
 运行时数据不入 git，需要时按 AGENTS.md 归档到 `run/archive.d/`。
@@ -83,6 +83,38 @@ build/vc-sender.exe --capabilities    → codecs 含 pyrowave，pyrowave_revisio
 - 同脚本 `--codec raw`：PASS（121/121、DShow 91）。原 `mjpeg_options` 重构后 raw 被误判为不支持，
   本次一并修复；这只是诊断脚本缺陷，不涉及产品 Raw 链路。
 
+
+## 提交后回环复跑（fb103d5）
+
+在提交 `fb103d5` 的干净工作区复跑本机回环：
+
+- `python scripts/verify.py --no-build --live Loopback`：ALL PASS，257 passed / 2 skipped
+  （含 Raw T0/T1 live：motion 240fps × 480 帧、零丢帧/零哈希错、p99<8.3ms）。
+- PyroWave 640×640 120fps 120 帧：PASS，120/120 解码、DShow 680 采样/120 个不同 hash、
+  decode_pipeline avg 0.785 / p99 1.291 ms，零重置/零丢弃。
+- PyroWave `--loss` 60fps 60 帧：PASS，59/59，decode_resets=1、decode_discarded=0。
+- MJPEG 416×416 120fps 回归：clean 60/60、`--loss` 59/59，各零错误。
+
+## 2026-11-13 240fps 回环复测与 Y 平面缺陷（重要）
+
+按 owner 要求补跑 640×640@240（`--max-bitrate 400`，每帧预算 208333，480 帧）：
+
+- 首跑虽然脚本 PASS（480/480 解码、零重置），但 `decoded_distinct_hashes` 只有 256/480，
+  且重复恰好是帧 N 与 N+256。根因：`common/pyrowave_codec.h` 把亮度解码到内部 `plane_y` 后
+  **从未拷回调用方的 NV12 输出**，实际只写了 UV；亮度是接收槽里的旧数据，258/480 帧完全重复。
+  此前 120fps 用例恰好因 UV 每帧不同而"看起来正常"，selftest 也只统计整体非零值，未发现。
+- 修复：亮度直接解码进会话 NV12 缓冲（`dst.data[0]=nv12`），色度平面解出后交错为 UV；
+  `--pyrowave-selftest` 改为分别统计亮度/色度非零；`p6_codec_verify.py` 对 motion 源新增
+  "每个解码帧哈希必须互不相同"断言，防止同类缺陷再次静默通过。
+- 修复后 640×640@240、480 帧：PASS。480/480 解码，`decoded_distinct_hashes=480`，
+  DShow 1361 次采样/480 个不同 hash；实测发送 239.99 fps、解码 240.25 fps；
+  `decode_pipeline_ms` avg 0.831 / p99 1.063 / max 3.17 ms；零重置/零丢弃；发送间隔 p99 4.169ms。
+  证据目录 `run/p6-codec-transport-20261113-215403-pyrowave-4547bb`。
+- 同轮回归：PyroWave 120fps 120/120（120 个不同 hash）、loss 59/59（59 个不同 hash）、
+  MJPEG clean 60/60、loss 59/59，全部 PASS。
+
+结论修正：先前 240fps 的队列丢弃死循环主因是"断档重建 Vulkan 设备"，不是同机调度抢占；
+软重置修复后 240fps 本机回环可稳定通过。仍不代表双机 240fps 吞吐或画质验收。
 
 ## 未验证 / 已知限制
 

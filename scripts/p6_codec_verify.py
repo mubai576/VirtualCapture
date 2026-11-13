@@ -179,6 +179,9 @@ def run_case(output, codec, encoder, decoder, width=416, height=416, fps=30, fra
             assert expected == actual
         decoded = {row["decoded_hash"] for row in received}
         assert video and all(row["hash"] in decoded for row in video)
+        if mode == "pattern":
+            # Motion frames all differ; identical decoded pixels mean a plane was never written.
+            assert len(decoded) == len(received), "decoded motion frames must be distinct"
         intervals = [b["send_qpc_ns"] - a["send_qpc_ns"] for a, b in zip(sent, sent[1:])]
         assert min(intervals) >= (10**9 + fps - 1) // fps
         window, window_bytes, peak = [], 0, 0
