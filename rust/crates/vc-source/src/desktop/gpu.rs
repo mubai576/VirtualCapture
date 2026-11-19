@@ -1,8 +1,9 @@
-//! D3D11 compute shader BGRA→NV12 转换（`sender/dda_gpu.h` 的 Rust 等价实现）。
+//! D3D11 计算着色器 BGRA→NV12 转换；旧 `sender/dda_gpu.h` 仅保留在 Git 历史。
 //!
-//! 数学与 CPU 路径完全同构：Y/UV 系数、2×2 平均和右移全部一致。输入
-//! `B8G8R8A8_UNORM` 通过 `Load` 精确取回 8 位整数（`value*255+0.5` 的
-//! UNORM 反归一化对 8 位可逆），因此 GPU 结果应与 CPU 逐字节一致。
+//! 数学与 CPU 参考实现（`crate::transform::bgra_to_nv12`，仅测试/oracle）完全
+//! 同构：Y/UV 系数、2×2 平均和右移全部一致。输入 `B8G8R8A8_UNORM` 通过
+//! `Load` 精确取回 8 位整数（`value*255+0.5` 的 UNORM 反归一化对 8 位可逆），
+//! 因此 GPU 结果应与 CPU 参考逐字节一致。桌面采集固定走本 GPU 路径。
 //!
 //! 任何初始化/编译/Map 失败都返回错误；调用方不得改走 CPU。
 
@@ -25,7 +26,7 @@ use windows::core::PCSTR;
 
 use crate::transform::Transform;
 
-/// 与 `sender/dda_gpu.h` 相同的 compute shader。
+/// 与本模块整数参考公式对应的计算着色器。
 const HLSL: &str = r#"
 Texture2D<float4> g_src : register(t0);
 RWStructuredBuffer<uint> g_y : register(u0);
@@ -480,7 +481,7 @@ mod tests {
     #[test]
     fn gpu_conversion_matches_cpu() {
         let Ok(context) = super::super::util::create_device() else {
-            eprintln!("skip: no hardware D3D11 device");
+            eprintln!("跳过：没有可用的硬件 D3D11 设备");
             return;
         };
         let converter = GpuConverter::new(&context.device, &context.context, 64, 64)

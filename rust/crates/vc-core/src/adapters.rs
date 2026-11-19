@@ -37,6 +37,10 @@ pub struct AdapterInfo {
     pub hardware_interface: Option<bool>,
     #[serde(rename = "virtual")]
     pub virtual_nic: Option<bool>,
+    /// Windows IPv4 接口的 NlMtu；元数据缺失或非 Windows 时为 None。
+    /// 这是网卡当前生效的 L3 MTU，不做任何提升或回写。
+    #[serde(default)]
+    pub mtu: Option<u32>,
     pub addresses: Vec<AdapterAddress>,
 }
 
@@ -100,6 +104,7 @@ pub fn enumerate(module: &Module) -> Result<Vec<AdapterInfo>, String> {
             item.transmit_link_bps = meta.transmit_link_bps;
             item.hardware_interface = meta.hardware_interface;
             item.virtual_nic = meta.virtual_nic;
+            item.mtu = meta.mtu;
             item.addresses = meta.addresses.clone();
         }
     }
@@ -147,6 +152,8 @@ struct NicMeta {
     hardware_interface: Option<bool>,
     #[serde(rename = "virtual")]
     virtual_nic: Option<bool>,
+    /// 只读取 `Get-NetIPInterface` 的 NlMtu，不调用任何 Set cmdlet。
+    mtu: Option<u32>,
     #[serde(default)]
     addresses: Vec<AdapterAddress>,
     #[allow(dead_code)]
@@ -160,12 +167,15 @@ fn windows_nic_metadata() -> std::collections::HashMap<String, NicMeta> {
     }
     const SCRIPT: &str = r#"[Console]::OutputEncoding = [Text.UTF8Encoding]::new()
 $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
+$ifs = @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue)
 @(Get-NetAdapter -IncludeHidden | ForEach-Object {
   $nic = $_
+  $iface = @($ifs | Where-Object ifIndex -eq $nic.ifIndex) | Select-Object -First 1
   [pscustomobject]@{guid=[string]$nic.InterfaceGuid; label=$nic.Name; mac=$nic.MacAddress;
     status=[string]$nic.Status; receive_link_bps=[uint64]$nic.ReceiveLinkSpeed;
     transmit_link_bps=[uint64]$nic.TransmitLinkSpeed;
     hardware_interface=[bool]$nic.HardwareInterface; virtual=[bool]$nic.Virtual;
+    mtu=$(if ($null -ne $iface.NlMtu) { [uint32]$iface.NlMtu } else { $null });
     addresses=@($ips | Where-Object InterfaceIndex -eq $nic.ifIndex |
       ForEach-Object { [pscustomobject]@{ip=$_.IPAddress; prefix=$_.PrefixLength} })}
 }) | ConvertTo-Json -Depth 4 -Compress"#;
@@ -386,6 +396,58 @@ pub fn choose_local_adapter<'a>(
     }
 }
 
+/// Intel I226 标记：只看系统名称/描述，大小写无关。
+fn is_i226(item: &AdapterInfo) -> bool {
+    item.description.to_ascii_lowercase().contains("i226")
+        || item
+            .label
+            .as_deref()
+            .is_some_and(|label| label.to_ascii_lowercase().contains("i226"))
+}
+
+/// 可确认物理网卡中的唯一 Intel I226。
+///
+/// 0 张返回 `Ok(None)`；多于 1 张返回错误而不是静默挑第一张，调用方必须要求
+/// 显式选择。虚拟网卡、回环与元数据未知的设备永远不参与 I226 优选。
+pub fn unique_i226(items: &[AdapterInfo]) -> Result<Option<&AdapterInfo>, String> {
+    let matches: Vec<&AdapterInfo> = items
+        .iter()
+        .filter(|item| item.is_physical_nic() && is_i226(item))
+        .collect();
+    match matches.len() {
+        0 => Ok(None),
+        1 => Ok(Some(matches[0])),
+        count => Err(format!(
+            "检测到 {count} 张可确认的 Intel I226 物理网卡，无法自动唯一选择；请在配置中显式指定网卡，绝不静默挑一张。"
+        )),
+    }
+}
+
+/// 未显式选择网卡时的自动选择：非回环控制器优先唯一 Intel I226，
+/// 否则沿用按控制连接出站 IPv4 精确匹配的路由选择。
+///
+/// 回环控制器（本机诊断）始终走 Npcap 回环，不因机器上存在 I226 而改选物理网卡。
+/// 多张 I226 直接报错；显式选择不经过本函数，保持原样。
+pub fn choose_auto_adapter<'a>(
+    items: &'a [AdapterInfo],
+    controller_ip: &str,
+) -> Result<&'a AdapterInfo, String> {
+    let ip: std::net::Ipv4Addr = controller_ip
+        .trim()
+        .parse()
+        .map_err(|_| format!("无效的主机 IPv4 地址：{controller_ip}"))?;
+    if ip.is_loopback() {
+        return items
+            .iter()
+            .find(|item| is_loopback_device(item))
+            .ok_or_else(|| "找不到 Npcap 回环设备（\\Device\\NPF_Loopback）。".to_string());
+    }
+    if let Some(i226) = unique_i226(items)? {
+        return Ok(i226);
+    }
+    choose_local_adapter(items, controller_ip)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -558,6 +620,137 @@ mod tests {
         )));
         // 采集端诊断可以只认回环设备名，但物理列表永远剔除它。
         assert!(physical_nics(&[nic(r"\Device\NPF_Loopback", Some(true), Some(false))]).is_empty());
+    }
+
+    fn i226(name: &str, label: Option<&str>, description: &str) -> AdapterInfo {
+        AdapterInfo {
+            name: name.into(),
+            description: description.into(),
+            label: label.map(str::to_string),
+            hardware_interface: Some(true),
+            virtual_nic: Some(false),
+            mtu: Some(9000),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn adapter_mtu_is_optional_and_serde_defaulted() {
+        let legacy: AdapterInfo =
+            serde_json::from_str(r#"{"name":"n","description":"d"}"#).unwrap();
+        assert_eq!(legacy.mtu, None);
+        let reported: AdapterInfo =
+            serde_json::from_str(r#"{"name":"n","description":"d","mtu":1500}"#).unwrap();
+        assert_eq!(reported.mtu, Some(1500));
+        let unknown: AdapterInfo =
+            serde_json::from_str(r#"{"name":"n","description":"d","mtu":null}"#).unwrap();
+        assert_eq!(unknown.mtu, None);
+    }
+
+    #[test]
+    fn unique_i226_counts_only_confirmed_physical_matches() {
+        let items = vec![
+            i226(r"\Device\NPF_{A}", Some("Ethernet 2"), "Intel(R) I226-V"),
+            nic(r"\Device\NPF_{V}", Some(true), Some(true)),
+            AdapterInfo {
+                name: r"\Device\NPF_{U}".into(),
+                description: "Intel I226-V".into(),
+                ..Default::default()
+            },
+            i226(r"\Device\NPF_Loopback", None, "Intel I226-V"),
+            AdapterInfo {
+                name: r"\Device\NPF_{R}".into(),
+                description: "Realtek 2.5GbE".into(),
+                hardware_interface: Some(true),
+                virtual_nic: Some(false),
+                ..Default::default()
+            },
+        ];
+        let found = unique_i226(&items).unwrap().unwrap();
+        assert_eq!(found.name, r"\Device\NPF_{A}");
+        // 标签命中同样有效。
+        let by_label = vec![i226(
+            r"\Device\NPF_{B}",
+            Some("I226-LM Control"),
+            "Ethernet Controller",
+        )];
+        assert_eq!(
+            unique_i226(&by_label).unwrap().unwrap().name,
+            r"\Device\NPF_{B}"
+        );
+        // 没有 I226 时返回 None，而不是错误。
+        assert!(
+            unique_i226(&[nic(r"\Device\NPF_{R}", Some(true), Some(false))])
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn unique_i226_refuses_to_pick_between_multiple_cards() {
+        let items = vec![
+            i226(
+                r"\Device\NPF_{A}",
+                None,
+                "Intel(R) Ethernet Controller I226-V",
+            ),
+            i226(
+                r"\Device\NPF_{B}",
+                None,
+                "Intel(R) Ethernet Controller I226-LM",
+            ),
+        ];
+        let error = unique_i226(&items).unwrap_err();
+        assert!(error.contains("2 张") && error.contains("显式指定") && error.contains("静默"));
+    }
+
+    #[test]
+    fn auto_adapter_prefers_unique_i226_without_route_dependency() {
+        let items = vec![
+            i226(
+                r"\Device\NPF_{A}",
+                None,
+                "Intel(R) Ethernet Controller I226-V",
+            ),
+            nic(r"\Device\NPF_{B}", Some(true), Some(false)),
+        ];
+        // TEST-NET-1 地址：唯一 I226 分支在创建路由探测前返回，不依赖真实网络。
+        let chosen = choose_auto_adapter(&items, "192.0.2.10").unwrap();
+        assert_eq!(chosen.name, r"\Device\NPF_{A}");
+        let error = choose_auto_adapter(&items[..1], "not-an-ip").unwrap_err();
+        assert!(error.contains("无效的主机 IPv4"));
+    }
+
+    #[test]
+    fn auto_adapter_keeps_loopback_diagnostics_on_loopback_device() {
+        let items = vec![
+            i226(
+                r"\Device\NPF_{A}",
+                None,
+                "Intel(R) Ethernet Controller I226-V",
+            ),
+            nic(r"\Device\NPF_Loopback", None, None),
+        ];
+        let chosen = choose_auto_adapter(&items, "127.0.0.1").unwrap();
+        assert_eq!(chosen.name, r"\Device\NPF_Loopback");
+    }
+
+    #[test]
+    fn auto_adapter_reports_multiple_i226_before_route_probe() {
+        let items = vec![
+            i226(
+                r"\Device\NPF_{A}",
+                None,
+                "Intel(R) Ethernet Controller I226-V",
+            ),
+            i226(
+                r"\Device\NPF_{B}",
+                None,
+                "Intel(R) Ethernet Controller I226-LM",
+            ),
+        ];
+        let error = choose_auto_adapter(&items, "192.0.2.10").unwrap_err();
+        assert!(error.contains("2 张"));
     }
 
     #[test]

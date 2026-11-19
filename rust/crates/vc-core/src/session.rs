@@ -49,6 +49,20 @@ impl SenderRequest {
     }
 
     pub fn confirm(&self, response: &PreparedSession) -> Result<(), String> {
+        // MTU 决定切包与 Raw batch，必须由响应显式确认；单独报错便于定位，
+        // 不能让不同 MTU 的响应只得到一条笼统的“参数不同”。
+        if self.capture.mtu != response.capture.mtu {
+            return Err(format!(
+                "对端未确认相同 MTU：请求 {}，响应 {}；拒绝按不同切包参数启动。",
+                self.capture.mtu, response.capture.mtu
+            ));
+        }
+        if self.capture.mtu_auto != response.capture.mtu_auto {
+            return Err(format!(
+                "对端未确认 MTU 解析模式：请求 mtu_auto={}，响应 mtu_auto={}；拒绝继续。",
+                self.capture.mtu_auto, response.capture.mtu_auto
+            ));
+        }
         let expected_batch =
             crate::process::expected_batch_packets(&self.capture, &response.adapter.name)?;
         if self.capture != response.capture
@@ -114,9 +128,14 @@ mod tests {
     }
 
     #[test]
-    fn confirm_requires_exact_raw_batch_and_null_for_encoded() {
+    fn confirm_requires_exact_mtu_raw_batch_and_null_for_encoded() {
+        // 主机下发的有效配置把自动 MTU 固化为显式值，响应必须逐字段确认。
+        let capture = Capture {
+            mtu_auto: false,
+            ..Default::default()
+        };
         let request = SenderRequest {
-            capture: Capture::default(),
+            capture,
             session_id: "s-test".into(),
             source_mac: "02:01:02:03:04:05".into(),
             auto_adapter: true,
@@ -126,7 +145,7 @@ mod tests {
             name: r"\Device\NPF_{A}".into(),
             ..Default::default()
         };
-        let mut response = PreparedSession {
+        let response = PreparedSession {
             capture: request.capture.clone(),
             batch_packets: Some(69),
             session_id: request.session_id.clone(),
@@ -134,14 +153,26 @@ mod tests {
             adapter: adapter.clone(),
         };
         assert!(request.confirm(&response).is_ok());
-        response.batch_packets = Some(68);
-        assert!(request.confirm(&response).is_err());
+
+        let mut wrong_batch = response.clone();
+        wrong_batch.batch_packets = Some(68);
+        assert!(request.confirm(&wrong_batch).is_err());
+
+        let mut wrong_mtu = response.clone();
+        wrong_mtu.capture.mtu = 1500;
+        let error = request.confirm(&wrong_mtu).unwrap_err();
+        assert!(error.contains("MTU") && error.contains("1500"), "{error}");
+
+        let mut wrong_mode = response.clone();
+        wrong_mode.capture.mtu_auto = true;
+        let error = request.confirm(&wrong_mode).unwrap_err();
+        assert!(error.contains("mtu_auto"), "{error}");
 
         let mut encoded_request = request.clone();
-        encoded_request.capture.codec = "mjpeg".into();
+        encoded_request.capture.codec = "pyrowave".into();
         encoded_request.capture.codec_experimental = true;
-        encoded_request.capture.encoder_backend = "turbojpeg:cpu".into();
-        encoded_request.capture.decoder_backend = "turbojpeg:cpu".into();
+        encoded_request.capture.encoder_backend = "pyrowave:vulkan".into();
+        encoded_request.capture.decoder_backend = "pyrowave:vulkan".into();
         let mut encoded_response = PreparedSession {
             capture: encoded_request.capture.clone(),
             batch_packets: None,

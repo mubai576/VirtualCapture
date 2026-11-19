@@ -1,11 +1,10 @@
-//! Negotiated NV12 stream geometry.
+//! 协商后的 NV12 流几何。
 //!
-//! Mirrors `VCStream` in `common/stream.h` for the one field group the DShow
-//! filter exposes: width, height and fps.  The geometry is immutable for a
-//! filter instance; a receiver session that publishes a different size must be
-//! picked up by reopening the downstream device (same rule as the C++ filter).
+//! 对应 DShow 滤镜暴露的唯一字段组（宽、高、fps），其 SHM v3 布局见
+//! `docs/spec/shm-v3.md`。几何对每个滤镜实例不可变；接收端会话公布不同
+//! 尺寸时，必须通过重开下游设备来接收新几何（与历史 C++ 滤镜同一规则）。
 
-/// Default / v2-compatible geometry: 640x640 @ 240 fps, 614400 bytes per frame.
+/// 默认 / 兼容 v2 的几何：640x640 @ 240 fps，每帧 614400 字节。
 pub const DEFAULT_WIDTH: u32 = 640;
 pub const DEFAULT_HEIGHT: u32 = 640;
 pub const DEFAULT_FPS: u32 = 240;
@@ -32,8 +31,7 @@ impl StreamGeometry {
         fps: DEFAULT_FPS,
     };
 
-    /// Validates the session constraints enforced by `vc_shm_valid`:
-    /// even dimensions in 2..=8192 and fps in 1..=1000.
+    /// 按 `vc_shm_valid` 的会话约束校验：宽高为 2..=8192 的偶数，fps 在 1..=1000。
     pub const fn new(width: u32, height: u32, fps: u32) -> Option<Self> {
         if width < 2 || height < 2 || width > MAX_DIMENSION || height > MAX_DIMENSION {
             return None;
@@ -59,7 +57,7 @@ impl StreamGeometry {
         self.fps
     }
 
-    /// NV12 packed frame size: width * height * 3 / 2.
+    /// NV12 紧凑帧大小：width * height * 3 / 2。
     pub const fn frame_bytes(self) -> u32 {
         self.width * self.height * 3 / 2
     }
@@ -72,22 +70,22 @@ impl StreamGeometry {
         self.width * self.height / 2
     }
 
-    /// DShow `AvgTimePerFrame` in 100 ns units (integer division like the C++ filter).
+    /// DShow `AvgTimePerFrame`，单位 100 ns（与历史 C++ 滤镜一样做整数除法）。
     pub const fn frame_100ns(self) -> i64 {
         10_000_000 / self.fps as i64
     }
 
-    /// Pacing period in ns, rounded up to a whole nanosecond (C++ `FRAME_NS`).
+    /// 发送节拍周期（ns，向上取整到整数纳秒，对应 C++ `FRAME_NS`）。
     pub const fn frame_ns(self) -> u64 {
         (1_000_000_000u64).div_ceil(self.fps as u64)
     }
 
-    /// Bytes per second at the negotiated geometry, saturated like the C++ `dwBitRate`.
+    /// 协商几何下的每秒比特数（按 C++ `dwBitRate` 方式饱和）。
     pub const fn bits_per_second(self) -> u64 {
         self.frame_bytes() as u64 * 8 * self.fps as u64
     }
 
-    /// `VIDEOINFOHEADER::dwBitRate` value (DWORD saturated).
+    /// `VIDEOINFOHEADER::dwBitRate` 取值（按 DWORD 饱和）。
     pub const fn dw_bit_rate(self) -> u32 {
         let bps = self.bits_per_second();
         if bps > u32::MAX as u64 {
@@ -97,7 +95,7 @@ impl StreamGeometry {
         }
     }
 
-    /// `VIDEO_STREAM_CONFIG_CAPS::Min/MaxBitsPerSecond` value (LONG saturated).
+    /// `VIDEO_STREAM_CONFIG_CAPS::Min/MaxBitsPerSecond` 取值（按 LONG 饱和）。
     pub const fn caps_bits_per_second(self) -> i32 {
         let bps = self.bits_per_second();
         if bps > i32::MAX as u64 {
@@ -107,8 +105,7 @@ impl StreamGeometry {
         }
     }
 
-    /// True when a media type / SHM header geometry pair must be treated as a
-    /// session change: the downstream device has to be reopened.
+    /// 媒体类型与 SHM 头几何必须视为会话变更（需重开下游设备）时返回 true。
     pub const fn differs(self, other: Self) -> bool {
         self.width != other.width || self.height != other.height || self.fps != other.fps
     }

@@ -240,7 +240,7 @@ async fn stats(State(state): State<AppState>) -> Reply {
     blocking(state.agent, |agent| (StatusCode::OK, Json(agent.stats()))).await
 }
 
-// ---------------------------------------------------------------- OTA
+// ---------------------------------------------------------------- OTA（升级）
 
 async fn update_status(State(state): State<AppState>, headers: HeaderMap) -> Reply {
     if !authorized(&headers) {

@@ -1,7 +1,7 @@
 """Validate extracted Rust release files and launchers without registering a camera.
 
 The payload intentionally has no C++ sender/receiver.  This smoke checks the
-Rust DLL ABI/capability contract (raw/mjpeg/pyrowave, sources, SHM v3), the OTA
+Rust DLL ABI/capability contract (raw/pyrowave, sources, SHM v3), the OTA
 manifest layout, the Rust DirectShow DLL through the isolated verifier,
 launchers, app-local runtime, managed-layout resolution and normal shutdown.
 """
@@ -100,10 +100,8 @@ def validate_stream_capabilities(caps):
     assert caps["variable_resolution"] is True, caps
     assert caps["pixel_format"] == "nv12", caps
     assert caps["sendqueue"] == "frame", caps
-    for codec in inventory.CODECS:
-        assert codec in caps["codecs"], caps
-    for source in inventory.SOURCES:
-        assert source in caps["sources"], caps
+    assert set(caps["codecs"]) == set(inventory.CODECS), caps
+    assert set(caps["sources"]) == set(inventory.SOURCES), caps
 
 
 def stream_capabilities(package):

@@ -1,6 +1,6 @@
 //! 有界、乱序容忍的 Raw NV12 重组。
 //!
-//! 语义与 `receiver/vc_receiver.cpp` 的 `Reassembler` 对齐：
+//! 语义沿用 Git 历史中 C++ `Reassembler` 的冻结契约：
 //! - 先校验 EtherType / 源 MAC（会话隔离，非认证），再解析 28 字节头；
 //! - `total` 必须等于当前会话的 `ceil(frame_bytes/payload_max)`，`seq < total`；
 //! - 每包 `payload_len` 必须是该 seq 的精确长度，CRC 只覆盖 `payload_len` 字节；
@@ -9,12 +9,12 @@
 //! - 未完成帧最多 `max_inflight_frames` 个，按帧号淘汰最旧；完成新帧时丢弃更旧残帧；
 //! - 缓冲总量不超过 `max_buffered_bytes`，绝不无界增长。
 //!
-//! 与 C++ 的有意差异（已写入提案）：
+//! 相较历史 C++ 实现的有意差异：
 //! 1. 帧号比较用 [`crate::wire::is_after`] 的序号算术，跨 2^32 回绕仍把新帧视为新；
 //!    C++ 用数值比较，非回绕场景两者完全一致。
 //! 2. 额外记录 `duplicate`、`crc_errors`、`ignored_other_source`、`late` 等诊断计数；
 //!    `packets_lost`/`dropped`/`gaps` 的口径保持不变。
-//! 3. 帧缓冲按槽独立分配并在完成时移交调用方，不实现 C++ 的 SHM 原地发布；发布策略由未来 receiver 决定。
+//! 3. 帧缓冲按槽独立分配并在完成时移交调用方；SHM 发布由 `vc-stream` 接收路径负责。
 
 use std::collections::VecDeque;
 use std::time::Instant;

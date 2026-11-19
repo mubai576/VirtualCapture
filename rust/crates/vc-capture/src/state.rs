@@ -78,7 +78,7 @@ impl Agent {
             return Err("被采集机未发现可确认的物理网卡；请检查 Npcap 与网卡连接。".into());
         }
         let adapter = if request.auto_adapter {
-            match vc_core::adapters::choose_local_adapter(&items, controller_ip) {
+            match vc_core::adapters::choose_auto_adapter(&items, controller_ip) {
                 Ok(item) => item.clone(),
                 Err(error)
                     if !self.loopback_diagnostics && is_loopback_controller(controller_ip) =>
@@ -97,6 +97,14 @@ impl Agent {
         if !adapter_permitted(&adapter, self.loopback_diagnostics, controller_ip) {
             return Err("回环网卡只允许在显式本地诊断时使用。".into());
         }
+        // 先确定实际发送网卡，再核对请求携带的生效 MTU；自动 MTU 已由主机
+        // 解析成显式值，采集端只读取 NlMtu 复核，绝不修改网卡设置。
+        // Npcap 回环没有 NIC MTU，只在显式本地诊断中跳过。
+        vc_core::budget::verify_mtu_for_adapter(
+            request.capture.mtu,
+            Some(&adapter),
+            "被采集机发送网卡",
+        )?;
         let module = self.slot.data_plane_module()?;
         let caps = process::require_capabilities(&module)?;
         process::require_stream_selection(
@@ -291,7 +299,9 @@ mod tests {
     fn encoded_start_requires_explicit_experimental_opt_in() {
         let mut agent = Agent::new(Config::default());
         let capture = vc_core::config::Capture {
-            codec: "mjpeg".into(),
+            codec: "pyrowave".into(),
+            encoder_backend: "pyrowave:vulkan".into(),
+            decoder_backend: "pyrowave:vulkan".into(),
             ..Default::default()
         };
         let request = SenderRequest {
@@ -303,6 +313,31 @@ mod tests {
         };
         let error = agent.prepare(&request, "127.0.0.1").unwrap_err();
         assert!(error.contains("codec_experimental"), "{error}");
+        assert!(agent.slot.session_id.is_none());
+    }
+
+    #[test]
+    fn mjpeg_start_is_rejected_as_cpu_codec() {
+        let mut agent = Agent::new(Config::default());
+        let capture = vc_core::config::Capture {
+            codec: "mjpeg".into(),
+            codec_experimental: true,
+            encoder_backend: "turbojpeg:cpu".into(),
+            decoder_backend: "turbojpeg:cpu".into(),
+            ..Default::default()
+        };
+        let request = SenderRequest {
+            capture,
+            session_id: "s-test".into(),
+            source_mac: "02:00:00:00:00:01".into(),
+            auto_adapter: true,
+            adapter: String::new(),
+        };
+        let error = agent.prepare(&request, "127.0.0.1").unwrap_err();
+        assert!(
+            error.contains("mjpeg") && error.contains("GPU-only"),
+            "{error}"
+        );
         assert!(agent.slot.session_id.is_none());
     }
 }

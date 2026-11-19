@@ -8,9 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use vc_media::{
-    AU_HEADER_BYTES, AU_MAGIC, AuSession, CodecConfig, Decoder, Encoder, KIND_EOS, KIND_FRAME,
-    MJPEG_IDENTITY, PYROWAVE_IDENTITY, build_au, capabilities, parse_au, pyrowave_frame_budget,
-    validate,
+    AuSession, CodecConfig, Decoder, Encoder, PYROWAVE_IDENTITY, build_au, capabilities, parse_au,
+    pyrowave_frame_budget, validate,
 };
 
 fn repo_root() -> PathBuf {
@@ -40,18 +39,6 @@ fn find_library_dir(
     None
 }
 
-fn turbojpeg_directory() -> Option<PathBuf> {
-    find_library_dir(
-        "VC_MEDIA_TURBOJPEG_DIR",
-        &[
-            "build/_deps/libjpeg-turbo-build/Release",
-            "build/Release",
-            "build",
-        ],
-        "turbojpeg.dll",
-    )
-}
-
 fn pyrowave_directory() -> Option<PathBuf> {
     find_library_dir(
         "VC_MEDIA_PYROWAVE_DIR",
@@ -68,8 +55,8 @@ fn mjpeg_config() -> CodecConfig {
     CodecConfig {
         codec: "mjpeg".into(),
         experimental: true,
-        encoder_backend: MJPEG_IDENTITY.into(),
-        decoder_backend: MJPEG_IDENTITY.into(),
+        encoder_backend: "turbojpeg:cpu".into(),
+        decoder_backend: "turbojpeg:cpu".into(),
         jpeg_quality: 90,
         ..CodecConfig::default()
     }
@@ -84,16 +71,6 @@ fn pyrowave_config() -> CodecConfig {
         max_bitrate_bps: 800_000_000,
         ..CodecConfig::default()
     }
-}
-
-fn flat_nv12(width: u32, height: u32, luma: u8, cb: u8, cr: u8) -> Vec<u8> {
-    let y_bytes = width as usize * height as usize;
-    let mut frame = vec![luma; y_bytes];
-    for _ in 0..y_bytes / 4 {
-        frame.push(cb);
-        frame.push(cr);
-    }
-    frame
 }
 
 fn ramp_nv12(width: u32, height: u32) -> Vec<u8> {
@@ -132,121 +109,38 @@ fn raw_passthrough_round_trips_without_dlls() {
 }
 
 #[test]
-fn mjpeg_round_trip_validates_envelope_and_headers() {
-    let Some(directory) = turbojpeg_directory() else {
-        eprintln!("SKIP: 未找到 turbojpeg.dll（页面需打包/构建该运行库）");
-        return;
-    };
+fn mjpeg_is_rejected_with_actionable_gpu_only_error() {
     let config = mjpeg_config();
-    for (width, height) in [(2u32, 2u32), (66, 34), (640, 640)] {
-        validate(&config, width, height, 30).unwrap();
-        let mut encoder =
-            Encoder::open_in_directory(&config, width, height, 30, &directory).unwrap();
-        assert_eq!(encoder.settings()["family"], "turbojpeg");
-        assert_eq!(encoder.settings()["identity"], MJPEG_IDENTITY);
-        assert_eq!(encoder.settings()["quality"], 90);
-        let input = flat_nv12(width, height, 96, 32, 208);
-        let encoded = encoder.encode(&input, 7).unwrap();
-        assert!(encoded.len() > AU_HEADER_BYTES);
-        assert_eq!(
-            u32::from_le_bytes(encoded[0..4].try_into().unwrap()),
-            AU_MAGIC
-        );
-        assert_eq!(encoded[5], 3);
-        assert_eq!(encoded[6], KIND_FRAME);
-        let unit = parse_au(
-            &encoded,
-            AuSession::mjpeg(width, height, 30),
-            7,
-            config.max_au_bytes,
-        )
-        .unwrap();
-        assert!(!unit.is_eos());
-
-        let mut decoder =
-            Decoder::open_in_directory(&config, width, height, 30, &directory).unwrap();
-        assert_eq!(decoder.settings()["role"], "decoder");
-        let decoded = decoder.decode(&encoded, 7).unwrap();
-        assert_eq!(decoded.len(), input.len());
-        for (index, (&source, &target)) in input.iter().zip(decoded.iter()).enumerate() {
-            assert!(
-                (i16::from(source) - i16::from(target)).abs() <= 2,
-                "{width}x{height} 像素 {index}: {source} vs {target}"
-            );
-        }
-        decoder.reset().unwrap();
-        assert_eq!(decoder.decode(&encoded, 7).unwrap().len(), input.len());
-        assert!(decoder.decode(&encoded, 8).is_err());
-        assert!(decoder.decode(&encoded[..encoded.len() - 1], 7).is_err());
-    }
-}
-
-#[test]
-fn mjpeg_rejects_malformed_envelope_and_mismatched_jpeg() {
-    let Some(directory) = turbojpeg_directory() else {
-        eprintln!("SKIP: 未找到 turbojpeg.dll");
-        return;
-    };
-    let config = mjpeg_config();
-    let mut encoder = Encoder::open_in_directory(&config, 68, 34, 30, &directory).unwrap();
-    let source = flat_nv12(68, 34, 80, 40, 200);
-    let encoded = encoder.encode(&source, 11).unwrap();
-    let payload = encoded[AU_HEADER_BYTES..].to_vec();
-
-    // 封装尺寸与会话/JPEG 头不一致：信封合法，但 JPEG 实际是 68x34。
-    let mismatched = build_au(AuSession::mjpeg(66, 34, 30), 11, &payload).unwrap();
-    let mut decoder = Decoder::open_in_directory(&config, 66, 34, 30, &directory).unwrap();
-    let error = decoder.decode(&mismatched, 11).unwrap_err().to_string();
-    assert!(
-        error.contains("JPEG") || error.contains("baseline"),
-        "未拒绝尺寸不一致 JPEG: {error}"
-    );
-
-    let mut decoder = Decoder::open_in_directory(&config, 68, 34, 30, &directory).unwrap();
-    // 信封/哈希/kind/帧号篡改全部拒绝。
-    for mutate in [
-        |bytes: &mut Vec<u8>| bytes[0] ^= 1,                   // magic
-        |bytes: &mut Vec<u8>| bytes[32] ^= 1,                  // hash
-        |bytes: &mut Vec<u8>| bytes[6] = KIND_EOS,             // kind 与载荷不符
-        |bytes: &mut Vec<u8>| bytes[24] = 0,                   // frame id
-        |bytes: &mut Vec<u8>| bytes[8] = 67,                   // width
-        |bytes: &mut Vec<u8>| bytes[7] = 47,                   // header bytes
-        |bytes: &mut Vec<u8>| bytes[28] = 1,                   // reserved
-        |bytes: &mut Vec<u8>| *bytes.last_mut().unwrap() ^= 1, // payload
+    for error in [
+        validate(&config, 640, 640, 30).unwrap_err(),
+        Encoder::open(&config, 640, 640, 30)
+            .err()
+            .expect("MJPEG 编码器不得打开"),
+        Decoder::open(&config, 640, 640, 30)
+            .err()
+            .expect("MJPEG 解码器不得打开"),
+        // 即使显式给出不存在的依赖目录，也必须在查找 DLL 之前拒绝。
+        Encoder::open_in_directory(&config, 640, 640, 30, Path::new("Z:\\missing"))
+            .err()
+            .expect("MJPEG 编码器不得打开"),
+        Decoder::open_in_directory(&config, 640, 640, 30, Path::new("Z:\\missing"))
+            .err()
+            .expect("MJPEG 解码器不得打开"),
     ] {
-        let mut bad = encoded.clone();
-        mutate(&mut bad);
-        assert!(decoder.decode(&bad, 11).is_err());
+        let error = format!("{error:#}");
+        assert!(
+            error.contains("CPU") && error.contains("turbojpeg:cpu"),
+            "{error}"
+        );
+        assert!(
+            error.contains("pyrowave") && error.contains("raw"),
+            "{error}"
+        );
+        assert!(
+            !error.contains("找不到"),
+            "错误应说明 GPU-only 原因：{error}"
+        );
     }
-
-    // 截断 JPEG（去掉 EOI），同步修正长度/哈希后仍必须被拒绝。
-    let mut truncated = encoded.clone();
-    truncated.truncate(truncated.len() - 2);
-    let payload_len = (truncated.len() - AU_HEADER_BYTES) as u32;
-    truncated[20..24].copy_from_slice(&payload_len.to_le_bytes());
-    let hash = vc_transport::checksum::fnv1a64(&truncated[AU_HEADER_BYTES..]);
-    truncated[32..40].copy_from_slice(&hash.to_le_bytes());
-    assert!(decoder.decode(&truncated, 11).is_err());
-    let empty_eos = build_au(AuSession::mjpeg(68, 34, 30), 12, &[]).unwrap();
-    assert_eq!(empty_eos[6], KIND_EOS);
-    assert!(decoder.decode(&empty_eos, 12).unwrap().is_empty());
-}
-
-#[test]
-fn mjpeg_bounded_output_fails_instead_of_reallocating() {
-    let Some(directory) = turbojpeg_directory() else {
-        eprintln!("SKIP: 未找到 turbojpeg.dll");
-        return;
-    };
-    let mut config = mjpeg_config();
-    config.max_au_bytes = 1024;
-    let mut encoder = Encoder::open_in_directory(&config, 640, 640, 30, &directory).unwrap();
-    let input = ramp_nv12(640, 640);
-    let error = encoder.encode(&input, 0).unwrap_err().to_string();
-    assert!(
-        error.contains("JPEG") || error.contains("超出") || error.contains("缓冲"),
-        "未在固定输出上限处失败: {error}"
-    );
 }
 
 #[test]
@@ -366,14 +260,13 @@ fn default_library_directory_is_current_module_directory() {
 #[test]
 fn capabilities_shape_is_honest() {
     let caps = capabilities();
-    assert_eq!(caps["codecs"][0], "raw");
-    assert_eq!(caps["codecs"][1], "mjpeg");
-    assert_eq!(caps["codecs"][2], "pyrowave");
+    assert_eq!(caps["codecs"], serde_json::json!(["raw", "pyrowave"]));
+    assert_eq!(caps["removed_codecs"], serde_json::json!(["mjpeg"]));
     assert_eq!(
         caps["hardware"]["encoder"]["declares_vendor_hardware"],
         false
     );
-    assert_eq!(caps["libraries"]["turbojpeg"]["file"], "turbojpeg.dll");
+    assert!(caps["libraries"].get("turbojpeg").is_none());
     assert_eq!(
         caps["libraries"]["pyrowave"]["file"],
         "libpyrowave-shared-1.dll"

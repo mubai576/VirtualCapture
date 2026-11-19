@@ -1,15 +1,16 @@
-//! Frozen SHM v3 wire layout shared with the C++ receiver and vcam
-//! (`vcam/vcam_shm.h`, canonical).  Only read-only views are used here.
+//! 冻结的 SHM v3 线格式，与接收端和虚拟卡共享（布局规范见
+//! `docs/spec/shm-v3.md`；Rust 写入端为 `vc-stream/src/shm.rs`）。本模块
+//! 只使用只读视图。
 //!
 //! ```text
 //! [0, 64)                     vc_shm_hdr_t       (ShmHeader)
 //! [64, 64 + 64*12)            vc_shm_slot_t[12]  (ShmSlot)
-//! [4096 + i*frame_bytes, ...) frame bytes of slot i
+//! [4096 + i*frame_bytes, ...) 槽 i 的完整帧数据
 //! ```
 //!
-//! The reader is the D11 seqlock protocol: plain aligned volatile loads, copy
-//! the frame, then accept only when `slot.seq` is unchanged.  Publications are
-//! identified by `(slot, seq)`, not by `latest_seq`.
+//! 读取端遵循 D11 seqlock 协议：普通对齐 volatile 读取，拷贝帧数据，然后
+//! 仅在 `slot.seq` 未变化时接受。发布以 `(slot, seq)` 标识，而不是
+//! `latest_seq`。
 
 use core::sync::atomic::{AtomicI32, Ordering};
 use std::ptr;
@@ -23,10 +24,10 @@ pub const SHM_VERSION_V2: u32 = 2;
 pub const SHM_SLOTS: u32 = 12;
 pub const SHM_DATA_OFF: u32 = 4096;
 pub const SHM_HASH_NONE: u32 = 0xFFFF_FFFF;
-/// Fixed v2 frame size (640x640 NV12).
+/// v2 固定帧大小（640x640 NV12）。
 pub const SHM_V2_FRAME_BYTES: u32 = 614_400;
 
-/// `vc_shm_hdr_t` (64 bytes, `#pragma pack(1)`; no implicit padding occurs).
+/// `vc_shm_hdr_t`（64 字节，`#pragma pack(1)`；本布局不会产生隐式填充）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ShmHeader {
@@ -44,7 +45,7 @@ pub struct ShmHeader {
     pub reserved: [u8; 20],
 }
 
-/// `vc_shm_slot_t` (64 bytes, `#pragma pack(1)`).
+/// `vc_shm_slot_t`（64 字节，`#pragma pack(1)`）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct ShmSlot {
@@ -61,12 +62,12 @@ const _: () = assert!(core::mem::size_of::<ShmHeader>() == 64);
 const _: () = assert!(core::mem::size_of::<ShmSlot>() == 64);
 const _: () = assert!(64 + 64 * SHM_SLOTS as usize <= SHM_DATA_OFF as usize);
 
-/// Total mapping size for a session frame size (C++ `vc_shm_size`).
+/// 会话帧大小对应的映射总大小（对应历史 C++ `vc_shm_size`）。
 pub const fn shm_size(frame_bytes: u32) -> usize {
     SHM_DATA_OFF as usize + SHM_SLOTS as usize * frame_bytes as usize
 }
 
-/// C++ `vc_shm_valid` for an already-mapped header.
+/// 校验已映射的头（对应历史 C++ `vc_shm_valid`）。
 pub fn valid_header(h: &ShmHeader) -> bool {
     if h.slots != SHM_SLOTS || h.data_off != SHM_DATA_OFF {
         return false;
@@ -87,12 +88,12 @@ pub fn valid_header(h: &ShmHeader) -> bool {
         && (h.frame_bytes as u64) == (h.width as u64) * (h.height as u64) * 3 / 2
 }
 
-/// Validates a mapped view.
+/// 校验一个映射视图。
 ///
 /// # Safety
 ///
-/// `view` must be null or point to at least 64 readable bytes (a complete
-/// [`ShmHeader`]) that stay mapped for the duration of the call.
+/// `view` 必须为空，或指向至少 64 个可读字节（完整的 [`ShmHeader`]），且
+/// 该内存在调用期间保持映射。
 pub unsafe fn valid_ptr(view: *const u8) -> bool {
     if view.is_null() {
         return false;
@@ -100,8 +101,7 @@ pub unsafe fn valid_ptr(view: *const u8) -> bool {
     valid_header(&*(view as *const ShmHeader))
 }
 
-/// Geometry advertised by a valid header.  v2 carries no geometry and always
-/// maps to the 640x640@240 session contract.
+/// 有效头所公布的几何。v2 头不携带几何，恒映射到 640x640@240 会话契约。
 pub fn geometry_from_header(h: &ShmHeader) -> Option<StreamGeometry> {
     if !valid_header(h) {
         return None;
@@ -112,57 +112,55 @@ pub fn geometry_from_header(h: &ShmHeader) -> Option<StreamGeometry> {
     StreamGeometry::new(h.width, h.height, h.fps)
 }
 
-/// Returns the address of the 64-byte slot header.
+/// 返回 64 字节槽头的地址。
 ///
 /// # Safety
 ///
-/// `view` must point to a mapped SHM region of at least
-/// `64 + 64 * SHM_SLOTS` bytes and `slot` must be smaller than [`SHM_SLOTS`],
-/// so the returned address lies inside the mapping.
+/// `view` 必须指向至少 `64 + 64 * SHM_SLOTS` 字节的已映射 SHM 区域，且
+/// `slot` 小于 [`SHM_SLOTS`]，使返回地址落在映射内部。
 pub unsafe fn slot_ptr(view: *mut u8, slot: u32) -> *mut ShmSlot {
     view.add(64 + 64 * slot as usize) as *mut ShmSlot
 }
 
-/// Returns the address of a frame slot's payload.
+/// 返回某帧槽载荷的地址。
 ///
 /// # Safety
 ///
-/// `view` must point to a valid mapped SHM region with a readable
-/// [`ShmHeader`], `slot` must be smaller than [`SHM_SLOTS`], and the mapping
-/// must cover `SHM_DATA_OFF + slot * frame_bytes + frame_bytes` bytes computed
-/// from that header.
+/// `view` 必须指向带可读 [`ShmHeader`] 的有效映射 SHM 区域，`slot` 小于
+/// [`SHM_SLOTS`]，且映射覆盖按该头计算的
+/// `SHM_DATA_OFF + slot * frame_bytes + frame_bytes` 字节。
 pub unsafe fn data_ptr(view: *mut u8, slot: u32) -> *mut u8 {
     let frame_bytes = (*(view as *const ShmHeader)).frame_bytes as usize;
     view.add(SHM_DATA_OFF as usize + slot as usize * frame_bytes)
 }
 
-/// Current publish counter (`hdr.latest_seq`), read with an aligned volatile load.
+/// 当前发布计数（`hdr.latest_seq`），以对齐 volatile 读取。
 ///
 /// # Safety
 ///
-/// `view` must point to a mapped SHM region containing a readable
-/// [`ShmHeader`] for the duration of the call.
+/// `view` 必须指向包含可读 [`ShmHeader`] 的已映射 SHM 区域，并在调用期间
+/// 保持有效。
 pub unsafe fn latest_seq(view: *const u8) -> i32 {
     ptr::read_volatile(&(*(view as *const ShmHeader)).latest_seq)
 }
 
-/// Latest published slot index, read with an aligned volatile load.
+/// 最新发布的槽索引，以对齐 volatile 读取。
 ///
 /// # Safety
 ///
-/// `view` must point to a mapped SHM region containing a readable
-/// [`ShmHeader`] for the duration of the call.
+/// `view` 必须指向包含可读 [`ShmHeader`] 的已映射 SHM 区域，并在调用期间
+/// 保持有效。
 pub unsafe fn latest_slot(view: *const u8) -> i32 {
     ptr::read_volatile(&(*(view as *const ShmHeader)).latest_slot)
 }
 
-/// `VCamPeek`: stable latest publish token, or `None` while the writer is
-/// filling.  The token is `(slot, seq)` and is used for dedupe.
+/// `VCamPeek`：返回稳定的最新发布令牌；写入端正在填槽时返回 `None`。令牌
+/// 为 `(slot, seq)`，用于去重。
 ///
 /// # Safety
 ///
-/// `view` must be null or point to a mapped SHM region whose header passes
-/// [`valid_header`]; the whole mapping must stay valid for the call.
+/// `view` 必须为空，或指向头能通过 [`valid_header`] 的已映射 SHM 区域；
+/// 整个映射在调用期间必须有效。
 pub unsafe fn peek(view: *mut u8) -> Option<(u32, i32)> {
     if !valid_ptr(view) {
         return None;
@@ -178,21 +176,21 @@ pub unsafe fn peek(view: *mut u8) -> Option<(u32, i32)> {
     Some((i as u32, seq))
 }
 
-/// Result of a successful seqlock copy.
+/// 一次成功 seqlock 拷贝的结果。
 #[derive(Clone, Copy, Debug)]
 pub struct SlotCopy {
     pub frame_id: u32,
     pub qpc_pub_ns: u64,
 }
 
-/// `VCamCopySlot`: copy one frame into `dst` (must hold at least
-/// `hdr.frame_bytes` writable bytes) and report whether the copy is stable.
+/// `VCamCopySlot`：把一帧拷入 `dst`（至少 `hdr.frame_bytes` 个可写字节），
+/// 并报告该拷贝是否稳定。
 ///
 /// # Safety
 ///
-/// `view` must be null or point to a valid mapped SHM region whose header and
-/// frame slots stay readable for the call.  `dst` must be null or point to at
-/// least `hdr.frame_bytes` writable bytes that do not overlap the mapping.
+/// `view` 必须为空，或指向有效的已映射 SHM 区域，其头和帧槽在调用期间保持
+/// 可读。`dst` 必须为空，或指向至少 `hdr.frame_bytes` 个可写字节，且不与
+/// 映射区域重叠。
 pub unsafe fn copy_slot(view: *mut u8, slot: u32, seq: i32, dst: *mut u8) -> Option<SlotCopy> {
     if dst.is_null() || slot >= SHM_SLOTS {
         return None;
@@ -214,7 +212,7 @@ pub unsafe fn copy_slot(view: *mut u8, slot: u32, seq: i32, dst: *mut u8) -> Opt
     }
 }
 
-// ---- vcam -> receiver feedback ring (`<map>.vcam`) ----
+// ---- vcam -> 接收端反馈环（`<map>.vcam`） ----
 
 pub const VSTAT_MAGIC: u32 = 0x5453_5656; // "VVST"
 pub const VSTAT_CAP: u32 = 1024;
@@ -223,7 +221,7 @@ pub const VSTAT_ENTRY_SIZE: usize = 32;
 pub const VSTAT_SIZE: usize = VSTAT_HDR_SIZE + VSTAT_CAP as usize * VSTAT_ENTRY_SIZE;
 pub const VSTAT_FLAG_REPEAT: u32 = 1;
 
-/// `vc_vstat_hdr_t` (16 bytes).
+/// `vc_vstat_hdr_t`（16 字节）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct VstatHeader {
@@ -233,7 +231,7 @@ pub struct VstatHeader {
     pub reserved: u32,
 }
 
-/// `vc_vstat_entry_t` (32 bytes).
+/// `vc_vstat_entry_t`（32 字节）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct VstatEntry {
@@ -249,12 +247,12 @@ const _: () = assert!(core::mem::size_of::<VstatHeader>() == VSTAT_HDR_SIZE);
 const _: () = assert!(core::mem::size_of::<VstatEntry>() == VSTAT_ENTRY_SIZE);
 const _: () = assert!(VSTAT_SIZE == 32_784);
 
-/// Initializes the feedback header if this mapping was freshly created.
+/// 若该反馈映射是刚刚创建的，则初始化其头部。
 ///
 /// # Safety
 ///
-/// `base` must be null or point to at least [`VSTAT_SIZE`] writable bytes
-/// that stay mapped for the call.
+/// `base` 必须为空，或指向至少 [`VSTAT_SIZE`] 个可写字节，且在调用期间
+/// 保持映射。
 pub unsafe fn vstat_init(base: *mut u8) {
     if base.is_null() {
         return;
@@ -267,12 +265,12 @@ pub unsafe fn vstat_init(base: *mut u8) {
     }
 }
 
-/// Publishes one delivery entry.
+/// 发布一条投递记录。
 ///
 /// # Safety
 ///
-/// `base` must be null or point to at least [`VSTAT_SIZE`] writable bytes
-/// that stay mapped for the call.
+/// `base` 必须为空，或指向至少 [`VSTAT_SIZE`] 个可写字节，且在调用期间
+/// 保持映射。
 pub unsafe fn vstat_push(base: *mut u8, frame_id: u32, pub_ns: u64, deliver_ns: u64, flags: u32) {
     if base.is_null() {
         return;
@@ -291,7 +289,7 @@ pub unsafe fn vstat_push(base: *mut u8, frame_id: u32, pub_ns: u64, deliver_ns: 
     ptr::write_volatile(ptr::addr_of_mut!((*e).n), k as u32 + 1);
 }
 
-/// C++ `vc_qpc_to_ns`: avoids `counter * 1e9` overflow.
+/// 对应历史 C++ `vc_qpc_to_ns`：避免 `counter * 1e9` 溢出。
 pub const fn qpc_to_ns(counter: u64, freq: u64) -> u64 {
     (counter / freq) * 1_000_000_000 + (counter % freq) * 1_000_000_000 / freq
 }
@@ -414,10 +412,10 @@ mod tests {
         let view = buf.as_mut_ptr() as *mut u8;
 
         let cases: [(u32, u32, u32, u32); 4] = [
-            (3, 2, 60, 9),    // odd width
-            (4, 3, 60, 18),   // odd height
-            (4, 2, 0, 12),    // fps below range
-            (4, 2, 1001, 12), // fps above range
+            (3, 2, 60, 9),    // 宽为奇数
+            (4, 3, 60, 18),   // 高为奇数
+            (4, 2, 0, 12),    // fps 低于范围
+            (4, 2, 1001, 12), // fps 高于范围
         ];
         for (w, h, fps, bytes) in cases {
             write_v3_header(view, 4, 2, 60, -1);
@@ -486,19 +484,19 @@ mod tests {
         assert_eq!(copy.qpc_pub_ns, 0x1122_3344_5566_7788);
         assert_eq!(frame, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
 
-        // A changed writer sequence marks the copy as torn.
+        // 写入端序号变化后，该拷贝应被判为撕裂。
         unsafe {
             (*slot_ptr(view, 3)).seq = 4;
         }
         assert!(unsafe { copy_slot(view, 3, 2, frame.as_mut_ptr()) }.is_none());
 
-        // Odd (filling) slot is not published.
+        // 奇数（填充中）槽不是已发布状态。
         unsafe {
             (*slot_ptr(view, 3)).seq = 5;
         }
         assert_eq!(unsafe { peek(view) }, None);
 
-        // Out-of-range slot is ignored.
+        // 越界槽应被忽略。
         unsafe {
             (*(view as *mut ShmHeader)).latest_slot = 12;
         }
@@ -530,7 +528,7 @@ mod tests {
                 (2, 2, 300, 400, VSTAT_FLAG_REPEAT)
             );
 
-            // Wrap to the same slot; n keeps the global counter.
+            // 回绕到同一槽；n 保留全局计数。
             *((base.add(4)) as *mut i32) = VSTAT_CAP as i32;
             vstat_push(base, 4, 700, 800, 0);
             let e_last = &*(base.add(VSTAT_HDR_SIZE) as *const VstatEntry);
@@ -541,7 +539,7 @@ mod tests {
 
     #[test]
     fn qpc_conversion_does_not_overflow() {
-        // 10 MHz counter after ~30 min: naive c*1e9 would wrap.
+        // 10 MHz 计数器约 30 分钟后：朴素写法 c*1e9 会溢出。
         let ns = qpc_to_ns(18_000_000_000, 10_000_000);
         assert_eq!(ns, 1_800_000_000_000);
         assert_eq!(qpc_to_ns(0, 10_000_000), 0);

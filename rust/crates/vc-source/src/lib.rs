@@ -1,7 +1,7 @@
 //! VirtualCapture Rust 采集源。
 //!
-//! 纯几何/像素转换在 [`transform`]（可移植、全整数）；Windows 桌面采集由
-//! [`DesktopSource`] 提供：
+//! 可移植的整数几何与 CPU 参考转换在 [`transform`]（仅测试/oracle，不参与
+//! 生产采集）；Windows 桌面采集由 [`DesktopSource`] 提供：
 //!
 //! - `dda`：DXGI Desktop Duplication，按 `output` 显示器序号取屏；
 //! - `wgc`：Windows Graphics Capture，`window` 非空时按标题子串取窗口，
@@ -11,8 +11,9 @@
 //!
 //! 采集失败是致命错误；`capture` 返回 `Ok(false)` 只表示在不超过 20 ms 的
 //! 等待窗口内没有新图像（例如输出空闲、仅指针更新或 WGC 帧池正在重建）。
-//! 不允许静默回退：DDA/WGC 不互相兜底，`gpu_convert=true` 时 GPU 初始化或
-//! 转换失败会让打开/采集直接报错，不会改走 CPU。
+//! 不允许静默回退：DDA/WGC 不互相兜底；桌面采集固定使用硬件 D3D11
+//! compute shader 做 BGRA→NV12，GPU 设备初始化或转换失败会让打开/采集直接
+//! 报错，不存在 CPU 转换分支、WARP 软件设备或自动降尺寸/降帧率。
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -26,7 +27,7 @@ pub use desktop::DesktopSource;
 
 /// `mode` 允许值。
 pub const MODES: [&str; 3] = ["pattern", "dda", "wgc"];
-/// `pattern` 允许值，与 `sender/pattern.h` / `vc-stream` 的五种图案一致。
+/// `pattern` 允许值，与 `vc-stream` 和独立 Python 参考的五种图案一致。
 pub const PATTERNS: [&str; 5] = ["counter", "checker", "rings", "noise", "motion"];
 /// `transform` 允许值。
 pub const TRANSFORMS: [&str; 4] = ["crop", "fit", "fill", "stretch"];
@@ -46,7 +47,8 @@ pub struct SourceConfig {
     pub window: String,
     /// `crop` | `fit` | `fill` | `stretch`。
     pub transform: String,
-    /// 显式启用 D3D11 compute shader 的 BGRA→NV12 转换；失败不回退 CPU。
+    /// 桌面采集（dda/wgc）必须为 true，固定使用 D3D11 硬件 GPU 转换；
+    /// CPU 转换与 WARP 回退已移除。pattern 诊断必须为 false。
     pub gpu_convert: bool,
 }
 
@@ -64,7 +66,8 @@ impl Default for SourceConfig {
 }
 
 /// 校验 [`SourceConfig`]。只检查配置本身；显示器/窗口是否存在、尺寸是否支持
-/// 由 [`DesktopSource::open`] 在真正建立采集时检查。
+/// 由 [`DesktopSource::open`] 在真正建立采集时检查。`dda`/`wgc` 必须显式
+/// `gpu_convert=true`，否则直接拒绝（不存在 CPU 转换或 WARP 回退）。
 pub fn validate(config: &SourceConfig) -> Result<()> {
     if !MODES.contains(&config.mode.as_str()) {
         bail!(
@@ -92,6 +95,13 @@ pub fn validate(config: &SourceConfig) -> Result<()> {
         bail!(
             "transform must be one of crop/fit/fill/stretch (got {:?})",
             config.transform
+        );
+    }
+    // 桌面采集只保留 GPU 路径：拒绝 false 而不是在 backend 内退回 CPU。
+    if matches!(config.mode.as_str(), "dda" | "wgc") && !config.gpu_convert {
+        bail!(
+            "mode={} requires gpu_convert=true: desktop capture uses D3D11 hardware GPU conversion only; CPU conversion and WARP fallback were removed. Use mode=pattern for diagnostics.",
+            config.mode
         );
     }
     if config.mode != "wgc" && !config.window.is_empty() {
@@ -131,6 +141,11 @@ mod tests {
             serde_json::from_str(r#"{"mode":"dda","gpu_convert":true}"#).unwrap();
         assert_eq!(config.mode, "dda");
         assert!(config.gpu_convert);
+        validate(&config).unwrap();
+        // 缺省 serde 值仍是 false，但 dda/wgc 缺省不会通过校验。
+        let missing: SourceConfig = serde_json::from_str(r#"{"mode":"dda"}"#).unwrap();
+        assert!(!missing.gpu_convert);
+        assert!(validate(&missing).is_err());
         assert!(serde_json::from_str::<SourceConfig>(r#"{"unknown":1}"#).is_err());
 
         let encoded = serde_json::to_value(SourceConfig::default()).unwrap();
@@ -142,6 +157,7 @@ mod tests {
         let mut config = SourceConfig {
             mode: "dda".into(),
             window: "notepad".into(),
+            gpu_convert: true,
             ..SourceConfig::default()
         };
         assert!(validate(&config).is_err());
@@ -166,5 +182,31 @@ mod tests {
         config.mode = "pattern".into();
         config.gpu_convert = true;
         assert!(validate(&config).is_err());
+    }
+
+    #[test]
+    fn desktop_modes_require_hardware_gpu_conversion() {
+        for mode in ["dda", "wgc"] {
+            let config = SourceConfig {
+                mode: mode.into(),
+                gpu_convert: false,
+                ..SourceConfig::default()
+            };
+            let error = validate(&config).unwrap_err().to_string();
+            assert!(error.contains("gpu_convert=true"), "{error}");
+            assert!(
+                error.contains("CPU") && error.contains("WARP"),
+                "错误必须说明已移除 CPU/WARP 回退：{error}"
+            );
+
+            let config = SourceConfig {
+                mode: mode.into(),
+                gpu_convert: true,
+                ..SourceConfig::default()
+            };
+            validate(&config).unwrap();
+        }
+        // pattern 诊断由 vc-stream 生成，保留显式 false 的默认配置。
+        validate(&SourceConfig::default()).unwrap();
     }
 }

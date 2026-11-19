@@ -1,12 +1,12 @@
-//! Shared in-process sender. Physical NICs submit a complete frame in one queue.
+//! 共享的进程内发送端。物理网卡以一次 queue 提交完整帧。
 use super::*;
 
 pub(crate) fn send(mut args: SendArgs) -> anyhow::Result<()> {
     if args.progress.is_none() {
         args.source.pattern = args.pattern.name().to_owned();
     }
-    // Reserve evidence before entering any native library. Only this owned file is
-    // rewritten; an earlier session's stats/hashlog can never be truncated.
+    // 在进入任何原生库之前先预约证据文件。只重写本次拥有的文件；早前会话的
+    // stats/hashlog 绝不会被截断。
     if args.stats_file.is_none() {
         args.stats_file = take_writer(None, args.stats.as_deref())?
             .map(|writer| writer.into_inner().map_err(|error| error.into_error()))
@@ -166,12 +166,12 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
         }
         let frame_id = frames as u32;
         let frame_start = qpc_ns();
-        // Schedule from capture start. Encoding and the send-rate ceiling are
-        // work inside this frame, not wake-up lateness to add to every period.
+        // 从采集起点排程。编码与发送速率上限属于本帧内部的工作，不应当作
+        // 唤醒迟到量叠加到每个周期。
         pacer.advance(frame_start);
         if let Some(source) = source.as_mut() {
-            // A static desktop is normal. Each source call is bounded; only a
-            // genuine source error or this session's cancellation ends the wait.
+            // 静态桌面是正常情况。每次源调用都有界；只有真正的源错误或本会话
+            // 取消才会结束等待。
             let mut captured = false;
             while !stopped(args.stop.as_deref()) {
                 if source.capture(&mut source_frame)? {
@@ -191,7 +191,7 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
             break;
         }
         let encode_started = qpc_ns();
-        // Raw borrows the actual NV12 pixels: no encode/decode copy or AU limit.
+        // Raw 直接借用实际 NV12 像素：没有编解码拷贝，也没有 AU 上限。
         let encoded = if let Some(encoder) = encoder.as_mut() {
             Some(encoder.encode(&source_frame, frame_id)?)
         } else {
@@ -212,9 +212,8 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
                 args.codec.max_au_bytes,
             )?;
         }
-        // Audit hashing reads the complete source and encoded frame. Do it
-        // before waiting for the next send slot so diagnostics don't consume
-        // time that should belong to the following 240 Hz frame.
+        // 审计哈希读取完整源帧与编码帧。放在等待下一个发送槽之前做，避免
+        // 诊断工作占用本应属于下一个 240 Hz 帧的时间。
         let audit_started = qpc_ns();
         let transport_hash = fnv1a64_hex(fnv1a64(frame));
         let source_hash = if raw {
@@ -563,8 +562,8 @@ impl<'a> FrameTransmitter<'a> {
                     self.api.handle_error(self.handle, "send packet")
                 );
             }
-            // Cancellation stops before/after whole frames, never halfway through
-            // an already-started frame. Diagnostic pacing may be shortened on stop.
+            // 取消只发生在整帧之前或之后，绝不打断已开始的帧。停止时诊断节拍
+            // 可以缩短。
             if self.pacing_us > 0 {
                 let _ = loop_sleep(
                     qpc_ns().saturating_add(self.pacing_us.saturating_mul(1000)),

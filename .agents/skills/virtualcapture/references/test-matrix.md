@@ -1,6 +1,7 @@
-# Test matrix T0–T5（ctrl 一键跑）
+# 冻结验收矩阵 T0–T5
 
-执行顺序：T0 不过不联双机；T1 不过不进 soak；T3 反例跑一次归档即可。
+执行顺序：T0不过不联双机；T1不过不进长稳；T3反例跑一次归档即可。
+下表历史门限原样保留，本次移除旧工具不意味着改判据。
 
 | 用例 | 条件 | 判据 |
 |---|---|---|
@@ -11,38 +12,31 @@
 | T4 pacing对照 | `pacing 0/50/200us` | 选 `dropped` vs CPU 最优为默认 |
 | T5 dda摸底 | 无边框 2K→640，240Hz×30s | 只看 `gpu_ms/pps/CPU`，不判 hash |
 
-D1 gates approved 2026-10-22, replacing the avg gate above:
-Rhythm is sender cadence from local sender hashlog qpc span, 4.166+-0.3ms, no cross-clock involved.
-Jitter keeps receiver p99 below 8.3ms. Receiver avg is judged on the steady window only, the final ring contains drain tail.
-Rest unchanged: dropped==0 and hash_mismatch==0 and complete==sent, senderCPU below 25 percent, receiverCPU below 30 percent.
 
-## 失败分诊
+## D1（2026-10-22 批准）
 
-1. `dropped>0` → 查 MTU 两端一致？EEE/中断合并关了吗？跑 T4 区分突发丢 vs 持续丢；
-   再看速率协商（2.5G 跌到 1G 则 1.18G 必挂）。
-2. `hash_mismatch>0` → 先看包头 CRC：CRC 错=传输损坏；CRC 对但帧 hash 错=生成/重组 bug。
-3. pps 只有一半 → 对照双端 stats：`sent` 少=sender 生成瓶颈；`sent` 够 `recv` 少=抓包丢。
-4. 版本错位 → ctrl 开跑前必须比对双端 `/version`，不一致直接 fail。
+节奏门采用发送端本地hashlog cadence：4.166±0.3ms，不涉跨机时钟；抖动仍为收端p99<8.3ms。
+接收avg只判稳态窗口，末尾ring含drain尾段。其余仍要求 complete==sent、dropped==0、hash_mismatch==0、senderCPU<25%、receiverCPU<30%。
 
-## 跨机对时/日志
+## 运行工具与缺口
 
-- Log lines D3: sender and receiver rows both carry qpc_ns; reconcile compares frame_id and hash only. Adjacent-frame gap over 1s flags checker-transient D7, auto by gap_any.py.
-- 控制面 NTP 对时（ms 级够用）；数据面不跑对时协议。
-- 失败自动 `POST /pcap/start` 留证 + `/receiver/report` 打包。
+- `python scripts/verify.py`：Rust本地静态/单元门与独立参考，不是T0/T1。
+- `rust/tests/dll_stream_smoke.py --performance`：显式motion/Loopback的本机模块cadence/延迟诊断；CPU门与物理/双机条件须另外报告，不因这个脚本PASS就标矩阵全通过。
+- 旧 `ctrl/vc-ctrl.py`、Python agent 与p6专项已从工作树移除。Rust REST v2没有旧 `/exec`、`/files`、`/pcap/start`、`/receiver/report`，主机也没有REST。**Rust双机T1–T5等价自动编排/完整取证工具未实现**；补齐前不声称可一键重现旧矩阵。
+- PyroWave专项经DLL smoke显式选codec；压缩hash/decoded/SHM/DShow分开核对，不套Raw像素相等门。画质、长稳、双机另验收。
 
-## Dual-NIC notes 2026-10-21 (thresholds frozen; these are advisories, see docs/history/plan-history.md S12-S14)
-- verdict avg uses the terminal 120-sample ring and end-drain dominates it. Steady state and sender_cadence are reported. Gates updated by D1 above.
-- sender ceiling on real NIC is ~200fps (pcap_sendpacket backpressure; loopback does 240). T2 pps baseline ~14000, not 16560. Recalibration is T-10 work, not a quiet edit. Update 2026-10-22: sendqueue batching (--batch 23/69) reaches the 240fps target (docs/history/plan-history.md S23); ~200fps was the single-packet ceiling.
-- broadcast dst hangs the sender (~350s, zero errors, alive): suspect switch storm suppression. Default to unicast --dst-mac <peer-MAC> until direct-cable retest. --dst-mac takes colon format.
-- mtu1500 on real NIC is slow-not-lossy (sender 69fps syscall-bound, pps 28k). The 101k-lossy counterexample needs a faster sender first.
-- dda mode (--mode dda): pattern 255 skips pixel verify, hash still reconciled; historically idle reused the last frame. P6-2 sends only new desktop images and caps send starts by --fps; downstream D12 may repeat a good frame. The historical 640 Raw gates above are unchanged; variable-size/codec acceptance remains separate.
+## 失败与证据
 
-## P6-3 开发验证（不替代上述门限）
+1. 丢帧先核对两端MTU/协商速率和包率、sent/recv；只读诊断，不擅自改EEE/ITR/Jumbo等物理参数。
+2. CRC错区分传输损坏；CRC对但整帧hash错查生成/重组。发送少与接收丢分别记录。
+3. 双端身份/版本、配置与实际backend须一致；参数不符直接失败，不静默修正。
+4. hashlog按frame_id/hash全量对账，不跨机减QPC。发端相邻帧gap>1s标记D7 transient，保留原证据。
+5. 双机结束立刻保全双端完整hashlog、stats与运行参数；Rust没有旧分页下载接口，必须提前安排独立完整导出路径。
 
-`scripts/p6_codec_verify.py`要求`--codec mjpeg`与双端`turbojpeg:cpu`，验证压缩字节hash、真实解码NV12到SHM/DShow、发送最小间隔和一秒最大载荷窗口；`--loss`注入frame20缺片，要求frame21的完整JPEG后恢复。使用motion/batch1/Loopback，仅本机功能测试。`scripts/p6_product_verify.py`验证隔离HTTP编排，注册操作为替身，不冒充真实注册验收。画质/色彩、物理链路、长稳和实时吞吐另验收，不能套Raw像素相等门。契约见`encoded-stream.md`，证据见`docs/bringup/bringup-20261103-mjpeg.md`。
-PyroWave（D24）可用`scripts/p6_codec_verify.py --codec pyrowave --encoder pyrowave:vulkan --decoder pyrowave:vulkan`
-做同样的压缩hash/真实解码/DShow/间隔/一秒窗口检查，`--loss`要求帧21起恢复；另有`--pyrowave-selftest`。
-`p6_product_verify.py --codec pyrowave --encoder pyrowave:vulkan --decoder pyrowave:vulkan`
-验证隔离HTTP→真实原生→SHM/DShow（注册为替身）。
-这些仍是本机功能证据，不计入任何Raw门限或既有PASS；无Vulkan 1.3时selftest报SKIP。
-证据见`docs/bringup/bringup-20261113-pyrowave.md`。
+## 历史实测限定（不改阈值）
+
+- 单包提交曾约200fps，sendqueue batch23/69后达到240fps；旧约14000pps不是悄悄重定T2基线的理由。
+- MTU1500物理卡实测曾69fps/约28kpps、慢而不丢；表中约101kpps丢帧反例需要足够快的发端，不能写成任意环境必丢。
+- 广播曾长时间挂起，历史建议单播；未直连复测前不将猜测当结论。
+- DDA/WGC只发新画面；静止不补假帧。D12允许下游重复最后好帧，不以此伪造motion推进。
+- 历史表格针对640² Raw；可变尺寸/有损组合独立验收，不继承旧PASS。

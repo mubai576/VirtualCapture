@@ -50,7 +50,16 @@ pub struct Capture {
     pub pattern: String,
     pub gpu_convert: bool,
     pub fps: u32,
+    /// 显式 L3 MTU（1500..9000）；`mtu_auto=true` 时由主机按两端网卡实际值解析。
     pub mtu: u32,
+    /// 自动 MTU：按两端所选网卡报告的 NlMtu 取 `min(local, peer, 9000)`。
+    ///
+    /// 迁移说明：旧配置没有本字段，字段级 `#[serde(default)]` 使其反序列化为
+    /// false，从而保留用户已保存的显式 `mtu`，不会被重新解释成自动；只有
+    /// [`Capture::default`]（新配置）才为 true。容器级 `#[serde(default)]` 无法
+    /// 区分“旧文件缺字段”和“新字段默认值”，所以这里必须单独标注。
+    #[serde(default)]
+    pub mtu_auto: bool,
     pub dst_mac: String,
     /// DDA/WGC 显示器编号 0..15。
     pub output: u32,
@@ -82,6 +91,7 @@ impl Default for Capture {
             gpu_convert: true,
             fps: 240,
             mtu: 9000,
+            mtu_auto: true,
             dst_mac: "ff:ff:ff:ff:ff:ff".into(),
             output: 0,
             wgc_window: String::new(),
@@ -216,8 +226,8 @@ impl Config {
         }
     }
 
-    /// 结构/取值范围校验。编码草案（codec=mjpeg/pyrowave）在参数合法时允许保存；
-    /// 能否启动由 [`Self::validate_start`] 判定。
+    /// 结构/取值范围校验。历史 MJPEG 草案与开发 PyroWave 草案在参数合法时允许保存；
+    /// 能否启动由 [`Self::validate_start`] 判定（MJPEG 永不支持启动）。
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
         let c = &self.capture;
@@ -239,6 +249,20 @@ impl Config {
         }
         if !matches!(c.mode.as_str(), "pattern" | "dda" | "wgc") {
             errors.push("capture.mode 必须是 pattern/dda/wgc。".into());
+        }
+        // DDA/WGC 只有 GPU 采集路径；pattern 是合成诊断源，必须显式关闭转换。
+        // 两端都不提供 CPU/WARP 回退，错误在这里明确拒绝而不是运行时降级。
+        if matches!(c.mode.as_str(), "dda" | "wgc") && !c.gpu_convert {
+            errors.push(
+                "capture.mode=dda/wgc 只支持 GPU 采集，不接受 gpu_convert=false；本项目没有 CPU/WARP 回退，请显式开启 GPU 转换，或改用 pattern 诊断源。"
+                    .into(),
+            );
+        }
+        if c.mode == "pattern" && c.gpu_convert {
+            errors.push(
+                "capture.mode=pattern 是合成测试源，不接受 gpu_convert=true；请显式设为 false，不能把 CPU 路径冒充 GPU 采集。"
+                    .into(),
+            );
         }
         if !matches!(
             c.pattern.as_str(),
@@ -342,8 +366,15 @@ impl Config {
         if c.mtu != self.receive.mtu {
             errors.push("采集与接收 MTU 不一致，不能用不同切包参数启动。".into());
         }
+        // MJPEG 的唯一后端是 CPU/SIMD，违反 GPU-only 要求；草案可以保存，
+        // 但启动一律明确拒绝，绝不静默改回 Raw 或切换其他编码。
+        if c.codec == "mjpeg" {
+            errors.push(
+                "codec=mjpeg 不受支持：MJPEG 唯一后端 turbojpeg:cpu 是 CPU/SIMD 编码，违反本项目的 GPU-only 要求；启动已拒绝，请改用 codec=raw 或 codec=pyrowave。"
+                    .into(),
+            );
+        }
         let expected_backend = match c.codec.as_str() {
-            "mjpeg" => Some("turbojpeg:cpu"),
             "pyrowave" => Some("pyrowave:vulkan"),
             _ => None,
         };
@@ -502,8 +533,68 @@ mod tests {
         assert_eq!(config.capture.fps, 240);
         assert_eq!(config.capture.transform, "crop");
         assert_eq!(config.capture.codec, "raw");
+        assert!(config.capture.mtu_auto);
         assert!(config.validate().is_empty());
         assert!(config.validate_start().is_empty());
+    }
+
+    #[test]
+    fn legacy_config_without_mtu_auto_keeps_explicit_mtu() {
+        // 旧文件没有 mtu_auto：必须按 false 读取，保留已保存的显式 MTU。
+        let capture: Capture =
+            serde_json::from_str(r#"{"mtu":1500,"width":416,"height":416}"#).unwrap();
+        assert!(!capture.mtu_auto);
+        assert_eq!(capture.mtu, 1500);
+
+        let config: Config = serde_json::from_str(
+            r#"{"version":1,"capture":{"mtu":1500,"width":416,"height":416}}"#,
+        )
+        .unwrap();
+        assert!(!config.capture.mtu_auto);
+        assert_eq!(config.capture.mtu, 1500);
+
+        // 新配置（默认值）默认自动 MTU；显式写入 false 后仍按固定值保存。
+        assert!(Capture::default().mtu_auto);
+        let fixed: Capture = serde_json::from_str(r#"{"mtu":9000,"mtu_auto":false}"#).unwrap();
+        assert!(!fixed.mtu_auto);
+        let auto: Capture = serde_json::from_str(r#"{"mtu":9000,"mtu_auto":true}"#).unwrap();
+        assert!(auto.mtu_auto);
+    }
+
+    #[test]
+    fn desktop_modes_require_gpu_and_pattern_requires_cpu_synthetic_source() {
+        let mut config = Config::default();
+        assert_eq!(config.capture.mode, "dda");
+        assert!(config.capture.gpu_convert);
+        assert!(config.validate().is_empty());
+
+        config.capture.gpu_convert = false;
+        let errors = config.validate();
+        assert!(
+            errors
+                .iter()
+                .any(|error| error.contains("dda/wgc") && error.contains("CPU/WARP"))
+        );
+
+        config.capture.mode = "wgc".into();
+        assert!(
+            config
+                .validate()
+                .iter()
+                .any(|error| error.contains("dda/wgc"))
+        );
+
+        // pattern 只做合成诊断；显式 false 允许，true 拒绝。
+        config.capture.mode = "pattern".into();
+        config.capture.gpu_convert = true;
+        assert!(
+            config
+                .validate()
+                .iter()
+                .any(|error| error.contains("pattern") && error.contains("gpu_convert=true"))
+        );
+        config.capture.gpu_convert = false;
+        assert!(config.validate().is_empty(), "{:?}", config.validate());
     }
 
     #[test]
@@ -540,13 +631,13 @@ mod tests {
         // 编码草案参数合法时可以保存，但未显式启用时启动门限拒绝。
         let errors = config.apply_patch(&json!({
             "capture": {
-                "codec": "mjpeg",
-                "encoder_backend": "turbojpeg:cpu",
-                "decoder_backend": "turbojpeg:cpu"
+                "codec": "pyrowave",
+                "encoder_backend": "pyrowave:vulkan",
+                "decoder_backend": "pyrowave:vulkan"
             }
         }));
         assert!(errors.is_empty(), "{errors:?}");
-        assert_eq!(config.capture.codec, "mjpeg");
+        assert_eq!(config.capture.codec, "pyrowave");
         assert!(
             config
                 .validate_start()
@@ -571,8 +662,33 @@ mod tests {
             config
                 .validate_start()
                 .iter()
-                .any(|e| e.contains("decoder_backend") && e.contains("turbojpeg:cpu"))
+                .any(|e| e.contains("decoder_backend") && e.contains("pyrowave:vulkan"))
         );
+    }
+
+    #[test]
+    fn mjpeg_draft_is_saveable_but_start_is_rejected_as_cpu_codec() {
+        let mut config = Config::default();
+        let errors = config.apply_patch(&json!({
+            "capture": {
+                "codec": "mjpeg",
+                "codec_experimental": true,
+                "encoder_backend": "turbojpeg:cpu",
+                "decoder_backend": "turbojpeg:cpu"
+            }
+        }));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(config.capture.codec, "mjpeg");
+        let errors = config.validate_start();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("mjpeg") && e.contains("CPU") && e.contains("GPU-only")),
+            "{errors:?}"
+        );
+        // 不允许静默改回 Raw 或替换后端：配置本身保持原样。
+        assert_eq!(config.capture.codec, "mjpeg");
+        assert_eq!(config.capture.encoder_backend, "turbojpeg:cpu");
     }
 
     #[test]
@@ -638,6 +754,9 @@ mod tests {
         assert_eq!(config.capture.fps, 240);
         assert_eq!(config.capture.mode, "dda");
         assert_eq!(config.capture.bitrate_mbps, 50);
+        // 旧文件没有 mtu_auto：按 false 迁移，保留原有显式 MTU 语义。
+        assert!(!config.capture.mtu_auto);
+        assert_eq!(config.capture.mtu, 9000);
         assert_eq!(config.transport.headroom_pct, 20);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -714,9 +833,9 @@ mod tests {
         assert!(config.validate().iter().any(|e| e.contains("最大码率")));
 
         // 编码后端允许目标码率高于最大码率（原生独立限流）。
-        config.capture.codec = "mjpeg".into();
-        config.capture.encoder_backend = "turbojpeg:cpu".into();
-        config.capture.decoder_backend = "turbojpeg:cpu".into();
+        config.capture.codec = "pyrowave".into();
+        config.capture.encoder_backend = "pyrowave:vulkan".into();
+        config.capture.decoder_backend = "pyrowave:vulkan".into();
         assert!(!config.validate().iter().any(|e| e.contains("最大码率")));
     }
 

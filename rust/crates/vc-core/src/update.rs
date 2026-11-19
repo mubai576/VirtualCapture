@@ -229,6 +229,7 @@ pub fn random_hex(bytes: usize) -> String {
         BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
     };
     let mut buffer = vec![0u8; bytes];
+    // 安全：buffer 可写且长度与传入的字节数一致；系统 RNG 不需要额外上下文。
     let status = unsafe {
         BCryptGenRandom(
             std::ptr::null_mut(),
@@ -1372,6 +1373,8 @@ fn process_alive(pid: u32) -> bool {
     if pid == 0 {
         return false;
     }
+    // 安全：只通过本进程打开的查询句柄读取退出码；句柄在成功路径上恰好关闭
+    // 一次，失败时提前返回。
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {

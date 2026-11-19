@@ -1,8 +1,8 @@
-//! Raw NV12 分片：与 `sender/vc_sender.cpp` 相同的切包参数和包头字段。
+//! Raw NV12 分片：遵循冻结的 wire 契约，旧 C++ 对照实现仅在 Git 历史中保留。
 //!
-//! 发送端真正的网卡写入仍由现有 C++ 实现负责；本模块只生成可交给任何 L2 发送 API
-//! （未来 Npcap 或测试桩）的包头/载荷。分片不复制帧数据：`Fragment::payload` 是原帧切片。
-//! `flags` 在 `frame_id == 0` 时置关键帧位，与现有 sender 一致。
+//! 本模块生成包头与载荷，网卡写入由 `vc-stream` 的 Npcap 发送路径负责。
+//! 分片不复制帧数据：`Fragment::payload` 是原帧切片。
+//! `flags` 在 `frame_id == 0` 时置关键帧位。
 
 use crate::checksum::crc32;
 use crate::wire::{

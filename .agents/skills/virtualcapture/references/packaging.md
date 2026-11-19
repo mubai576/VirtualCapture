@@ -1,40 +1,29 @@
-# 便携目录打包契约（2026-10-29）
+# Rust 便携包契约
 
-入口：`python scripts/package.py [--allow-dirty] [--output <目录>]`。
-相对路径按仓库根解析，支持从其他工作目录调用脚本。默认输出 `dist/VirtualCapture/`。
-仅支持 Windows x64 / 64 位 Python；依赖 Git、CMake、MSVC、pytest、PyInstaller。
+唯一实现 `rust/packaging/package.py`；根 `scripts/package.py` 仅原样转发参数。版本来自 `rust/Cargo.toml`，载荷与许可的唯一清单为 `rust/packaging/inventory.py`。
 
-流程：预检 → `scripts/verify.py`（完整构建/自检/pytest）→ CMake Runtime install（7 个原生目标与 MSVC DLL）
-→ `packaging/vc-agent.spec` 冻结 agent → 拷贝脚本/文档 → 隔离目录成品冒烟 → 来源不变检查 → 清单 → 发布目录。
-GUI 内置于 agent，不另拷网页资源。
-成品 `.ps1` 统一为 UTF-8 BOM / CRLF，发布前使用 Windows PowerShell 5.1 解析全部脚本并检查便携目录程序查找。
+## 构建与发布门禁
 
-产物根目录：`vc-agent.exe`、`vc-sender.exe`、`vc-receiver.exe`、`vc-vcam.dll`、`vc-testwin.exe`、
-`vc-monitor.exe`、`vc-monitor-diag.exe`、`vc-vcam-verify.exe`、MSVC runtime DLL、`version.json`、
-`Start-VirtualCapture.cmd`、`Start-Capture-Worker.cmd`、`README.md`、`package-manifest.json`；子目录 `ctrl/`、`scripts/`、`docs/`。
-只打包 ctrl/scripts 顶层运行脚本和 docs 下 Markdown；排除 tests、缓存、构建入口、历史取证脚本、机器配置与运行证据。
-Python 控制/分析脚本是可选工具，需目标机 Python；TUI 另需 rich。主 agent / GUI / C++ 程序不依赖目标机 Python。
-Npcap 驱动不随目录复制，目标机实际收发前需安装 Npcap。
-MJPEG静态链接libjpeg-turbo，Runtime install另带`licenses/libjpeg-turbo-LICENSE.md`和`licenses/libjpeg-turbo-README.ijg`；缺任一原文打包失败。
-源文档`docs/runbooks/mjpeg.md`包含IJG归属声明、依赖版本/固定摘要及离线缓存操作，无新增运行时DLL。
-PyroWave动态链接`libpyrowave-shared-1.dll`（与exe同目录，须随包分发），并带
-`licenses/pyrowave-LICENSE.txt`（MIT）与`licenses/granite-LICENSE.txt`（MIT）；缺任一即打包失败。
-源文档`docs/runbooks/pyrowave.md`记录固定提交/摘要、Granite运行时子集、离线缓存与Vulkan 1.3前提。
+Windows x64：Rust MSVC/Windows SDK、Python（pefile/Pillow）、Git、CMake/MSVC。所有产品及隔离验证器由 Cargo 构建；`rust/packaging/native/` 只构建固定 PyroWave 第三方库并收集 app-local MSVC。
 
-主机入口调用 `scripts/start-host.ps1`，采集后台入口调用 `scripts/start-capture-worker.ps1`；两者共用 `start-agent.ps1`，隐藏启动，默认端口 5143，等待健康检查。同目录同角色服务复用；角色、目录或能力冲突则拒绝。源码目录可使用相同脚本启动 Python agent，主机支持 `-NoBrowser`。日志写入运行目录的 `run/agent-*.stdout.log|stderr.log`。
-冻结成品冒烟同时验证主机 GUI 和采集后台：校验 `/health` 角色、版本与 root，后台的 `/`、`/ui`、`/ui/` 必须返回 404。
-冒烟进程树退出后，临时目录清理遇到 Windows 文件占用会在 10 秒内重试；超过期限仍失败则不发布，不跳过清理错误。
+流程：源码来源快照 → fmt/tests/Clippy/Release → 原生依赖 build/install → 载荷/许可与 PE 导入审计 → 完整候选清单/ZIP解压 → portable/DLL/adapter/真实GUI/capture OTA smoke → 来源不变复核 → 唯一 dist 目录/ZIP/SHA-256。
+`--extended-smokes` 追加 control 与 host_update。本地隔离 OTA 不等于真实双机部署。
 
-保护与 provenance：
-- 工作区脏时默认拒绝；owner 已确认可包含当前改动后用 `--allow-dirty`。2026-10-29 owner 已明确授权本次包含 GUI 等当前工作区全部功能。
-- 清单记录版本、UTC 构建时间、Git revision、dirty 状态、逐源文件 SHA-256 与逐产物 SHA-256。
-- 构建期间源码发生变化则失败，不替换旧成品。
-- 仓库内仅允许输出到 `dist/` 的子目录；已存在目录须带匹配的成品清单标记。
-- 成功时旧目录（含其中用户配置/运行证据）整体移入 `<输出目录名>.archive/`；新目录重命名失败则还原旧目录。
-- 日志在 `build/package/package-*.log`。临时构建内容不进入成品。
-- 打包不注册 DLL、不修改机器配置、不启动真实采集/传输、不执行 OTA。
+GUI 截图必须非空白；黑屏就是失败，不删断言、不以窗口存在代替。失败只保留候选和日志，不发布“已验收”最终包。日志位于 `build/rust-package/<build_id>/package.log`，未执行门禁保持 pending。
 
-这是完整便携目录，**不是 OTA zip**；不得整体上传 `/update`。
-OTA允许的根文件额外包含`libpyrowave-shared-1.dll`，与sender/receiver同目录、同批激活，
-纳入prev快照/回滚及本轮激活失败恢复（含首次新增后失败时移除）；旧agent先独立升级白名单，
-再传含必需运行时的完整OTA。操作仍为stage/activate分离，不自动部署。
+## 载荷与运行前提
+
+- 图形入口 `VirtualCapture.exe`；Rust `vc-host/vc-capture/vc-updater/vc-stream/vc-transport/vc-vcam-verify.exe`。
+- `vc_stream.dll` C ABI v1、Rust `vc_vcam.dll`、`libpyrowave-shared-1.dll`、MSVC runtime。
+- 启动脚本、使用说明、生成的 `version.json`、许可证、`package-manifest.json`。
+- codecs 精确为 raw/pyrowave；sources 为 pattern/dda/wgc。旧 C++ 产品、`turbojpeg.dll` 与开发证据禁止进入包。
+- 目标机无需 Rust/Python/VS；实际收发需自行安装 Npcap。桌面转换需要硬件 D3D11；PyroWave 需真实 GPU 的 Vulkan1.3 驱动。驱动不随包复制。
+
+## 来源保护与输出
+
+默认 dirty 工作区拒绝；`--allow-dirty` 只在确认收录范围后使用，不代表允许夹带并发未审阅改动。
+来源记录 Git revision/dirty、受跟踪与未忽略源码 SHA-256；构建中源码改变则失败。凭据、配置、run/build/dist 等不得作为来源或载荷收录；尤其不得读取现有更新令牌。
+
+每次新建 `dist/VirtualCapture-Rust-<version>-windows-x64-<time>-<id>/` 及同名 ZIP/.sha256；不覆盖旧 `dist/VirtualCapture` 或运行配置。没有旧 `--output` 覆盖目录语义。
+
+同一个完整 Rust ZIP 可用于 Rust OTA stage，必须先完整校验、再在停止且非 pending 状态激活；不兼容旧 Python `/update`。SHA-256 只证完整性，不是发布者签名。详细运行布局、令牌配对、就绪与回滚见 `rust-control.md`。

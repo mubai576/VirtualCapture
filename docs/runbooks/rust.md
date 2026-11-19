@@ -1,196 +1,70 @@
-# Rust + GPUI 开发版（D26–D28）
+# Rust 运行与本机诊断
 
-被采集机运行 `vc-capture.exe` CLI 后台，主机运行 `vc-host.exe` GPUI 工作台；编排、配置、预算与 OTA
-在 UI 无关的 `vc-core` 中。Rust 产品数据面是模块化的：`vc-core` 进程内加载版本化 `vc_stream.dll`
-（C ABI v1）运行采集/接收；采集源、编解码与传输编在该 DLL 内，`vc_vcam.dll` 是 Rust COM DirectShow
-虚拟摄像头。独立 `vc-stream.exe` 诊断 CLI 与 DLL 复用同一 crate。产品启动不再以
-`vc-sender.exe`/`vc-receiver.exe` CLI 拼装本机数据面；旧 C++ 产品与协议契约另存，不进入 Rust 包。
-`vc-updater` 是版本切换助手，由 OTA 从 `updates/worker/` 启动。
+构建/完整包见 `build.md`，详细API/生命周期见 `.agents/skills/virtualcapture/references/rust-control.md`。
+仅在独立根目录验证；运行开发版不代表授权替换当前双端部署。
 
-设计与契约：[重构提案](../proposals/rust-rewrite-20261114.md)、
-[OTA 目录与事务](../proposals/rust-ota-layout-20261114.md)、
-[Rust 控制面契约](../../.agents/skills/virtualcapture/references/rust-control.md)。
+## 运行
 
-## 构建
+便携包：主机双击 `VirtualCapture.exe`，被采集机双击 `Start-Capture.cmd`（无参数默认15143）。主机输入 `IPv4:15143`；省略端口和直接运行vc-capture默认仍为5143。主机无本机REST，无浏览器UI。
 
-Windows x64、MSVC/Windows SDK、Rust MSVC 工具链（本轮 Rust/Cargo 1.97.1）。
-GPUI 使用 `gpui-kit 0.9.1`，需要图形桌面。`vc-host/build.rs` 从 `assets/app-icon.svg` 生成 ICO，
-再调用 Windows SDK 的 `rc.exe` 写入 exe 图标；找不到时可用 `VC_RC` 指向 `rc.exe`，否则构建失败。
+源码构建独立启动示例（先自行选择不与已用服务冲突的运行目录/端口）：
 
 ```powershell
-cmake -S . -B build
-cmake --build build --config Release
-cargo build --manifest-path rust/Cargo.toml --workspace --locked
+.\rust\target\release\vc-capture.exe --bind 127.0.0.1 --port 15143 --root .\run\capture-dev --native-dir .\rust\target\release
 ```
-
-输出 `rust/target/debug/{vc-capture,vc-host,vc-launcher,vc-updater,vc-transport,vc-stream,vc-vcam-diag}.exe`
-与 `{vc_stream.dll,vc_vcam.dll}`；加 `--release` 输出到 `rust/target/release/`。`vc-stream.exe` 是独立
-Npcap Raw 诊断工具，也与 `vc_stream.dll` 共用实现；`vc_vcam.dll` 为 Rust DShow COM 虚拟摄像头。
-`vc-launcher.exe` 在包内命名为 `VirtualCapture.exe`，作为带图标的主机图形启动入口。
-原 `scripts/package.py` 与根 CMake 仍只构建/打包原产品；Rust 便携包、Rust 原生运行库与 OTA 使用
-`rust/packaging/package.py`，载荷清单以 `rust/packaging/inventory.py` 为准（原生运行库单独由
-`rust/packaging/native/CMakeLists.txt` 构建，不构建旧 C++ 产品）。
-
-## 绿色运行压缩包
 
 ```powershell
-python -I rust/packaging/package.py --allow-dirty
+.\rust\target\release\vc-host.exe --root .\run\host-dev --native-dir .\rust\target\release
 ```
 
-`--allow-dirty` 表示已检查当前 Rust worktree 改动；默认有未提交文件就拒绝。构建机另需 Python pefile、
-Pillow；目标机不需要 Python/Rust/VS。流程为 Rust fmt/tests/Clippy/Release build → 构建
-`rust/packaging/native`（仅 `vc-vcam-verify.exe`、固定 TurboJPEG/PyroWave 共享库与许可）→
-按 `inventory.py` 收集 Rust EXE/DLL、app-local MSVC runtime、第三方许可 → 拒绝旧 C++ 产品与开发数据
-→ ZIP 解压验证 → `portable_smoke`、同进程 `dll_stream_smoke`、adapter/gui/ota smoke → SHA-256 清单与最终 ZIP。
-旧 `scripts/verify.py` 仍是独立旧产品门禁，不由 Rust 打包流程执行；默认门禁也不含
-control/host_update 专项，`--extended-smokes` 额外执行 120 帧 Raw Loopback `control_smoke`
-（Rust REST 控制面 + 进程内 `vc_stream.dll` 接收端）与 `host_update_smoke`（HostController
-更新与真实 capture helper 重开）。
+Ctrl+C正常退出采集后台；GUI停止/正常关窗按精确会话停远端、本机DLL和本次管理的虚拟卡。真实注册操作必须单独授权；测试优先使用下述不注册的隔离工具。
 
-载荷以 `inventory.py` 为准：`VirtualCapture.exe`、`vc-host`/`vc-capture`/`vc-updater`/`vc-stream`/
-`vc-transport` EXE，`vc_stream.dll`、`vc_vcam.dll`，`vc-vcam-verify.exe`，`turbojpeg.dll`、
-`libpyrowave-shared-1.dll` 与 MSVC runtime；旧 `vc-sender.exe`/`vc-receiver.exe`/`vc-vcam.dll` 出现即失败。
+配置独立 `vc-rust-config.json`，不导入旧Python配置。CLI `--root/--native-dir` 优先于环境变量；显式native目录缺文件就失败，不从旧构建补齐。默认DDA/硬件GPU/640²@240/Raw/crop；pattern是显式合成诊断。普通产品只允许已识别物理网卡，默认优先唯一I226；多I226须选定，失效选择需重选。MTU默认读取双端值，可切手动，不能超过已报告网卡限制；不修改驱动Jumbo。
 
-输出 `dist/VirtualCapture-Rust-<版本>-windows-x64-<时间>-<唯一号>/` 与同名 `.zip` / `.zip.sha256`。
-每次新目录，不替换原 `dist/VirtualCapture`；日志与解压运行目录留在 `build/rust-package/<构建号>/`。
-任一门禁失败会终止发布最终包；候选包的清单中未跑门禁保持pending，实际结果以 `build/rust-package/<构建号>/package.log` 为准。
+PyroWave需显式授权开发编码、精确双端 `pyrowave:vulkan` 与Vulkan1.3真实GPU；不支持MJPEG/CPU转换，无自动降级。深蓝画幅只是尺寸比例示意，不是实时预览。
 
-包内入口按 `app/current.json` 选择当前 release：
+## OTA与证据目录
 
-- **主机双击 `VirtualCapture.exe`**：Windows图形子系统、原生图标；直接解析current并启动GPUI，不调用CMD/PowerShell。
-  日志及启动回执写`<data>/run/host-*`，失败弹出原生错误对话框；支持`--root`/`--native-dir`，默认根为入口所在目录。
-  OTA从0.2.0升到0.2.1时，新host在首帧就绪前补齐ROOT入口；已有入口保留，始终按current选择版本。
-  原`Start-Host.cmd`/`scripts/start-host.ps1`只保留兼容诊断用途，不是日常入口。
-- `Start-Capture.cmd` → `scripts/resolve-capture.ps1`：只返回当前 `build_id`，CMD 用原始 Unicode 根
-  直接运行 CLI；无参数默认 `0.0.0.0:15143`，exe 本身仍默认 5143。
-- 图形入口与采集启动器都支持空格/中文路径；`VirtualCapture.exe --root <目录>`可分离主机配置。
-  图形入口放在`app/releases/<build_id>/`时也会识别固定ROOT，避免把配置另存到版本目录。
-
-## 目录布局与 OTA（D27）
-
-固定运行根 `--root`。存在 `app/current.json` 即进入 Managed 布局：
+固定ROOT；无current时为扁平配置/run。有 `app/current.json` 后：
 
 ```text
-ROOT/app/releases/<build_id>/   当前/历史版本程序
-ROOT/app/current.json           原子切换的当前指针（含 build_id/version/generation）
-ROOT/data/vc-rust-config.json   配置
-ROOT/data/run/                  stats/hashlog/日志
-ROOT/data/update-token.json     采集端更新令牌（仅 --print-update-token 打印）
-ROOT/data/update-peer-token.json 主机配对令牌
-ROOT/updates/staged/<build_id>/ 已校验待激活
-ROOT/updates/worker/            helper、job 与日志
-ROOT/updates/incoming/          上传临时区
-ROOT/updates/history.jsonl      激活/回滚事件
+app/releases/<build_id>/       程序与历史版本
+app/current.json              当前指针
+data/vc-rust-config.json       配置
+data/run/                     证据与固定虚拟卡owner证明
+updates/staged/ worker/ incoming/
+updates/history.jsonl         激活与回滚历史
 ```
 
-无 `current.json` 的扁平目录保持 `ROOT/vc-rust-config.json` 与 `ROOT/run/`。**首次激活**只把旧配置与令牌
-复制到 `data/`，不移动 `run/` 或旧目录；首次升级失败时移除 `current.json` 即可回到扁平布局。
-已进入 Managed 后程序与配置分目录，版本切换不移动正在使用的配置与证据。
+首次激活只复制配置/配对凭据，不移动旧run；失败可回原布局。令牌仅通过用户明确操作配对，不进health/普通配置/日志。现有根令牌不读取、显示、打包或删除。
 
-流程：
+完整Rust ZIP先stage校验，停止且无cleanup_pending才activate；helper等待旧PID退出、复核载荷、切current并确认新ROOT/build/就绪，失败恢复旧指针重启。HTTP202不是成功证明。与旧Python OTA不互通；版本校验/SHA256不等于发布者签名。不要手动改staging/prev或owner证明。
 
-1. 采集端运行 `vc-capture.exe --print-update-token --root <ROOT>`，把令牌填入主机“应用更新”面板并配对；
-   令牌不进入 health、日志或普通配置，错误令牌返回 401。
-2. 主机选择同一便携 ZIP：可暂存本机、或上传采集机；上传带 `X-VC-SHA256`，超时 180s。
-   暂存只校验并解包到 `updates/staged/`，不切 `current`；运行中允许暂存，采集或待清理时不可激活。
-3. “应用更新”提交 `{build_id}`，服务返回 202 并由 `vc-updater` 等待旧 PID 退出、复核载荷、
-   原子切换 `current.json`、启动新程序。采集端确认 Rust 身份/ROOT/build/新PID；主机以
-   `--update-ready <path>` 首帧后回执。
-4. 失败恢复旧指针并重启旧版本，历史写入 `history.jsonl`；不可指定回滚到未暂存/未保留的 build。
-   ZIP 只接受本产品 `package-manifest.json`，拒绝路径穿越、重复、符号链接、越界与哈希不符；
-   SHA-256 不是发布者签名。
+## 本机专项（均不替代双机验收）
 
-旧 0.1.0 程序没有更新端点，**首次启用 OTA 需要一次手工 bootstrap**（用支持 OTA 的版本替换一次），
-之后才可全程从固定 ROOT 更新。不要把 Rust ZIP 上传到旧 Python agent 的 `/update`。
+先 `python scripts/verify.py`；以下按所需前提显式执行，证据写gitignored run/。
 
-## 独立运行
+| 脚本（`python -I rust/tests/<脚本>`） | 验证内容 |
+|---|---|
+| `transport_vectors.py` | 独立Python oracle、冻结向量、Rust pcap回放，不开网卡 |
+| `raw_stream_smoke.py` | 双Rust CLI、motion/640²@60/120帧/Loopback/batch1、全量参考哈希与私有SHM |
+| `raw_stream_perf.py --batch 1` | motion/640²@240/2400帧/Loopback，同机cadence/延迟与独立CPU门 |
+| `dll_stream_smoke.py --package rust/target/release` | 真实DLL同进程ABI、Raw收发/完整hash/SHM、stop/destroy |
+| `dll_stream_smoke.py --package rust/target/release --codec pyrowave` | 显式PyroWave压缩传输/解码证据，需同目录原生库 |
+| `source_dll_smoke.py --dll rust/target/release/vc_stream.dll --allow-dda-unavailable` | 私有Tk动态窗口、WGC硬件GPU/缩放/关闭；DDA无输出记BLOCKED，不换源 |
+| `vcam_dll_smoke.py` | Rust隔离验证器真实加载COM DLL、SHM/重复/阻塞Stop/Disconnect七场景，不注册 |
+| `adapter_smoke.py --package rust/target/release` | CLI完整枚举与产品物理列表、非显式Loopback拒绝；不收发物理网卡 |
+| `control_smoke.py` | 随机端口/独立ROOT，REST+真实DLL Raw回环、精确停止与证据保护，不注册 |
+| `gui_smoke.py --package rust/target/release` | 真实GPUI交互、HTTP错误与正常退出，非空白截图硬门 |
+| `ota_smoke.py --package <完整包>` | 私有ROOT/端口、capture/helper stage/activate/rollback |
+| `host_update_smoke.py --package <完整包>` | 私有HostController/更新助手/真实GPUI重开 |
 
-两个入口都支持 `--root`、`--native-dir`；优先级 CLI > `VC_ROOT`/`VC_NATIVE_DIR` > 自动探测。
-`--native-dir` 必须直接包含 `vc_stream.dll`（主机还需 `vc_vcam.dll`），显式目录优先且不搜索回退；
-未指定时按 Managed 当前 release → build → ROOT → exe 目录查找。示例指向 debug 目标目录，
-Release 构建改用 `rust/target/release`。
+仅dll/source等支持的脚本可用 `--self-check`；具体参数以该脚本 `--help` 为准。图形native程序不通过浏览器预览验证。
 
-```powershell
-.\rust\target\debug\vc-capture.exe --bind 0.0.0.0 --port 15143 --root D:/VirtualCaptureRust/capture --native-dir D:/Project/REA/VirtualCapture-rust/rust/target/debug
-.\rust\target\debug\vc-host.exe --root D:/VirtualCaptureRust/host --native-dir D:/Project/REA/VirtualCapture-rust/rust/target/debug
-```
+## 故障边界
 
-- 两端列表只保留 Windows 明确 `hardware_interface=true` 且 `virtual=false` 的物理网卡，排除回环与
-  元数据未知设备；展示、自动选卡、手动选择、prepare/start 共用该列表。主机枚举失败清空旧列表，
-  失效选择清除后须手动重选。
-- 被采集机默认禁止回环；仅显式 `--allow-loopback-diagnostics` 且控制器本身是回环地址时允许
-  `\Device\NPF_Loopback`，用于本机诊断，不冒充物理容量。`--list-adapters` 仍是完整诊断枚举。
-- 默认 640×640@240、Raw、crop、DDA、GPU 转换、MTU9000；Raw batch 由尺寸/MTU 自动计算为整帧
-  （无用户可调 batch），Npcap Loopback 诊断固定 batch1；可变尺寸要求偶数。
-  MJPEG/PyroWave 必须显式 `codec_experimental=true` 且后端精确匹配，否则 Rust 启动明确拒绝，不静默降级。
-- 产品启动不拉起 sender/receiver 子进程；`vc_stream.dll` 缺失、ABI/能力不符时明确失败，不回退旧程序。
-- 虚拟卡归属由 HKCU CLSID `VirtualCaptureOwner` 与本根精确匹配的 schema 2 证明确定（DLL、运行根、PID、进程创建时间）。current/pending 固定在 `ROOT/data/run/vcam-owned.json`、`ROOT/data/run/vcam-owned.pending.json`，兼容读取旧 `ROOT/run/vcam-owned.json`，不随 Legacy/Managed/OTA 回滚改变位置，也不移动旧 run 证据。Windows 等价根路径先规范化；旧 release DLL 已被 OTA 删除时，以最深存在祖先 canonicalize 并拼接缺失后缀，恢复 junction 别名一致性。仅 `NotFound` 允许继续向上解析，其他路径错误、悬空重解析点及含 `/`、`.`、`..` 的歧义 verbatim 路径保持未证明并拒绝恢复，不退回词法相等。支持盘符、UNC 与合法 `\\?\Volume{GUID}\` 文件系统路径；卷 GUID 保留命名空间，不接受任意设备路径。若 Windows 将卷 GUID 路径规范化为已分配盘符，须查询盘符根对应卷 GUID 并确认重建后的完整路径一致；全局 owner DLL/根记录须保持规范拼写。共享 `--native-dir` 不允许不同运行根互相接管，缺少全局 owner 值的旧注册不自动恢复。
-- owner 更新先保全旧全局证明，再刷盘新 pending、提交注册表、提升 current；注册表写失败或提交后进程中断仍保留一份精确证明，重试不放宽记录一致性要求。该机制不是断电时跨文件系统/注册表的原子事务；未知状态仍拒绝自动接管/注销，详细顺序见 [Rust 控制契约](../../.agents/skills/virtualcapture/references/rust-control.md)。
-- 数据面模块必须报告 stream revision 2、可变尺寸、SHM v3、sendqueue=frame 与 codecs/sources；
-  虚拟卡注册前用 `vc-vcam-verify.exe --dll ... --capabilities` 隔离探测；已有注册必须证明属于本根本进程或确认已退出属主，不能接管其他根、其他存活属主或未知注册。
-- PyroWave 在 ready 前显式编解码预热，使用同几何/后端/预算的合成 NV12，输出丢弃；冷启动耗时另记，
-  不计入正式帧号/hashlog/SHM/稳态帧率。创建/预热/编码/解码/重置/销毁受原生 5 秒看门狗覆盖；
-  超时只报告会话粘性超时，不终止宿主；挂起时保留 worker/句柄/DLL，
-  pending 期间不能改配置/激活 OTA/注册虚拟卡，不能安全停止时不自动卸载，交由进程退出回收。
-- 正常停止/关窗按会话号停远端 sender、停本机 receiver，只回收本控制器注册的 DLL；
-  停止未确认显示待清理，先清理再改配置。断电/强杀不保证清理。
-
-## 独立 Raw Npcap 互操作诊断
-
-`vc-stream.exe` 是随包的 Windows 诊断 CLI，不属于 `vc-capture` 控制 API；它与 `vc_stream.dll` 共用 crate 实现，但不注册 DShow，也不切换产品数据面。当前 CLI 仍是 Raw pattern 诊断（DDA/WGC 与编码经同一 crate 的 DLL ABI 在进程内运行）。需要 Windows + Npcap。完整逐帧证据和范围见[bring-up 记录](../bringup/bringup-20261119-rust-data-plane.md)。
-
-```powershell
-cmake --build build --config Release
-cargo build --manifest-path rust/Cargo.toml -p vc-stream --release --locked
-python -I rust/tests/raw_stream_smoke.py --self-check
-python -I rust/tests/raw_stream_smoke.py
-```
-
-默认只用 `\\Device\\NPF_Loopback`、640×640@60、MTU9000、120 帧、motion、batch1，并同时运行 C++/Rust 双向 TX 与 C++/Rust 双接收端；六份完整 hashlog 必须逐帧一致，且全部与 Python pattern reference 对账。Rust receiver 默认发布唯一私有 SHM v3 mapping，冒烟会检查布局、最新帧 payload 和 hash 标记。该 smoke 只验证功能互操作，不证明物理网卡、吞吐、延迟、双机、长稳或 DShow 生命周期。无 `--batch` 参数覆盖时固定 batch1；显式 batch 原值使用，不自动 retry/fallback。运行证据留在 gitignored `run/rust-raw-stream-smoke-<id>/`。
-
-同机 240 fps 探针使用独立 harness：
-
-```powershell
-python -I rust/tests/raw_stream_perf.py --self-check
-python -I rust/tests/raw_stream_perf.py --batch 1
-```
-
-默认测 2400 帧 Raw 640×640@240、motion、MTU9000、Npcap Loopback、SHM v3；用同机 hashlog QPC 配对测发送准备完成至末片重组完成延迟，并独立报告 T0 CPU 门禁。当前本机样本 cadence 与 p99 <10ms 达标，但 sender CPU 门限未通过；见[性能证据和限制](../bringup/bringup-20261119-rust-data-plane.md#240-fps-同机性能探针)。这不替代物理网卡或双机 T1/T2。`--batch 69` 可显式进行对照，短发送即失败且不自动 fallback。结果保存在 gitignored `run/rust-raw-perf-<id>/`。
-
-## 验证
-
-```powershell
-cargo fmt --manifest-path rust/Cargo.toml --all --check
-cargo test --manifest-path rust/Cargo.toml --workspace --locked
-cargo clippy --manifest-path rust/Cargo.toml --workspace --all-targets --locked -- -D warnings
-python scripts/verify.py
-python -I rust/tests/adapter_smoke.py
-python -I rust/tests/dll_stream_smoke.py --package <解压目录>
-python -I rust/tests/control_smoke.py
-python -I rust/tests/gui_smoke.py
-python -I rust/tests/ota_smoke.py
-python -I rust/tests/host_update_smoke.py
-python -I rust/tests/transport_vectors.py
-```
-
-- `adapter_smoke.py`：真实启动采集后台，确认 `--list-adapters` 仍为完整列表、`/adapters` 只含物理网卡、
-  无诊断开关时回环 prepare 被 409 拒绝且未启动采集。
-- `dll_stream_smoke.py`：同一进程 ctypes 加载真实 `vc_stream.dll`（C ABI v1），覆盖 ABI 布局/版本、
-  start/status/stop/destroy、Raw 与按 `--codec mjpeg|pyrowave` 选择的发送/接收 hash、SHM v3 与
-  pending stop；不启动任何 sender/receiver/vc-stream/vc-vcam-verify 子进程，默认只用 Npcap Loopback。
-  `--package <解压目录>` 测发布包，`--performance` 才加本机 cadence/延迟门；它不证明物理网卡或双机。
-- `control_smoke.py`：Rust `vc-capture` REST 控制面 + 同一进程内 `vc_stream.dll` 接收端，不启动
-  sender/receiver EXE；随机回环控制端口、独立 ROOT、私有 SHM，以 `--allow-loopback-diagnostics`
-  启动后台，120 帧 Raw motion 全量 FNV 对账，并检查错误会话停止、运行中改配置、复用会话不得覆盖
-  证据及 DLL stop/destroy 生命周期。默认由 `--extended-smokes` 追加。
-- `gui_smoke.py`：真实 GPUI 窗口的预设持久化、物理网卡刷新与筛选、1080 宽布局、HTTP 错误和正常退出。
-- `ota_smoke.py`：私有ROOT/随机端口，真实capture/helper暂存、激活、回滚和失败恢复；`--package <解压目录>`使用Release。
-- `host_update_smoke.py`：需要 `vc_stream.dll` 与 `vc_vcam.dll`；从 UI 无关 HostController 驱动
-  对端更新与本机 helper 重开，确认新 GPUI 回执；支持 `--package`，默认由 `--extended-smokes` 追加。
-- `source_dll_smoke.py`：通过真实 DLL ABI 对私有窗口做 WGC CPU/GPU 采集、缩放与关闭生命周期检查；DDA需要可用DXGI显示输出；`--allow-dda-unavailable`只将无输出明确记录为BLOCKED，不会改用其他源。证据留在 `run/rust-source-dll-smoke-*`。
-- `vcam_dll_smoke.py`：通过隔离 `vc-vcam-verify.exe` 检查 `vc_vcam.dll` 的SHM v3、交付/重复和阻塞Stop/Disconnect生命周期，不注册DirectShow或操作注册表。证据留在 `run/rust-vcam-dll-smoke-*`。
-- `transport_vectors.py`：真实C++黄金向量、独立Rust库测试与pcap CLI回放，不开网卡。
-
-以上只证明本机功能。2026-11-19三编码Release DLL Loopback性能、WGC与vcam隔离验证及失败边界见
-[本机 Rust-R3 记录](../bringup/bringup-20261119-rust-r3-local.md)：Raw/MJPEG/PyroWave各2400帧 motion/640×640@240
-同机cadence和<10ms延迟门通过；不代表物理NIC或双机验收。该轮DDA因无DXGI输出BLOCKED，GUI smoke全黑截图触发硬门失败，故便携包完整验收未通过。Rust OTA 的双机升级/回滚、DShow完整编排、编码画质、双机240fps与长稳仍待专项验收；Rust-R3保持IN PROGRESS。性能结论必须注明pattern/batch/adapter，Loopback不冒充物理网卡/双机结论。
+- pending不是释放；DLL stop/destroy未确认不得卸载，也不能改配置/OTA/注册。PyroWave每操作5秒看门狗只标粘性错误，可能挂起的对象留至进程退出。
+- 虚拟卡只允许匹配全局owner与本根精确schema2证明的恢复；其他根、其他存活宿主、旧注册无owner、路径/进程状态未知均拒绝。不要手动绕过保护。
+- 无DXGI输出只把DDA实采记BLOCKED；不能用WGC或pattern给DDA补PASS。GUI黑屏就是FAIL。
+- 旧双机自动矩阵工具已移除，Rust替代尚缺；门限不变。实际物理NIC/双机/长稳/画质/完整产品DShow及便携门仍须独立证据。
+- 历史本机结果在 `docs/bringup/bringup-20261119-rust-r3-local.md`；其中旧MJPEG数据仅属当时版本，不是当前支持。

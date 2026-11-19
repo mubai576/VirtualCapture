@@ -1,9 +1,11 @@
 //! 编解码配置、显式身份校验与能力声明。
 //!
-//! 字段/取值范围来自 `references/encoded-stream.md`：
-//! Raw 是缺省且无编码参数；MJPEG 必须显式 `experimental=true` 且两端
-//! `turbojpeg:cpu`；PyroWave 必须显式 `experimental=true` 且两端
-//! `pyrowave:vulkan`。不接受的组合明确报错，绝不静默回退 Raw 或换后端。
+//! 只保留 Raw NV12 直通与 PyroWave（`pyrowave:vulkan`，Vulkan 1.3 GPU 计算，
+//! 阶段一 CPU 上传/回读）。MJPEG 的唯一后端 `turbojpeg:cpu` 是 CPU/SIMD
+//! 编码，违反本项目的 GPU-only 要求，生产实现与 `turbojpeg.dll` 已移除；
+//! wire codec id 3 仍保留用于安全拒绝旧流，但 `validate`/`Encoder::open`/
+//! `Decoder::open` 都会明确拒绝 `codec=mjpeg`。不接受的组合明确报错，绝不
+//! 静默回退 Raw 或换后端。
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -12,9 +14,9 @@ use vc_transport::Geometry;
 
 use crate::au::AU_HEADER_BYTES;
 
-/// MJPEG 唯一允许的后端身份（固定 libjpeg-turbo CPU/SIMD）。
-pub const MJPEG_IDENTITY: &str = "turbojpeg:cpu";
-/// PyroWave 唯一允许的后端身份（Vulkan 计算，intra-only）。
+/// MJPEG 被拒绝的原因（其唯一后端是 CPU/SIMD）。
+pub const MJPEG_UNSUPPORTED: &str = "codec=mjpeg 不受支持：MJPEG 唯一后端 turbojpeg:cpu 是 CPU/SIMD 编码，违反本项目的 GPU-only 要求，生产实现与 turbojpeg.dll 已移除；请改用 codec=pyrowave（pyrowave:vulkan，Vulkan 1.3 GPU 计算）或 codec=raw";
+/// PyroWave 唯一允许的后端身份（Vulkan 1.3 GPU 计算，intra-only）。
 pub const PYROWAVE_IDENTITY: &str = "pyrowave:vulkan";
 /// `max_au_bytes` 下限（含 48B 封装）。
 pub const MIN_AU_BYTES: usize = 1024;
@@ -29,15 +31,15 @@ pub const MAX_BITRATE_BPS: u64 = 2_000_000_000;
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(default, deny_unknown_fields)]
 pub struct CodecConfig {
-    /// raw | mjpeg | pyrowave
+    /// raw | pyrowave；历史 mjpeg 会被明确拒绝。
     pub codec: String,
     /// 开发编码必须显式启用；Raw 必须为 false。
     pub experimental: bool,
-    /// 与 codec 精确匹配：MJPEG 为 `turbojpeg:cpu`，PyroWave 为 `pyrowave:vulkan`。
+    /// 与 codec 精确匹配：PyroWave 为 `pyrowave:vulkan`。
     pub encoder_backend: String,
     /// 接收端身份；两端必须一致。
     pub decoder_backend: String,
-    /// 仅 MJPEG 使用；1..100，固定 4:2:0 + 快速整数 DCT。
+    /// 仅历史 MJPEG 配置使用；保留字段以兼容旧配置，MJPEG 本身会被拒绝。
     pub jpeg_quality: u32,
     /// 含 48B 封装的访问单元内存上限；1024..16777216。
     pub max_au_bytes: usize,
@@ -122,7 +124,13 @@ fn require_encoded_identity(config: &CodecConfig, identity: &str) -> Result<()> 
 }
 
 /// 校验配置与会话几何；不打开 DLL、不分配编解码器。
+///
+/// MJPEG 在其它字段检查之前直接以 GPU-only 原因拒绝，保证旧配置得到可操作
+/// 的错误，而不是被误认为仍受支持。
 pub fn validate(config: &CodecConfig, width: u32, height: u32, fps: u32) -> Result<()> {
+    if config.codec == "mjpeg" {
+        bail!("{MJPEG_UNSUPPORTED}");
+    }
     let geometry = Geometry::new(width, height)
         .with_context(|| format!("无效 NV12 会话尺寸 {width}x{height}"))?;
     common_checks(config, &geometry, fps)?;
@@ -130,7 +138,7 @@ pub fn validate(config: &CodecConfig, width: u32, height: u32, fps: u32) -> Resu
         "raw" => {
             ensure!(
                 !config.experimental,
-                "raw 不接受 experimental=true；要启用开发编码请把 codec 改为 mjpeg/pyrowave"
+                "raw 不接受 experimental=true；要启用开发编码请把 codec 改为 pyrowave"
             );
             ensure!(
                 config.encoder_backend.is_empty(),
@@ -143,9 +151,6 @@ pub fn validate(config: &CodecConfig, width: u32, height: u32, fps: u32) -> Resu
                 config.decoder_backend
             );
         }
-        "mjpeg" => {
-            require_encoded_identity(config, MJPEG_IDENTITY)?;
-        }
         "pyrowave" => {
             require_encoded_identity(config, PYROWAVE_IDENTITY)?;
             let budget = pyrowave_frame_budget_for(config, &geometry, fps)?;
@@ -155,7 +160,9 @@ pub fn validate(config: &CodecConfig, width: u32, height: u32, fps: u32) -> Resu
             );
         }
         other => {
-            bail!("codec={other} 不受支持；只允许 raw/mjpeg/pyrowave，H.264/H.265 等已按 D23 移除")
+            bail!(
+                "codec={other} 不受支持；只允许 raw/pyrowave，MJPEG（CPU/SIMD）与 H.264/H.265 均已移除"
+            )
         }
     }
     Ok(())
@@ -190,31 +197,24 @@ pub fn pyrowave_frame_budget(
 }
 
 /// 运行时能力声明：只声明编译进来的路径和候选后端，不冒充已配置/已验证硬件。
+///
+/// `codecs` 只列出 raw/pyrowave；MJPEG 仅存在于历史 wire codec id（3）中，
+/// 由 `removed_codecs` 如实标注，便于宿主拒绝旧配置/旧流。
 pub fn capabilities() -> Value {
-    let encoded = |codec: &str, identity: &str, family: &str, name: &str| {
-        json!({
-            "codec": codec,
-            "identity": identity,
-            "family": family,
-            "name": name,
-            "experimental": true,
-            "hardware": false,
-            "frames_tested": 0,
-            "stream_validated": false
-        })
-    };
-    let mjpeg = encoded(
-        "mjpeg",
-        MJPEG_IDENTITY,
-        "turbojpeg",
-        "libjpeg-turbo 3.1.2 CPU/SIMD",
-    );
-    let pyrowave = encoded(
-        "pyrowave",
-        PYROWAVE_IDENTITY,
-        "pyrowave",
-        "PyroWave Vulkan compute (intra-only)",
-    );
+    // PyroWave 是 Vulkan 计算后端，不是固定厂商硬件编码器；hardware=false
+    // 表示不声明固定硬件，gpu_compute 表示实际由 GPU 计算。
+    let pyrowave = json!({
+        "codec": "pyrowave",
+        "identity": PYROWAVE_IDENTITY,
+        "family": "pyrowave",
+        "name": "PyroWave Vulkan 1.3 GPU compute (intra-only, CPU upload/readback)",
+        "experimental": true,
+        "hardware": false,
+        "gpu_compute": true,
+        "vulkan_min_version": "1.3",
+        "frames_tested": 0,
+        "stream_validated": false
+    });
     let raw = json!({
         "codec": "raw",
         "identity": "raw",
@@ -228,24 +228,21 @@ pub fn capabilities() -> Value {
     });
     json!({
         "codec_revision": 1,
-        "mjpeg_revision": 1,
         "pyrowave_revision": 1,
         "pixel_format": "nv12",
-        "codecs": ["raw", "mjpeg", "pyrowave"],
+        "codecs": ["raw", "pyrowave"],
+        "removed_codecs": ["mjpeg"],
+        "removed_codec_wire_ids": {"mjpeg": 3},
         "encoded_requires_experimental": true,
         "no_automatic_fallback": true,
         "libraries": {
-            "turbojpeg": {
-                "file": "turbojpeg.dll",
-                "alternate": "libturbojpeg.dll"
-            },
             "pyrowave": {
                 "file": "libpyrowave-shared-1.dll"
             }
         },
         "native": {
-            "encoders": [raw.clone(), mjpeg.clone(), pyrowave.clone()],
-            "decoders": [raw.clone(), mjpeg.clone(), pyrowave.clone()]
+            "encoders": [raw.clone(), pyrowave.clone()],
+            "decoders": [raw.clone(), pyrowave.clone()]
         },
         "hardware": {
             "encoder": {
@@ -253,14 +250,14 @@ pub fn capabilities() -> Value {
                 "status": "candidates_only",
                 "declares_vendor_hardware": false,
                 "frames_tested": 0,
-                "backends": [mjpeg.clone(), pyrowave.clone()]
+                "backends": [pyrowave.clone()]
             },
             "decoder": {
                 "revision": 1,
                 "status": "candidates_only",
                 "declares_vendor_hardware": false,
                 "frames_tested": 0,
-                "backends": [mjpeg, pyrowave]
+                "backends": [pyrowave]
             }
         },
         "stream_validated": false
@@ -306,11 +303,18 @@ mod tests {
         assert_eq!(config, CodecConfig::default());
         assert!(serde_json::from_str::<CodecConfig>(r#"{"codec":"raw","bogus":1}"#).is_err());
         let encoded: CodecConfig = serde_json::from_str(
-            r#"{"codec":"mjpeg","experimental":true,"encoder_backend":"turbojpeg:cpu","decoder_backend":"turbojpeg:cpu","jpeg_quality":86}"#,
+            r#"{"codec":"pyrowave","experimental":true,"encoder_backend":"pyrowave:vulkan","decoder_backend":"pyrowave:vulkan","jpeg_quality":86}"#,
         )
         .unwrap();
         assert_eq!(encoded.jpeg_quality, 86);
         assert_eq!(encoded.max_au_bytes, 8_388_608);
+        validate(&encoded, 640, 640, 240).unwrap();
+        // 旧 MJPEG 配置仍可反序列化（字段保留），但校验会以 GPU-only 原因拒绝。
+        let mjpeg: CodecConfig = serde_json::from_str(
+            r#"{"codec":"mjpeg","experimental":true,"encoder_backend":"turbojpeg:cpu","decoder_backend":"turbojpeg:cpu","jpeg_quality":86}"#,
+        )
+        .unwrap();
+        assert!(validate(&mjpeg, 640, 640, 240).is_err());
     }
 
     #[test]
@@ -337,25 +341,42 @@ mod tests {
     }
 
     #[test]
-    fn encrypted_codecs_need_explicit_experimental_and_exact_identity() {
-        let mut config = encoded_config("mjpeg", MJPEG_IDENTITY);
+    fn encoded_codecs_need_explicit_experimental_and_exact_identity() {
+        let mut config = encoded_config("pyrowave", PYROWAVE_IDENTITY);
         validate(&config, 640, 640, 240).unwrap();
 
         config.experimental = false;
         assert!(validate(&config, 640, 640, 240).is_err());
         config.experimental = true;
-        config.encoder_backend = "turbojpeg:gpu".into();
+        config.encoder_backend = "pyrowave:gpu".into();
         assert!(validate(&config, 640, 640, 240).is_err());
-        config.encoder_backend = MJPEG_IDENTITY.into();
+        config.encoder_backend = PYROWAVE_IDENTITY.into();
         config.decoder_backend = String::new();
         assert!(validate(&config, 640, 640, 240).is_err());
 
-        let config = encoded_config("mjpeg", PYROWAVE_IDENTITY);
+        let config = encoded_config("pyrowave", "turbojpeg:cpu");
         assert!(validate(&config, 640, 640, 240).is_err());
-        let config = encoded_config("pyrowave", MJPEG_IDENTITY);
+        let config = encoded_config("mjpeg", PYROWAVE_IDENTITY);
         assert!(validate(&config, 640, 640, 240).is_err());
         let config = encoded_config("pyrowave", PYROWAVE_IDENTITY);
         validate(&config, 640, 640, 240).unwrap();
+    }
+
+    #[test]
+    fn mjpeg_is_rejected_with_actionable_cpu_backend_error() {
+        // 无论其它字段是否合法，MJPEG 都必须立即给出 GPU-only 的可操作错误。
+        for config in [
+            encoded_config("mjpeg", "turbojpeg:cpu"),
+            CodecConfig {
+                codec: "mjpeg".into(),
+                ..CodecConfig::default()
+            },
+        ] {
+            let error = validate(&config, 640, 640, 240).unwrap_err().to_string();
+            assert_eq!(error, MJPEG_UNSUPPORTED);
+            assert!(error.contains("CPU") && error.contains("turbojpeg:cpu"));
+            assert!(error.contains("pyrowave") && error.contains("raw"));
+        }
     }
 
     #[test]
@@ -366,7 +387,7 @@ mod tests {
         };
         assert!(validate(&config, 640, 640, 240).is_err());
         let config = CodecConfig {
-            encoder_backend: MJPEG_IDENTITY.into(),
+            encoder_backend: PYROWAVE_IDENTITY.into(),
             ..CodecConfig::default()
         };
         assert!(validate(&config, 640, 640, 240).is_err());
@@ -387,7 +408,7 @@ mod tests {
     #[test]
     fn pyrowave_budget_matches_documented_minimum() {
         let mut config = encoded_config("pyrowave", PYROWAVE_IDENTITY);
-        // 80 Mbps / 8 / 240 = 41666; max_au-48 = 8388560; raw = 614400.
+        // 80 Mbps / 8 / 240 = 41666；max_au-48 = 8388560；raw = 614400。
         assert_eq!(
             pyrowave_frame_budget(&config, 640, 640, 240).unwrap(),
             41_666
@@ -417,7 +438,10 @@ mod tests {
         assert_eq!(caps["pixel_format"], "nv12");
         assert_eq!(caps["no_automatic_fallback"], true);
         let codecs = caps["codecs"].as_array().unwrap();
-        assert_eq!(codecs.len(), 3);
+        assert_eq!(codecs, &["raw", "pyrowave"]);
+        assert_eq!(caps["removed_codecs"], json!(["mjpeg"]));
+        assert_eq!(caps["removed_codec_wire_ids"]["mjpeg"], 3);
+        assert!(caps["libraries"].get("turbojpeg").is_none());
         assert_eq!(caps["hardware"]["encoder"]["status"], "candidates_only");
         assert_eq!(
             caps["hardware"]["encoder"]["declares_vendor_hardware"],
@@ -425,10 +449,14 @@ mod tests {
         );
         assert_eq!(caps["hardware"]["decoder"]["frames_tested"], 0);
         let backends = caps["hardware"]["encoder"]["backends"].as_array().unwrap();
+        assert_eq!(backends.len(), 1);
         assert!(backends.iter().all(|backend| backend["frames_tested"] == 0));
         assert!(backends.iter().all(|backend| backend["hardware"] == false));
-        assert_eq!(caps["native"]["encoders"][1]["identity"], MJPEG_IDENTITY);
-        assert_eq!(caps["native"]["decoders"][2]["identity"], PYROWAVE_IDENTITY);
+        assert_eq!(backends[0]["identity"], PYROWAVE_IDENTITY);
+        assert_eq!(backends[0]["gpu_compute"], true);
+        assert_eq!(backends[0]["vulkan_min_version"], "1.3");
+        assert_eq!(caps["native"]["encoders"][1]["identity"], PYROWAVE_IDENTITY);
+        assert_eq!(caps["native"]["decoders"][1]["identity"], PYROWAVE_IDENTITY);
         assert_eq!(caps["stream_validated"], false);
     }
 }

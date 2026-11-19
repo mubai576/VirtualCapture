@@ -122,13 +122,13 @@ def measure(exe, run, token, ref_samples, batch, report):
     view = smoke.open_shm_view(shm, rx, cfg["ready_timeout_s"], "RX")
     try:
         tx = smoke.Child("tx", tx_cmd, run)
-        smoke.wait_children([rx, tx], cfg["phase_timeout_s"], "Raw performance")
+        smoke.wait_children([rx, tx], cfg["stream_timeout_s"], "Raw performance")
         report["exit_codes"] = {"tx": tx.proc.returncode, "rx": rx.proc.returncode}
         tx_stats = smoke.read_json(run / "tx-stats.json", "TX stats")
         rx_stats = smoke.read_json(run / "rx-stats.json", "RX stats")
         report.update(tx_stats=tx_stats, rx_stats=rx_stats)
-        smoke.validate_tx_stats(tx_stats, True, FRAMES, cfg["total_packets"], session, "TX stats")
-        smoke.validate_rx_stats(rx_stats, True, FRAMES, session, True, "RX stats")
+        smoke.validate_tx_stats(tx_stats, FRAMES, cfg["total_packets"], session, "TX stats")
+        smoke.validate_rx_stats(rx_stats, FRAMES, session, True, "RX stats")
         smoke.require(tx_stats.get("pattern") == "motion" and tx_stats.get("fps_target") == FPS
                       and tx_stats.get("batch") == batch and tx_stats.get("pacing_us") == 0,
                       f"incorrect sender configuration: {tx_stats}")

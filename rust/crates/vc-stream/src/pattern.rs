@@ -1,8 +1,9 @@
-//! 纯整数 NV12 测试源：`sender/pattern.h` 的逐字节 Rust 移植。
+//! 纯整数 NV12 测试源，即现行 Rust 版 pattern 实现；与历史 C++ `sender/pattern.h`
+//! 的逐字节语义一致。
 //!
 //! 五种图案（counter/checker/rings/noise/motion）全部只用整数运算，
 //! 同一 `frame_id` 必得同一帧，便于丢帧重放和哈希对账。生成结果与
-//! C++ `sender/pattern.h`、Python `ctrl/pattern_ref.py`（`gen_native`）逐字节一致：
+//! 历史C++图案、独立Python `rust/tests/reference/pattern_ref.py`（`gen_native`）逐字节一致：
 //! 包含可变宽高、运动色块在几何边缘的裁剪规则、行内 PRNG 尾部字节规则，
 //! 以及 32 位无符号回绕语义。默认产品尺寸仍为 640×640，但本模块不内置该假设。
 //!
@@ -297,11 +298,11 @@ mod tests {
 
     // 独立黄金向量来源（常量不是本实现算出来的）：
     //
-    // 1. `build/Release/vc-sender.exe --selftest`（C++17，含 sender/pattern.h）
+    // 1. 历史 `build/Release/vc-sender.exe --selftest`（C++17，含 sender/pattern.h）
     //    打印的 `VEC full`（640×640，fid 0..3）与 `VEC variable`（418×282，fid 0..1）。
-    // 2. 用 MSVC 19.44 单独编译的 fixture（仅 include 真实 sender/pattern.h 和
+    // 2. 历史用 MSVC 19.44 单独编译的 fixture（仅 include 真实 sender/pattern.h 和
     //    common/fnv1a.h），生成 2×2、100×70、60×40 及高/回绕 fid 向量。
-    // 3. `ctrl/pattern_ref.py::gen_native`（独立 Python 镜像）对上述 37 个变异场景
+    // 3. `rust/tests/reference/pattern_ref.py::gen_native`（独立 Python 镜像）对上述 37 个变异场景
     //    逐一复算，与 C++ fixture 输出完全一致后才写入下表。
     //
     // 哈希为 Y+UV 拼接后的 FNV-1a64，与 C++ `vc_fnv1a64_two`、

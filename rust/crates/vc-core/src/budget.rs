@@ -1,6 +1,6 @@
 //! 链路预算：只看采集/接收尺寸、MTU 与两端网卡速率，不改配置、不启停进程。
 //!
-//! 公式与 `references/stream-config.md` 一致：`P = mtu - 42`，
+//! 公式与 `references/rust-control.md` 一致：`P = mtu - 42`，
 //! `wire = B + N*66 + max(0, 18 - last)`，`usable = min(rx, tx) * (100 - headroom) / 100`。
 //! 状态沿用历史 agent：`exceeds` 只在超过物理线速时成立，超过 `usable` 才是 `margin`；
 //! 速率未知只告警，明确断开的物理网卡才是 `down`。
@@ -87,6 +87,106 @@ impl Link {
 pub enum Direction {
     Receive,
     Transmit,
+}
+
+/// 自动 MTU 所需的网卡 NlMtu；缺失、低于 1500 或回环都明确报错。
+fn reported_mtu(adapter: Option<&AdapterInfo>, role: &str) -> Result<u32, String> {
+    let Some(adapter) = adapter else {
+        return Err(format!(
+            "{role}尚未确定，无法读取 IPv4 NlMtu；自动 MTU 需要先选定物理网卡。"
+        ));
+    };
+    if crate::adapters::is_loopback_device(adapter) {
+        return Err(format!(
+            "{role}是本机 Npcap 回环，没有 NIC MTU；自动 MTU 只用于物理网卡，请显式指定 MTU。"
+        ));
+    }
+    match adapter.mtu {
+        Some(mtu) if mtu >= 1500 => Ok(mtu.min(vc_transport::MAX_MTU as u32)),
+        Some(mtu) => Err(format!(
+            "{role}（{}）报告 IPv4 NlMtu={mtu}，低于冻结传输最小值 1500；请确认网卡配置，显式 MTU 也不能超过报告值（程序不会修改网卡）。",
+            adapter.display()
+        )),
+        None => Err(format!(
+            "{role}（{}）未报告 IPv4 NlMtu，无法自动解析或校验显式 MTU；请确认网卡已启用 IPv4。",
+            adapter.display()
+        )),
+    }
+}
+
+/// 自动 MTU：`min(主机接收网卡, 被采集机发送网卡, 9000)`。
+///
+/// 两端都必须报告有效的 IPv4 NlMtu；只知道一端时无法保证另一端能重组大包，
+/// 因此明确报错，不猜 1500 或 9000。Npcap 回环没有 NIC MTU，不能参与自动解析。
+pub fn resolve_auto_mtu(
+    host: Option<&AdapterInfo>,
+    capture: Option<&AdapterInfo>,
+) -> Result<u32, String> {
+    let host_mtu = reported_mtu(host, "主机接收网卡")?;
+    let capture_mtu = reported_mtu(capture, "被采集机发送网卡")?;
+    Ok(host_mtu.min(capture_mtu).min(vc_transport::MAX_MTU as u32))
+}
+
+/// 显式 MTU 必须不超过网卡报告的 IPv4 NlMtu。
+///
+/// 只读校验，绝不调用 Set cmdlet 或修改网卡。Npcap 回环没有 NIC MTU，
+/// 只在显式本地诊断中跳过检查；物理网卡缺报告同样拒绝，不能假设可发送。
+pub fn verify_mtu_for_adapter(
+    mtu: u32,
+    adapter: Option<&AdapterInfo>,
+    role: &str,
+) -> Result<(), String> {
+    let Some(adapter) = adapter else {
+        return Err(format!(
+            "{role}尚未确定，无法确认显式 MTU {mtu} 不超过网卡报告值。"
+        ));
+    };
+    if crate::adapters::is_loopback_device(adapter) {
+        return Ok(());
+    }
+    if !(1500..=vc_transport::MAX_MTU as u32).contains(&mtu) {
+        return Err(format!(
+            "显式 MTU {mtu} 不在 1500..9000，无法确认{role}可用。"
+        ));
+    }
+    match adapter.mtu {
+        Some(reported) if mtu <= reported => Ok(()),
+        Some(reported) => Err(format!(
+            "显式 MTU {mtu} 超过{role}（{}）报告的 IPv4 NlMtu={reported}；请降低 MTU 或调整网卡设置（程序不会修改网卡）。",
+            adapter.display()
+        )),
+        None => Err(format!(
+            "{role}（{}）未报告 IPv4 NlMtu，无法确认显式 MTU {mtu} 可用；请确认网卡已启用 IPv4。",
+            adapter.display()
+        )),
+    }
+}
+
+/// 产生本次预算/准备/启动共用的有效配置。
+///
+/// - `mtu_auto=true`：解析两端所选网卡的报告值并冻结为显式 MTU；
+/// - `mtu_auto=false`：校验显式 MTU 不超过已知网卡报告值（对端尚未确定时由
+///   采集端在 prepare 时按实际网卡复核）；
+/// - 无论哪种模式，都把 `receive.mtu` 镜像为同一个生效值，避免两端用不同
+///   切包参数启动。返回的是副本，保存的配置与 `mtu_auto` 标志不变。
+pub fn host_effective_config(
+    config: &Config,
+    host: Option<&AdapterInfo>,
+    capture: Option<&AdapterInfo>,
+) -> Result<Config, String> {
+    let mut effective = config.clone();
+    if effective.capture.mtu_auto {
+        effective.capture.mtu = resolve_auto_mtu(host, capture)?;
+        // 生效请求必须携带冻结值；采集端把它当作有效 MTU 复核，不再自行解析。
+        effective.capture.mtu_auto = false;
+    } else {
+        verify_mtu_for_adapter(effective.capture.mtu, host, "主机接收网卡")?;
+        if let Some(capture) = capture {
+            verify_mtu_for_adapter(effective.capture.mtu, Some(capture), "被采集机发送网卡")?;
+        }
+    }
+    effective.receive.mtu = effective.capture.mtu;
+    Ok(effective)
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -310,6 +410,7 @@ mod tests {
             transmit_link_bps: Some(tx),
             hardware_interface: Some(true),
             virtual_nic: Some(false),
+            mtu: Some(9000),
             addresses: vec![],
         }
     }
@@ -472,9 +573,9 @@ mod tests {
     #[test]
     fn encoded_draft_is_rejected_until_explicitly_enabled() {
         let mut config = Config::default();
-        config.capture.codec = "mjpeg".into();
-        config.capture.encoder_backend = "turbojpeg:cpu".into();
-        config.capture.decoder_backend = "turbojpeg:cpu".into();
+        config.capture.codec = "pyrowave".into();
+        config.capture.encoder_backend = "pyrowave:vulkan".into();
+        config.capture.decoder_backend = "pyrowave:vulkan".into();
         let (host, capture) = both(2_500_000_000);
         let draft = plan(&config, Some(&host), Some(&capture));
         assert!(draft.network.is_estimate);
@@ -521,6 +622,96 @@ mod tests {
         assert!(overflow.network.packets_per_frame > u64::from(u16::MAX));
         assert!(overflow.errors.iter().any(|e| e.contains("uint16")));
         assert!(!overflow.can_start);
+    }
+
+    #[test]
+    fn auto_mtu_uses_min_of_both_nics_and_caps_at_9000() {
+        let host = adapter(2_500_000_000, 2_500_000_000);
+        let mut peer = adapter(2_500_000_000, 2_500_000_000);
+        peer.mtu = Some(1500);
+        assert_eq!(resolve_auto_mtu(Some(&host), Some(&peer)).unwrap(), 1500);
+        peer.mtu = Some(4000);
+        assert_eq!(resolve_auto_mtu(Some(&host), Some(&peer)).unwrap(), 4000);
+        peer.mtu = Some(9216);
+        assert_eq!(resolve_auto_mtu(Some(&host), Some(&peer)).unwrap(), 9000);
+
+        peer.mtu = Some(1400);
+        let error = resolve_auto_mtu(Some(&host), Some(&peer)).unwrap_err();
+        assert!(error.contains("低于") && error.contains("1500"), "{error}");
+        peer.mtu = None;
+        let error = resolve_auto_mtu(Some(&host), Some(&peer)).unwrap_err();
+        assert!(
+            error.contains("未报告") && error.contains("NlMtu"),
+            "{error}"
+        );
+        assert!(resolve_auto_mtu(None, Some(&peer)).is_err());
+        assert!(resolve_auto_mtu(Some(&host), None).is_err());
+
+        // Npcap 回环没有 NIC MTU，不能参与自动解析（只用于显式诊断）。
+        let loopback = AdapterInfo {
+            name: NPF_LOOPBACK.into(),
+            description: "Adapter for loopback".into(),
+            ..Default::default()
+        };
+        assert!(resolve_auto_mtu(Some(&host), Some(&loopback)).is_err());
+    }
+
+    #[test]
+    fn explicit_mtu_must_fit_reported_nic_mtu() {
+        let mut host = adapter(2_500_000_000, 2_500_000_000);
+        assert!(verify_mtu_for_adapter(9000, Some(&host), "主机接收网卡").is_ok());
+        host.mtu = Some(1500);
+        let error = verify_mtu_for_adapter(9000, Some(&host), "主机接收网卡").unwrap_err();
+        assert!(error.contains("超过") && error.contains("1500"), "{error}");
+        assert!(verify_mtu_for_adapter(1500, Some(&host), "主机接收网卡").is_ok());
+        host.mtu = None;
+        let error = verify_mtu_for_adapter(9000, Some(&host), "主机接收网卡").unwrap_err();
+        assert!(error.contains("未报告"), "{error}");
+        assert!(verify_mtu_for_adapter(9000, None, "主机接收网卡").is_err());
+        assert!(verify_mtu_for_adapter(1499, Some(&adapter(1, 1)), "网卡").is_err());
+
+        // 回环只在显式本地诊断中使用，没有 NIC MTU 可核对。
+        let loopback = AdapterInfo {
+            name: NPF_LOOPBACK.into(),
+            ..Default::default()
+        };
+        assert!(verify_mtu_for_adapter(9000, Some(&loopback), "诊断回环").is_ok());
+    }
+
+    #[test]
+    fn effective_config_freezes_auto_mtu_and_mirrors_receiver() {
+        let mut config = Config::default();
+        config.capture.mtu = 9000;
+        config.receive.mtu = 1500;
+        let mut host = adapter(2_500_000_000, 2_500_000_000);
+        host.mtu = Some(9000);
+        let mut peer = adapter(2_500_000_000, 2_500_000_000);
+        peer.mtu = Some(4000);
+
+        let effective = host_effective_config(&config, Some(&host), Some(&peer)).unwrap();
+        assert_eq!(effective.capture.mtu, 4000);
+        assert!(!effective.capture.mtu_auto);
+        assert_eq!(effective.receive.mtu, 4000);
+        // 保存的配置不被改写，自动标志仍保留。
+        assert!(config.capture.mtu_auto);
+        assert_eq!(config.capture.mtu, 9000);
+        assert_eq!(config.receive.mtu, 1500);
+
+        // 自动 MTU 必须有对端网卡报告，否则明确失败。
+        assert!(host_effective_config(&config, Some(&host), None).is_err());
+        assert!(host_effective_config(&config, None, Some(&peer)).is_err());
+
+        // 显式 MTU：已知的两端报告都必须容得下；对端尚未确定时留给采集端复核。
+        let mut explicit = config.clone();
+        explicit.capture.mtu_auto = false;
+        explicit.capture.mtu = 9000;
+        let mut peer_small = peer.clone();
+        peer_small.mtu = Some(1500);
+        assert!(host_effective_config(&explicit, Some(&host), Some(&peer_small)).is_err());
+        let effective = host_effective_config(&explicit, Some(&host), None).unwrap();
+        assert_eq!(effective.capture.mtu, 9000);
+        assert_eq!(effective.receive.mtu, 9000);
+        assert!(!effective.capture.mtu_auto);
     }
 
     #[test]

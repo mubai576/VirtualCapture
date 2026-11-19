@@ -13,6 +13,10 @@ crate-type = ["cdylib", "rlib"]
 name = "vc-vcam-diag"
 path = "src/bin/vc_vcam_diag.rs"
 
+[[bin]]
+name = "vc-vcam-verify"
+path = "src/bin/vc_vcam_verify.rs"
+
 [dependencies]
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",

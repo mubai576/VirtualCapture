@@ -1,4 +1,4 @@
-//! Owned loader for the versioned C ABI. A session keeps its DLL loaded until joined.
+//! 版本化 C ABI 的自有加载器。会话一直保持其 DLL 处于加载状态，直到 join 完成。
 use std::ffi::{CString, c_char, c_void};
 use std::path::Path;
 use std::ptr;
@@ -43,7 +43,7 @@ impl Module {
                 path.display()
             ));
         }
-        // Read only the mandatory two-u32 prefix before copying any function pointers.
+        // 只读取强制的前两个 u32 前缀，之后才拷贝任何函数指针。
         let prefix = pointer.cast::<u32>();
         let (version, size) = unsafe { (ptr::read(prefix), ptr::read(prefix.add(1))) };
         if version != ABI_VERSION || size < std::mem::size_of::<VcStreamApiV1>() as u32 {
@@ -111,7 +111,7 @@ pub struct StreamSession {
     loaded: Arc<LoadedModule>,
     handle: *mut c_void,
 }
-// The owning controller serializes the handle. No Rust references cross the DLL boundary.
+// 句柄由持有它的控制器串行化；没有任何 Rust 引用跨越 DLL 边界。
 unsafe impl Send for StreamSession {}
 impl StreamSession {
     pub fn stats(&self) -> Result<Value, String> {
@@ -128,7 +128,7 @@ impl StreamSession {
         })?;
         serde_json::from_str(&text).map_err(|e| format!("invalid DLL status JSON: {e}"))
     }
-    /// Requests cancellation. False means the worker still owns its resources.
+    /// 请求取消。返回 false 表示 worker 仍持有其资源。
     pub fn stop(&mut self) -> Result<bool, String> {
         let mut error = [0i8; ERROR_CAPACITY];
         let mut written = 0;
@@ -160,8 +160,8 @@ impl Drop for StreamSession {
             }
             DestroyOutcome::Pending => {}
         }
-        // Normal shutdown keeps the handle until stop confirms cleanup. If a caller
-        // abandons it, retain the image while the driver call or worker is outstanding.
+        // 正常关闭会保留句柄，直到 stop 确认清理完成。如果调用方中途放弃，
+        // 只要驱动调用或 worker 尚未结束，就继续保留 DLL 映像。
         let address = handle as usize;
         let loaded = self.loaded.clone();
         if std::thread::Builder::new()
@@ -169,7 +169,7 @@ impl Drop for StreamSession {
             .spawn(move || reap_until_released(loaded, address))
             .is_err()
         {
-            // No safe synchronous fallback if a native call is hung.
+            // 原生调用若已挂起，没有安全的同步兜底方案。
             std::mem::forget(self.loaded.clone());
         }
     }
@@ -226,7 +226,7 @@ fn read_text(
     if first < 0 {
         return Err(error_text(&error, "data-plane query failed"));
     }
-    // Status changes while running; honor buffer-too-small and retry with a bound.
+    // 运行期间状态会变化；尊重缓冲区过小的返回值，并在有限次数内重试。
     for _ in 0..8 {
         let capacity = (required as usize).saturating_add(1024).min(TEXT_LIMIT);
         if required == 0 || required as usize > TEXT_LIMIT {

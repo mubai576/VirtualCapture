@@ -5,8 +5,9 @@ cdecl C ABI v1), starts an in-process receiver session, waits for its ready
 marker, opens its private SHM v3 mapping read-only, then starts an in-process
 sender session.  Both sessions run on the exact Npcap Loopback adapter
 (`\\Device\\NPF_Loopback`) with a unique locally administered source MAC and a
-unique `Local\\...` SHM name.  Raw is the default; MJPEG and PyroWave are
-explicit opt-in encodings with explicit configuration.
+unique `Local\\...` SHM name.  Raw is the default; PyroWave is the only
+explicit opt-in development encoding.  MJPEG was removed from the Rust
+product and is rejected explicitly; there is no silent codec fallback.
 
 There are no subprocesses: no `vc-sender.exe`, no `vc-receiver.exe`, no
 `vc-stream.exe`, no `vc-vcam-verify.exe`.  No DirectShow filter is registered
@@ -27,8 +28,9 @@ Gates
   stays loaded for the whole process.
 * Coverage: every TX and RX hash row for frame ids 0..N-1 is required, all TX
   and RX rows must agree, and the configured motion pattern is checked against
-  the independent Python reference in `ctrl/pattern_ref.py` (all frames by
-  default; `--ref-samples` selects a spread and the report says so).
+  the independent Python reference in
+  `rust/tests/reference/pattern_ref.py` (all frames by default;
+  `--ref-samples` selects a spread and the report says so).
 * Raw: the final published SHM NV12 frame is read through the v3 seqlock
   layout and must hash to the receiver hashlog row for the same frame id, with
   `hash_fid == frame_id`.
@@ -55,7 +57,7 @@ metrics, and cleanup results.  Failures are written to `failure.json`.
 Usage (from the repository root)::
 
     python -I rust/tests/dll_stream_smoke.py --package path/to/extracted
-    python -I rust/tests/dll_stream_smoke.py --package path/to/extracted --codec mjpeg --jpeg-quality 85
+    python -I rust/tests/dll_stream_smoke.py --package path/to/extracted --codec pyrowave
     python -I rust/tests/dll_stream_smoke.py --dll rust/target/release/vc_stream.dll --performance
     python -I rust/tests/dll_stream_smoke.py --self-check
 
@@ -101,10 +103,10 @@ DEFAULT_HEIGHT = 640
 DEFAULT_MTU = 9000
 DEFAULT_REF_SAMPLES = 0  # 0 = every frame
 DEST_MAC = [0xFF] * 6
-# One-second send budgets from the encoded runbooks: MJPEG diagnostics use
-# 800 Mbps and PyroWave 400 Mbps, both above a full intra frame at 60 fps, so
-# the rate window is exercised without silently throttling the smoke cadence.
-DEFAULT_BITRATE_BPS = {"raw": 80_000_000, "mjpeg": 800_000_000, "pyrowave": 400_000_000}
+# One-second send budgets from the encoded runbook: PyroWave uses 400 Mbps,
+# above a full intra frame at 60 fps, so the rate window is exercised without
+# silently throttling the smoke cadence.  Raw carries no encoding budget.
+DEFAULT_BITRATE_BPS = {"raw": 80_000_000, "pyrowave": 400_000_000}
 SHM_PREFIX = "Local\\VirtualCaptureDllSmoke."
 SHM_HEADER_BYTES = 64
 SHM_SLOT_BYTES = 64
@@ -436,10 +438,13 @@ def _module_loaded():
 # Configuration and requests
 
 
-def _codec_config(codec, jpeg_quality, max_au_bytes, max_bitrate_bps, decode_in_flight):
-    if codec not in ("raw", "mjpeg", "pyrowave"):
-        raise smoke.SmokeError(f"unsupported codec {codec!r}; only raw/mjpeg/pyrowave")
-    jpeg = 80 if jpeg_quality is None else int(jpeg_quality)
+def _codec_config(codec, max_au_bytes, max_bitrate_bps, decode_in_flight):
+    if codec == "mjpeg":
+        raise smoke.SmokeError(
+            "MJPEG was removed from the Rust product; only raw and pyrowave are supported")
+    if codec not in ("raw", "pyrowave"):
+        raise smoke.SmokeError(f"unsupported codec {codec!r}; only raw/pyrowave")
+    jpeg = 80  # frozen ABI field; unused by raw and PyroWave
     max_au = 8_388_608 if max_au_bytes is None else int(max_au_bytes)
     bitrate = DEFAULT_BITRATE_BPS[codec] if max_bitrate_bps is None else int(max_bitrate_bps)
     in_flight = 2 if decode_in_flight is None else int(decode_in_flight)
@@ -447,9 +452,6 @@ def _codec_config(codec, jpeg_quality, max_au_bytes, max_bitrate_bps, decode_in_
         experimental = False
         encoder = ""
         decoder = ""
-    elif codec == "mjpeg":
-        experimental = True
-        encoder = decoder = "turbojpeg:cpu"
     else:
         experimental = True
         encoder = decoder = "pyrowave:vulkan"
@@ -468,7 +470,8 @@ def _codec_config(codec, jpeg_quality, max_au_bytes, max_bitrate_bps, decode_in_
 def _validate_codec_config(config, width, height, fps):
     """Local mirror of vc_media::validate; the DLL remains authoritative."""
     codec = config["codec"]
-    _require(codec in ("raw", "mjpeg", "pyrowave"), f"unsupported codec {codec!r}")
+    _require(codec in ("raw", "pyrowave"),
+             f"unsupported codec {codec!r}; only raw/pyrowave")
     _require(1 <= fps <= 1000, f"fps must be 1..1000, got {fps}")
     _require(1 <= config["jpeg_quality"] <= 100,
              f"jpeg_quality must be 1..100, got {config['jpeg_quality']}")
@@ -480,7 +483,7 @@ def _validate_codec_config(config, width, height, fps):
         _require(config["experimental"] is False and config["encoder_backend"] == ""
                  and config["decoder_backend"] == "", "raw must not carry a codec backend")
         return
-    identity = {"mjpeg": "turbojpeg:cpu", "pyrowave": "pyrowave:vulkan"}[codec]
+    identity = "pyrowave:vulkan"
     _require(config["experimental"] is True,
              f"{codec} is an explicit development codec and requires experimental=true")
     _require(config["encoder_backend"] == identity and config["decoder_backend"] == identity,
@@ -495,15 +498,13 @@ def _validate_codec_config(config, width, height, fps):
 
 
 def _resolve_codec_options(args):
-    if args.jpeg_quality is not None and args.codec != "mjpeg":
-        raise smoke.SmokeError("--jpeg-quality is only valid with --codec mjpeg")
     if args.codec == "raw":
         for flag, value in (("--max-au-bytes", args.max_au_bytes),
                             ("--max-bitrate-bps", args.max_bitrate_bps),
                             ("--decode-in-flight", args.decode_in_flight)):
             if value is not None:
-                raise smoke.SmokeError(f"{flag} requires --codec mjpeg|pyrowave; Raw has no encoding options")
-    config = _codec_config(args.codec, args.jpeg_quality, args.max_au_bytes,
+                raise smoke.SmokeError(f"{flag} requires --codec pyrowave; Raw has no encoding options")
+    config = _codec_config(args.codec, args.max_au_bytes,
                            args.max_bitrate_bps, args.decode_in_flight)
     _validate_codec_config(config, args.width, args.height, args.fps)
     return config
@@ -1018,7 +1019,7 @@ def _abi_probes(api, receiver_request, sender_request):
     probes.append(tiny)
 
     unsupported = copy.deepcopy(sender_request)
-    unsupported["codec"] = _codec_config("mjpeg", None, None, None, None)
+    unsupported["codec"] = _codec_config("pyrowave", None, None, None)
     unsupported["codec"]["experimental"] = False
     unsupported["stats"] = str(Path(sender_request["stats"]).with_name("probe-unsupported-stats.json"))
     unsupported["hashlog"] = str(Path(sender_request["hashlog"]).with_name("probe-unsupported-hash.jsonl"))
@@ -1101,7 +1102,6 @@ def _hard_exit_pending(run_dir, report, message):
 def _preflight_dependencies(codec_name, dll_dir, report):
     candidates = {
         "raw": (),
-        "mjpeg": ("turbojpeg.dll", "libturbojpeg.dll"),
         "pyrowave": ("libpyrowave-shared-1.dll",),
     }[codec_name]
     if not candidates:
@@ -1143,7 +1143,7 @@ def _run_pending_probe(api, cfg, run_dir, token, report):
     request = _receiver_request(
         {**cfg, "frames": 0, "receiver_timeout_s": 30},
         session,
-        _codec_config("raw", None, None, None, None),
+        _codec_config("raw", None, None, None),
         _random_source_mac(),
         shm_name,
         stats_path,
@@ -1300,7 +1300,7 @@ def execute(args, dll_path, package, run_dir, token, report):
             "ready": tx_ready,
         })
 
-        deadline = time.monotonic() + cfg["phase_timeout_s"]
+        deadline = time.monotonic() + cfg["stream_timeout_s"]
         tx_final = _wait_done(api, tx_handle, tx_session, "TX", deadline)
         rx_final = _wait_done(api, rx_handle, rx_session, "RX", deadline)
         report["sessions"]["sender"]["final"] = tx_final
@@ -1311,7 +1311,7 @@ def execute(args, dll_path, package, run_dir, token, report):
         report["stats"] = {"tx": tx_stats, "rx": rx_stats}
 
         if raw:
-            smoke.validate_tx_stats(tx_stats, True, cfg["frames"], cfg["total_packets"],
+            smoke.validate_tx_stats(tx_stats, cfg["frames"], cfg["total_packets"],
                                     tx_session, "TX stats")
         else:
             _require(tx_stats.get("sent_frames") == cfg["frames"] and tx_stats.get("frames") == cfg["frames"],
@@ -1323,7 +1323,7 @@ def execute(args, dll_path, package, run_dir, token, report):
             _require(smoke.is_int(tx_stats.get("encoded_bytes")) and tx_stats["encoded_bytes"] > 0,
                      f"TX stats: encoded_bytes {tx_stats.get('encoded_bytes')!r}")
             _require(tx_stats.get("batch") is None, f"TX stats: encoded batch {tx_stats.get('batch')!r}")
-        smoke.validate_rx_stats(rx_stats, True, cfg["frames"], rx_session, True, "RX stats")
+        smoke.validate_rx_stats(rx_stats, cfg["frames"], rx_session, True, "RX stats")
 
         for role, stats in (("TX", tx_stats), ("RX", rx_stats)):
             smoke.require_adapter(stats.get("adapter"), f"{role} stats")
@@ -1498,21 +1498,41 @@ def self_check(args):
                              DEFAULT_MTU, 1)
     _require(cfg["frame_bytes"] == 614400 and cfg["total_packets"] == 69,
              f"unexpected Loopback config: {cfg}")
+    _require(cfg["stream_timeout_s"] > cfg["receiver_timeout_s"],
+             "self-check: stream deadline must cover receiver timeout")
     checks["loopback_config"] = {"frame_bytes": cfg["frame_bytes"],
                                  "total_packets": cfg["total_packets"],
                                  "receiver_timeout_s": cfg["receiver_timeout_s"]}
+    # 共用 Rust CLI 的统计校验器；纯自检也覆盖迁移后的函数签名。
+    smoke.validate_tx_stats({"session_id": "self-tx", "adapter": smoke.LOOPBACK,
+                             "send_errors": 0, "sent_frames": cfg["frames"],
+                             "frames": cfg["frames"],
+                             "sent_packets": cfg["frames"] * cfg["total_packets"]},
+                            cfg["frames"], cfg["total_packets"], "self-tx", "self TX")
+    smoke.validate_rx_stats({"session_id": "self-rx", "adapter": smoke.LOOPBACK,
+                             "complete": cfg["frames"], "dropped": 0, "packets_lost": 0,
+                             "hash_mismatch": 0, "crc_errors": 0, "gaps": 0,
+                             "hash_rows": cfg["frames"], "shm_published": cfg["frames"]},
+                            cfg["frames"], "self-rx", True, "self RX")
+    checks["shared_stats_contract"] = "passed"
 
     codec = _resolve_codec_options(args)
     checks["codec_config"] = codec
     _validate_codec_config(codec, DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FPS)
-    bad = _codec_config("mjpeg", None, None, None, None)
+    try:
+        _codec_config("mjpeg", None, None, None)
+    except smoke.SmokeError as exc:
+        checks["mjpeg_rejection"] = str(exc)
+    else:
+        raise smoke.SmokeError("self-check: removed MJPEG codec was accepted")
+    bad = _codec_config("pyrowave", None, None, None)
     bad["experimental"] = False
     try:
         _validate_codec_config(bad, DEFAULT_WIDTH, DEFAULT_HEIGHT, DEFAULT_FPS)
     except smoke.SmokeError as exc:
         checks["experimental_rejection"] = str(exc)
     else:
-        raise smoke.SmokeError("self-check: mjpeg without experimental was accepted")
+        raise smoke.SmokeError("self-check: pyrowave without experimental was accepted")
 
     source = _source_config()
     mac = _random_source_mac()
@@ -1574,7 +1594,7 @@ def self_check(args):
                 "send_qpc_ns": 1_001_000_000 + fid * 4_166_667}
           for fid in range(4)}
     rx = {fid: {"qpc_ns": row["send_qpc_ns"] + 2_000_000} for fid, row in tx.items()}
-    valid_metrics = _compute_metrics(tx, rx, 4, "mjpeg", 240, True)
+    valid_metrics = _compute_metrics(tx, rx, 4, "pyrowave", 240, True)
     _validate_metrics(valid_metrics, 4)
     _require(valid_metrics["performance_pass"], "self-check: valid performance gate failed")
     rejected = []
@@ -1681,20 +1701,18 @@ def parse_args(argv=None):
     parser.add_argument("--mtu", type=int, default=DEFAULT_MTU,
                         help=f"L2 MTU (default {DEFAULT_MTU})")
     parser.add_argument("--codec", choices=("raw", "mjpeg", "pyrowave"), default="raw",
-                        help="data-plane codec (default raw; encoded modes are explicit)")
-    parser.add_argument("--jpeg-quality", type=int, default=None,
-                        help="MJPEG quality 1..100 (only with --codec mjpeg)")
+                        help="data-plane codec (default raw; pyrowave is explicit; mjpeg is "
+                             "removed and rejected with a clear error)")
     parser.add_argument("--max-au-bytes", type=int, default=None,
-                        help="encoded access-unit cap 1024..16777216 (encoded modes)")
+                        help="encoded access-unit cap 1024..16777216 (PyroWave)")
     parser.add_argument("--max-bitrate-bps", type=int, default=None,
-                        help="one-second send budget in bits/s (encoded modes; default 800 Mbps "
-                             "for mjpeg, 400 Mbps for pyrowave)")
+                        help="one-second send budget in bits/s (PyroWave; default 400 Mbps)")
     parser.add_argument("--decode-in-flight", type=int, default=None,
-                        help="configured decoder in-flight limit 1..8 (encoded modes; default 2)")
+                        help="configured decoder in-flight limit 1..8 (PyroWave; default 2)")
     parser.add_argument("--ref-samples", type=int, default=DEFAULT_REF_SAMPLES,
                         help="motion reference frames: 0 = all (default), otherwise a spread")
     parser.add_argument("--performance", action="store_true",
-                        help="also gate mean TX frame/send cadence within 1% and both send/start-to-RX p99 < 10 ms")
+                        help="also gate mean TX frame/send cadence within 1%% and both send/start-to-RX p99 < 10 ms")
     parser.add_argument("--self-check", action="store_true",
                         help="check pure ctypes/layout/hash helpers only; never loads the DLL")
     return parser.parse_args(argv)

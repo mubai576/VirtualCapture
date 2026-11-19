@@ -1,6 +1,6 @@
-//! Versioned C ABI. The caller owns text buffers/memory and must retain the DLL
-//! until every handle is destroyed. Start queues a worker, not a ready stream.
-//! Stop and destroy return 1 while the worker is still unwinding or in a driver.
+//! 版本化 C ABI。调用方拥有文本缓冲/内存，并且必须保持 DLL 存活，直到所有
+//! 句柄被销毁。Start 只是排队一个 worker，不保证流已就绪。worker 仍在收尾
+//! 或处在驱动调用中时，Stop 与 destroy 返回 1。
 
 use std::ffi::{CStr, c_char, c_void};
 use std::fs::{File, OpenOptions};

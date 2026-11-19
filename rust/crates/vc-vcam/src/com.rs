@@ -1,18 +1,18 @@
-//! Hand-written DirectShow source-filter COM server.
+//! 手写的 DirectShow 源滤镜 COM 服务器。
 //!
-//! Layout and behaviour follow `vcam/vcam.cpp`:
-//! * one `IBaseFilter` + `IAMFilterMiscFlags` object owning one `IPin` object;
-//! * the pin exposes `IPin`, `IAMStreamConfig`, `IKsPropertySet`,
-//!   `ISpecifyPropertyPages`, `IKsControl` and `IKsPin` as separate interface
-//!   tear-offs that all share the filter reference count (no cycles);
-//! * a worker thread pulls the latest complete SHM v3 frame and pushes it to
-//!   the downstream allocator; before the first verified frame it emits
-//!   nothing, after one it repeats only that last good frame.
+//! 布局与行为遵循历史 C++ 实现 `vcam/vcam.cpp`：
+//! * 一个 `IBaseFilter` + `IAMFilterMiscFlags` 对象拥有一个 `IPin` 对象；
+//! * pin 以独立接口 tear-off 的形式暴露 `IPin`、`IAMStreamConfig`、
+//!   `IKsPropertySet`、`ISpecifyPropertyPages`、`IKsControl` 与 `IKsPin`，
+//!   它们共享滤镜引用计数（不形成环）；
+//! * 一个 worker 线程拉取最新的完整 SHM v3 帧（布局见
+//!   `docs/spec/shm-v3.md`）并推给下游 allocator；首个校验帧之前不输出
+//!   任何数据，之后只重复最后一帧好帧。
 //!
-//! Every interface returns its own vtable pointer, so a tear-off is exactly
-//! `{ vtbl, owner }`; the owner of every tear-off (and of the object base) is
-//! stored at pointer offset 1, which makes QueryInterface/AddRef/Release
-//! independent of which sub-object the caller used.
+//! 每个接口返回自己的 vtable 指针，因此一个 tear-off 恰好是
+//! `{ vtbl, owner }`；所有 tear-off（以及对象基址）的 owner 都存放在指针
+//! 偏移 1 处，使 QueryInterface/AddRef/Release 不依赖调用方使用的是哪个
+//! 子对象。
 
 #![allow(non_snake_case)]
 
@@ -62,12 +62,12 @@ use crate::media;
 use crate::shm::{self, VSTAT_FLAG_REPEAT};
 use crate::win::{self, ShmSet};
 
-// ---------- process-wide COM bookkeeping ----------
+// ---------- 进程级 COM 记账 ----------
 
 static G_OBJS: AtomicI32 = AtomicI32::new(0);
 static G_LOCKS: AtomicI32 = AtomicI32::new(0);
 
-// ---------- object layouts ----------
+// ---------- 对象布局 ----------
 
 #[repr(C)]
 struct FilterTear<V> {
@@ -84,7 +84,7 @@ struct PinTear<V> {
 #[repr(C)]
 struct FilterObj {
     vtbl: *const IBaseFilterVtbl,
-    owner: *mut FilterObj, // self, also readable through the tear-off slot
+    owner: *mut FilterObj, // 自身；也可通过 tear-off 的槽位读取
     refs: AtomicU32,
     misc: FilterTear<IAMFilterMiscFlagsVtbl>,
     core: Arc<FilterCore>,
@@ -94,7 +94,7 @@ struct FilterObj {
 #[repr(C)]
 struct PinObj {
     vtbl: *const IPinVtbl,
-    owner: *mut PinObj, // self
+    owner: *mut PinObj, // 自身
     filter: *mut FilterObj,
     stream_config: PinTear<IAMStreamConfigVtbl>,
     ks_prop: PinTear<IKsPropertySetVtbl>,
@@ -103,7 +103,7 @@ struct PinObj {
     ks_pin: PinTear<IKsPinVtbl>,
 }
 
-/// Every tear-off and every object base stores its owner at offset 1.
+/// 每个 tear-off 和每个对象基址都把其 owner 存放在偏移 1 处。
 unsafe fn owner_slot<T>(this: *mut c_void) -> *mut T {
     if this.is_null() {
         return ptr::null_mut();
@@ -119,11 +119,11 @@ unsafe fn pin_owner(this: *mut c_void) -> *mut PinObj {
     owner_slot::<PinObj>(this)
 }
 
-// ---------- shared filter state ----------
+// ---------- 共享滤镜状态 ----------
 
 struct Shared {
     state: i32,
-    graph: *mut c_void, // borrowed IFilterGraph; the graph owns its filters
+    graph: *mut c_void, // 借用的 IFilterGraph；图拥有其滤镜
     clock: Option<IReferenceClock>,
     peer: Option<IPin>,
     input: Option<IMemInputPin>,
@@ -167,9 +167,9 @@ pub struct FilterCore {
     shared: Mutex<Shared>,
 }
 
-// COM objects are apartment-neutral here: all mutable state is behind locks,
-// interfaces stored in `Shared` are reference counted, and the worker thread
-// only touches state handed to it under those locks.
+// 这里的 COM 对象与套间无关（apartment-neutral）：所有可变状态都在锁后，
+// `Shared` 中保存的接口都已计引用，worker 线程只接触在锁保护下交给它的
+// 状态。
 unsafe impl Send for FilterCore {}
 unsafe impl Sync for FilterCore {}
 
@@ -275,7 +275,7 @@ impl FilterCore {
                 let _ = CloseHandle(stop);
             }
         }
-        // The worker is gone, so the read-only view can be dropped safely.
+        // worker 已退出，可以安全丢弃只读视图。
         self.lock_shared().shm = None;
     }
 
@@ -315,12 +315,12 @@ impl FilterCore {
         S_OK
     }
 
-    // ---------- worker ----------
+    // ---------- worker（工作线程） ----------
 
     fn worker(self: Arc<Self>, stop_raw: usize) {
-        // Legacy worker policy (`vcam.cpp:715-721`): 1 ms timer period plus
-        // MMCSS "Capture" / HIGHEST fallback on this thread.  Reverted when
-        // this function returns, on every exit path.
+        // 沿用历史 worker 策略（`vcam.cpp:715-721`）：1 ms 定时器周期，并在
+        // 本线程应用 MMCSS "Capture" / HIGHEST 回退。本函数返回时在每条退出
+        // 路径上恢复。
         let _scheduling = win::WorkerScheduling::raise();
         let stop = HANDLE(stop_raw as *mut c_void);
         let geometry = self.geometry;
@@ -402,8 +402,8 @@ impl FilterCore {
                     }
                 }
             } else {
-                // No receiver mapping: keep the 240 Hz cadence, but never
-                // fabricate a frame; only the last good frame may repeat.
+                // 没有接收端映射：保持 240 Hz 节拍，但绝不伪造帧；只有最后
+                // 一帧好帧可以重复。
                 loop {
                     let now = win::qpc_ns();
                     if now >= next_ns {
@@ -426,7 +426,7 @@ impl FilterCore {
                 }
             }
 
-            // No fresh frame, no verified frame yet: emit nothing at all.
+            // 既没有新帧，也还没有校验帧：完全不输出。
             if !fresh && !has_last_good {
                 tcount = tcount.saturating_add(frame_100ns);
                 discont = true;
@@ -454,7 +454,7 @@ impl FilterCore {
 
             let mut sample = None;
             if unsafe { alloc.GetBuffer(&mut sample, None, None, 0) }.is_err() {
-                break; // decommitted / stopping
+                break; // 已释放 / 正在停止
             }
             let Some(sample) = sample else {
                 break;
@@ -541,7 +541,7 @@ impl FilterCore {
     }
 }
 
-// ---------- object construction / refcounts ----------
+// ---------- 对象构造 / 引用计数 ----------
 
 unsafe fn create_filter() -> *mut FilterObj {
     G_OBJS.fetch_add(1, Ordering::SeqCst);
@@ -1397,7 +1397,7 @@ unsafe extern "system" fn ks_control_event(
     STATUS_NOT_SUPPORTED
 }
 
-// ---------- IKsPin stubs ----------
+// ---------- IKsPin 桩函数 ----------
 
 unsafe extern "system" fn ks_pin_query_mediums(
     _this: *mut c_void,
@@ -1486,7 +1486,7 @@ unsafe extern "system" fn ks_pin_set_pin_framing_cache(
     E_NOTIMPL
 }
 
-// ---------- vtables ----------
+// ---------- vtable（虚表） ----------
 
 static FILTER_VTBL: IBaseFilterVtbl = IBaseFilterVtbl {
     base__: IUnknownVtbl {
@@ -1967,16 +1967,15 @@ unsafe extern "system" fn factory_lock_server(_this: *mut c_void, lock: i32) -> 
     S_OK
 }
 
-// ---------- DLL exports (called from lib.rs) ----------
+// ---------- DLL 导出（由 lib.rs 调用） ----------
 
-/// DllGetClassObject entry point (called by `lib.rs`).
+/// DllGetClassObject 入口（由 `lib.rs` 调用）。
 ///
 /// # Safety
 ///
-/// Non-null `class_id`/`interface_id` must point to readable GUIDs and a
-/// non-null `out` must point to a writable pointer slot, all valid for the
-/// call.  On `S_OK` the caller receives one owned interface reference and
-/// must release it through COM.
+/// 非空的 `class_id`/`interface_id` 必须指向可读 GUID，非空 `out` 必须指向
+/// 可写指针槽，且在调用期间全部有效。返回 `S_OK` 时调用方获得一个自有接口
+/// 引用，必须通过 COM 释放。
 pub unsafe fn dll_get_class_object(
     class_id: *const GUID,
     interface_id: *const GUID,
@@ -2002,10 +2001,10 @@ pub fn dll_can_unload_now() -> HRESULT {
     }
 }
 
-// ---------- registration (HKCU required, HKLM best effort) ----------
+// ---------- 注册（HKCU 必需，HKLM 尽力而为） ----------
 
-/// REGFILTER2 v2 blob: 1 output pin, 1 media type (vids/NV12), pin category
-/// PIN_CATEGORY_CAPTURE.  Must stay byte-identical to the C++ filter.
+/// REGFILTER2 v2 数据块：1 个输出 pin、1 个媒体类型（vids/NV12）、pin 类别
+/// PIN_CATEGORY_CAPTURE。必须与历史 C++ 滤镜逐字节一致。
 pub const FILTER_DATA: [u8; 104] = [
     0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x20, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x30, 0x70, 0x69, 0x33, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
@@ -2122,7 +2121,7 @@ pub fn register_server() -> HRESULT {
         ) {
             return SELFREG_E_CLASS;
         }
-        // Best effort like the C++ filter: an unelevated install only needs HKCU.
+        // 与历史 C++ 滤镜一致采用尽力而为：非提权安装只需 HKCU。
         let _ = write_hive(
             HKEY_LOCAL_MACHINE,
             &clsid_key,
@@ -2146,7 +2145,7 @@ pub fn unregister_server() -> HRESULT {
     S_OK
 }
 
-// ---------- make sure the helper is used (and keep it public for the diag) ----------
+// ---------- 确保该辅助函数被使用（同时为诊断保持公开） ----------
 
 pub fn capabilities_json() -> &'static str {
     crate::capabilities::CAPABILITIES_JSON
@@ -2160,7 +2159,7 @@ mod tests {
     fn filter_data_blob_is_the_expected_regfilter2() {
         assert_eq!(FILTER_DATA.len(), 104);
         assert_eq!(&FILTER_DATA[0..4], &[0x02, 0x00, 0x00, 0x00]);
-        // Pin category GUID (last 16 bytes) is PIN_CATEGORY_CAPTURE.
+        // pin 类别 GUID（最后 16 字节）应为 PIN_CATEGORY_CAPTURE。
         let category = unsafe {
             core::slice::from_raw_parts(&PIN_CATEGORY_CAPTURE as *const GUID as *const u8, 16)
         };
@@ -2178,8 +2177,8 @@ mod tests {
 
     #[test]
     fn can_unload_when_no_objects_exist() {
-        // Unit tests do not create COM objects; this only asserts the counter
-        // gate itself.  A verifier checks the real graph lifetime in-process.
+        // 单元测试不创建 COM 对象；这里只断言计数门本身。真实图生命周期由
+        // 验证器在进程内检查。
         assert_eq!(dll_can_unload_now(), S_OK);
     }
 

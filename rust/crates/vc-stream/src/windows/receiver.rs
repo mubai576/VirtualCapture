@@ -1,5 +1,5 @@
-//! Shared in-process receiver. Npcap threads only capture/reassemble/validate;
-//! one joined worker performs all decoding, publication and decoded hashing.
+//! 共享的进程内接收端。Npcap 线程只做捕获/重组/校验；由一个被 join 的
+//! worker 完成全部解码、发布与解码后哈希。
 use super::*;
 
 use super::ThreadPriority;
@@ -8,7 +8,7 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Condvar, MutexGuard};
 use std::thread::JoinHandle;
 
-/// At most two complete AUs may wait for the single synchronous decoder.
+/// 最多允许两个完整 AU 等待这个单线程同步解码器。
 const QUEUE_LIMIT: usize = 2;
 const CAPTURE_BUFFER_BYTES: i32 = 128 * 1024 * 1024;
 const PROGRESS_INTERVAL: Duration = Duration::from_millis(500);
@@ -50,7 +50,7 @@ pub(crate) fn receive(mut args: ReceiveArgs) -> anyhow::Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// Raw: single-threaded, zero-copy decode/publish/hash path.
+// Raw：单线程、零拷贝的解码/发布/哈希路径。
 // ---------------------------------------------------------------------------
 
 struct RawCounters {
@@ -415,7 +415,7 @@ fn raw_capture_loop(
 }
 
 // ---------------------------------------------------------------------------
-// Encoded: reassembly/validation on the capture thread, one decoder worker.
+// 编码：捕获线程负责重组/校验，另有一个解码 worker。
 // ---------------------------------------------------------------------------
 
 struct Work {
@@ -489,7 +489,7 @@ impl SharedDecoder {
                 *error = Some(text);
             }
         }
-        // Publish the text before the flag observers use as the acquire side.
+        // 先发布文本，再设置观察者用作 acquire 侧的标志。
         self.failed.store(true, Ordering::Release);
     }
 
@@ -519,9 +519,8 @@ struct WorkerHandle {
 }
 
 impl WorkerHandle {
-    /// Request queue closure and join exactly the one worker. A native decode/Drop
-    /// that never returns leaves this join pending, which intentionally keeps the
-    /// owning ABI session and DLL image alive.
+    /// 请求关闭队列，并只 join 这一个 worker。若某次原生 decode/Drop 永不返回，
+    /// 该 join 会一直挂起；这会有意让所属 ABI 会话与 DLL 映像继续保持存活。
     fn shutdown(&mut self) -> Option<String> {
         {
             let mut queue = lock(&self.shared.queue);
@@ -1125,7 +1124,7 @@ fn live_encoded_progress(
 }
 
 // ---------------------------------------------------------------------------
-// Decoder worker: creation, bounded drain, reset/recreate, hashing, SHM.
+// 解码 worker：创建、有界排空、重置/重建、哈希、SHM。
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
@@ -1186,7 +1185,7 @@ fn worker_main(
         })
         .is_err()
     {
-        // The owning receiver has gone away; no readiness observer remains.
+        // 所属接收端已消失，不再有就绪观察者。
         return Ok(());
     }
     drop(init);
@@ -1237,15 +1236,15 @@ fn worker_loop(
                 .reset()
                 .context("reset decoder after stream discontinuity")?;
             shared.resets.fetch_add(1, Ordering::AcqRel);
-            // Every encoded AU is independent, but the following flag preserves the
-            // C++ receiver's explicit "wait for a key/random-access frame" visible state.
+            // 每个编码 AU 都独立，但下面这个标志保留历史 C++ 接收端显式的
+            // “等待关键帧/随机访问帧”可见状态。
             shared.waiting_idr.store(true, Ordering::Release);
         }
         have_last = true;
         last_frame_id = work.frame_id;
         if work.eos {
-            // EOS carries no picture. There is no pending decoder output because this
-            // worker decodes synchronously, so accepting it is already "drained".
+            // EOS 不携带画面。本 worker 同步解码，不存在待处理的解码器输出，
+            // 因此接受 EOS 本身就已算“排空”。
             ensure!(
                 shared.pending.load(Ordering::Acquire) == 0,
                 "EOS arrived while a decoder frame was still pending"
@@ -1360,8 +1359,8 @@ fn recover_decoder(
     fps: u32,
     operation: &OperationState,
 ) -> anyhow::Result<()> {
-    // Destroy the failed decoder before constructing its replacement. PyroWave's
-    // reset keeps the Vulkan device; a recreate is the C++ `reopen(true)` path.
+    // 先销毁失败的解码器，再构造其替代者。PyroWave 的 reset 保留 Vulkan
+    // 设备；重建相当于历史 C++ 的 `reopen(true)` 路径。
     *slot = None;
     let decoder =
         Decoder::open_observed(codec, geometry.width(), geometry.height(), fps, operation)?;
@@ -1370,10 +1369,10 @@ fn recover_decoder(
 }
 
 // ---------------------------------------------------------------------------
-// Evidence and error helpers.
+// 证据与错误辅助函数。
 // ---------------------------------------------------------------------------
 
-/// Merge the fields of `extra` into `target`, preserving unrelated live metrics.
+/// 把 `extra` 的字段合并进 `target`，保留无关的实时指标。
 fn add_json_fields(target: &mut Value, extra: Value) {
     let (Some(target), Value::Object(extra)) = (target.as_object_mut(), extra) else {
         return;
@@ -1462,8 +1461,8 @@ fn init_failure(
 ) -> anyhow::Error {
     let text = format!("{error:#}");
     shared.fail(text.clone());
-    // Send before the caller returns and drops the partially created Publisher /
-    // Decoder, so an observer waiting on readiness can see why creation failed.
+    // 在调用方返回并丢弃部分创建的 Publisher / Decoder 之前发送，使等待就绪
+    // 的观察者能看到创建失败的原因。
     let _ = init.send(WorkerInit::Failed(text));
     error
 }

@@ -1,6 +1,6 @@
 //! 压缩访问单元（VCAU）的便携封装解析/构建。
 //!
-//! 来源是 `common/access_unit.h` 与 `references/encoded-stream.md`：
+//! 当前契约见 `references/encoded-stream.md`；布局保留历史访问单元格式：
 //! 48 字节小端头 + 编码载荷，整段再交给传输层按 `P=mtu-42` 分片。28 字节
 //! `vc_wire.h` 包头完全不变，本封装只存在于数据面载荷内。
 //!
@@ -15,7 +15,7 @@ pub const AU_HEADER_BYTES: usize = 48;
 pub const AU_MAGIC: u32 = 0x5541_4356;
 /// 封装修订号。
 pub const AU_REVISION: u8 = 1;
-/// 编码历史值 1（H.264）已按 D23 移除，遇到即无效。
+/// 历史 MJPEG wire id；其 CPU/SIMD 后端已移除，保留该值只为安全识别并拒绝旧流。
 pub const CODEC_MJPEG: u8 = 3;
 /// PyroWave（D24）。
 pub const CODEC_PYROWAVE: u8 = 4;
@@ -27,7 +27,7 @@ pub const KIND_EOS: u8 = 2;
 /// 会话约定的编码身份。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AuSession {
-    /// [`CODEC_MJPEG`] 或 [`CODEC_PYROWAVE`]。
+    /// [`CODEC_MJPEG`]（仅用于解析/拒绝旧流）或 [`CODEC_PYROWAVE`]。
     pub codec: u8,
     pub width: u32,
     pub height: u32,
@@ -35,6 +35,7 @@ pub struct AuSession {
 }
 
 impl AuSession {
+    /// MJPEG 会话只用于识别/拒绝旧流；本 crate 不再提供 MJPEG 编解码器。
     pub fn mjpeg(width: u32, height: u32, fps: u32) -> Self {
         Self {
             codec: CODEC_MJPEG,

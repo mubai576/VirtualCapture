@@ -1,12 +1,12 @@
 """Isolated smoke for the Rust DirectShow virtual camera DLL ``vc_vcam.dll``.
 
-The real ``tools/vcam_verify/vcam_verify.cpp`` verifier is used unchanged in
-its ``--dll`` mode: it calls ``DllGetClassObject`` in-process (no COM
-registration), builds a private filter graph, connects the filter to its own
-``IMemInputPin`` sink, hashes every delivered sample and checks the
-``VIDEOINFOHEADER`` timestamp, then calls Stop/Disconnect, ``DllCanUnloadNow``
-and ``FreeLibrary``.  This script only supplies input data and judges the
-evidence.
+The Rust ``vc-vcam-verify.exe`` verifier is used in its ``--dll`` mode: it
+calls ``DllGetClassObject`` in-process (no COM registration), builds a private
+filter graph, connects the filter to its own ``IMemInputPin`` sink, hashes
+every delivered sample and checks the ``VIDEOINFOHEADER`` timestamp, then
+calls Stop/Disconnect, ``DllCanUnloadNow`` and ``FreeLibrary``.  This script
+only supplies input data and judges the evidence.  The verifier is built into
+``rust/target/release`` by cargo, not by the native CMake tree.
 
 Input data is a private SHM v3 mapping created by Python (ctypes) with a unique
 ``Local\\VirtualCaptureVcamSmoke.<token>`` name and passed to the child through
@@ -42,7 +42,7 @@ Usage (repository root)::
 
     python -I rust/tests/vcam_dll_smoke.py
     python -I rust/tests/vcam_dll_smoke.py --dll rust/target/release/vc_vcam.dll \
-        --verify build/rust-package-native/Release/vc-vcam-verify.exe
+        --verify rust/target/release/vc-vcam-verify.exe
     python -I rust/tests/vcam_dll_smoke.py --self-check
 
 This is an isolated, same-machine DirectShow-filter smoke.  It is not a
@@ -69,7 +69,7 @@ import uuid
 REPO = Path(__file__).resolve().parents[2]
 RUN_ROOT = REPO / "run"
 DEFAULT_DLL = REPO / "rust" / "target" / "release" / "vc_vcam.dll"
-DEFAULT_VERIFY = REPO / "build" / "rust-package-native" / "Release" / "vc-vcam-verify.exe"
+DEFAULT_VERIFY = REPO / "rust" / "target" / "release" / "vc-vcam-verify.exe"
 SHM_PREFIX = "Local\\VirtualCaptureVcamSmoke."
 
 SHM_MAGIC = 0x33414356  # "VCA3"
@@ -152,7 +152,7 @@ def qpc_ns():
 
 
 # ---------------------------------------------------------------------------
-# Private SHM v3 writer (mirrors vcam/vcam_shm.h / scripts/vc_shm.py)
+# Private SHM v3 writer (independent layout from docs/spec/shm-v3.md)
 
 
 class ShmWriter:
@@ -676,8 +676,10 @@ def execute(args, dll, verify, run_dir, token):
     ctx = {"dll": dll, "verify": verify, "next_private_name": next_private_name}
     report = {
         "status": "RUNNING",
-        "scope": "isolated in-process DShow source filter via vc-vcam-verify --dll; "
-                 "private SHM v3 only; no registration, registry, agent, Npcap or stable mapping",
+        "scope": "isolated in-process DShow source filter via the Rust "
+                 "vc-vcam-verify.exe --dll; private SHM v3 only; no registration, "
+                 "registry, agent, Npcap or stable mapping",
+        "verifier_source": "rust/crates/vc-vcam (cargo bin vc-vcam-verify)",
         "run_dir": str(run_dir),
         "token": token,
         "dll": file_identity(dll),

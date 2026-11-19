@@ -1,8 +1,8 @@
-//! Media-type helpers mirroring `VCamCreateType`, `VCamCopyType`,
-//! `VCamTypeMatches` and `GetStreamCaps` from `vcam/vcam.cpp`.
+//! 媒体类型辅助函数，对应历史 C++ 实现 `vcam/vcam.cpp` 中的
+//! `VCamCreateType`、`VCamCopyType`、`VCamTypeMatches` 与 `GetStreamCaps`。
 //!
-//! Only `FORMAT_VideoInfo` + NV12 at the negotiated session geometry is
-//! advertised.  A filter instance never silently changes size or fps.
+//! 只公布协商会话几何下的 `FORMAT_VideoInfo` + NV12。滤镜实例绝不静默
+//! 改变尺寸或 fps。
 
 use core::ffi::c_void;
 use core::mem::size_of;
@@ -21,21 +21,20 @@ use crate::abi::{
 use crate::geometry::StreamGeometry;
 
 pub const GUID_NULL: GUID = GUID::from_u128(0);
-/// `MAKEFOURCC('N','V','1','2')`.
+/// NV12 的 FourCC 值，即 `MAKEFOURCC('N','V','1','2')`。
 pub const FOURCC_NV12: u32 = 0x3231_564E;
 
 pub const VIDEOINFOHEADER_SIZE: u32 = 88;
 
-/// Allocates an `AM_MEDIA_TYPE` + `VIDEOINFOHEADER` pair with CoTaskMemAlloc,
-/// exactly like `VCamCreateType`.  Caller owns the result and frees it with
-/// [`free_media_type`].
+/// 用 CoTaskMemAlloc 分配一对 `AM_MEDIA_TYPE` + `VIDEOINFOHEADER`，
+/// 与 `VCamCreateType` 完全一致。调用方取得所有权，并用
+/// [`free_media_type`] 释放。
 ///
 /// # Safety
 ///
-/// The returned allocation must be released exactly once with
-/// [`free_media_type`]; the caller must not free it by any other means.
-/// `geometry` must be a valid session geometry (all values built through
-/// [`StreamGeometry`] satisfy this).
+/// 返回的分配必须用 [`free_media_type`] 恰好释放一次；调用方不得通过
+/// 其他方式释放。`geometry` 必须是有效的会话几何（凡经 [`StreamGeometry`]
+/// 构造的值都满足）。
 pub unsafe fn alloc_media_type(geometry: StreamGeometry) -> *mut MediaType {
     let mt = CoTaskMemAlloc(size_of::<MediaType>()) as *mut MediaType;
     if mt.is_null() {
@@ -82,8 +81,8 @@ pub unsafe fn alloc_media_type(geometry: StreamGeometry) -> *mut MediaType {
 
     (*mt).majortype = MEDIATYPE_Video;
     (*mt).subtype = MEDIASUBTYPE_NV12;
-    (*mt).bFixedSizeSamples = 1; // TRUE
-    (*mt).bTemporalCompression = 0; // FALSE
+    (*mt).bFixedSizeSamples = 1; // TRUE（定长样本）
+    (*mt).bTemporalCompression = 0; // FALSE（无时间压缩）
     (*mt).lSampleSize = geometry.frame_bytes();
     (*mt).formattype = FORMAT_VideoInfo;
     (*mt).pUnk = ptr::null_mut();
@@ -92,13 +91,12 @@ pub unsafe fn alloc_media_type(geometry: StreamGeometry) -> *mut MediaType {
     mt
 }
 
-/// Frees internals and the `AM_MEDIA_TYPE` itself (C++ `VCamFreeType`).
+/// 释放内部缓冲以及 `AM_MEDIA_TYPE` 本身（对应 C++ `VCamFreeType`）。
 ///
 /// # Safety
 ///
-/// `mt` must be null or an allocation returned by [`alloc_media_type`] that
-/// has not been freed before.  After the call the pointer is dangling and
-/// must not be used again.
+/// `mt` 必须为空，或为 [`alloc_media_type`] 返回且尚未释放的分配。调用后
+/// 指针即悬垂，不得再次使用。
 pub unsafe fn free_media_type(mt: *mut MediaType) {
     if mt.is_null() {
         return;
@@ -107,15 +105,13 @@ pub unsafe fn free_media_type(mt: *mut MediaType) {
     CoTaskMemFree(Some(mt as *const c_void));
 }
 
-/// Frees only the internals of a possibly embedded media type
-/// (C++ `VCamClearType`).
+/// 只释放媒体类型的内部成员，结构体本身可内嵌（对应 C++ `VCamClearType`）。
 ///
 /// # Safety
 ///
-/// `mt` must be null or point to a writable, initialized `MediaType` whose
-/// non-null `pbFormat` comes from CoTaskMemAlloc and whose non-null `pUnk`
-/// holds a COM reference owned by this media type.  The struct is zeroed, so
-/// the same internals must not be cleared twice.
+/// `mt` 必须为空，或指向可写、已初始化的 `MediaType`：其非空 `pbFormat`
+/// 来自 CoTaskMemAlloc，非空 `pUnk` 持有由该媒体类型拥有的 COM 引用。
+/// 本调用会把结构体清零，因此同一内部成员不得重复清理。
 pub unsafe fn clear_media_type(mt: *mut MediaType) {
     if mt.is_null() {
         return;
@@ -129,15 +125,14 @@ pub unsafe fn clear_media_type(mt: *mut MediaType) {
     ptr::write_bytes(mt as *mut u8, 0, size_of::<MediaType>());
 }
 
-/// Deep copy into a caller-provided `AM_MEDIA_TYPE` (C++ `VCamCopyType`).
+/// 深拷贝到调用方提供的 `AM_MEDIA_TYPE`（对应 C++ `VCamCopyType`）。
 ///
 /// # Safety
 ///
-/// `dst` must be null or point to a writable `MediaType` that does not alias
-/// `src` and does not own live internals (they are zeroed by this call).
-/// `src` must be null or point to a valid initialized `MediaType` whose
-/// `pbFormat`/`pUnk` members stay valid for the call.  On success the caller
-/// owns the new internals and must release them with [`clear_media_type`].
+/// `dst` 必须为空，或指向可写、且不与 `src` 别名、也不持有存活内部成员的
+/// `MediaType`（本调用会将其清零）。`src` 必须为空，或指向有效的已初始化
+/// `MediaType`，其 `pbFormat`/`pUnk` 在调用期间保持有效。成功后新内部成员
+/// 归调用方所有，须用 [`clear_media_type`] 释放。
 pub unsafe fn copy_media_type(
     dst: *mut MediaType,
     src: *const MediaType,
@@ -172,15 +167,14 @@ pub unsafe fn copy_media_type(
     S_OK
 }
 
-/// C++ `VCamTypeMatches`: GUID_NULL acts as "don't care"; when a
-/// `FORMAT_VideoInfo` payload is present it must carry the session geometry,
-/// frame duration, NV12 fourcc and exact frame size.
+/// 对应 C++ `VCamTypeMatches`：GUID_NULL 视为“不关心”；当带有
+/// `FORMAT_VideoInfo` 载荷时，它必须匹配会话几何、帧时长、NV12 fourcc
+/// 与精确帧大小。
 ///
 /// # Safety
 ///
-/// `mt` must be null or point to a readable initialized `MediaType`; when
-/// `pbFormat` is non-null it must address at least `cbFormat` readable bytes
-/// for the duration of the call.
+/// `mt` 必须为空，或指向可读的已初始化 `MediaType`；`pbFormat` 非空时，
+/// 它必须在调用期间可读至少 `cbFormat` 字节。
 pub unsafe fn matches_type(mt: *const MediaType, geometry: StreamGeometry) -> bool {
     if mt.is_null() {
         return false;
@@ -216,13 +210,13 @@ pub unsafe fn matches_type(mt: *const MediaType, geometry: StreamGeometry) -> bo
     true
 }
 
-/// Fills the caller's `VIDEO_STREAM_CONFIG_CAPS` buffer exactly like
-/// `CVMamPin::GetStreamCaps`, advertising one immutable capability.
+/// 按 C++ pin 的 `GetStreamCaps` 填充调用方的 `VIDEO_STREAM_CONFIG_CAPS`
+/// 缓冲，只广告一项不可变能力。
 ///
 /// # Safety
 ///
-/// `caps` must be null or address at least
-/// `size_of::<VideoStreamConfigCaps>()` writable bytes.
+/// `caps` 必须为空，或至少指向 `size_of::<VideoStreamConfigCaps>()` 个
+/// 可写字节。
 pub unsafe fn fill_stream_caps(geometry: StreamGeometry, caps: *mut u8) {
     if caps.is_null() {
         return;
@@ -397,7 +391,7 @@ mod tests {
         assert_eq!(PINDIR_OUTPUT, 1);
     }
 
-    // Small helper so the mutation test stays readable.
+    // 小辅助函数：让变异测试保持易读。
     impl MediaType {
         unsafe fn bmiHeader_mut(&mut self) -> &mut VideoInfoHeader {
             &mut *(self.pbFormat as *mut VideoInfoHeader)

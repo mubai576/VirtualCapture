@@ -1,135 +1,36 @@
-# PLAN：VirtualCapture（P5 稳定版封存 → P6 可配置采集与传输）
+# PLAN：VirtualCapture Rust
 
-> 入口与规则见根目录 `AGENTS.md`。本文件只放：现状、冻结契约、待决事项、当前任务卡。
-> 完成一项在卡头标 DONE + 一行证据；长证据写 `docs/bringup/` 或 `docs/proposals/`，这里只放链接。
-> 档案（只读）：旧 PLAN 全文与 "hist S11/S23/…" 编号 → `docs/history/plan-history.md`；
-> 已关闭的 P1~P3 卡原文 → `docs/history/phase3-closed-cards.md`。
+入口/仓库地图/硬规则见 AGENTS.md；长证据只放docs/bringup或proposals。历史PLAN与旧实现查Git；docs/history为只读档案。
 
-## 0. 现状快照（2026-11-02；P6 进度更新 2026-11-03）
+## 0. 当前状态（2026-11-19）
 
-P4 历史测试结论保留；2026-11-02 已只读封存当前部署，不新增性能结论。owner 已反馈约三天实际使用满意，优先保住已用版本，不追加压力测试或扩展 G3/G4。详见 `docs/bringup/bringup-20261102.md`。
+- 开发全面转Rust，产品宿主进程内加载vc_stream.dll；旧C++/Python产品树和旧运维脚本从工作树移除，只保留Git历史。独立Python测试参考与打包协调不是产品后台，继续保留。
+- 当前编码Raw/显式PyroWave；DDA/WGC仅硬件GPU转换，CPU MJPEG移除。必要CPU上传/回读/Npcap/hash/SHM仍存在，不宣称零CPU或零拷贝。
+- I226优先、可配置MTU默认读取网卡；本次仅只读查询与产品逻辑，不修改物理网卡、不操作PC2、不注册真实虚拟卡。
+- Rust-R3保持IN PROGRESS。本轮 Rust 总门、Raw/PyroWave DLL Loopback、GPU DDA/WGC、隔离 DirectShow、控制面、适配器、CLI 与 GUI smoke 均有本机证据；GUI 本轮窗口非黑屏。历史三编码与GUI黑屏仅代表当时版本，不覆盖本轮结果；完整便携包尚未验收，硬门不能绕过。
+- 物理网卡/双机/长稳/画质/完整DShow编排与完整包验收仍待专项。旧双机自动T1–T5工具已移除，Rust等价编排/完整取证工具尚缺，门限不变。
+- 已用部署不因本重构改变。角色按实际运行状态，不从旧PC编号推断；历史封存见 docs/bringup/bringup-20261102.md，后续部署观测见 docs/bringup/bringup-20261113-release-0.5.0.md。
 
-封存后 owner 已批准继续开发（D19）：分辨率预设 `416×416 / 640×640 / 720p / 1080p / 1440p` + 自定义，
-裁切/缩放与双端链路预算。P6-1 与 P6-2 开发版已接通，原生 Raw/四种变换/发送限速/动态 SHM 与虚拟卡完成本机隔离验证。
-**2026-11-13 owner 决定（D23）移除 H.264/H.265**（含 Media Foundation 与原生 NVENC）及其测试结果和
-`vc-codec-probe`/`vc-codec-roundtrip`；当前编码只保留 D21 批准的 MJPEG。P6-3 MJPEG 开发版已接通
-L2/有界解码/每帧恢复/SHM/DShow 与 GUI，默认不启用，须明确开发授权。双机/长稳/画质仍待验收，不替换现有部署。
-**同日 owner 批准（D24）接入 PyroWave**（Vulkan 计算小波 intra-only）：开发版后端 `pyrowave:vulkan`，
-阶段一 CPU 上传/回读，两端需 Vulkan 1.3；本机 Loopback 功能验证通过，未双机/长稳/画质验收。
+## 1. 当前契约
 
-| 维度 | 状态 |
+| 范围 | 契约与真相源 |
 |---|---|
-| 传输正确性 | ✅ 双机 T0/T1 五档/T2 10min 零丢零错；T2 144000 帧 PC2 hashlog 分页全量对账零错（docs/bringup/bringup-20261022.md） |
-| 240fps | ✅ DDA 实测 235fps（testwin D3D11 动画源），batch=69，gpu_convert=on |
-| 延迟 | ✅ D14 网卡调优后全程 p99=9.83ms（batch=69）；rseg_max 1015ms→35ms（-97%）；Npcap 用户态实用极限约 10ms |
-| P4-1 GPU 采集 | ✅ gpu_dispatch_ms=0.028ms（D3D11 timestamp，235fps 实测）；gpu_convert 代码落地，默认 CPU 路径待 owner 切换 |
-| P4-2 延迟测量 | ✅ 分段计时落地（pc1_seg + rseg）；双机实测门限候选 <10ms；确认包（flags bit1）待 owner 终审 |
-| P4-3 虚拟采集卡 | ✅ vcam DShow filter 落地，本机回环 4455 帧逐字节零错，240.0fps，D12 无信号行为实现；PC2 接线验收待 P4-4 |
-| P4-4 虚拟卡验收 | ✅ DONE 2026-10-23：三判据全通（J1 枚举/J2 NV12 640x640@240/J3 35069帧零错+SHM hash 27/27一致）；tools/vcam_verify/ + scripts/p4_4_shm_verify.py；docs/bringup/bringup-20261023-p4-4-vcam-acceptance.md |
-| 产品链路 P4 | ✅ P4-1/2/3/4 全部完成 |
-| 网卡调优 | ✅ PC2 I226-V: FlowControl=0, ITR=0（D14，docs/runbooks/pc2-nic-tuning.md）；PC1 Realtek 已同等设置 |
-| P5 实际使用 | owner 于 2026-11-02 确认约三天实际效果测试、目前满意；不等同连续 72h 或全量零丢帧验收 |
-| 当前部署 | PC1 192.168.2.100 = host（I226-V，receiver + GUI + vcam）；PC2 192.168.2.59 = capture（Realtek 2.5G，sender）；两端 :5143 在线，封存时均停止采集 |
-| 版本与来源 | 两端 /health 均报 0.4.1 / product_revision=2；成品清单逐字节一致；主机 87 项载荷哈希通过，封存前 299 项源码与成品记录一致；远端实际二进制尚未独立核验 |
-| 已用版本封存 | `archive/baseline-20261102-230617/`：主机成品、双端配置/当前完整 hashlog、源码工作区和 Git bundle；未编译、重启、提交或 OTA |
+| Wire | proto/vc_wire.h冻结28B、0x88B5；payload=mtu−42，Raw帧B=w×h×3/2、N=ceil(B/payload)，不占保留位；skill references/wire-protocol.md |
+| 产品拓扑 | vc-host GPUI主机（无REST）；vc-capture REST v2采集后台；vc-core进程内加载C ABI v1，EXE/DLL共享实现，不回退旧进程；references/rust-control.md |
+| 网卡/MTU | 明确物理非虚拟网卡，唯一I226优先；显式选择保持、多卡歧义拒绝。新配置自动MTU，旧缺字段保留显式值；双端只读NlMtu取最小、上限9000，不改系统参数 |
+| GPU/编码 | DDA/WGC强制硬件GPU；pattern独立诊断。Raw不压缩；PyroWave显式开发/精确backend、GOP1、真实GPU Vulkan1.3；MJPEG明确拒绝，旧codec ID不复用；references/encoded-stream.md |
+| 批提交 | Raw物理卡整帧一个sendqueue，编码按实际AU整帧一次提交，零/短发送失败。显式Loopback固定batch1例外，不冒充产品性能 |
+| 生命周期 | stop/destroy仅0证明释放；pending保留worker/句柄/DLL，未知destroy不盲重试。PyroWave每操作5s粘性看门狗不退出宿主；待清理锁配置/OTA/虚拟卡 |
+| SHM/DShow | docs/spec/shm-v3.md；动态NV12、12槽、只读seqlock、事件对；D12从无好帧不输出、停流只重复最后好帧。隔离verifier由Cargo构建，无注册表枚举回退 |
+| 归属/OTA | 全局owner+本根schema2精确证明/互斥/刷盘pending；未知拒绝接管。固定app/data/updates，配对令牌独立，stage不等于activate成功；references/rust-control.md |
+| 构建/包 | Cargo workspace/locked为唯一产品入口；CMake仅PyroWave第三方库。scripts/verify.py为Rust总闸，package.py为薄入口；唯一dist不覆盖旧成品，GUI黑屏硬失败；references/packaging.md |
+| 判据 | test-matrix.md冻结T0–T5/D1；Raw整帧FNV，性能motion且注明batch/adapter，跨机不减QPC；有损transport/decoded出口分开核对 |
 
-环境：MSVC 19.44（cmake VS 生成器直连，cl 不在 PATH）、python 3.14、Npcap 运行时、
-`thirdparty/npcap-sdk` + `thirdparty/ninja` 已 vendor。当前产品接线：PC2=192.168.2.59 被采集，
-PC1=192.168.2.100 接收；历史报告中的 PC1 sender / PC2 receiver 不代表当前角色。主机 ROOT 为 `dist/VirtualCapture`，
-采集后台 ROOT 为 `C:\Users\s1973\Documents\VirtualCapture`，端口 5143；没有变更 IP、网卡或运行配置。
-
-## 1. 冻结契约（改即全线返工，须 owner 批准）
-
-### 1.1 包头与链路
-- `proto/vc_wire.h`：`vc_pkt_hdr_t` 28B，EtherType `0x88B5`，`payload = mtu - 42`，
-  `total = ceil(B/payload)`，`B=width*height*3/2`；缺省仍为614400。P6-2 控制面显式协商几何/MTU/源MAC，不占用包头/flags。proto/ 归 owner 锁定。
-
-### 1.2 构建
-- 根 `CMakeLists.txt` 编排 `common/`、`sender/`、`receiver/`、`vcam/` 与 `tools/`，MSVC 优先；统一规则在 `cmake/`。默认 `-B build` 下发收端入口仍为 `build/vc-sender.exe`、`build/vc-receiver.exe`；各目标路径见 `docs/runbooks/build.md`。
-- 一键便携包：`python scripts/package.py [--allow-dirty] [--output <目录>]`；默认 `dist/VirtualCapture/`，包含 7 个原生目标、冻结 agent（含 GUI）、MSVC 运行库、脚本和文档。生成文件 SHA-256 与源码来源清单；成功才替换，旧成品整目录归档。契约见 skill `references/packaging.md`。
-
-### 1.3 CLI（动词级冻结；dda/batch 为已落地的追加，本次正式纳入）
-```text
-vc-sender.exe --adapter <子串> --mode pattern|file|dda|wgc --pattern motion --fps 240
-  --frames 0 --ethertype 0x88B5 --mtu 9000 --pacing-us 0 --batch 69 --dst-mac ff:ff:ff:ff:ff:ff
-  --session <id> --stats <path> --hashlog <path> [--file <nv12> --loop] [--list-adapters] [--selftest] [--gpu-convert]
-  [--output 0 --wgc-window <标题子串> --wgc-no-cursor]
-  [--width 640 --height 640 --transform crop|fit|fill|stretch --source-mac <MAC>] [--capabilities]
-vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
-  --session <id> --stats <path> --hashlog <path> --timeout-s 0 [--expect-frames N] [--shm <mapname>] [--selftest]
-  [--width 640 --height 640 --fps 240 --source-mac <MAC>] [--capabilities]
-```
-
-P6-3 MJPEG共同CLI追加：`--codec mjpeg --codec-backend turbojpeg:cpu --codec-hardware 0 --gop 1 --bitrate <bps> --max-bitrate <bps> --decode-in-flight N --max-au-bytes N --jpeg-quality 1..100`；另有`--codec-backends/--codec-check/--au-selftest/--mjpeg-selftest`。压缩载荷/API/日志契约见skill `references/encoded-stream.md`，28B包头不变；Raw CLI和判据不变。`--codec h264|hevc` 在打开网卡前以退出码2拒绝。
-
-WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture 采集 `--output` 指定显示器（默认0），`--wgc-window <标题子串>` 改为按窗口采集；窗口模式默认包含光标，`--wgc-no-cursor` 关闭。WGC 仍经 DWM 合成，不消除合成延迟；独占全屏不可采集；失败显式报错，不回退 DDA。DDA 同样支持 `--output`。不改变 28B 包头、raw 逐像素判据与 `--gpu-convert` 语义。
-
-### 1.4 文件型 IPC
-- stats ~500ms 原子覆写（tmp→rename）；hashlog 每帧 append 一行。
-- `sender.hash.jsonl`：`{"frame_id":N,"hash":"<16hex>","qpc_ns":T,"send_qpc_ns":S}`；T为采集/生成开始，S为开始分包发送
-- receiver hashlog D3 carries qpc_ns; reconcile compares frame_id and hash only.
-- vcam DShow 设备契约（2026-10-25）：FriendlyName `VirtualCapture`，pin `Capture`（PIN_CATEGORY_CAPTURE），仿 GC573 枚举为 `(video)`；HKCU CLSID 键下可选 REG_SZ `FrameMap`、REG_DWORD `Motion`=1（D12 显式 bring-up）。
-- receiver `--shm <name>` (P4-3): publish latest complete frame to named file mapping (layout vcam/vcam_shm.h, NOT proto/); stats adds `shm_published`; agent /receiver/start forwards `shm`.
-- **shm v2（D15 历史；开发版由下述 P6-2 v3 替代）**：`vcam/vcam_shm.h` 为唯一布局（magic `VCA2`，12 槽 ring，数据区 4096 起）；receiver 原地重组进空闲槽，发布=翻槽 seq + 置命名事件 `<name>.evt0/.evt1`（manual-reset 交替），整帧哈希在发布后由哈希线程写入（`hash_fid==frame_id` 才有效）；vcam 事件驱动（新帧立即交付，静默 1.5 帧后才重复上一帧，D12 不变）。v1 读端遇 v2 映射判"无信号"，不崩。Python 镜像 `scripts/vc_shm.py`，monitor 使用公共布局。
-- vcam→receiver 回写环 `<name>.vcam`（`vc_vstat_*`，仅测量）：receiver stats 新增 `vseg_avg_ms/vseg_p50_ms/vseg_p99_ms/vseg_max_ms`（receiver 发布→vcam 交付下游，同机 QPC，不含重复帧）、`vcam_delivered`、`vcam_repeats`、`hash_queue_max`；sender stats 新增 `cap_lag_avg_ms/cap_lag_p99_ms/cap_lag_max_ms`（dda：DXGI LastPresentTime→转换完成，同机 QPC）。
-- receiver hashlog `qpc_ns` = 重组完成时刻（原为当次循环起点，差 <1 包）；sender PC1 段不再含整帧哈希（哈希移到末包之后）。历史 D15 的 DDA 不限速由 P6-2 替代：发送开始间隔至少 ceil(1e9/fps) ns、不补发追赶；timeout/鼠标更新/重复 LastPresentTime 不发送或递增frame_id。
-- sender stats 新增 `gpu_dispatch_ms`（D3D11 timestamp 包住 CopyResource 的真 GPU 时间均值）+ `gpu_dispatch_samples`（有效样本数）；`gpu_ms` 仍为 capture() wall-clock，待 P4-1 实测分布后按 D10 决定是否切换口径。
-- sender stats 新增 `gpu_convert`（0/1，采集走 CPU 还是 GPU compute shader；GPU 失败显式报错，不静默回退）。
-- P6-R2（2026-11-13）：编码路径补齐pc1_seg（源帧准备完→末包提交返回）/rseg（首片→AU齐片），最新10000帧、零样本null，不含跨机QPC或解码混算；PyroWave配置/双端stats追加实际Vulkan设备name/type/ID/UUID/LUID/API/driver与compute/zero_copy，GUI类别只读按codec显示，false不等于CPU后端。详情见skill encoded-stream.md；Raw/包头/判据不变。
-- P4-2步骤1（免协议改动）：receiver stats 新增 `rseg_avg_ms/rseg_p50_ms/rseg_p99_ms/rseg_max_ms`（R(N)=首包到达→重组完成，同机QPC）；sender stats 新增 `pc1_seg_avg_ms/pc1_seg_p99_ms/pc1_seg_max_ms`（PC1段=采集/生成完成→末包发出，同机QPC）；确认包（flags bit1）仍待 owner 终审后做步骤2。
-- P5 GUI（D16）：agent 新增 `/ui`、`/config`（ROOT/vc-config.json）、`/vcam/status|register`、`/product/{start,stop,status}`、`/product/local/{start,stop}`；`/sender/start` 可选 `gpu_convert`。详见 agent-api.md。
-- P5-U2（D17）：仅主机（默认 `--role host`）提供 UI，收端角色固定；被采集机 `--role capture` 仅后台。产品控制端口 5143，UI 只填 IPv4，网卡自动枚举后下拉选择；主机下发采集参数，对端按控制路由匹配网卡。默认 SHM 固定隐藏，接收前注册 vcam，停止/失败/子进程退出时回收；开始/停止采集合为一个按钮。API 追加能力标记、网卡详情与生命周期语义，详见 agent-api.md；数据面与判据不变。
-- P5-U2 后续精简：连接配置仅显示 IP、网卡和目标帧率，移除画面来源、像素转换、发送批大小及 MTU；隐藏参数沿用后台配置，保存时保留原值，底层 API 与默认值不变。
-- P5-U3 后端整合：产品启动约 1 秒存活检查，提前退出失败并回滚；stats 追加进程诊断和实际采集方式，界面等待首帧。`/health.root` 支持启动器校验同目录/同角色复用；主机与采集后台各有便携启动入口。契约见 agent-api.md、packaging.md。
-- P6-1（D19）：配置新增输出宽高、crop/fit/fill/stretch、raw/mjpeg、目标/最大码率与链路预留余量；旧配置仍为 640×640 / crop / raw。新增只读 `GET /stream/capabilities` 与草稿 `POST /stream/plan`，`/adapters` 追加数值型收/发链路速率，`/health.stream_revision=1`（历史，现已由P6-2的2替代）。该阶段的非640/缩放拒绝由P6-2解锁；编码模式仍在注册/启动前409拒绝；禁止低层接口静默忽略新流参数。预算使用 mtu-42 和完整 L2 线速开销，不是实测吞吐或帧率保证；速率未知不冒充可行。完整契约见 skill `references/stream-config.md`。
-- P6-2（D19）：`stream_revision=2`、显式 descriptor 双端回显、实际原生能力探测与源 MAC 会话过滤；旧后台/二进制拒绝。可变尺寸 Raw、整数 crop/fit/fill/stretch、发送帧率上限已接通。SHM v3（VCA3，header offset32/36/40=width/height/fps，动态12槽步长）；新读端兼容固定v2，旧读端拒绝v3，writer拒绝已有同名映射。DShow 创建时固定一档真实会话格式，改尺寸先关下游再重新开始/打开；D12不变。详情与低层API见 skill `references/stream-config.md`。
-- 哈希 FNV-1a64（初值 14695981039346656037，prime 1099511628211，小写 16hex），整帧 B 字节（旧默认614400B）。
-
-- P6-3开发编码（仅MJPEG）：codec_revision=1、mjpeg_revision=1；控制面显式`turbojpeg:cpu`/硬件类别false/GOP1/码率/队列/内存上限及开发授权。48B VCAU只在载荷内，压缩长度动态分片，CRC+整体压缩hash；独立有界CPU解码、每帧独立恢复、EOS/drain，解码NV12继续SHM v3。sender记source_hash/transport_hash，receiver另记transport与decoded_hash，不套用Raw reconcile。只读codec-check与GUI能力、状态及完整契约见skill `references/encoded-stream.md`。
-- P6-3后续诊断支持显式自定义尺寸/fps/变换、CPU/GPU及后端类别、有界测试时长，区分发送fps/源hash/解码hash/DShow重复；decoder另请求CODECAPI低延迟属性，但HEVC单帧上限仍失败，不自动加深。完整参数与同机计时范围见skill `references/encoded-stream.md`。
-- P6-3性能修正：严格截止限速、有界分型准备；追加最近10000帧timing_ms及逐帧encode_wait_ns，保持encoder1帧/decoder显式上限。编码sender沿用Raw发送线程调度设置（MMCSS Capture/TIME_CRITICAL、进程HIGH），不改系统全局/GPU优先级或编码参数。编码receiver首包改取Npcap返回后，修正旧decode_pipeline_ms含读取等待的偏差，不作为解码提速。指标/等待语义见skill `references/encoded-stream.md`；H.264/H.265相关实验报告已按D23删除。
-- P6-3帧龄优化：准备预测改为请求IDR/非IDR各最近64次nearest-rank p95+0.1ms、最多一个周期，原帧率/码率闸及队列上限不变；stats追加preparation，逐帧日志追加prepare_lead_ns/prepare_work_ns，专项脚本重放验证预测，完整口径见skill encoded-stream。不把低帧龄冒充无代价吞吐改善。
-- P6-3 MJPEG（D21）：显式turbojpeg:cpu CPU/SIMD、JPEG质量1..100（默认80）、GOP1、每帧独立；sender/receiver和descriptor追加mjpeg_revision=1与jpeg_quality，Raw会话字段不变。VCAU codec=3只扩展48B载荷语义，28B包头不变；原码率上限/队列与SHM/DShow不变。目标码率不应用于JPEG，不自动降质；精确能力/配置确认及帧21恢复规则见skill encoded-stream，构建依赖/许可证见docs/runbooks/mjpeg.md。
-- MJPEG内存优化只调整本地缓冲生命周期：本帧借用JPEG输出、复用封装/分片/按需增容sendqueue、压缩hash不重复扫描，直接解码到未发布帧槽；错误时abandon，成功才publish。CRC/全部逐帧哈希、固定质量与原队列/限速/载荷/IPC均保留；audit_hash指标语义与故障门见skill encoded-stream。
-
-- P6 review修正（2026-11-13）：WGC按ContentSize处理窗口尺寸并显式上报关闭/回调错误；底层API源选择先校验、receiver独立转发fps；PyroWave必需DLL纳入OTA激活/备份/回滚。当前编码忽略的目标码率不约束最大码率；PyroWave同步操作5秒看门狗以原生退出码124结束挂起子进程，不在GPU挂起时阻塞清理。DShow诊断追加有序推进检查，D12停流重复允许、motion冻结不得PASS；详见skill各references。
-
-### 1.5 全局禁止
-1. 不改包头尺寸/字段顺序。 2. 像素生成禁用浮点。 3. 原有 raw 模式禁止压缩；D21 批准的 MJPEG 为开发有损模式（H.264/H.265 已按 D23 移除），不得复用 raw 逐像素哈希门来声称有损正确性。
-4. 性能宣称必须用 `motion` 并注明 pattern/batch/adapter。 5. 跨机不报 QPC 差值延迟，只报 inter-arrival。
-6. 不许拿回环数据冒充双机结论。 7. 不许放宽 test-matrix 判据（改判据只能经 D1）。
-注：UNORM 解码允许 float（B8G8R8A8_UNORM→float→floor(v*255+0.5) 属格式转换，非像素生成；结果必须和 CPU 参考逐字节一致，dda_gpu 自测已证）；不许拿它当先例去别处用 float。
-
-### 1.6 目录
-以 `AGENTS.md` Repo map 为准；产物与运行数据全部 gitignore；任务只碰自己的目录。共享 CRC32/FNV 统一在 `common/`，原生辅助工具源码归 `tools/`；`proto/vc_wire.h`、`sender/pattern.h`、`vcam/vcam_shm.h` 的契约位置保留。
-
-### 1.7 PC1 Raw 长运行诊断（2026-11-08 增量）
-独立 `scripts/longrun_diagnostics.py` 默认每秒/6小时，只 GET 双端 stats、观察系统/下游资源并留全量样本；`--mark/--stop` 只标记/结束记录器。候选 Raw receiver/vcam 通过进程环境 `VC_DIAG=1` 提供固定有界 `Local\VirtualCapture.Diag.<pid>` 旁路计时（stats准备/写盘、hash写盘、GetBuffer、Receive）；不改现有 wire、帧 SHM、rseg/vseg 语义或验收门限。契约见 skill `references/longrun-diagnostics.md`，操作见 `docs/runbooks/longrun-diagnostics.md`。
-
-### 1.8 Rust 产品路径开发版（D26–D28）
-
-独立 `rust` 分支：`vc-capture` CLI后台 + `vc-host` GPUI主机客户端；编排/配置/预算/OTA在UI无关的 `vc-core`。
-D26控制面、D27 OTA与运行布局、D28全面Rust授权；控制API允许重新设计，Rust身份与显式会话回显，不与旧Python后台混跑。
-Rust产品宿主**进程内加载版本化 `vc_stream.dll` C ABI v1**（start/status/stop/destroy/capabilities）运行采集/接收，
-不再以 `vc-sender.exe`/`vc-receiver.exe` CLI 拼装本机数据面；独立 `vc-stream.exe` 诊断入口与DLL复用同一crate实现。
-`vc-source`提供pattern/DDA/WGC与crop/fit/fill/stretch整数变换；`vc-media`动态加载固定TurboJPEG/PyroWave运行库，
-仅支持NV12 Raw、MJPEG、PyroWave；`vc-vcam`为Rust COM `vc_vcam.dll`，外部`vc-vcam-verify.exe`只做隔离只读探测。
-Raw启动按准确尺寸/MTU计算一帧一个batch（`ceil(B/(mtu-42))`），编码按实际AU整帧单次queue；Npcap Loopback仅显式本机诊断，
-固定batch1并按包提交，不作为产品性能/双机结论。28B包头、wire、Raw逐帧判据与旧C++/Python契约不改；旧C++产品不进入Rust包。
-PyroWave在ready前以同几何/后端/帧预算合成NV12显式预热，丢弃输出、不进入正式帧号/统计；创建/预热/编码/解码/重置/销毁的5秒看门狗只置会话`OperationState`粘性超时，不`process::exit`；挂起时保留worker/句柄/DLL，
-pending期间锁配置/OTA/虚拟卡，不能安全停止时不得自动卸载。
-配置独立`vc-rust-config.json`；MJPEG/PyroWave必须显式`codec_experimental=true`且两端后端精确匹配，未协商组合拒绝启动。
-会话号重复不覆盖运行证据；自动注册前隔离探测实际DShow DLL能力。虚拟卡归属由HKCU CLSID `VirtualCaptureOwner`与本根精确匹配的schema 2证明共同确定（DLL/运行根/PID/进程创建时间一致）；current/pending固定在`ROOT/data/run/vcam-owned{,.pending}.json`，兼容读取旧`ROOT/run/vcam-owned.json`，不受Legacy/Managed/OTA回滚影响；Windows路径以现存路径或最深存在祖先canonicalize后拼回缺失后缀，恢复已删除旧DLL的junction别名；仅`NotFound`可向上，访问错误/悬空重解析点/歧义verbatim路径拒绝恢复。规范owner支持盘符、UNC与合法`\\?\Volume{GUID}\`文件系统路径；若 Windows 将卷GUID路径规范化为已分配盘符，必须查询盘符根对应的卷GUID并确认重建后的完整路径一致，否则拒绝。全局DLL/根必须保持规范拼写。持CLSID全局mutex先保全旧证明、刷盘pending，再提交注册表并提升current，写失败/进程中断仍保留精确证明，不放宽不一致记录判定。只允许本根本进程或确认已退出属主恢复；跨根、其他存活属主、旧注册缺少全局owner或状态未知均拒绝接管/注销，空注册的全局预约也不能被另一宿主接管。
-两端产品列表/选卡/prepare/start仅接受系统明确硬件且非虚拟的物理网卡，未知与回环不入普通列表；失效接收选择清除后须手动重选。
-采集CLI全枚举保留，后台仅显式`--allow-loopback-diagnostics`允许本地回环诊断。
-D27 Rust OTA：独立令牌配对、ZIP清单校验暂存、停止状态helper激活/就绪失败回滚；固定ROOT分离app/releases、data、updates，legacy配置保留。
-独立绿色包入口`rust/packaging/package.py`，载荷以`rust/packaging/inventory.py`为准，新建唯一dist目录与ZIP，不替换旧产品；
-主机日常双击带图标的`VirtualCapture.exe`直接按current打开GPUI，无CMD/PowerShell；采集CLI启动器默认15143（exe/省略端口仍5143），
-不含Npcap驱动，不兼容旧Python OTA。
-实现已落地但Rust-R3仍IN PROGRESS：三编码Release DLL在同机Loopback各2400帧 motion/640²@240 的cadence与<10ms延迟门通过；WGC窗口实采和隔离vcam DLL场景通过。该次Rust DDA smoke因无DXGI输出受阻，便携包GUI非空白截图门失败；完整打包未验收。物理网卡整帧batch、双机、长稳、画质与完整DShow编排仍未验收；不部署。证据：[Rust-R3本机验证](docs/bringup/bringup-20261119-rust-r3-local.md)、[Raw数据面诊断](docs/bringup/bringup-20261119-rust-data-plane.md)。
-CLI/API/生命周期完整契约见[skill Rust控制面](.agents/skills/virtualcapture/references/rust-control.md)。
+浮点只允许已批准UNORM格式解码例外且逐字节匹配整数参考，不扩展为图案生成许可。实际配置/能力/精确回显优先，预算不当实测。
 
 ## 2. 决策记录与待决事项
+
+D1–D28为历史决策原记录，涉及已移除实现的路径/命令只在Git历史中有效；后续决策优先，不把旧授权解释为本轮部署/提交授权。
 
 | # | 事项 | 建议 | 解锁 |
 |---|---|---|---|
@@ -161,152 +62,25 @@ CLI/API/生命周期完整契约见[skill Rust控制面](.agents/skills/virtualc
 | D26 | Rust + GPUI 重构 | ✅owner（2026-11-14）：在新 `rust` 分支开发、现有实现先不动；首期Rust控制面复用C++二进制，主机GPUI内嵌逻辑、被采集机CLI后台，允许重新设计API。后续软件集成先保留UI无关核心；C ABI DLL后续实现。28B头不因控制面授权自动解冻，不自动部署。设计见 docs/proposals/rust-rewrite-20261114.md | Rust-R1 |
 | D27 | Rust后端、OTA与运行布局 | ✅owner（2026-11-14）：OTA最高优先级，恢复自动更新通道；重新规划工作/更新目录，开始后端Rust迁移，并行处理双端物理网卡、UI冗余与应用图标。反馈切换后约增加10ms，按同配置/同机分段排查，不预判根因；28B头/Raw判据保留，旧部署与运行证据不自动覆盖。 | Rust-R2 |
 | D28 | 全面转 Rust 产品路径 | ✅owner（2026-11-19）：目标全面转Rust；产品宿主通过版本化DLL模块在进程内连接数据面，不再以sender/receiver EXE CLI拼装本机数据面；模块可编译DLL与独立EXE并复用同一实现；仅NV12 Raw/MJPEG/PyroWave。Raw启动按尺寸/MTU计算一帧一个batch；编码按实际AU整帧单次queue；Loopback仅显式诊断且固定batch1例外。旧C++/Python契约与稳定部署不改、不自动替换；Rust-R3保持IN PROGRESS，实测验收前不标DONE。 | Rust-R3 |
+| D29 | Rust-only、I226/可配置MTU、仅GPU与中文文档 | owner（2026-11-19）要求：“使用网卡 i226；可配置mtu 默认读取网卡参数；统一迁移到 rust；只做GPU 降级到CPU无法满足我的性能需求”，并要求移除非Rust工程产品代码、简化文档、Rust注释中文化。执行为旧产品只留Git、保留独立测试/构建工具、删除CPU MJPEG/转换降级；不自动部署/提交/push，不解冻wire或放宽验收。I226多卡拒绝与MTU双端最小是实现默认，不冒充额外owner批示。 | Rust-R3结构收拢 |
 
-## 3. 任务卡
+## 3. 当前任务卡
 
-当前优先：P6 分阶段开发；P5 已用版本封存保留，G3/G4 暂不推进。P4 卡保留历史完成证据；改代码必跑 `python scripts/verify.py`，不重建/替换正在使用的 dist 成品。
+### Rust-R3 模块化全Rust产品 — IN PROGRESS
 
-### 已关闭（原文见 docs/history/phase3-closed-cards.md）
+已实现版本化进程内DLL、Rust采集/编解码/Npcap/SHM/COM、OTA及精确owner恢复。历史本机证据：[Rust-R3](docs/bringup/bringup-20261119-rust-r3-local.md)、[Raw诊断](docs/bringup/bringup-20261119-rust-data-plane.md)。Rust-R3a 收拢与 GPU/MTU 子卡已通过本机总门，证据见[本轮收拢记录](docs/bringup/bringup-20261119-rust-r3a-restructure.md)。Rust-R3 整体仍需 Rust-R3b 的双机矩阵工具及物理链路、长稳、画质、完整包与 OTA 验收；不以历史292 tests或本机Loopback结果代替。
 
-| 卡 | 结论 | 证据 |
-|---|---|---|
-| P1-1 止血 | DONE | f128e03 / 67e8ce5；live 用例 VC_ADAPTER=Loopback 通过 |
-| P1-2 构建+git+治理 | DONE | docs/runbooks/build.md；run/ 顶层 <60 |
-| P1-3 文档同步 | DONE | e0483fb；2026-10-23 再整理为 AGENTS.md + docs/ 分层 |
-| P2 0.3.8 + T-06 | DONE | 810f11d；docs/bringup/bringup-20261022.md（备注：T1×5 离线对账仅覆盖头部 ~27%，判定依据 PC2 in-run 全量校验；T2 已分页补全） |
-| P3 OTA 0.4.0 | DONE | e01af52 / ac0e2b4 / ae44cbc；PC2 推→回滚→再推全绿 |
+### Rust-R3a 仓库收拢与GPU/MTU — DONE
 
-### 遗留观察 / 小改动（不阻塞 P4）
+旧产品/根CMake/退休工具仅从工作树移除并保留 Git 历史；Cargo提供隔离vcam verifier，独立Python图案/向量参考迁入rust/tests/reference。当前文档统一Rust入口；中文注释、GPU-only、I226与MTU实现通过总门（fmt、22组/312项测试、Clippy、Release、独立参考与DLL自检）。详细专项证据与未验收边界见[本轮bring-up](docs/bringup/bringup-20261119-rust-r3a-restructure.md)。
 
-- **P5-LR 实现/隔离验证 DONE（2026-11-08）**：PC1 Raw 独立每秒/6小时采样、可选旁路阻塞计时、候选生命周期/Stop/Disconnect 修正；最终 verify 含 Loopback 408 passed / 2 skipped，六组 motion 各 720 帧零缺失/错哈希。已用成品87项哈希未变；现场6小时记录已启动，实际长时卡顿根因**仍待复现关联**。证据：`docs/bringup/bringup-20261108-longrun.md`。
+### Rust-R3b 双机矩阵替代与产品验收 — TODO
 
-- stop 记来源 IP：agent 侧已提交（d15287d，写 run/exec.log），随下个版本上 PC2。
-- /activate 应答与 execv 竞争导致 RST，调用方靠轮询 /version；可改为先回应答再 execv。
-- T2 重跑盯：发端 203.5ms 间隔（batch69 后首次 >20ms）、外部 stop 是否复发。
-- PC2 当前已为 capture 后台（2026-11-02 /health）；计划任务/watchdog 是否覆盖 Documents 部署仍未核实，本轮不调整启动方式。
-- 直连线：owner 决定短期不考虑；线到后补 广播 vs 单播 T2。
+补Rust控制面的双机编排/完整hashlog保全工具，再在单独授权下按冻结T1/T2等执行；物理NIC整帧batch、双机240fps/长稳、画质、DDA、完整DShow与完整包/OTA分别验收。失败/BLOCKED/未跑保持原结论。
 
-### S1 项目结构整理 — DONE（2026-10-29）
+## 历史证据入口
 
-`common/` 合并重复校验头、`tools/` 收纳原生辅助工具、`cmake/` 统一规则；verify ALL PASS（28 passed / 3 skipped）+ 独立目录干净构建通过。证据：`docs/proposals/project-structure-20261029.md`。
-
-### S2 一键编译打包 — DONE（2026-10-29）
-
-`python scripts/package.py --allow-dirty` 实际生成 `dist/VirtualCapture/`（含当前 GUI）；verify ALL PASS（42 passed / 3 skipped）+ 成品隔离冒烟/PowerShell 5.1 检查/79 项载荷哈希通过。证据：`docs/proposals/packaging-20261029.md`。
-
-### P5-U1 GUI 优化 — DONE（2026-10-29）
-
-总览/连接配置改版，修复编辑覆盖、离线/桩进程指标与会话帧率基线；verify ALL PASS（46 passed / 4 skipped），桌面/窄屏及隔离双端交互通过。证据：`docs/proposals/gui-20261029.md`；当时未打包，后续已并入 U3 成品，当前来源核对见 `docs/bringup/bringup-20261102.md`。
-
-### P5-U2 主机 UI 与采集后台 — DONE（2026-10-29）
-
-落实 D17：主机专属 UI、固定 5143/纯 IP、网卡下拉选择、自动虚拟卡生命周期及统一开始/停止按钮；配置精简为 IP/网卡/目标帧率。verify ALL PASS（58 passed / 4 skipped）+ PowerShell 5.1 解析与隔离浏览器保存验证通过。证据：`docs/proposals/gui-host-20261029.md`；该轮仅隔离验证，后续打包与使用状态见 U3/U4，不回填未经专项验证的注册表结论。
-
-### P5-U3 后端与完整项目整合 — DONE（本机实现 2026-10-29；实际使用确认 2026-11-02）
-
-主机/后台真实编排、启动失败回传、实际会话状态与两个启动入口已接通；2026-10-29 本机 verify 含 Loopback live：65 passed / 2 skipped。motion 26957 帧、DDA 7431 帧收发全量对账零缺零错，两轮 SHM 各 20/20 一致，DShow 实际取帧通过。证据：`docs/proposals/gui-integration-20261029.md`。截至 2026-11-02 两端已上线，owner 约三天实际使用满意；专项自动化双机验收不据此补判通过。
-
-### P5-U4 已用版本封存 — 主机 DONE / 远端二进制待独立导出（2026-11-02）
-
-主机成品 87/87 哈希通过，封存前源码 299/299 与成品记录一致；双端清单/配置/最新完整 hashlog、源码及 Git bundle 已保全，原文件不动。证据：`docs/bringup/bringup-20261102.md`；远端仅文本接口可读，16 项 PE 文件只核对存在与大小，不冒充实际字节备份。历史 dropped=1 保留观察，不阻塞日常使用，也不改为零丢帧通过。
-
-### P6-1 GUI 配置与链路预算 — DONE（2026-11-03）
-
-五档预设 + 自定义、四种裁切/缩放草案、raw/MJPEG 规划、两端方向速率及 L2 线速预算；verify ALL PASS（122 passed / 4 skipped）+ Edge 隔离桌面/手机宽度 13 项检查通过。原生/包头/SHM/部署未修改，未实现组合拒绝启动；稳定成品 87/87 与封存 424/424 完整性复核通过。证据：`docs/proposals/configurable-stream-20261102.md`。
-
-### P6-2 可变尺寸 raw 全链路 — DONE（开发实现与本机验证，2026-11-03）
-
-显式会话/真实原生能力、可变尺寸Raw、四种整数变换、发送上限、SHM v3及动态DShow已打通；motion回环七组1665帧、DDA/GPU三组300帧全量对账零错，产品HTTP→真实原生→DShow 121/121一致。双机与交付留P6-4。证据：`docs/bringup/bringup-20261103-p6-raw.md`（含总闸与生命周期负例）。
-
-### P6-3 编码能力与后端（MJPEG / PyroWave） — IN PROGRESS（2026-11-03；2026-11-13 更新）
-
-H.264/H.265（Media Foundation 与原生 NVENC）于 2026-11-13 按 D23 从源码、构建、契约与测试中移除，
-相关报告、提案与开发包一并删除；不再提供 `vc-codec-probe`/`vc-codec-roundtrip`。当前编码为 D21 的 MJPEG
-与 D24 的 PyroWave（均为开发版、每帧独立）。
-
-MJPEG开发实现与本机专项 — DONE（D21）：libjpeg-turbo CPU/SIMD、独立帧恢复、质量配置及GUI/产品贯通；总闸含Loopback401 passed / 2 skipped。640² motion/batch1/Loopback两轮7200帧，239.86～239.97fps、生成至DShow首次交付avg1.67～1.73ms/P99约2.0～2.2ms，Q80约141Mbps（显式800Mbps上限）；真实本机DDA仅34.5fps，未证明PC2/DDA240或双机延迟。完整证据与独立测试包入口见`docs/bringup/bringup-20261103-mjpeg.md`；不自动替换部署，P6-3总体仍IN PROGRESS。
-
-MJPEG缓冲优化 — DONE（本机实现/验证，2026-11-03）：去掉发送临时JPEG复制与接收整帧复制、复用缓冲及压缩hash；403 passed / 2 skipped含Loopback。交叉31200帧全部收发/首次交付且新旧压缩输出与解码像素一致；240档avg1.67～1.69→1.64ms、60档1.80→1.73～1.74ms，P99区间重叠、总CPU收益未证实，不宣称大幅提速。11项专项及真实sender/receiver的无网卡故障注入通过；证据/独立包结果见`docs/bringup/bringup-20261103-mjpeg-opt.md`，不切换部署。
-
-PyroWave（D24）— 开发实现与本机功能验证 DONE（2026-11-13）：固定提交构建 `libpyrowave-shared-1.dll`，
-capabilities/codec-check/descriptor、48B VCAU（codec=4）、有界解码与 GUI 后端选择接通；`verify.py` ALL PASS。
-640² motion/batch1/Loopback 120fps 120/120、30fps 60/60 解码，零丢包/零传输错/零解码错，压缩 hash 与 sender 全量一致；
-`p6_codec_verify.py --codec pyrowave` 含 DShow 全对账与 `--loss` 帧21恢复均 PASS；
-`p6_product_verify.py --codec pyrowave` 隔离HTTP→真实原生→DShow（418×282）117/117 通过（同时修复该脚本 raw 分支被误拒）。
-期间发现并修复两个真实缺陷：①流断档不再重建 Vulkan 设备（只重建解码器对象），否则设备创建慢于帧周期会触发队列丢弃死循环；
-②解码亮度原先未写回 NV12 输出（只写了UV），240fps 480帧只有256个不同解码哈希；现亮度直写会话缓冲并加自检/断言。
-修复后 640²@240 回环 480/480 解码、480 个不同哈希、零丢弃（发送239.99/解码240.25 fps），不代表双机吞吐。
-未做 PC2 部署/双机/长稳/画质；证据与探针数字见`docs/bringup/bringup-20261113-pyrowave.md`，
-构建/限制见`docs/runbooks/pyrowave.md`。
-
-### P6-R1 采集与编解码 review 修正 — DONE（本机回归，2026-11-13）
-
-8项修复提交62e37cd；总闸301 passed / 4 skipped、WGC CPU/GPU私有窗口resize/close通过、PyroWave阻塞注入与640²@240回环480/480通过。0.5.0已打包并启动本机host，PC2错误角色阻塞远端部署。证据：[修复回归](docs/bringup/bringup-20261113-review-fixes.md)、[发布/部署状态](docs/bringup/bringup-20261113-release-0.5.0.md)。
-
-### P6-R2 编码指标与设备身份 — DONE（本机回归，2026-11-13）
-
-补编码pc1_seg/rseg、PyroWave只读Vulkan类别与实际设备身份；总闸303 passed / 6 skipped，本机motion/Loopback/batch1的MJPEG、PyroWave及显式丢片恢复通过，实测编解码设备RTX 4070。未提交/打包/部署。证据：[修复记录](docs/bringup/bringup-20261113-pyrowave-metrics.md)。
-
-### Rust-R1 控制面 + GPUI — DONE（开发实现与本机功能验证，2026-11-14）
-
-D26独立rust分支：UI无关vc-core、vc-capture CLI/REST、vc-host GPUI，复用C++且仅Raw；Rust51项测试、fmt/Clippy/build通过，原总闸303 passed / 6 skipped，motion/416²@60/batch1/Loopback120帧全量FNV一致，真实窗口连接错误与正常退出通过。DShow完整编排/双机/长稳与SDK DLL未验/未实现，不部署。证据：[Rust开发记录](docs/bringup/bringup-20261114-rust-control.md)，入口：[Rust runbook](docs/runbooks/rust.md)。
-
-### Rust-UI1 采集工作台视觉重做 — DONE（2026-11-14）
-
-浅色设备侧栏、深蓝输出画幅示意、主区设置与可折叠明细；真实窗口预设持久化/错误展示/1080宽布局/正常退出通过，Rust51项与Clippy/build通过，原总闸303 passed / 6 skipped。证据：[Rust开发记录](docs/bringup/bringup-20261114-rust-control.md#rust-ui1-界面重做2026-11-14)，设计：[UI提案](docs/proposals/rust-ui-20261114.md)。
-
-### Rust-P1 绿色运行包 — DONE（2026-11-14）
-
-Rust Release独立ZIP约16.5MB，包含原生数据面/MSVC运行库/许可、主机与CLI启动器、逐文件SHA-256；中文/空格路径解压、两CMD/health/实际运行库加载/真实GPUI及motion416²@60/batch1/Loopback120帧全量FNV通过，Rust56项与原总闸303 passed / 6 skipped通过。不替换稳定部署，未提交。证据：[Rust交付记录](docs/bringup/bringup-20261114-rust-control.md#rust-p1-绿色运行包2026-11-14)，入口：[Rust runbook](docs/runbooks/rust.md#绿色运行压缩包)。
-
-### Rust-UI2 主区布局与物理接收网卡 — DONE（2026-11-14）
-
-统一四行设置与紧凑输出/操作栏；核心统一过滤本机物理接收设备，失效选择清除后手动重选。真实窗口枚举14项保留3项、隐藏11项，预设/错误/窄窗口通过；Rust56项、fmt/Clippy/build、原总闸303 passed / 6 skipped及CLI回环120帧全量FNV回归通过。未提交/部署。证据：[Rust开发记录](docs/bringup/bringup-20261114-rust-control.md#rust-ui2-主区调整与物理接收网卡2026-11-14)。
-
-### Rust-R2 OTA与后端迁移起点 — DONE（开发实现与本机功能验证，2026-11-14）
-
-D27并行完成双端物理网卡、精简UI/原生图标、固定ROOT版本布局、Rust OTA及vc-transport冻结wire/重组；0.2.0独立ZIP已交付，Rust116项、原总闸303 passed / 6 skipped、Release解压/GUI/120帧全量FNV/完整候选OTA与HostController重启通过。未提交/部署；生产数据面仍C++，约10ms增加尚未定位，双机/长稳未验收。证据：[Rust-R2交付记录](docs/bringup/bringup-20261114-rust-control.md#rust-r2-ota布局与后端迁移起点d272026-11-14)。
-
-### Rust-UI3 主机图形启动入口 — DONE（本机功能与交付验证，2026-11-14）
-
-0.2.1已交付，主机双击带图标的VirtualCapture.exe直接进入OTA当前版本；Release完整门禁与旧0.2.0真实GUI选ZIP/应用/重启、ROOT入口生成/再次打开、配置保留通过。被采集端仍CLI，旧包保留，未提交/部署。证据：[图形入口交付记录](docs/bringup/bringup-20261114-rust-control.md#rust-ui3-主机图形启动入口2026-11-14)。
-
-### Rust-R2a 独立 Raw Npcap 互操作探针 — DONE（Loopback 功能与本机性能测量，2026-11-19）
-
-新增不接产品控制面的`vc-stream` Windows Npcap Raw L2发送/接收工具与可选SHM v3 writer；Release版本与C++双向交叉收发，640×640@60、MTU9000、69包/帧、batch1、motion，每方向120帧，六条hashlog全量一致且Python参考120/120一致，接收零丢片/CRC/hash错，SHM v3 frame 119有效。另以双Rust进程、640×640@240、2400帧、motion、batch1在Npcap Loopback测得发送steady cadence 239.999996 fps、接收完成cadence 240.001583 fps，发送hashlog `send_qpc_ns` 到重组完成 `qpc_ns` 延迟 p99 4.3892 ms、最大4.4946 ms，2400帧均低于10ms、hash全匹配；requested cadence/latency目标通过。T0 CPU门禁未过：sender 37.51%（要求<25%），receiver 23.95%（要求<30%）；因此不标T0全通过。Loopback不是物理网卡/双机验收；batch69对照短发送失败且无fallback；不接控制器、产品包/OTA。证据：[Raw数据面诊断记录](docs/bringup/bringup-20261119-rust-data-plane.md)。
-
-### Rust-R3 模块化全 Rust 产品路径 — IN PROGRESS
-
-目标拓扑与模块接口见[Rust 重构提案](docs/proposals/rust-rewrite-20261114.md)：产品宿主使用 Rust crates/版本化 DLL，不再以 sender/receiver CLI 子进程拼接本机数据面；独立 EXE 与 DLL 共享同一 crate 实现，双机间保留版本化控制 API；仅 NV12 Raw、MJPEG、PyroWave。
-已落地（开发实现）：`vc-core` 进程内加载 `vc_stream.dll` C ABI v1（`vc_module_get_api`；start/status/stop/destroy/capabilities）；`vc-stream` 的 DLL 与 CLI 复用同一实现；`vc-source` 提供 pattern/DDA/WGC 与 crop/fit/fill/stretch 整数变换；`vc-media` 安全搜索动态加载固定 `turbojpeg.dll`/`libpyrowave-shared-1.dll`，三编码显式后端、无静默回退；`vc-vcam` 为 Rust COM `vc_vcam.dll`，发布包仅保留外部 `vc-vcam-verify.exe` 做隔离只读探测，旧 C++ 产品不进入 Rust 包。Raw 启动按尺寸/MTU 整帧一个 batch（Loopback 诊断固定 batch1 例外），编码按实际 AU 整帧单次 queue。PyroWave 原生 5 秒看门狗以会话 `OperationState` 粘性超时报告，不 `process::exit`；挂起时保留 worker/句柄/DLL，pending 期间锁配置/OTA/虚拟卡，不能安全停止时不得自动卸载。旧 C++ CLI/协议契约不变。
-本机证据：[Rust-R3验证记录](docs/bringup/bringup-20261119-rust-r3-local.md)。Release DLL 三编码各2400帧 motion/640×640@240 Loopback性能门通过，source-start→RX p99 Raw/MJPEG/PyroWave分别0.9700/3.4589/6.6164ms，均无≥10ms帧，TX/RX完整对账；最新 owner 路径修复轮 workspace 292 tests（vc-core 132、owner 29）、fmt/Clippy/Release build通过；legacy verify 303 passed / 0 failed / 6 skipped（逐项跳过原因未捕获，历史失败与中间尝试均保留）。WGC窗口采集/缩放/关闭生命周期通过；该次Rust DDA smoke无DXGI输出为BLOCKED；vcam DLL隔离7场景通过且未注册。便携候选前三项smoke通过，但GUI截图全黑导致硬门禁失败，候选无完整验收。
-Rust-R3仍未DONE：物理网卡整帧batch、双机、长稳、画质、完整包/OTA与完整DShow编排未验收；Loopback不冒充双机/物理网卡结论。虚拟卡全局owner与每根稳定current/pending精确证明修复共享native-dir跨根接管、布局切换及写入中断风险；后续路径别名修复与本机验证进度见bring-up记录，未操作真实注册表/DShow。
-
-### P6-4 组合验收与交付 — TODO
-
-raw / 编码分开验收，motion、尺寸/帧率/模式/网卡/batch 全记录；双机证据与完整 hashlog 保全。未专项验收的组合不标已达标，owner 确认后再安排发布/切换，稳定版可回退。
-
-### P4 产品链路（按 docs/spec/requirements.md；提案与批示见 docs/proposals/）
-
-```text
-P4-1 采集性能：DONE（代码）
-     gpu_dispatch_ms=0.028ms（D3D11 timestamp，双机 DDA 235fps 实测，2026-10-23）。
-     GPU compute shader（居中裁+整数BT.601）落地，--gpu-convert 显式开启，失败报错不回退。
-     待 owner 决策：①gpu_convert 设为默认开（D10）；②T5 门限写入 test-matrix。
-P4-2 端到端延迟测量：DONE（分段计时代码）
-     双机实测：pc1_seg_p99=3.14ms，rseg_p99=6.70ms，全程 p99=9.83ms（batch=69，D14 网卡调优后）。
-     batch 对比（优化后）：batch=69 最优（全程 9.27ms，rseg_max=9.9ms 最稳定）。
-     待 owner 决策：①全程 p99 门限拍板（建议 <10ms）；②确认包（flags bit1）是否实现。
-P4-3 PC2 虚拟采集卡：DONE（代码+本机验证）
-     vcam DShow filter 落地，本机回环 4455 帧逐字节零错，240.0fps QPC 起搏。
-     D12 无信号默认行为实现（7e7ce80）：无映射→stall，撕裂+有历史帧→repeat-last，正常→输出。
-     OTA 白名单已放行 vc-vcam.dll；验收手册：docs/runbooks/pc2-vcam-acceptance.md。
-P4-4 虚拟卡出口验收（不含推理）：DONE 2026-10-23
-     J1 PASS：vc-vcam-verify.exe（tools/vcam_verify/ C++）ICreateDevEnum 枚举到 VirtualCapture 640x640 NV12（2026-10-25 改名为 `VirtualCapture`，见 docs/runbooks/vcam.md）。
-     J2 PASS：IAMStreamConfig GetFormat = NV12 640x640 AvgTimePerFrame=41666 (240.0fps)。
-     J3 PASS：35069帧 shm_published==complete, dropped=0, hash_mismatch=0；SHM FNV-1a64 采样 27/27 与 receiver hashlog 一致。
-     验收工具：build/vcam_verify/Release/vc-vcam-verify.exe + scripts/p4_4_shm_verify.py。
-     证据：docs/bringup/bringup-20261023-p4-4-vcam-acceptance.md。
-P4 原范围外：推理端及其联调（D8）、独占全屏 Hook。原“超 2.5G 后编解码另立项”（hist S24）已由 D19 解锁为 P6，非 P4 历史验收的一部分。
-owner 待决：①全程延迟门限 <10ms；②gpu_convert 默认开；③确认包是否实现；④T5 门限数字。
-```
+- P1–P3与旧PLAN：docs/history/（只读）。
+- P4/P5及封存：docs/bringup/bringup-20261022.md、bringup-20261023-p4-4-vcam-acceptance.md、bringup-20261102.md。
+- P6与Rust既有实现/发布：带日期docs/bringup与docs/proposals。旧MJPEG报告保留为历史，不代表当前后端存在。
+- 未关闭现场Raw数小时卡顿关联、物理双机与维护窗口仍需独立安排；不以结构清理关闭历史观察。

@@ -1,7 +1,7 @@
-//! Thread-local capture scheduling, shared by sender, receiver and decoder.
+//! 线程级采集调度，供发送端、接收端与解码器共用。
 //!
-//! The guard must stay on the registering thread and restores its scheduling on
-//! every exit path. Loading a data-plane DLL never raises host process priority.
+//! 该 guard 必须留在注册它的线程上，并在每条退出路径上恢复线程调度状态。
+//! 加载数据面 DLL 绝不会提升宿主进程优先级。
 use std::ffi::c_void;
 use std::marker::PhantomData;
 use std::rc::Rc;
@@ -12,9 +12,9 @@ use windows_sys::Win32::System::Threading::{
     TIMER_ALL_ACCESS, WaitForSingleObject,
 };
 
-/// One private timer per sending thread: no global timer-resolution or process
-/// priority changes. An unnamed auto-reset timer cannot interfere with another
-/// DLL session. The caller bounds waits and keeps a short QPC precision tail.
+/// 每个发送线程一个私有定时器：不改变全局定时器分辨率，也不改变进程优先级。
+/// 未命名自动重置定时器不会干扰其他 DLL 会话。调用方负责给等待设界，并保留
+/// 一小段 QPC 精度尾部。
 struct FrameTimer(HANDLE);
 
 impl FrameTimer {
@@ -39,8 +39,8 @@ impl FrameTimer {
         {
             return;
         }
-        // Failure only changes wakeup precision; the outer QPC check still
-        // enforces the exact deadline and never sends early.
+        // 失败只影响唤醒精度；外层 QPC 检查仍会强制执行精确截止时间，且
+        // 绝不提前发送。
         std::thread::sleep(std::time::Duration::from_nanos(ns));
     }
 }
@@ -60,15 +60,15 @@ pub(super) fn wait_for(ns: u64) {
     TIMER.with(|timer| timer.wait(ns));
 }
 
-// GetThreadPriority returns MAXLONG on failure (THREAD_PRIORITY_ERROR_RETURN).
+// GetThreadPriority 失败时返回 MAXLONG（THREAD_PRIORITY_ERROR_RETURN）。
 const PRIORITY_ERROR: i32 = i32::MAX;
 
 pub(super) struct ThreadPriority {
     mmcss: *mut c_void,
     old: i32,
     raised: bool,
-    // MMCSS registration belongs to the calling thread, even if this struct's
-    // native fields later change to types which implement Send/Sync.
+    // MMCSS 注册属于调用线程；即使本结构体的原生字段以后改成实现了
+    // Send/Sync 的类型，也不能让它跨线程。
     _same_thread: PhantomData<Rc<()>>,
 }
 

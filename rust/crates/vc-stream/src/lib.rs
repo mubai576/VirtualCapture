@@ -1,4 +1,4 @@
-//! Rust media data plane, shared by the diagnostic CLI and versioned product DLL.
+//! Rust 媒体数据面，由诊断 CLI 与版本化产品 DLL 共用。
 
 #![recursion_limit = "256"]
 

@@ -64,8 +64,8 @@ fn owner_path_key(path: &str) -> String {
     let path = if let Some(unc) = path.strip_prefix(r"\\?\unc\") {
         format!(r"\\{unc}")
     } else if path.as_bytes().get(5..7) == Some(b":\\") {
-        // Only a DOS drive loses its verbatim prefix. A volume GUID must keep
-        // its namespace so the key cannot alias a relative "Volume{...}" path.
+        // 只有 DOS 盘符会去掉 verbatim 前缀。卷 GUID 必须保留其命名空间，
+        // 否则键值可能与相对的 "Volume{...}" 路径混叠。
         path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
     } else {
         path
@@ -90,8 +90,8 @@ fn canonicalize_for_owner_using(
 ) -> std::io::Result<PathBuf> {
     match canonicalize(path) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            // A dangling junction/symlink is not a deleted lexical component.
-            // Do not climb past an existing entry whose target cannot be resolved.
+            // 悬挂的 junction/symlink 不算“已删除的词法组件”。
+            // 若现存条目的目标无法解析，绝不越过它继续向上攀爬。
             match symlink_metadata(path) {
                 Ok(_) => Err(std::io::Error::other("existing owner path is unresolved")),
                 Err(metadata_error) if metadata_error.kind() != std::io::ErrorKind::NotFound => {
@@ -121,8 +121,8 @@ fn normalize_windows(
             Prefix::Verbatim(name) if volume_guid_namespace(name) && input.is_absolute() => true,
             _ => return None,
         };
-        // Verbatim traversal has different rules. Never reinterpret literal
-        // separators or dot components as ordinary Win32 traversal.
+        // verbatim 路径的遍历规则不同。绝不把字面分隔符或点组件当作
+        // 普通 Win32 遍历重新解释。
         if verbatim
             && (path.contains('/') || path.split('\\').any(|part| matches!(part, "." | "..")))
         {
@@ -142,9 +142,9 @@ fn normalize_windows(
             _ => lexical.push(component.as_os_str()),
         }
     }
-    // A removed OTA release DLL cannot itself be canonicalized. Resolve the
-    // deepest existing ancestor so junction aliases still map to the real root.
-    // Only NotFound may add a missing suffix; all other errors remain unproven.
+    // 已被移除的 OTA release DLL 本身无法规范化。改为解析最深的现存祖先，
+    // 使 junction 别名仍能映射到真实根。只有 NotFound 才允许补上缺失后缀；
+    // 其他错误都视为未能证明。
     let resolved = canonicalize_with_existing_ancestor(&lexical, &canonicalize)?;
     Some(resolved.to_string_lossy().into_owned())
 }
@@ -250,7 +250,7 @@ fn owner_paths_at(root: &std::path::Path) -> [PathBuf; 3] {
     [
         stable.join(OWNER_FILE),
         stable.join(OWNER_PENDING_FILE),
-        // Read-only compatibility with pre-journal Legacy roots. Do not move run/.
+        // 只读兼容 pre-journal 的 Legacy 根。不要移动 run/。
         root.join("run").join(OWNER_FILE),
     ]
 }
@@ -373,6 +373,7 @@ fn volume_guid_for_dos_root(root: &str) -> Option<String> {
 
         let root: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
         let mut volume = [0u16; 128];
+        // 安全：root 以 NUL 结尾，volume 可写且容量按 u16 个数传入。
         let ok = unsafe {
             GetVolumeNameForVolumeMountPointW(
                 root.as_ptr(),
@@ -453,8 +454,8 @@ fn save_owner_file(path: &std::path::Path, record: &OwnerRecord) -> Result<(), S
     std::fs::rename(&temporary, path).map_err(|error| format!("无法保存虚拟卡所有权记录：{error}"))
 }
 
-/// Caller holds the CLSID mutex. The callback is the only registry operation;
-/// tests inject failures at the commit boundary without touching real COM/HKCU.
+/// 调用方持有 CLSID 互斥锁。回调是唯一的注册表操作；测试在提交边界注入
+/// 失败，不触碰真实 COM/HKCU。
 fn write_owner_transaction(
     root: &std::path::Path,
     record: &OwnerRecord,
@@ -465,15 +466,15 @@ fn write_owner_transaction(
     let dir = current.parent().expect("owner path has a parent");
     std::fs::create_dir_all(dir)
         .map_err(|error| format!("无法创建运行目录 {}：{error}", dir.display()))?;
-    // A prior interrupted commit may have only a pending/Legacy mirror. Promote
-    // its exact global proof before overwriting pending for the next attempt.
+    // 先前中断的提交可能只留下 pending/Legacy 镜像。在覆盖 pending 之前，
+    // 先提升它的精确全局证明，供下一次尝试使用。
     if let Some(previous) = previous {
         save_owner_file(&current, previous)?;
     }
     save_owner_file(&pending, record)?;
     let value = serde_json::to_string(record).map_err(|error| error.to_string())?;
-    // On error keep BOTH mirrors: current proves the old registry value; pending
-    // proves a new value if the process died just after the registry commit.
+    // 出错时保留两个镜像：current 证明旧的注册表值；若进程恰在注册表提交
+    // 之后死亡，pending 证明新值。
     write_registry(&value)?;
     std::fs::rename(&pending, &current)
         .map_err(|error| format!("虚拟卡归属已提交，待提交镜像保留供重试：{error}"))
@@ -520,6 +521,7 @@ fn process_liveness(pid: u32) -> ProcessState {
     if pid == 0 {
         return ProcessState::Unknown;
     }
+    // 安全：FILETIME 输出均已零初始化，句柄有效且只关闭一次；失败返回 Unknown。
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
@@ -646,8 +648,8 @@ fn decide_recovery_with_global_owner_using(
         return Recovery::Unknown;
     }
 
-    // The registry record is global for this per-user CLSID. Consult it before
-    // any run-root-local record so another root cannot adopt a shared DLL.
+    // 注册表记录对每个用户的 CLSID 是全局的。先查它，再看任何 run-root
+    // 本地记录，这样其他根无法占用共享 DLL。
     if !same_path(root, &registry_owner.root) {
         return match owner_liveness {
             OwnerLiveness::LiveElsewhere => Recovery::Busy,
@@ -740,28 +742,8 @@ pub fn check_available(status: &VcamStatus) -> Result<(), String> {
 
 /// 隔离子进程只读探测实际 DLL，不注册 COM 或接管现用设备。
 pub fn require_capabilities() -> Result<(), String> {
-    let mut probe = crate::paths::native_exe("vc-vcam-verify.exe");
-    if !probe.is_file() {
-        // --native-dir may be build/Release while --root is an isolated runtime.
-        if let Some(build) = dll_path().parent().and_then(|dir| dir.parent()) {
-            let candidate = build.join("vcam_verify/Release/vc-vcam-verify.exe");
-            if candidate.is_file() {
-                probe = candidate;
-            }
-        }
-    }
-    if !probe.is_file() {
-        for config in ["Release", "Debug"] {
-            let candidate = crate::paths::root()
-                .join("build/vcam_verify")
-                .join(config)
-                .join("vc-vcam-verify.exe");
-            if candidate.is_file() {
-                probe = candidate;
-                break;
-            }
-        }
-    }
+    // 隔离验证器与 Rust DLL 同一次 Cargo 构建，不搜索已移除的 C++ 工具目录。
+    let probe = crate::paths::native_exe("vc-vcam-verify.exe");
     let output = crate::process::run_bounded(
         std::process::Command::new(&probe)
             .arg("--dll")
@@ -814,6 +796,8 @@ impl RegistrationLock {
         };
         use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
         let name = wide(name);
+        // 安全：name 是以 NUL 结尾的 UTF-16 缓冲区；句柄在成功时移交本对象，
+        // 失败路径则立即关闭。
         let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
         if handle.is_null() {
             return Err(format!(
@@ -843,6 +827,7 @@ impl RegistrationLock {
 impl Drop for RegistrationLock {
     fn drop(&mut self) {
         use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
+        // 安全：句柄由 acquire 创建且只由本对象持有；释放后立即关闭，不再使用。
         unsafe {
             ReleaseMutex(self.handle);
             CloseHandle(self.handle);
@@ -949,7 +934,7 @@ pub fn unregister() -> Result<VcamStatus, String> {
     if !after.registered.is_empty() {
         return Err("注销后虚拟采集卡注册仍存在，需重试停止。".into());
     }
-    // DllUnregisterServer removed the entire CLSID key, including its global owner value.
+    // DllUnregisterServer 删除了整个 CLSID 键，包括其全局 owner 值。
     clear_owner();
     Ok(after)
 }
@@ -1009,7 +994,7 @@ fn unregister_stale_owned() -> Result<(), String> {
     if !after.registered.is_empty() {
         return Err("旧版本虚拟卡注册未能清除，已停止启动；请手动检查注册表。".into());
     }
-    // The CLSID owner value was removed together with the server registration.
+    // CLSID owner 值随服务器注册一起被删除。
     clear_owner();
     Ok(())
 }
@@ -1065,6 +1050,8 @@ fn read_registry_string(subkey: &str, value_name: &str) -> RegistryRead {
     }
     let mut buffer = vec![0u16; (size / 2) as usize + 1];
     let mut size = (buffer.len() * 2) as u32;
+    // 安全：传入的缓冲区可写、按 u16 对齐，容量以字节数告知；RegQueryValueExW
+    // 最多写入该容量。
     let query = unsafe {
         RegQueryValueExW(
             key,
@@ -1108,6 +1095,8 @@ fn read_registered_dll() -> RegistryRead {
 #[cfg(windows)]
 fn write_string_value(name: &str, value: &str) -> Result<(), String> {
     let wide = wide(value);
+    // 安全：wide 在调用期间保持存活；按 len * 2 字节读取 u16 缓冲区，u8 视图
+    // 没有对齐要求。
     let bytes = unsafe { std::slice::from_raw_parts(wide.as_ptr() as *const u8, wide.len() * 2) };
     write_value(name, bytes, 1)
 }
@@ -1357,8 +1346,8 @@ mod tests {
         let retry = root.record(3333);
         write_owner_transaction(&root.0, &previous, None, |_| Ok(())).unwrap();
         let mut global = previous.clone();
-        // Simulate process death immediately after the global write, before the
-        // final rename. No real registry operations are executed in these tests.
+        // 模拟全局写成功后、最终 rename 之前进程立即死亡。
+        // 这些测试不执行任何真实注册表操作。
         write_owner_transaction(&root.0, &next, Some(&previous), |value| {
             global = serde_json::from_str(value).unwrap();
             Err("injected interruption after global commit".into())
@@ -1369,8 +1358,8 @@ mod tests {
         assert_eq!(read_owner_file(&current), Some(previous));
         assert_eq!(read_owner_file(&pending), Some(next.clone()));
 
-        // A retry must promote the authoritative pending record FIRST. Another
-        // interruption before its registry write must not destroy that proof.
+        // 重试必须首先提升权威的 pending 记录。若在其注册表写入前再次中断，
+        // 也不能销毁这份证明。
         write_owner_transaction(&root.0, &retry, Some(&next), |_| {
             assert_eq!(read_owner_file(&current), Some(next.clone()));
             Err("injected retry failure before global commit".into())
@@ -1388,7 +1377,7 @@ mod tests {
         let mut global = None;
         write_owner_transaction(&root.0, &record, None, |value| {
             global = Some(serde_json::from_str::<OwnerRecord>(value).unwrap());
-            // A directory at the destination makes the final rename fail.
+            // 目标是目录，使最终 rename 失败。
             std::fs::create_dir(&current).unwrap();
             Ok(())
         })
@@ -1432,8 +1421,8 @@ mod tests {
         let root = OwnerTestRoot::new();
         let real_root = root.0.clone();
         std::fs::create_dir_all(root.0.join("app/releases/b2")).unwrap();
-        // A unique missing alias inside the private fixture. Never a fixed host
-        // path such as C:\Alias that could exist on this machine.
+        // 私有 fixture 内的唯一缺失别名。绝不用固定主机路径（例如本机
+        // 可能存在的 C:\Alias）。
         let alias_prefix = root.0.join("missing-alias");
         let alias_root = alias_prefix.to_string_lossy().into_owned();
         let registered = alias_prefix
@@ -1451,8 +1440,8 @@ mod tests {
             .into_owned();
         let expected_root = real_root.to_string_lossy().into_owned();
         let record = owner_at(&expected_dll, &expected_root, 1234);
-        // The same owner serialized with the alias spelling: it is only equal
-        // through the injected comparison, never through the global normalizer.
+        // 同一个 owner 用别名拼写序列化：只能通过注入的比较判定相等，
+        // 绝不可能通过全局规范化器。
         let alias_record = owner_at(&registered, &alias_root, 1234);
         let canonicalize_alias = |candidate: &Path| -> std::io::Result<PathBuf> {
             if let Ok(relative) = candidate.strip_prefix(&alias_prefix) {
@@ -1578,7 +1567,7 @@ mod tests {
             );
         }
         if let Some(plain_root) = plain_root {
-            // Verbatim traversal is literal, not ordinary Win32 traversal.
+            // verbatim 遍历是字面语义，不是普通 Win32 遍历。
             let verbatim_traversal = format!(r"{}\child\..", equivalent[0]);
             assert_eq!(normalize(&verbatim_traversal), None, "{verbatim_traversal}");
             let outside = format!(r"{plain_root}2\.");
@@ -1724,7 +1713,7 @@ mod tests {
             owner_path_key(r"Volume{12345678-1234-1234-1234-123456789abc}\app\vc_vcam.dll");
         assert!(!relative_key.starts_with(r"\\?\"), "{relative_key}");
         assert_ne!(volume_key, relative_key);
-        // A DOS drive still loses its verbatim prefix so spellings compare equal.
+        // DOS 盘符仍会去掉 verbatim 前缀，使不同拼写比较相等。
         assert_eq!(
             owner_path_key(r"\\?\C:\Root\vc_vcam.dll"),
             owner_path_key(r"C:\Root\vc_vcam.dll")
@@ -1929,7 +1918,7 @@ mod tests {
             Recovery::Local,
             "crashed owner with a matching record may be reused"
         );
-        // A live host from this root still owns the same registration.
+        // 来自本根的存活宿主仍拥有同一注册。
         assert_eq!(
             decide_recovery(
                 &local,
@@ -1968,7 +1957,7 @@ mod tests {
             ),
             Recovery::StaleOwned
         );
-        // Old release still running: do not steal its card.
+        // 旧 release 仍在运行：不要抢它的卡。
         assert_eq!(
             decide_recovery(
                 &previous,
@@ -1979,7 +1968,7 @@ mod tests {
             ),
             Recovery::Busy
         );
-        // Liveness unknown: fail closed rather than assuming the owner is dead.
+        // 存活状态未知：失败关闭，而不是假定 owner 已死。
         assert_eq!(
             decide_recovery(
                 &previous,
@@ -1990,7 +1979,7 @@ mod tests {
             ),
             Recovery::Unknown
         );
-        // No ownership record or a mismatched one: never touch it.
+        // 没有所有权记录或记录不匹配：绝不触碰。
         assert_eq!(
             decide_recovery(&previous, &local, None, OwnerLiveness::Unknown, true),
             Recovery::Foreign
@@ -2009,7 +1998,7 @@ mod tests {
             ),
             Recovery::Foreign
         );
-        // A recorded path outside this runtime root is another installation.
+        // 记录路径在本运行根之外，属于另一个安装。
         assert_eq!(
             decide_recovery(&previous, &local, Some(&record), OwnerLiveness::Dead, false),
             Recovery::Foreign
@@ -2027,7 +2016,7 @@ mod tests {
         let active_a = owner_at(&shared, &root_a, 2222);
         let stale_b = owner_at(&shared, &root_b, 1234);
 
-        // Runtime B's old per-root record cannot override the global live owner A.
+        // 运行根 B 旧的每根记录不能覆盖全局存活 owner A。
         assert_eq!(
             decide_recovery_with_global_owner(
                 &shared,
@@ -2040,7 +2029,7 @@ mod tests {
             ),
             Recovery::Busy
         );
-        // Once A exits, B still cannot unregister/adopt A's owner: root mismatch wins.
+        // A 退出后，B 仍不能注销/接管 A 的 owner：根不匹配优先。
         assert_eq!(
             decide_recovery_with_global_owner(
                 &shared,
@@ -2053,7 +2042,7 @@ mod tests {
             ),
             Recovery::Foreign
         );
-        // A corrupt/missing local mirror cannot be used to recover the global record.
+        // 损坏/缺失的本地镜像不能用来恢复全局记录。
         assert_eq!(
             decide_recovery_with_global_owner(
                 &shared,
@@ -2151,7 +2140,7 @@ mod tests {
         }
         assert!(!path_inside_root(&canonical_root, &canonical_root));
         assert!(!path_inside_root("", &canonical_root));
-        // Empty inputs must not become the working directory during normalization.
+        // 归一化时，空输入绝不能变成工作目录。
         let cwd = std::env::current_dir().unwrap();
         assert!(!path_inside_root(
             &cwd.join("vc_vcam.dll").to_string_lossy(),

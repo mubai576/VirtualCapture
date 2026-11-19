@@ -1,9 +1,8 @@
-//! Read-only diagnostic for the VirtualCapture SHM v3 ring.
+//! VirtualCapture SHM v3 环的只读诊断工具。
 //!
-//! This binary does not touch COM, the registry, or the receiver: it opens the
-//! same mapping name the filter would use, validates the frozen header, waits
-//! for a stable seqlock publication and reports the frame id / hash.  Useful
-//! to prove the shared reader path on a machine before registering the DLL.
+//! 本程序不接触 COM、注册表或接收端：它打开滤镜会使用的同名映射（布局见
+//! `docs/spec/shm-v3.md`），校验冻结头，等待一次稳定的 seqlock 发布，并
+//! 报告帧 id / 哈希。适用于在注册 DLL 之前证明机器上的共享读取路径可用。
 //!
 //! ```text
 //! vc-vcam-diag.exe --capabilities

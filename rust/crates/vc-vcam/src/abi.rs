@@ -1,9 +1,8 @@
-//! Raw Win32/DirectShow ABI shared by the hand-written COM objects.
+//! 手写 COM 对象共用的原始 Win32/DirectShow ABI 定义。
 //!
-//! The reference implementation is `vcam/vcam.cpp`: same vtables, same field
-//! order, same signatures.  Media types and caps are defined here instead of
-//! using the windows-crate structs (which wrap interface pointers in
-//! `ManuallyDrop`) so ownership stays explicit; every layout is asserted.
+//! 参考实现为历史 C++ 滤镜 `vcam/vcam.cpp`：vtable、字段顺序与签名逐一对应。
+//! 媒体类型与能力结构在此自行定义，而不使用 windows crate 的结构体（后者用
+//! `ManuallyDrop` 包裹接口指针），以便所有权保持显式；所有布局都有断言校验。
 
 #![allow(non_snake_case, non_upper_case_globals)]
 
@@ -12,7 +11,7 @@ use core::mem::size_of;
 
 use windows::core::{GUID, HRESULT};
 
-// ---------- HRESULT values used by the filter ----------
+// ---------- 滤镜用到的 HRESULT 值 ----------
 
 pub const S_OK: HRESULT = HRESULT(0);
 pub const S_FALSE: HRESULT = HRESULT(1);
@@ -26,7 +25,7 @@ pub const E_INVALIDARG: HRESULT = HRESULT(0x8007_0057u32 as i32);
 pub const E_PROP_ID_UNSUPPORTED: HRESULT = HRESULT(0x8007_0490u32 as i32);
 pub const CLASS_E_NOAGGREGATION: HRESULT = HRESULT(0x8004_0110u32 as i32);
 pub const CLASS_E_CLASSNOTAVAILABLE: HRESULT = HRESULT(0x8004_0111u32 as i32);
-/// `MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x0201)` from olectl.h.
+/// olectl.h 中 `MAKE_HRESULT(SEVERITY_ERROR, FACILITY_ITF, 0x0201)` 的值。
 pub const SELFREG_E_CLASS: HRESULT = HRESULT(0x8004_0201u32 as i32);
 pub const VFW_E_ALREADY_CONNECTED: HRESULT = HRESULT(0x8004_0204u32 as i32);
 pub const VFW_E_INVALID_DIRECTION: HRESULT = HRESULT(0x8004_0208u32 as i32);
@@ -36,7 +35,7 @@ pub const VFW_E_NOT_FOUND: HRESULT = HRESULT(0x8004_0216u32 as i32);
 pub const VFW_E_TYPE_NOT_ACCEPTED: HRESULT = HRESULT(0x8004_022Au32 as i32);
 pub const VFW_E_NO_TRANSPORT: HRESULT = HRESULT(0x8004_0266u32 as i32);
 pub const VFW_S_CANT_CUE: HRESULT = HRESULT(0x0004_0268u32 as i32);
-/// `STATUS_NOT_SUPPORTED`, returned by the IKsControl stubs like the C++ pin.
+/// `STATUS_NOT_SUPPORTED`；IKsControl 桩函数与历史 C++ pin 一样返回它。
 pub const STATUS_NOT_SUPPORTED: HRESULT = HRESULT(0xC000_00BBu32 as i32);
 
 pub const fn failed(hr: HRESULT) -> bool {
@@ -47,7 +46,7 @@ pub const fn succeeded(hr: HRESULT) -> bool {
     hr.0 >= 0
 }
 
-// ---------- GUIDs ----------
+// ---------- GUID ----------
 
 pub const CLSID_VCAM: GUID = GUID::from_u128(0xB84C7E21_4A5F_4E2B_9C11_5A3D7F01229A);
 pub const IID_IUNKNOWN: GUID = GUID::from_u128(0x0000_0000_0000_0000_C000_0000_0000_0046);
@@ -60,10 +59,10 @@ pub const PIN_CATEGORY_CAPTURE: GUID = GUID::from_u128(0xFB6C4281_0353_11D1_905F
 pub const KSPROPERTY_SUPPORT_GET: u32 = 1;
 pub const AMPROPERTY_PIN_CATEGORY: u32 = 0;
 
-// Standard DirectShow IIDs are taken from the windows crate in `com.rs`
-// (`<IPin as Interface>::IID`), removing hand-copied GUID risk.
+// 标准 DirectShow IID 在 `com.rs` 中直接取自 windows crate
+// （`<IPin as Interface>::IID`），避免手抄 GUID 出错。
 
-// ---------- raw media structs ----------
+// ---------- 原始媒体结构体 ----------
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -120,8 +119,8 @@ impl Default for VideoInfoHeader {
     }
 }
 
-/// `AM_MEDIA_TYPE` with a raw `pUnk` pointer (the windows-crate struct wraps
-/// it in `ManuallyDrop<Option<IUnknown>>`, same layout).
+/// `AM_MEDIA_TYPE`，`pUnk` 为裸指针（windows crate 的结构体用
+/// `ManuallyDrop<Option<IUnknown>>` 包裹，布局相同）。
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct MediaType {
@@ -151,7 +150,7 @@ pub struct AllocatorPropertiesRaw {
     pub cbPrefix: i32,
 }
 
-/// `VIDEO_STREAM_CONFIG_CAPS` exactly as declared by strmif.h.
+/// `VIDEO_STREAM_CONFIG_CAPS`，与 strmif.h 的声明逐字段一致。
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct VideoStreamConfigCaps {
@@ -184,14 +183,14 @@ impl Default for VideoStreamConfigCaps {
     }
 }
 
-/// `FILTER_INFO` (`achName[128]` then `IFilterGraph*`).
+/// `FILTER_INFO`（先 `achName[128]`，再 `IFilterGraph*`）。
 #[repr(C)]
 pub struct FilterInfoRaw {
     pub achName: [u16; 128],
     pub pGraph: *mut c_void,
 }
 
-/// `PIN_INFO` (`IBaseFilter*`, direction, `achName[128]`).
+/// `PIN_INFO`（`IBaseFilter*`、方向、`achName[128]`）。
 #[repr(C)]
 pub struct PinInfoRaw {
     pub pFilter: *mut c_void,
@@ -199,7 +198,7 @@ pub struct PinInfoRaw {
     pub achName: [u16; 128],
 }
 
-/// `CAUUID` (ocidl.h).
+/// `CAUUID`（ocidl.h）。
 #[repr(C)]
 pub struct CaUuidRaw {
     pub cElems: u32,
@@ -213,8 +212,8 @@ pub const STATE_STOPPED: i32 = 0;
 pub const STATE_PAUSED: i32 = 1;
 pub const STATE_RUNNING: i32 = 2;
 
-// Layout guarantees.  The C++ side uses #pragma pack(1); every field here is
-// naturally aligned, so repr(C) produces the identical byte map.
+// 布局保证。历史 C++ 侧使用 #pragma pack(1)；这里每个字段都自然对齐，
+// 因此 repr(C) 产生完全相同的字节布局。
 const _: () = assert!(size_of::<RawRect>() == 16);
 const _: () = assert!(size_of::<SizeI>() == 8);
 const _: () = assert!(size_of::<BitmapInfoHeader>() == 40);
@@ -229,7 +228,7 @@ const _: () = assert!(size_of::<FilterInfoRaw>() == 264);
 #[cfg(target_pointer_width = "64")]
 const _: () = assert!(size_of::<PinInfoRaw>() == 272);
 
-// ---------- COM vtable types ----------
+// ---------- COM vtable 类型 ----------
 
 #[repr(C)]
 pub struct IUnknownVtbl {
@@ -357,7 +356,7 @@ pub struct IKsControlVtbl {
     ) -> HRESULT,
 }
 
-/// IKsPin vtable as declared by the C++ filter (legacy ksproxy layout).
+/// IKsPin vtable，按历史 C++ 滤镜声明（旧式 ksproxy 布局）。
 #[repr(C)]
 pub struct IKsPinVtbl {
     pub base__: IUnknownVtbl,
@@ -407,15 +406,14 @@ pub struct IClassFactoryVtbl {
     pub LockServer: unsafe extern "system" fn(*mut c_void, i32) -> HRESULT,
 }
 
-// ---------- raw COM helpers ----------
+// ---------- 原始 COM 辅助函数 ----------
 
-/// AddRef through a foreign interface pointer without taking ownership.
+/// 通过外部接口指针调用 AddRef，不接管所有权。
 ///
 /// # Safety
 ///
-/// `ptr` must be null or a valid COM interface pointer whose vtable is
-/// readable and whose `AddRef` entry is callable, and the object must stay
-/// alive for the duration of the call.
+/// `ptr` 必须为空，或为有效 COM 接口指针：其 vtable 可读、`AddRef` 项可
+/// 调用，且对象在调用期间保持存活。
 pub unsafe fn com_addref(ptr: *mut c_void) -> u32 {
     if ptr.is_null() {
         return 0;
@@ -424,14 +422,13 @@ pub unsafe fn com_addref(ptr: *mut c_void) -> u32 {
     ((*vtbl).AddRef)(ptr)
 }
 
-/// Release through a foreign interface pointer.
+/// 通过外部接口指针调用 Release。
 ///
 /// # Safety
 ///
-/// `ptr` must be null or a valid COM interface pointer whose vtable is
-/// readable and whose `Release` entry is callable.  The call may destroy the
-/// object; the caller must not use `ptr` afterwards unless it owns another
-/// reference.
+/// `ptr` 必须为空，或为有效 COM 接口指针：其 vtable 可读、`Release` 项可
+/// 调用。该调用可能销毁对象；除非调用方还持有另一个引用，否则此后不得再
+/// 使用 `ptr`。
 pub unsafe fn com_release(ptr: *mut c_void) -> u32 {
     if ptr.is_null() {
         return 0;
@@ -440,15 +437,15 @@ pub unsafe fn com_release(ptr: *mut c_void) -> u32 {
     ((*vtbl).Release)(ptr)
 }
 
-// ---------- small string / memory helpers ----------
+// ---------- 小工具：字符串 / 内存 ----------
 
-/// UTF-16 conversion with a trailing NUL, as expected by the Win32 *W APIs.
+/// 转换成带结尾 NUL 的 UTF-16，符合 Win32 *W API 的期望格式。
 pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(core::iter::once(0)).collect()
 }
 
-/// Copies `src` (which must be NUL-terminated or short enough) into a fixed
-/// Win32 name buffer, truncating safely.
+/// 把 `src`（必须 NUL 结尾，或长度不超过目标缓冲）拷贝进固定大小的 Win32
+/// 名称缓冲，安全截断，并保证结尾 NUL。
 pub fn copy_name(dst: &mut [u16], src: &[u16]) {
     let limit = dst.len().saturating_sub(1);
     let count = src.len().min(limit);
@@ -459,12 +456,12 @@ pub fn copy_name(dst: &mut [u16], src: &[u16]) {
     }
 }
 
-/// NUL-terminated UTF-16 equality (the reverse of what `wcslen`+`wcscmp` does).
+/// 比较 NUL 结尾的 UTF-16 字符串是否相等（`wcslen`+`wcscmp` 的反向组合）。
 ///
 /// # Safety
 ///
-/// `ptr` must be null or point to a NUL-terminated UTF-16 string that stays
-/// readable for the duration of the call.
+/// `ptr` 必须为空，或指向一个在调用期间保持可读的、NUL 结尾的 UTF-16
+/// 字符串。
 pub unsafe fn wide_eq(ptr: *const u16, expected: &[u16]) -> bool {
     if ptr.is_null() {
         return false;

@@ -1,45 +1,36 @@
-"""Four-way Raw L2 interop smoke: C++/Rust TX and C++/Rust RX over private Loopback.
+"""Rust-only Raw L2 smoke: `vc-stream.exe` TX and RX over private Loopback.
 
-Phase 1 runs `vc-sender.exe` (C++ TX) while `vc-receiver.exe` and
-`vc-stream.exe receive` (Rust RX) capture the same stream concurrently.
-Phase 2 runs `vc-stream.exe send` (Rust TX) while the same two receivers
-capture a second stream.  Both phases use motion, packed 640x640 NV12,
-MTU 9000, 60 fps, 120 frames and batch 1 unless overridden.  A default run
-is a documented short functional send, not a capacity or latency claim:
-the physical batch-69 burst has not been proven on Npcap Loopback, so
-batch 1 is the default.  An explicit --batch value is passed verbatim,
-with no retry or fallback.
+One Rust sender and one Rust receiver share a motion stream using packed
+640x640 NV12, MTU 9000, 60 fps, 120 frames and batch 1 unless overridden.  A
+default run is a documented short functional send, not a capacity or latency
+claim: the physical batch-69 burst has not been proven on Npcap Loopback, so
+batch 1 is the default.  An explicit --batch value is passed verbatim, with no
+retry or fallback.
 
 The gate is functional, not a capacity or latency claim:
   * each hashlog has exactly frame ids 0..N-1, with no duplicate rows;
-  * every sender/receiver hashlog from both phases agrees on every frame;
+  * the sender and receiver hashlogs agree on every FNV-1a64 hash;
   * a selected subset of frames matches the independent
-    `ctrl/pattern_ref.py::gen_native` FNV-1a64 reference.  When fewer than
-    all frames are selected the report says so; the remaining frames are
+    `rust/tests/reference/pattern_ref.py::gen_native` reference.  When fewer
+    than all frames are selected the report says so; the remaining frames are
     covered only by full actual-stream agreement, never claimed as
     reference-checked;
-  * each process echoes the requested session id; Rust roles also echo the
-    adapter in --ready/stats, while the legacy C++ adapter selection is read
-    from its exact native stdout (`[receiver] adapter ...` and
-    `[sender] adapter match ...`);
+  * both processes echo the requested session id and the exact adapter in
+    --ready/stats;
   * receiver stats report complete=N with 0 dropped, lost, CRC and hash
-    mismatch counters; Rust RX also reports gaps=0, hash_rows=N and a SHM
-    publish count; the C++ receiver runs with SHM off (shm_published=0);
+    mismatch counters, gaps=0, hash_rows=N and the expected SHM publish count;
     sender stats report N frames, all packets sent and 0 send errors;
-    every process exits 0;
-  * when Rust SHM is enabled, the private v3 mapping is opened while the
-    Rust receiver is still alive (after its --ready marker), held across the
-    run, and its layout plus latest published frame are validated after the
-    writer exits.  The mapping handle is acquired before the sender starts,
-    so the check does not depend on receiver-exit scheduling.  The Rust
-    receiver publishes --ready only after capture, SHM and hash output open;
-    the harness verifies the mapping and hashlog are visible at that point.
+    both processes exit 0;
+  * when SHM is enabled, the private v3 mapping is opened while the receiver
+    is still alive (after its --ready marker), held across the run, and its
+    layout plus latest published frame/hash marker are validated after the
+    writer exits.  The mapping handle is acquired before the sender starts, so
+    the check does not depend on receiver-exit scheduling.
 
-Only the exact `\\Device\\NPF_Loopback` adapter is used.  Each stream gets a
-unique locally administered unicast source MAC and (per Rust receiver) a
-unique `Local\\...` SHM name.  No DShow registration, agent/service, physical
-NIC, PC2 or deployed 5143 runtime is touched.  C++ tool paths default to
-`build/Release`; the Rust tool defaults to
+Only the exact `\\Device\\NPF_Loopback` adapter is used.  The stream gets a
+unique locally administered unicast source MAC and a unique `Local\\...` SHM
+name.  No DShow registration, agent/service, physical NIC, PC2 or deployed
+5143 runtime is touched.  The Rust tool defaults to
 `rust/target/release/vc-stream.exe`.
 
 Evidence (stdout/stderr logs, stats and complete hashlogs for every process)
@@ -71,19 +62,16 @@ import traceback
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
-CTRL_DIR = ROOT / "ctrl"
-if str(CTRL_DIR) not in sys.path:
-    sys.path.insert(0, str(CTRL_DIR))
-import pattern_ref  # noqa: E402  (independent Python mirror of sender/pattern.h)
+REFERENCE_DIR = Path(__file__).resolve().parent / "reference"
+if str(REFERENCE_DIR) not in sys.path:
+    sys.path.insert(0, str(REFERENCE_DIR))
+import pattern_ref  # noqa: E402  (independent Python mirror of pattern.rs)
 
 LOOPBACK = r"\Device\NPF_Loopback"
-CPP_RX_ADAPTER_MARKER = "[receiver] adapter "
-CPP_TX_ADAPTER_MARKER = "[sender] adapter match "
 DEST_MAC = "ff:ff:ff:ff:ff:ff"
 ETHERNET_HEADER = 14
 WIRE_HEADER = 28
 PACKET_OVERHEAD = ETHERNET_HEADER + WIRE_HEADER
-DEFAULT_CPP_DIR = ROOT / "build" / "Release"
 DEFAULT_RUST_EXE = ROOT / "rust" / "target" / "release" / "vc-stream.exe"
 
 SHM_MAGIC = 0x33414356  # "VCA3"
@@ -160,7 +148,7 @@ def build_config(frames, fps, width, height, mtu, batch):
         "payload_bytes": payload,
         "total_packets": total_packets,
         "receiver_timeout_s": receiver_timeout,
-        "phase_timeout_s": float(receiver_timeout + 15),
+        "stream_timeout_s": float(receiver_timeout + 15),
         "ready_timeout_s": 15.0,
     }
 
@@ -259,28 +247,25 @@ def validate_ready(ready, session_id, label):
     return {"session_id": ready["session_id"], "adapter": ready["adapter"]}
 
 
-def validate_tx_stats(stats, rust, frames, total_packets, session_id, label):
+def validate_tx_stats(stats, frames, total_packets, session_id, label):
     require(isinstance(stats, dict), f"{label}: stats is not a JSON object")
     require_session(stats.get("session_id"), session_id, label)
+    require_adapter(stats.get("adapter"), label)
     errors = stats.get("send_errors")
     require(is_int(errors) and errors == 0, f"{label}: send_errors must be 0, got {errors!r}")
     sent = stats.get("sent_frames")
     require(is_int(sent) and sent == frames, f"{label}: sent_frames must be {frames}, got {sent!r}")
-    adapter = None
-    if rust:
-        require_adapter(stats.get("adapter"), label)
-        adapter = stats["adapter"]
-        alias = stats.get("frames")
-        require(is_int(alias) and alias == frames,
-                f"{label}: frames must be {frames}, got {alias!r}")
-        require(alias == sent, f"{label}: frames {alias} != sent_frames {sent}")
+    alias = stats.get("frames")
+    require(is_int(alias) and alias == frames,
+            f"{label}: frames must be {frames}, got {alias!r}")
+    require(alias == sent, f"{label}: frames {alias} != sent_frames {sent}")
     packets = stats.get("sent_packets")
     expected_packets = frames * total_packets
     require(is_int(packets) and packets == expected_packets,
             f"{label}: sent_packets must be {expected_packets}, got {packets!r}")
     return {
         "session_id": stats.get("session_id"),
-        "adapter": adapter,
+        "adapter": stats["adapter"],
         "frames": sent,
         "sent_frames": sent,
         "sent_packets": packets,
@@ -288,51 +273,36 @@ def validate_tx_stats(stats, rust, frames, total_packets, session_id, label):
     }
 
 
-def validate_rx_stats(stats, rust, frames, session_id, shm_enabled, label):
+def validate_rx_stats(stats, frames, session_id, shm_enabled, label):
     require(isinstance(stats, dict), f"{label}: stats is not a JSON object")
     require_session(stats.get("session_id"), session_id, label)
+    require_adapter(stats.get("adapter"), label)
     complete = stats.get("complete")
     require(is_int(complete) and complete == frames,
             f"{label}: complete must be {frames}, got {complete!r}")
-    for key in ("dropped", "packets_lost", "hash_mismatch"):
+    for key in ("dropped", "packets_lost", "hash_mismatch", "crc_errors"):
         value = stats.get(key)
         require(is_int(value) and value == 0, f"{label}: {key} must be 0, got {value!r}")
-    adapter = None
-    if rust:
-        require_adapter(stats.get("adapter"), label)
-        adapter = stats["adapter"]
-        value = stats.get("crc_errors")
-        require(is_int(value) and value == 0, f"{label}: crc_errors must be 0, got {value!r}")
-        gaps = stats.get("gaps")
-        require(is_int(gaps) and gaps == 0, f"{label}: gaps must be 0, got {gaps!r}")
-        hash_rows = stats.get("hash_rows")
-        require(is_int(hash_rows) and hash_rows == frames,
-                f"{label}: hash_rows must equal complete={frames}, got {hash_rows!r}")
-        published = stats.get("shm_published")
-        expected_published = frames if shm_enabled else 0
-        require(is_int(published) and published == expected_published,
-                f"{label}: shm_published must be {expected_published} "
-                f"({'SHM enabled' if shm_enabled else 'SHM disabled'}), got {published!r}")
-    else:
-        if "crc_errors" in stats:
-            require(stats["crc_errors"] == 0,
-                    f"{label}: crc_errors must be 0, got {stats['crc_errors']!r}")
-        if "gaps" in stats:
-            require(is_int(stats["gaps"]) and stats["gaps"] == 0,
-                    f"{label}: gaps must be 0, got {stats['gaps']!r}")
-        published = stats.get("shm_published", 0)
-        require(is_int(published) and published == 0,
-                f"{label}: C++ receiver must run with SHM off, shm_published={published!r}")
+    gaps = stats.get("gaps")
+    require(is_int(gaps) and gaps == 0, f"{label}: gaps must be 0, got {gaps!r}")
+    hash_rows = stats.get("hash_rows")
+    require(is_int(hash_rows) and hash_rows == frames,
+            f"{label}: hash_rows must equal complete={frames}, got {hash_rows!r}")
+    published = stats.get("shm_published")
+    expected_published = frames if shm_enabled else 0
+    require(is_int(published) and published == expected_published,
+            f"{label}: shm_published must be {expected_published} "
+            f"({'SHM enabled' if shm_enabled else 'SHM disabled'}), got {published!r}")
     return {
         "session_id": stats.get("session_id"),
-        "adapter": adapter,
+        "adapter": stats["adapter"],
         "complete": complete,
         "dropped": stats["dropped"],
         "packets_lost": stats["packets_lost"],
         "hash_mismatch": stats["hash_mismatch"],
-        "crc_errors": stats.get("crc_errors", 0),
-        "gaps": stats.get("gaps"),
-        "hash_rows": stats.get("hash_rows") if rust else None,
+        "crc_errors": stats["crc_errors"],
+        "gaps": gaps,
+        "hash_rows": hash_rows,
         "shm_published": published,
     }
 
@@ -413,7 +383,7 @@ def open_shm_view(name, child, timeout, label):
         time.sleep(0.05)
 
 
-def validate_shm(view, name, child, cfg, rust_rx_hashes, label):
+def validate_shm(view, name, child, cfg, rx_hashes, label):
     """Validate static v3 layout and the latest published frame after the writer exited."""
     header = struct.unpack(SHM_HDR_FMT, view.read(0, SHM_HDR_SIZE))
     (magic, version, slots, frame_bytes, data_off, latest_slot, latest_seq,
@@ -447,9 +417,9 @@ def validate_shm(view, name, child, cfg, rust_rx_hashes, label):
     require(seq1 == seq2, f"{label}: SHM slot seq changed during read ({seq1} != {seq2})")
 
     actual = pattern_ref.fnv1a64_hex(payload)
-    require(actual == rust_rx_hashes[frame_id],
+    require(actual == rx_hashes[frame_id],
             f"{label}: SHM frame {frame_id} FNV {actual} != Rust RX hashlog "
-            f"{rust_rx_hashes[frame_id]}")
+            f"{rx_hashes[frame_id]}")
     require(hash_fid == frame_id,
             f"{label}: SHM hash_fid {hash_fid} != frame_id {frame_id} (frame was not hash-marked)")
     require(slot_hash == int(actual, 16),
@@ -481,22 +451,6 @@ def tail(path, limit=2400):
     except OSError:
         return "<missing log>"
     return text[-limit:].replace("\r", "")
-
-
-def read_native_adapter(path, marker, expected, label):
-    """Read the adapter line legacy C++ writes to its own stdout, unchanged."""
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except OSError as error:
-        raise SmokeError(f"{label}: cannot read native stdout {path}: {error}") from error
-    for line in text.splitlines():
-        if line.startswith(marker):
-            reported = line[len(marker):].split(" (", 1)[0].strip()
-            require(reported == expected,
-                    f"{label}: native adapter {reported!r} != {expected!r} (line: {line!r})")
-            return reported
-    raise SmokeError(
-        f"{label}: native stdout {path} has no {marker!r} line; tail:\n{text[-2400:]}")
 
 
 class Child:
@@ -573,34 +527,6 @@ def stop_all():
     return errors
 
 
-def wait_for_stats_ready(child, path, timeout, label):
-    """C++ receivers have no --ready marker; their first live stats write proves capture is open."""
-    deadline = time.monotonic() + timeout
-    last_error = None
-    while True:
-        returncode = child.proc.poll()
-        if returncode is not None:
-            child.close_logs()
-            raise SmokeError(
-                f"{label}: receiver exited {returncode} before its first stats write; "
-                f"stderr tail:\n{tail(child.stderr_path)}")
-        if path.is_file():
-            try:
-                stats = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError) as error:
-                last_error = error
-            else:
-                require(isinstance(stats, dict), f"{label}: first stats write is not a JSON object")
-                require(stats.get("running") is not False,
-                        f"{label}: receiver wrote final stats before any capture: {stats}")
-                return stats
-        if time.monotonic() >= deadline:
-            raise SmokeError(
-                f"{label}: receiver stats {path} did not become readable within {timeout}s "
-                f"({last_error}); stderr tail:\n{tail(child.stderr_path)}")
-        time.sleep(0.05)
-
-
 def wait_for_path(child, path, timeout, label):
     deadline = time.monotonic() + timeout
     while True:
@@ -652,46 +578,37 @@ def record_command(evidence, role, argv, directory):
 
 
 # ---------------------------------------------------------------------------
-# One phase: one sender, two concurrent receivers
+# One Rust TX/RX stream
 
 
-def run_phase(phase_name, sender_kind, cfg, ref_ids, expected_ref, args, tools, source_mac):
-    phase_dir = RUN / phase_name
-    phase_dir.mkdir(parents=True)
+def run_stream(cfg, ref_ids, expected_ref, args, tools):
+    stream_dir = RUN / "stream"
+    stream_dir.mkdir(parents=True)
     session_id = "rsmoke-" + uuid.uuid4().hex[:12]
+    source_mac = make_local_mac()
     shm_name = None
     if not args.no_shm:
         shm_name = "Local\\VirtualCaptureRawStreamSmoke." + uuid.uuid4().hex
 
     paths = {
-        "cpp-rx.stats": phase_dir / "cpp-rx.stats.json",
-        "cpp-rx.hashlog": phase_dir / "cpp-rx.hash.jsonl",
-        "rust-rx.stats": phase_dir / "rust-rx.stats.json",
-        "rust-rx.hashlog": phase_dir / "rust-rx.hash.jsonl",
-        "rust-rx.ready": phase_dir / "rust-rx.ready.json",
-        "sender.stats": phase_dir / "sender.stats.json",
-        "sender.hashlog": phase_dir / "sender.hash.jsonl",
+        "rx.stats": stream_dir / "rx.stats.json",
+        "rx.hashlog": stream_dir / "rx.hash.jsonl",
+        "rx.ready": stream_dir / "rx.ready.json",
+        "tx.stats": stream_dir / "tx.stats.json",
+        "tx.hashlog": stream_dir / "tx.hash.jsonl",
     }
     evidence = {
-        "directory": str(phase_dir),
+        "directory": str(stream_dir),
         "source_mac": source_mac,
         "dest_mac": DEST_MAC,
         "session_id": session_id,
         "shm_name": shm_name,
         "commands": {},
         "logs": {},
-        "stats": {
-            "cpp-rx": str(paths["cpp-rx.stats"]),
-            "rust-rx": str(paths["rust-rx.stats"]),
-            "sender": str(paths["sender.stats"]),
-        },
-        "hashlogs": {
-            "cpp-rx": str(paths["cpp-rx.hashlog"]),
-            "rust-rx": str(paths["rust-rx.hashlog"]),
-            "sender": str(paths["sender.hashlog"]),
-        },
+        "stats": {"rx": str(paths["rx.stats"]), "tx": str(paths["tx.stats"])},
+        "hashlogs": {"rx": str(paths["rx.hashlog"]), "tx": str(paths["tx.hashlog"])},
     }
-    EVIDENCE.setdefault("phases", {})[phase_name] = evidence
+    EVIDENCE["stream"] = evidence
 
     width = str(cfg["width"])
     height = str(cfg["height"])
@@ -700,144 +617,88 @@ def run_phase(phase_name, sender_kind, cfg, ref_ids, expected_ref, args, tools, 
     frames = str(cfg["frames"])
     receiver_timeout = str(cfg["receiver_timeout_s"])
 
-    cpp_rx_argv = [
-        tools["cpp_receiver"], "--adapter", LOOPBACK,
-        "--width", width, "--height", height, "--fps", fps, "--mtu", mtu,
-        "--source-mac", source_mac, "--session", session_id,
-        "--stats", paths["cpp-rx.stats"], "--hashlog", paths["cpp-rx.hashlog"],
-        "--timeout-s", receiver_timeout, "--expect-frames", frames,
-    ]
-    rust_rx_argv = [
+    rx_argv = [
         tools["rust"], "receive", "--adapter", LOOPBACK,
         "--source-mac", source_mac, "--session", session_id,
         "--width", width, "--height", height, "--fps", fps, "--mtu", mtu,
         "--expect-frames", frames, "--timeout-s", receiver_timeout,
-        "--stats", paths["rust-rx.stats"], "--hashlog", paths["rust-rx.hashlog"],
-        "--ready", paths["rust-rx.ready"],
+        "--stats", paths["rx.stats"], "--hashlog", paths["rx.hashlog"],
+        "--ready", paths["rx.ready"],
     ]
     if shm_name:
-        rust_rx_argv += ["--shm", shm_name]
+        rx_argv += ["--shm", shm_name]
+    tx_argv = [
+        tools["rust"], "send", "--adapter", LOOPBACK,
+        "--source-mac", source_mac, "--dst-mac", DEST_MAC,
+        "--session", session_id,
+        "--width", width, "--height", height, "--fps", fps, "--mtu", mtu,
+        "--batch", str(cfg["batch"]), "--frames", frames,
+        "--stats", paths["tx.stats"], "--hashlog", paths["tx.hashlog"],
+        "--pattern", "motion",
+    ]
 
-    if sender_kind == "cpp":
-        sender_argv = [
-            tools["cpp_sender"], "--adapter", LOOPBACK, "--mode", "pattern",
-            "--pattern", "motion", "--width", width, "--height", height,
-            "--fps", fps, "--mtu", mtu, "--batch", str(cfg["batch"]),
-            "--frames", frames, "--source-mac", source_mac, "--dst-mac", DEST_MAC,
-            "--session", session_id,
-            "--stats", paths["sender.stats"], "--hashlog", paths["sender.hashlog"],
-        ]
-    else:
-        sender_argv = [
-            tools["rust"], "send", "--adapter", LOOPBACK,
-            "--source-mac", source_mac, "--dst-mac", DEST_MAC,
-            "--session", session_id,
-            "--width", width, "--height", height, "--fps", fps, "--mtu", mtu,
-            "--batch", str(cfg["batch"]), "--frames", frames,
-            "--stats", paths["sender.stats"], "--hashlog", paths["sender.hashlog"],
-            "--pattern", "motion",
-        ]
-
-    label = phase_name
-    record_command(evidence, "cpp-rx", cpp_rx_argv, phase_dir)
-    cpp_rx = Child("cpp-rx", cpp_rx_argv, phase_dir)
-    cpp_initial = wait_for_stats_ready(
-        cpp_rx, paths["cpp-rx.stats"], cfg["ready_timeout_s"], f"{label}/cpp-rx")
-    evidence["cpp_rx_initial_stats"] = cpp_initial
-
-    record_command(evidence, "rust-rx", rust_rx_argv, phase_dir)
-    rust_rx = Child("rust-rx", rust_rx_argv, phase_dir)
-    wait_for_path(rust_rx, paths["rust-rx.ready"], cfg["ready_timeout_s"], f"{label}/rust-rx")
-    ready = read_json(paths["rust-rx.ready"], f"{label}/rust-rx.ready")
-    ready_summary = validate_ready(ready, session_id, f"{label}/rust-rx.ready")
-    evidence["rust_ready"] = ready
-    require(paths["rust-rx.hashlog"].is_file(),
-            f"{label}/rust-rx: hashlog was not open before --ready was written")
+    record_command(evidence, "rx", rx_argv, stream_dir)
+    rx = Child("rx", rx_argv, stream_dir)
+    wait_for_path(rx, paths["rx.ready"], cfg["ready_timeout_s"], "rx")
+    ready = read_json(paths["rx.ready"], "rx.ready")
+    ready_summary = validate_ready(ready, session_id, "rx.ready")
+    evidence["ready"] = ready
+    require(paths["rx.hashlog"].is_file(),
+            "rx: hashlog was not open before --ready was written")
 
     shm_view = None
     try:
         if shm_name:
             # Acquire the read-only view before TX starts and hold it while the
             # writer exits, so the ABI check is independent of exit timing.
-            shm_view = open_shm_view(shm_name, rust_rx, cfg["ready_timeout_s"], f"{label}/rust-rx")
+            shm_view = open_shm_view(shm_name, rx, cfg["ready_timeout_s"], "rx")
         time.sleep(0.15)
 
-        record_command(evidence, "sender", sender_argv, phase_dir)
-        sender = Child("sender", sender_argv, phase_dir)
+        record_command(evidence, "tx", tx_argv, stream_dir)
+        tx = Child("tx", tx_argv, stream_dir)
 
-        wait_children([cpp_rx, rust_rx, sender], cfg["phase_timeout_s"], label)
-
+        wait_children([rx, tx], cfg["stream_timeout_s"], "stream")
         evidence["exit_codes"] = {
-            "cpp-rx": cpp_rx.proc.returncode,
-            "rust-rx": rust_rx.proc.returncode,
-            "sender": sender.proc.returncode,
+            "rx": rx.proc.returncode,
+            "tx": tx.proc.returncode,
         }
 
-        native_adapters = None
-        if sender_kind == "cpp":
-            native_adapters = {
-                "cpp-rx": read_native_adapter(
-                    cpp_rx.stdout_path, CPP_RX_ADAPTER_MARKER, LOOPBACK, f"{label}/cpp-rx"),
-                "sender": read_native_adapter(
-                    sender.stdout_path, CPP_TX_ADAPTER_MARKER, LOOPBACK, f"{label}/sender"),
-            }
-            evidence["native_adapters"] = native_adapters
-
-        tx_stats = read_json(paths["sender.stats"], f"{label}/sender.stats")
-        cpp_stats = read_json(paths["cpp-rx.stats"], f"{label}/cpp-rx.stats")
-        rust_stats = read_json(paths["rust-rx.stats"], f"{label}/rust-rx.stats")
-
+        tx_stats = read_json(paths["tx.stats"], "tx.stats")
+        rx_stats = read_json(paths["rx.stats"], "rx.stats")
         tx_summary = validate_tx_stats(
-            tx_stats, sender_kind == "rust", cfg["frames"], cfg["total_packets"],
-            session_id, f"{label}/sender")
-        cpp_summary = validate_rx_stats(
-            cpp_stats, False, cfg["frames"], session_id, False, f"{label}/cpp-rx")
-        rust_summary = validate_rx_stats(
-            rust_stats, True, cfg["frames"], session_id, shm_name is not None,
-            f"{label}/rust-rx")
+            tx_stats, cfg["frames"], cfg["total_packets"], session_id, "tx")
+        rx_summary = validate_rx_stats(
+            rx_stats, cfg["frames"], session_id, shm_name is not None, "rx")
 
-        sender_hashes = parse_hashlog(paths["sender.hashlog"], cfg["frames"], f"{label}/sender")
-        cpp_hashes = parse_hashlog(paths["cpp-rx.hashlog"], cfg["frames"], f"{label}/cpp-rx")
-        rust_hashes = parse_hashlog(paths["rust-rx.hashlog"], cfg["frames"], f"{label}/rust-rx")
+        tx_hashes = parse_hashlog(paths["tx.hashlog"], cfg["frames"], "tx")
+        rx_hashes = parse_hashlog(paths["rx.hashlog"], cfg["frames"], "rx")
 
-        require_no_mismatch(sender_hashes, cpp_hashes, "sender", "cpp-rx", label)
-        require_no_mismatch(sender_hashes, rust_hashes, "sender", "rust-rx", label)
+        require_no_mismatch(tx_hashes, rx_hashes, "tx", "rx", "stream")
         for fid in ref_ids:
             expected = expected_ref[fid]
-            require(sender_hashes[fid] == expected,
-                    f"{label}: sender frame {fid} FNV {sender_hashes[fid]} != "
-                    f"pattern_ref {expected}")
-            require(cpp_hashes[fid] == expected,
-                    f"{label}: cpp-rx frame {fid} FNV {cpp_hashes[fid]} != "
-                    f"pattern_ref {expected}")
-            require(rust_hashes[fid] == expected,
-                    f"{label}: rust-rx frame {fid} FNV {rust_hashes[fid]} != "
-                    f"pattern_ref {expected}")
+            require(tx_hashes[fid] == expected,
+                    f"tx frame {fid} FNV {tx_hashes[fid]} != pattern_ref {expected}")
+            require(rx_hashes[fid] == expected,
+                    f"rx frame {fid} FNV {rx_hashes[fid]} != pattern_ref {expected}")
 
         shm_result = None
         if shm_view is not None:
             # The writer has exited, but our read-only view keeps the pagefile
             # section alive; validate layout and the latest frame now.
             shm_result = validate_shm(
-                shm_view, shm_name, rust_rx, cfg, rust_hashes, f"{label}/rust-rx")
+                shm_view, shm_name, rx, cfg, rx_hashes, "rx")
     finally:
         if shm_view is not None:
             shm_view.close()
 
     result = {
-        "name": phase_name,
-        "sender": sender_kind,
+        "name": "rust-tx-rx",
         "source_mac": source_mac,
         "dest_mac": DEST_MAC,
         "session_id": session_id,
         "frame_ids": f"0..{cfg['frames'] - 1} (unique; no duplicate rows)",
-        "stats_summary": {
-            "sender": tx_summary,
-            "cpp-rx": cpp_summary,
-            "rust-rx": rust_summary,
-        },
-        "native_adapters": native_adapters,
-        "rust_ready": ready_summary,
+        "stats_summary": {"tx": tx_summary, "rx": rx_summary},
+        "ready": ready_summary,
         "stats_files": evidence["stats"],
         "hashlog_files": evidence["hashlogs"],
         "hashlogs_equal": True,
@@ -848,11 +709,7 @@ def run_phase(phase_name, sender_kind, cfg, ref_ids, expected_ref, args, tools, 
         "logs": evidence["logs"],
         "shm": shm_result,
     }
-    streams = {
-        "sender": sender_hashes,
-        "cpp-rx": cpp_hashes,
-        "rust-rx": rust_hashes,
-    }
+    streams = {"tx": tx_hashes, "rx": rx_hashes}
     return result, streams
 
 
@@ -861,17 +718,10 @@ def run_phase(phase_name, sender_kind, cfg, ref_ids, expected_ref, args, tools, 
 
 
 def require_tools(args):
-    cpp_dir = args.cpp_dir.expanduser().resolve()
-    tools = {
-        "cpp_dir": str(cpp_dir),
-        "cpp_sender": str(cpp_dir / "vc-sender.exe"),
-        "cpp_receiver": str(cpp_dir / "vc-receiver.exe"),
-        "rust": str(args.rust_exe.expanduser().resolve()),
-    }
-    require(Path(tools["cpp_sender"]).is_file(), f"C++ sender not found: {tools['cpp_sender']}")
-    require(Path(tools["cpp_receiver"]).is_file(), f"C++ receiver not found: {tools['cpp_receiver']}")
-    require(Path(tools["rust"]).is_file(),
-            f"Rust vc-stream not found: {tools['rust']} (build rust/target/release/vc-stream.exe first)")
+    rust = Path(args.rust_exe).expanduser().resolve()
+    tools = {"rust": str(rust)}
+    require(rust.is_file(),
+            f"Rust vc-stream not found: {rust} (build rust/target/release/vc-stream.exe first)")
     return tools
 
 
@@ -891,12 +741,6 @@ def execute(args):
     EVIDENCE["binaries"] = tools
     EVIDENCE["adapter"] = LOOPBACK
 
-    macs = []
-    while len(macs) < 2:
-        candidate = make_local_mac()
-        if candidate not in macs:
-            macs.append(candidate)
-
     ref_ids = sample_frames(cfg["frames"], args.ref_samples)
     EVIDENCE["reference"] = {
         "frames_checked": len(ref_ids),
@@ -907,33 +751,26 @@ def execute(args):
     expected_ref = reference_hashes(ref_ids, cfg["width"], cfg["height"])
     reference_elapsed = time.perf_counter() - started
 
-    phases = []
-    streams = []
-    for phase_name, sender_kind, source_mac in (
-            ("phase-1-cpp-tx", "cpp", macs[0]),
-            ("phase-2-rust-tx", "rust", macs[1])):
-        result, phase_streams = run_phase(
-            phase_name, sender_kind, cfg, ref_ids, expected_ref, args, tools, source_mac)
-        phases.append(result)
-        streams.extend(
-            (f"{phase_name}/{role}", hashes) for role, hashes in phase_streams.items())
-    agreement = validate_stream_agreement(streams, cfg["frames"], "cross-phase")
+    result, phase_streams = run_stream(cfg, ref_ids, expected_ref, args, tools)
+    agreement = validate_stream_agreement(
+        [(f"stream/{role}", hashes) for role, hashes in phase_streams.items()],
+        cfg["frames"], "stream")
 
     all_reference = len(ref_ids) == cfg["frames"]
     if all_reference:
         reference_check = (
-            f"all {cfg['frames']} frames match ctrl/pattern_ref.py::gen_native")
+            f"all {cfg['frames']} frames match rust/tests/reference/pattern_ref.py::gen_native")
     else:
         reference_check = (
             f"{len(ref_ids)}/{cfg['frames']} sampled frames match "
-            f"ctrl/pattern_ref.py::gen_native; the remaining "
+            f"rust/tests/reference/pattern_ref.py::gen_native; the remaining "
             f"{cfg['frames'] - len(ref_ids)} frames are covered only by full "
             f"actual-stream agreement, not by the Python reference")
 
     report = {
         "ok": True,
         "result": "PASS",
-        "scope": ("local Npcap Loopback functional interop only; not dual-machine, "
+        "scope": ("local Npcap Loopback functional smoke only; not dual-machine, "
                   "throughput, latency, long-run, DShow, or quality acceptance"),
         "run": str(RUN),
         "adapter": LOOPBACK,
@@ -955,7 +792,7 @@ def execute(args):
         },
         "binaries": tools,
         "reference": {
-            "module": "ctrl/pattern_ref.py::gen_native (motion)",
+            "module": "rust/tests/reference/pattern_ref.py::gen_native (motion)",
             "frames_checked": len(ref_ids),
             "frames_total": cfg["frames"],
             "all_frames": all_reference,
@@ -967,27 +804,24 @@ def execute(args):
             "frames_per_stream": cfg["frames"],
             "all_frames_equal": True,
         },
-        "phases": phases,
+        "stream": result,
         "checks": [
-            "exact frame ids 0..N-1 with no duplicate rows in every sender/receiver hashlog",
-            "every sender/receiver hashlog from both phases agrees on every FNV-1a64 hash",
+            "exact frame ids 0..N-1 with no duplicate rows in both sender and receiver hashlogs",
+            "sender and receiver hashlogs agree on every FNV-1a64 hash",
             reference_check,
-            "every process echoed the requested session id; Rust adapter fields and C++ "
-            "native stdout both report \\Device\\NPF_Loopback",
-            "0 receiver drops / lost packets / CRC errors / hash mismatches; Rust gaps=0 "
-            "and hash_rows=N",
-            "C++ receiver ran with SHM off (shm_published=0); Rust shm_published matches "
-            "complete or is 0 with --no-shm",
+            "both processes echoed the requested session id and the exact Loopback adapter",
+            "0 receiver drops / lost packets / CRC errors / hash mismatches; gaps=0 and hash_rows=N",
+            "shm_published matches complete or is 0 with --no-shm",
             "sender reports N frames, N*packets_per_frame packets and 0 send errors",
-            "all six C++/Rust processes exited 0",
+            "both Rust processes exited 0",
         ],
         "evidence": EVIDENCE,
     }
-    if any(phase["shm"] for phase in phases):
+    if result["shm"]:
         report["checks"].append(
-            "Rust private SHM v3 geometry, latest published frame, FNV and hash marker validated")
+            "private SHM v3 geometry, latest published frame, FNV and hash marker validated")
     else:
-        report["checks"].append("Rust private SHM ABI check skipped (--no-shm)")
+        report["checks"].append("private SHM ABI check skipped (--no-shm)")
 
     return report
 
@@ -1010,10 +844,9 @@ def self_check():
     require(sample_frames(120, 0) == list(range(120)), "ref-samples=0 must select all")
     require(sample_frames(120, 1) == [0], "single reference sample must be frame 0")
 
+    reference_check = pattern_ref.self_check(full=False)
     y_plane, uv_plane = pattern_ref.gen_native("motion", 0, 640, 640)
     digest = pattern_ref.frame_hash_yuv(y_plane, uv_plane)
-    # Cross-checked with build/Release/vc-sender.exe --selftest "VEC full motion 0"
-    # and build/pattern-rs-check pattern-fixture motion 0 640 640.
     require(digest == "f6f53d2aeac3c9dc", f"unexpected pattern_ref motion frame 0 hash {digest}")
 
     session = "rsmoke-self"
@@ -1037,49 +870,16 @@ def self_check():
         expect_smoke_error(lambda: parse_hashlog(log, 3, "self-check short"),
                            "missing frame rows")
 
-        rx_native = temp / "cpp-rx.stdout.log"
-        rx_native.write_text(
-            "[receiver] adapter \\Device\\NPF_Loopback (Npcap Loopback Adapter)\n",
-            encoding="utf-8")
-        require(read_native_adapter(
-                    rx_native, CPP_RX_ADAPTER_MARKER, LOOPBACK, "self-check cpp-rx") == LOOPBACK,
-                "C++ receiver adapter marker was not parsed")
-        tx_native = temp / "cpp-sender.stdout.log"
-        tx_native.write_text(
-            "[sender] adapter match \\Device\\NPF_Loopback (Npcap Loopback Adapter)\n",
-            encoding="utf-8")
-        require(read_native_adapter(
-                    tx_native, CPP_TX_ADAPTER_MARKER, LOOPBACK, "self-check cpp-tx") == LOOPBACK,
-                "C++ sender adapter marker was not parsed")
-        tx_native.write_text(
-            "[sender] adapter match \\Device\\NPF_Ethernet (Other)\n", encoding="utf-8")
-        expect_smoke_error(
-            lambda: read_native_adapter(
-                tx_native, CPP_TX_ADAPTER_MARKER, LOOPBACK, "self-check wrong-adapter"),
-            "wrong native adapter")
-        rx_native.write_text("no adapter line\n", encoding="utf-8")
-        expect_smoke_error(
-            lambda: read_native_adapter(
-                rx_native, CPP_RX_ADAPTER_MARKER, LOOPBACK, "self-check missing-adapter"),
-            "missing native adapter marker")
-
-    cpp_tx = {"session_id": session, "sent_frames": 120,
-              "sent_packets": 8280, "send_errors": 0}
-    rust_tx = {"session_id": session, "adapter": LOOPBACK, "frames": 120,
-               "sent_frames": 120, "sent_packets": 8280, "send_errors": 0}
-    cpp_rx = {"session_id": session, "complete": 120, "dropped": 0,
-              "packets_lost": 0, "hash_mismatch": 0, "gaps": 0,
-              "shm_published": 0}
-    rust_rx = {"session_id": session, "adapter": LOOPBACK, "complete": 120,
-               "dropped": 0, "packets_lost": 0, "crc_errors": 0,
-               "hash_mismatch": 0, "gaps": 0, "hash_rows": 120,
-               "shm_published": 120}
-    validate_tx_stats(cpp_tx, False, 120, 69, session, "self-check cpp-tx")
-    validate_tx_stats(rust_tx, True, 120, 69, session, "self-check rust-tx")
-    validate_rx_stats(cpp_rx, False, 120, session, False, "self-check cpp-rx")
-    validate_rx_stats(rust_rx, True, 120, session, True, "self-check rust-rx")
-    validate_rx_stats({**rust_rx, "shm_published": 0}, True, 120, session, False,
-                      "self-check rust-rx no-shm")
+    tx_stats = {"session_id": session, "adapter": LOOPBACK, "frames": 120,
+                "sent_frames": 120, "sent_packets": 8280, "send_errors": 0}
+    rx_stats = {"session_id": session, "adapter": LOOPBACK, "complete": 120,
+                "dropped": 0, "packets_lost": 0, "crc_errors": 0,
+                "hash_mismatch": 0, "gaps": 0, "hash_rows": 120,
+                "shm_published": 120}
+    validate_tx_stats(tx_stats, 120, 69, session, "self-check tx")
+    validate_rx_stats(rx_stats, 120, session, True, "self-check rx")
+    validate_rx_stats({**rx_stats, "shm_published": 0}, 120, session, False,
+                      "self-check rx no-shm")
 
     ready = validate_ready(
         {"session_id": session, "adapter": LOOPBACK, "pid": 123}, session, "self-check ready")
@@ -1094,43 +894,39 @@ def self_check():
         "ready adapter mismatch")
 
     expect_smoke_error(
-        lambda: validate_rx_stats({**rust_rx, "crc_errors": 1}, True, 120, session, True,
+        lambda: validate_rx_stats({**rx_stats, "crc_errors": 1}, 120, session, True,
                                   "self-check bad-crc"),
         "nonzero CRC errors")
     expect_smoke_error(
-        lambda: validate_rx_stats({**rust_rx, "gaps": 1}, True, 120, session, True,
+        lambda: validate_rx_stats({**rx_stats, "gaps": 1}, 120, session, True,
                                   "self-check gaps"),
         "nonzero frame gaps")
     expect_smoke_error(
-        lambda: validate_rx_stats({**rust_rx, "hash_rows": 119}, True, 120, session, True,
+        lambda: validate_rx_stats({**rx_stats, "hash_rows": 119}, 120, session, True,
                                   "self-check hash-rows"),
         "wrong hash row count")
     expect_smoke_error(
-        lambda: validate_rx_stats({**rust_rx, "shm_published": 119}, True, 120, session, True,
+        lambda: validate_rx_stats({**rx_stats, "shm_published": 119}, 120, session, True,
                                   "self-check shm-count"),
         "wrong SHM publish count")
     expect_smoke_error(
-        lambda: validate_rx_stats({**rust_rx, "shm_published": 120}, True, 120, session, False,
+        lambda: validate_rx_stats({**rx_stats, "shm_published": 120}, 120, session, False,
                                   "self-check shm-disabled"),
         "SHM publish count without --shm")
     expect_smoke_error(
-        lambda: validate_rx_stats({**cpp_rx, "shm_published": 1}, False, 120, session, False,
-                                  "self-check cpp-shm"),
-        "C++ receiver SHM enabled")
-    expect_smoke_error(
-        lambda: validate_tx_stats({**rust_tx, "sent_packets": 0}, True, 120, 69, session,
+        lambda: validate_tx_stats({**tx_stats, "sent_packets": 0}, 120, 69, session,
                                   "self-check bad-packets"),
         "wrong packet count")
     expect_smoke_error(
-        lambda: validate_tx_stats({**rust_tx, "frames": 119}, True, 120, 69, session,
+        lambda: validate_tx_stats({**tx_stats, "frames": 119}, 120, 69, session,
                                   "self-check frames-alias"),
         "frames/sent_frames disagreement")
     expect_smoke_error(
-        lambda: validate_tx_stats({**rust_tx, "session_id": "other"}, True, 120, 69, session,
+        lambda: validate_tx_stats({**tx_stats, "session_id": "other"}, 120, 69, session,
                                   "self-check tx-session"),
         "TX session mismatch")
     expect_smoke_error(
-        lambda: validate_tx_stats({**rust_tx, "adapter": "\\Device\\NPF_Ethernet"}, True,
+        lambda: validate_tx_stats({**tx_stats, "adapter": "\\Device\\NPF_Ethernet"},
                                   120, 69, session, "self-check tx-adapter"),
         "TX adapter mismatch")
 
@@ -1161,17 +957,18 @@ def self_check():
         "result": "PASS",
         "mode": "self-check",
         "scope": "pure Python only; no binaries, adapters, SHM mappings, or child processes",
+        "reference": reference_check,
         "checks": [
             "640x640 NV12 is 614400 bytes and fragments into 69 MTU-9000 packets",
             "default sender batch is 1 and explicit --batch is preserved verbatim",
             "source MAC is locally administered unicast",
             "reference sampling covers first and last frame",
-            "pattern_ref motion frame 0 matches the C++/Rust golden hash",
+            "reference oracle matches 2x2, 100x70 and motion-640 frozen vectors",
             "hashlog parser enforces exact ids, no duplicates and no missing rows",
-            "C++ and Rust TX/RX stats schemas pass, including session/adapter echoes, "
-            "Rust gaps/hash_rows/shm_published and C++ SHM-off",
-            "invalid stats, ready markers, native adapter lines and stream agreement are rejected",
-            "SHM v3 structure sizes and data offset match vcam/vcam_shm.h",
+            "Rust TX/RX stats schemas pass, including session/adapter echoes, "
+            "gaps/hash_rows/shm_published",
+            "invalid stats, ready markers and stream agreement are rejected",
+            "SHM v3 structure sizes and data offset match the Rust receiver contract",
         ],
     }
 
@@ -1189,9 +986,6 @@ def parse_args(argv=None):
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--cpp-dir", type=Path, default=DEFAULT_CPP_DIR,
-                        help="directory containing vc-sender.exe/vc-receiver.exe "
-                             "(default: build/Release)")
     parser.add_argument("--rust-exe", type=Path, default=DEFAULT_RUST_EXE,
                         help="Rust vc-stream.exe (default: rust/target/release/vc-stream.exe)")
     parser.add_argument("--frames", type=int, default=120, help="frames per stream (default: 120)")
@@ -1204,7 +998,8 @@ def parse_args(argv=None):
     parser.add_argument("--height", type=int, default=640, help="NV12 height, even (default: 640)")
     parser.add_argument("--mtu", type=int, default=9000, help="L2 MTU (default: 9000)")
     parser.add_argument("--ref-samples", type=int, default=0,
-                        help="frames checked against pattern_ref.py; 0 = all (default: 0)")
+                        help="frames checked against reference/pattern_ref.py; 0 = all "
+                             "(default: 0)")
     parser.add_argument("--no-shm", action="store_true",
                         help="do not pass --shm to the Rust receiver and skip the ABI probe")
     parser.add_argument("--self-check", action="store_true",
@@ -1247,7 +1042,7 @@ def main(argv=None):
 
     RUN = make_run_dir()
     CHILDREN.clear()
-    EVIDENCE = {"phases": {}}
+    EVIDENCE = {}
     failure = None
     failure_traceback = None
     try:

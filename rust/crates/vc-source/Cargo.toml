@@ -1,6 +1,6 @@
 [package]
 name = "vc-source"
-description = "VirtualCapture Rust 桌面采集：DDA/WGC、整数 BGRA→NV12 裁切/缩放、可选 D3D11 GPU 转换"
+description = "VirtualCapture Rust 桌面采集：DDA/WGC、D3D11 硬件 GPU BGRA→NV12 与整数裁切/缩放（无 CPU/WARP 回退）"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

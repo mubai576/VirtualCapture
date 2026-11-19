@@ -1,10 +1,13 @@
 //! PyroWave 1.x C ABI（`libpyrowave-shared-1.dll`）的 Vulkan 计算编/解码。
 //!
-//! 与 `common/pyrowave_codec.h` 一致：
+//! 当前契约见 `references/encoded-stream.md`：
+//! - 实际计算在 Vulkan 1.3 GPU 上（intra-only）；PyroWave 不是固定厂商硬件
+//!   编码器，本 crate 也不声称零拷贝；
 //! - 阶段一只走 CPU 缓冲：编码上传 NV12、解码同步回读 YUV420P 后再交错成 NV12；
 //! - 每帧预算 `min(max_bitrate/8/fps, max_au-48, raw NV12)`，单帧单 packet；
 //! - 解码器重置只重建 decoder，保留已创建的 Vulkan 设备；
-//! - 设备信息查询 PyroWave 已选中的同一设备，不另建探测设备。
+//! - 设备信息查询 PyroWave 已选中的同一设备，不另建探测设备；
+//! - 无 Vulkan 1.3 设备、库缺失或原生调用失败都直接报错，绝不回退 Raw/CPU。
 
 use std::ffi::c_int;
 use std::ptr;
@@ -215,6 +218,24 @@ fn device_json(api: &PyroApi, device: PyroDevice) -> Value {
     device::settings(instance, physical)
 }
 
+/// GPU-only 必须以已选设备的真实属性为证；未知或软件设备不能靠后端名称蒙混过关。
+fn require_gpu_device(info: &Value) -> Result<()> {
+    ensure!(
+        info["status"] == "selected"
+            && matches!(
+                info["type"].as_str(),
+                Some("integrated_gpu" | "discrete_gpu")
+            ),
+        "PyroWave GPU-only 要求可确认的集成或独立 GPU，拒绝 CPU/虚拟/未知 Vulkan 设备：{info}"
+    );
+    let api = info["api_version"].as_u64().unwrap_or(0);
+    ensure!(
+        api <= u32::MAX as u64 && api >> 29 == 0 && api >= ((1 << 22) | (3 << 12)),
+        "PyroWave 需要 Vulkan 1.3 或更高版本的 GPU，实际 API 值为 {api}"
+    );
+    Ok(())
+}
+
 fn load_device(api: &PyroApi) -> Result<(PyroDevice, Value)> {
     let mut device: PyroDevice = ptr::null_mut();
     check(
@@ -224,6 +245,11 @@ fn load_device(api: &PyroApi) -> Result<(PyroDevice, Value)> {
     )?;
     ensure!(!device.is_null(), "PyroWave 返回了空设备句柄");
     let info = device_json(api, device);
+    if let Err(error) = require_gpu_device(&info) {
+        // 安全：尚未创建编解码器；拒绝的软件/未知设备必须在本次受看门狗保护的操作内释放。
+        unsafe { (api.device_destroy)(device) };
+        return Err(error);
+    }
     Ok((device, info))
 }
 
@@ -448,6 +474,8 @@ impl PyroWaveEncoder {
             "upload_path": "cpu_nv12",
             "decode_path": "cpu_yuv420p",
             "compute": "vulkan",
+            "gpu_compute": true,
+            "vulkan_min_version": "1.3",
             "zero_copy": false,
             "device": self.device_info.clone(),
         })
@@ -653,6 +681,8 @@ impl PyroWaveDecoder {
             "upload_path": "cpu_nv12",
             "decode_path": "cpu_yuv420p",
             "compute": "vulkan",
+            "gpu_compute": true,
+            "vulkan_min_version": "1.3",
             "zero_copy": false,
             "device": self.device_info.clone(),
         })
@@ -723,6 +753,37 @@ impl Drop for PyroWaveDecoder {
             && let Some(library) = self._library.take()
         {
             std::mem::forget(library);
+        }
+    }
+}
+
+#[cfg(test)]
+mod gpu_requirement_tests {
+    use super::*;
+
+    #[test]
+    fn accepts_only_proven_hardware_gpu_with_vulkan_1_3() {
+        for kind in ["integrated_gpu", "discrete_gpu"] {
+            let info =
+                json!({"status":"selected", "type":kind, "api_version":(1u32 << 22) | (3 << 12)});
+            assert!(require_gpu_device(&info).is_ok());
+        }
+        for kind in ["cpu", "virtual_gpu", "other", ""] {
+            let info =
+                json!({"status":"selected", "type":kind, "api_version":(1u32 << 22) | (3 << 12)});
+            assert!(require_gpu_device(&info).is_err());
+        }
+    }
+
+    #[test]
+    fn unknown_device_or_old_vulkan_cannot_bypass_gpu_only() {
+        for info in [
+            json!({"status":"unavailable"}),
+            json!({"status":"selected", "type":"discrete_gpu"}),
+            json!({"status":"selected", "type":"discrete_gpu", "api_version":(1u32 << 22) | (2 << 12)}),
+            json!({"status":"selected", "type":"discrete_gpu", "api_version":u64::MAX}),
+        ] {
+            assert!(require_gpu_device(&info).is_err());
         }
     }
 }

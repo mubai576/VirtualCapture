@@ -1,13 +1,13 @@
-//! VirtualCapture 数据面迁移的第一块：与 UI 无关的 Rust wire 基础。
+//! VirtualCapture 产品共享的 Rust wire、校验、分片与重组。
 //!
-//! 本 crate 只实现 `proto/vc_wire.h` 冻结的 28 字节包头、`common/crc32.h` 的包载荷 CRC32、
-//! `common/fnv1a.h` 的整帧 FNV-1a64，以及 Raw NV12 的分片和有界乱序重组。
-//! 它不读取配置、不开网卡、不接触 DShow，也不改变旧 C++ 实现或协议。
+//! 本 crate 实现 `proto/vc_wire.h` 冻结的 28 字节包头、包载荷 CRC32、
+//! 整帧 FNV-1a64，以及 Raw NV12 的分片和有界乱序重组。
+//! 它不读取配置、不开网卡、不接触 DShow，不改变冻结协议。
 //!
 //! 接入方式：
-//! - 未来 Rust sender 用 [`fragment::fragments`] 生成包头/载荷，用
+//! - Rust sender 用 [`fragment::fragments`] 生成包头/载荷，用
 //!   [`fragment::write_ethernet`] 写入发帧缓冲，再由 Npcap 发送。
-//! - 未来 Rust receiver 把 Npcap 回调里的完整以太帧交给
+//! - Rust receiver 把 Npcap 回调里的完整以太帧交给
 //!   [`reassembly::Reassembler::push_ethernet`]；它返回完成帧，交由发布/哈希线程处理。
 //! - 会话宽高、MTU、源 MAC 来自控制面，包头本身**不携带**这些信息（proto 冻结）。
 //!

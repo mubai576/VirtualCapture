@@ -1,4 +1,4 @@
-//! Stable graphical entry, packaged as VirtualCapture.exe. No shell or PowerShell.
+//! 稳定的图形入口，打包为 VirtualCapture.exe。不依赖 shell 或 PowerShell。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 use std::path::{Path, PathBuf};
@@ -18,8 +18,8 @@ struct Cli {
     native_dir: Option<PathBuf>,
 }
 
-/// Also allow starting the entry from a release installed by an older OTA client.
-/// A version.json inside that release must not turn it into a separate data root.
+/// 也允许从旧 OTA 客户端安装的 release 启动本入口。
+/// 该 release 内的 version.json 不得把它变成独立的数据根。
 fn default_root(package: &Path) -> PathBuf {
     if let Some(releases) = package.parent()
         && releases.file_name().is_some_and(|name| name == "releases")
@@ -100,7 +100,7 @@ fn launch(cli: Cli) -> Result<(), String> {
         "pid": child.id(), "root": root, "exe": exe,
         "stdout": stdout_path, "stderr": stderr_path,
     });
-    // Diagnostic receipt only: it never contains pairing/update tokens.
+    // 仅用于诊断的回执：绝不包含配对/更新令牌。
     if let Ok(file) = std::fs::OpenOptions::new()
         .create_new(true)
         .write(true)
@@ -108,7 +108,7 @@ fn launch(cli: Cli) -> Result<(), String> {
     {
         let _ = serde_json::to_writer(file, &details);
     }
-    // Release the stable entry quickly so OTA can restart the actual GUI directly.
+    // 尽快释放稳定入口，以便 OTA 直接重启真正的 GUI。
     std::thread::sleep(Duration::from_millis(700));
     if let Some(status) = child.try_wait().map_err(|e| e.to_string())?
         && !status.success()
@@ -128,6 +128,8 @@ fn report_error(message: &str) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{MB_ICONERROR, MB_OK, MessageBoxW};
         let title: Vec<u16> = "VirtualCapture 启动失败\0".encode_utf16().collect();
         let text: Vec<u16> = message.encode_utf16().chain(Some(0)).collect();
+        // 安全：text/title 都是以 NUL 结尾的 UTF-16 缓冲区，且在调用期间保持
+        // 存活；MessageBoxW 不会保留这些指针。
         unsafe {
             MessageBoxW(
                 std::ptr::null_mut(),

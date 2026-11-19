@@ -1,6 +1,10 @@
-//! 可移植的整数几何与 BGRA→NV12 转换。
+//! 可移植的整数几何与 BGRA→NV12 CPU 参考实现。
 //!
-//! 与 `common/stream.h` 的 `VCTransform` / `vc_bgrx_nv12` 逐字节等价：
+//! 生产桌面采集只使用硬件 D3D11 compute shader（`desktop::gpu`）；
+//! 本模块的 [`bgra_to_nv12`] 仅作为 GPU 路径的逐字节参考 oracle 与单元测试
+//! 使用，不参与实际采集，也不构成运行时 CPU 回退。
+//!
+//! 与Git历史 `common/stream.h` 的整数公式逐字节等价，当前参考由本模块维护：
 //!
 //! - 最近邻采样，全程整数除法；
 //! - Y = `(77R + 150G + 29B) >> 8`；
@@ -51,7 +55,7 @@ impl TransformMode {
     }
 }
 
-/// CPU 路径真正从源纹理拷出的矩形。
+/// CPU 参考实现从源纹理拷出的矩形（生产路径不再使用；保留给测试/oracle）。
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CopyRect {
     pub x: u32,
@@ -189,8 +193,9 @@ impl Transform {
         Some((sx, sy))
     }
 
-    /// CPU 拷贝到 staging 时应使用的源矩形。
+    /// CPU 参考实现拷贝到 staging 时应使用的源矩形。
     ///
+    /// 仅供测试/oracle；GPU 转换器直接对整张源纹理采样。
     /// `crop` 只拷中心窗口；其余模式拷整个源区域，再由采样窗口缩放
     /// （`fill` 的 `ox/oy` 是相对完整源图像的坐标，不能只拷采样区域）。
     pub fn copy_rect(
@@ -228,6 +233,7 @@ fn fit_extent(src: u32, numerator: u32, denominator: u32) -> u32 {
 
 /// 将 packed BGRA（`B8G8R8A8_UNORM`，行跨度 `pitch`）转换为 packed NV12。
 ///
+/// **参考实现**：仅用于单元测试与 GPU 逐字节对账，生产采集不会调用。
 /// `dst` 前 `width*height` 字节是 Y 平面，随后 `width*height/2` 字节是
 /// interleaved UV。所有采样坐标由 `transform` 给出，转换全程无浮点。
 pub fn bgra_to_nv12(src: &[u8], pitch: usize, transform: &Transform, dst: &mut [u8]) -> Result<()> {

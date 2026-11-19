@@ -199,8 +199,8 @@ fn build_ico(shapes: &[Shape]) -> Vec<u8> {
         .iter()
         .map(|&size| {
             let rgba = render(shapes, size);
-            // 256px uses PNG like modern shells expect; smaller frames stay DIB,
-            // which every Windows icon loader accepts.
+            // 256px 使用 PNG，符合现代 shell 的预期；更小的帧保持 DIB，
+            // 所有 Windows 图标加载器都能接受。
             let data = if size >= 256 {
                 encode_png(size, &rgba)
             } else {
@@ -424,14 +424,14 @@ fn encode_dib(size: u32, rgba: &[u8]) -> Vec<u8> {
     out.extend_from_slice(&0u32.to_le_bytes());
     out.extend_from_slice(&(size * size * 4).to_le_bytes());
     out.extend_from_slice(&[0u8; 16]);
-    // XOR bitmap: BGRA, bottom-up.
+    // XOR 位图：BGRA，自底向上。
     for y in (0..size).rev() {
         for x in 0..size {
             let i = ((y * size + x) * 4) as usize;
             out.extend_from_slice(&[rgba[i + 2], rgba[i + 1], rgba[i], rgba[i + 3]]);
         }
     }
-    // AND mask: zero means "use the alpha channel".
+    // AND 掩码：零表示“使用 alpha 通道”。
     let stride = size.div_ceil(32) * 4;
     out.resize(out.len() + (stride * size) as usize, 0);
     out

@@ -194,14 +194,7 @@ def history(root):
 def resolve_binaries(args):
     package = args.package.resolve() if args.package else None
     bin_dir = (args.bin or package or ROOT / "rust/target/debug").resolve()
-    native = args.native or package
-    if native is None:
-        for candidate in (bin_dir, ROOT / "build/Release", ROOT / "build"):
-            if (candidate / "vc_stream.dll").is_file():
-                native = candidate
-                break
-    if native is None:
-        native = bin_dir
+    native = args.native or package or bin_dir
     required = ["vc-host.exe", "vc-capture.exe", "vc-updater.exe"]
     missing = [name for name in required if not (bin_dir / name).is_file()]
     if missing:

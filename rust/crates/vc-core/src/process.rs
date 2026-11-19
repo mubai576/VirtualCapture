@@ -709,7 +709,7 @@ pub fn raw_frame_batch_from_capture(capture: &Capture) -> Result<u32, String> {
     Ok(u32::from(packets))
 }
 
-/// Npcap Loopback rejects large sendqueues; it is diagnostic-only and sends per packet.
+/// Npcap 回环不支持大 sendqueue；它只用于诊断，按包提交（batch=1）。
 pub fn raw_send_batch_for_adapter(capture: &Capture, adapter: &str) -> Result<u32, String> {
     if adapter.eq_ignore_ascii_case(r"\Device\NPF_Loopback") {
         Ok(1)
@@ -848,8 +848,10 @@ pub fn validate_capabilities(caps: &Value) -> Result<(), String> {
     if caps.get("sendqueue").and_then(Value::as_str) != Some("frame") {
         missing.push("sendqueue=frame");
     }
-    if !declares(caps, "codecs", &["raw", "mjpeg", "pyrowave"]) {
-        missing.push("codecs=[raw,mjpeg,pyrowave]");
+    // 只声明 Raw 与 Vulkan GPU 计算的 PyroWave；MJPEG 的 CPU/SIMD 后端已被移除，
+    // 能力表不能继续声称支持它，否则会误导宿主选择不可启动的组合。
+    if !declares(caps, "codecs", &["raw", "pyrowave"]) {
+        missing.push("codecs=[raw,pyrowave]");
     }
     if !declares(caps, "sources", &["pattern", "dda", "wgc"]) {
         missing.push("sources=[pattern,dda,wgc]");
@@ -1038,7 +1040,7 @@ mod tests {
         );
         assert_eq!(expected_batch_packets(&raw, "physical").unwrap(), Some(69));
         let encoded = Capture {
-            codec: "mjpeg".into(),
+            codec: "pyrowave".into(),
             ..Default::default()
         };
         assert_eq!(expected_batch_packets(&encoded, "physical").unwrap(), None);
@@ -1142,16 +1144,31 @@ mod tests {
             "shm_version": 3,
             "variable_resolution": true,
             "sendqueue": "frame",
-            "codecs": ["raw", "mjpeg", "pyrowave"],
+            "codecs": ["raw", "pyrowave"],
             "sources": ["pattern", "dda", "wgc"]
         });
         validate_capabilities(&good).unwrap();
-        require_stream_selection(&good, "mjpeg", Some("dda")).unwrap();
+        require_stream_selection(&good, "pyrowave", Some("dda")).unwrap();
+        // 旧 DLL 仍多声明 mjpeg 不影响 Raw/PyroWave 契约；能力表只是声明层，
+        // 真正拒绝 mjpeg 启动的是配置启动门限（validate_start），二者不互相代替。
+        let mut with_removed = good.clone();
+        with_removed["codecs"] = json!(["raw", "mjpeg", "pyrowave"]);
+        validate_capabilities(&with_removed).unwrap();
+        assert!(require_stream_selection(&with_removed, "mjpeg", None).is_ok());
 
         let mut missing_codec = good.clone();
         missing_codec["codecs"] = json!(["raw"]);
         let error = validate_capabilities(&missing_codec).unwrap_err();
-        assert!(error.contains("codecs"));
+        assert!(error.contains("codecs") && error.contains("pyrowave"));
+
+        // 只有 Raw/MJPEG、没有 PyroWave 的旧能力也不满足契约。
+        let mut legacy = good.clone();
+        legacy["codecs"] = json!(["raw", "mjpeg"]);
+        assert!(
+            validate_capabilities(&legacy)
+                .unwrap_err()
+                .contains("pyrowave")
+        );
 
         let mut wrong_queue = good.clone();
         wrong_queue["sendqueue"] = json!("packet");
@@ -1283,13 +1300,9 @@ mod tests {
 
     #[test]
     fn pyrowave_ready_timeout_covers_multistep_warmup_inside_rest_budget() {
-        // Raw/MJPEG 就绪仍是单步操作，保持 10 秒。
+        // Raw 就绪仍是单步操作，保持 10 秒。
         assert_eq!(
             ready_timeout(&json!({"codec": {"codec": "raw"}})),
-            READY_TIMEOUT
-        );
-        assert_eq!(
-            ready_timeout(&json!({"codec": {"codec": "mjpeg"}})),
             READY_TIMEOUT
         );
         assert_eq!(ready_timeout(&json!({})), READY_TIMEOUT);

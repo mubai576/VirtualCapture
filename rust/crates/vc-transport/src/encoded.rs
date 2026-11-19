@@ -1,6 +1,6 @@
 //! 有界、乱序容忍的压缩访问单元（AU）重组。
 //!
-//! 传输层语义对齐 `common/access_unit.h` 的 `vcau::Assembler`，但只处理冻结的 28B
+//! 传输层遵守 `references/encoded-stream.md` 的访问单元契约，只处理冻结的 28B
 //! `vc_wire.h` 包头和以太帧，**不解析** 48B VCAU 封装：magic、codec、会话尺寸、
 //! frame_id 与整体 payload hash 由调用方在完成帧上校验（VCAU 解析在 `vc-media`）。
 //! 本模块保证：
@@ -707,7 +707,7 @@ mod tests {
             (header(10, 0, 0, 1, 0, 0, &unit), IgnoreReason::BadGeometry),
             // total 超过 max_au_bytes 允许的包数（3000/1458 -> 3）
             (header(10, 0, 4, 1, 0, 0, &unit), IgnoreReason::BadGeometry),
-            // seq >= total
+            // seq >= total（序号越界）
             (header(10, 3, 3, 1, 0, 0, &unit), IgnoreReason::BadGeometry),
             // 非末片长度不是 payload_max
             (

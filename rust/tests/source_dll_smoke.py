@@ -1,19 +1,23 @@
 """Real DDA/WGC capture smoke through the release `vc_stream.dll` ABI.
 
-The script loads a *copy* of the release `vc_stream.dll` (and its codec DLLs)
-from a private `build/source-dll-smoke-<id>/` directory, starts an in-process
-Raw receiver and sender on the exact Npcap Loopback adapter, and drives real
-desktop capture backends:
+The script loads a *copy* of the release `vc_stream.dll` from a private
+`build/source-dll-smoke-<id>/` directory, starts an in-process Raw receiver and
+sender on the exact Npcap Loopback adapter, and drives the real GPU desktop
+capture backends:
 
-* DDA CPU `stretch` (whole-monitor integer scaling) and DDA GPU `fill`
-  (GPU integer BGRA->NV12 with centre crop) against the existing
-  `build/Release/vc-testwin.exe` fixture;
-* WGC CPU `crop` against a private Tk window, including a live window resize
+* DDA GPU `stretch` and GPU `fill` (GPU integer BGRA->NV12 with centre crop)
+  against the private animated fixture window on the desktop;
+* WGC GPU `crop` against the private Tk window, including a live window resize
   that must make the frame pool recreate and the source dimensions update;
 * WGC GPU `stretch` against the same private window (integer scaling);
 * a WGC close lifecycle run (sender only) where closing the fixture window
   must surface the terminal `WGC capture item closed` error instead of
   hanging or silently repeating frames.
+
+Desktop capture is GPU-only here: every combo requests `gpu_convert=true`.
+There is no CPU conversion path, no backend substitution and no fallback; a
+missing GPU conversion, source or DXGI output is an explicit failure (or an
+explicit DDA BLOCKED record with --allow-dda-unavailable).
 
 Every combo uses a unique session id, source MAC and `Local\\...` SHM v3
 mapping.  No registry, DirectShow filter, agent/service, physical NIC, PC2 or
@@ -68,11 +72,9 @@ import raw_stream_smoke as smoke  # noqa: E402
 
 ROOT = smoke.ROOT
 DEFAULT_DLL = ROOT / "rust" / "target" / "release" / "vc_stream.dll"
-DEFAULT_TESTWIN = ROOT / "build" / "Release" / "vc-testwin.exe"
 BUILD_PREFIX = "source-dll-smoke-"
 RUN_PREFIX = "rust-source-dll-smoke-"
 FIXTURE_TITLE_PREFIX = "VirtualCapture Source Smoke "
-TESTWIN_TITLE = "VirtualCapture DDA Test"
 DEST_MAC = [0xFF] * 6
 MTU = 9000
 FPS = 30
@@ -154,7 +156,7 @@ def _fixture_main(args):
         width = max(canvas.winfo_width(), 2)
         height = max(canvas.winfo_height(), 2)
         canvas.delete("all")
-        # Colour bands change every frame so both WGC CPU and GPU captures
+        # Colour bands change every frame so the DDA and WGC GPU captures
         # see new pixels even at a 30 fps sender cadence.
         for band in range(8):
             x0 = band * width // 8
@@ -243,13 +245,6 @@ def _start_fixture(title, width, height):
     return process, found[0]
 
 
-def _start_testwin(path):
-    _require(path.is_file(), f"vc-testwin fixture is missing: {path}")
-    process = subprocess.Popen([str(path)])
-    found = _wait_window(process, TESTWIN_TITLE, "vc-testwin")
-    return process, found[0]
-
-
 def _close_window(hwnd):
     return bool(USER32.PostMessageW(hwnd, WM_CLOSE, 0, 0))
 
@@ -306,15 +301,13 @@ def _stage_module(source_dll, token):
     stage = (ROOT / "build" / f"{BUILD_PREFIX}{token}").resolve()
     stage.mkdir(parents=True, exist_ok=False)
     copied = []
-    for name in ("vc_stream.dll", "turbojpeg.dll", "libpyrowave-shared-1.dll"):
+    for name in ("vc_stream.dll",):
         origin = source_dll.parent / name
-        if name == "vc_stream.dll":
-            _require(origin.is_file(), f"release DLL is missing: {origin}")
-        if origin.is_file():
-            target = stage / name
-            shutil.copy2(origin, target)
-            copied.append({"name": name, "source": str(origin),
-                           "staged": str(target), "sha256": _sha256(target)})
+        _require(origin.is_file(), f"release DLL is missing: {origin}")
+        target = stage / name
+        shutil.copy2(origin, target)
+        copied.append({"name": name, "source": str(origin),
+                       "staged": str(target), "sha256": _sha256(target)})
     return stage, stage / "vc_stream.dll", copied
 
 
@@ -330,7 +323,7 @@ def _source_config(mode, window, transform, gpu_convert):
 
 
 def _codec_raw():
-    return dll._codec_config("raw", None, None, None, None)
+    return dll._codec_config("raw", None, None, None)
 
 
 def _sender_request(cfg, session, source, source_mac, stats, hashlog):
@@ -448,7 +441,7 @@ def _validate_sender_ready_source(ready, cfg, session, source):
 
 
 def _validate_sender_stats(tx_stats, cfg, session, source):
-    smoke.validate_tx_stats(tx_stats, True, cfg["frames"], cfg["total_packets"],
+    smoke.validate_tx_stats(tx_stats, cfg["frames"], cfg["total_packets"],
                             session, "TX stats")
     _require(smoke.is_int(tx_stats.get("source_skipped"))
              and tx_stats["source_skipped"] >= 0,
@@ -513,6 +506,8 @@ def _cleanup_entry(api, entry, label):
 
 def run_combo(api, run_dir, token, name, source, width, height, frames,
               resize=None, fixture_hwnd=None):
+    _require(source.get("gpu_convert") is True,
+             f"{name}: desktop capture is GPU-only; gpu_convert=false is not allowed")
     cfg = smoke.build_config(frames, FPS, width, height, MTU, 1)
     tx_session = f"src-{token}-{name}-tx"
     rx_session = f"src-{token}-{name}-rx"
@@ -574,9 +569,9 @@ def run_combo(api, run_dir, token, name, source, width, height, frames,
             }
 
         tx_final = _wait_done(api, tx_handle, tx_session, f"{name} TX",
-                              time.monotonic() + cfg["phase_timeout_s"])
+                              time.monotonic() + cfg["stream_timeout_s"])
         rx_final = _wait_done(api, rx_handle, rx_session, f"{name} RX",
-                              time.monotonic() + cfg["phase_timeout_s"])
+                              time.monotonic() + cfg["stream_timeout_s"])
         entry["sessions"]["sender"]["final"] = tx_final
         entry["sessions"]["receiver"]["final"] = rx_final
 
@@ -584,7 +579,7 @@ def run_combo(api, run_dir, token, name, source, width, height, frames,
         rx_stats = smoke.read_json(rx_stats_path, f"{name} RX stats")
         entry["stats"] = {"tx": tx_stats, "rx": rx_stats}
         fps_actual, final_source = _validate_sender_stats(tx_stats, cfg, tx_session, source)
-        smoke.validate_rx_stats(rx_stats, True, frames, rx_session, True,
+        smoke.validate_rx_stats(rx_stats, frames, rx_session, True,
                                 f"{name} RX stats")
         for role, stats in (("TX", tx_stats), ("RX", rx_stats)):
             smoke.require_adapter(stats.get("adapter"), f"{name} {role} stats")
@@ -702,6 +697,8 @@ def _read_partial_rows(path, label):
 
 
 def run_close_lifecycle(api, run_dir, token, source, fixture):
+    _require(source.get("gpu_convert") is True,
+             "wgc-close: desktop capture is GPU-only; gpu_convert=false is not allowed")
     name = "wgc-close"
     close_frame_bytes = WGC_WIDTH * WGC_HEIGHT * 3 // 2
     close_payload = MTU - smoke.PACKET_OVERHEAD
@@ -714,7 +711,7 @@ def run_close_lifecycle(api, run_dir, token, source, fixture):
         "frame_bytes": close_frame_bytes,
         "total_packets": (close_frame_bytes + close_payload - 1) // close_payload,
         "ready_timeout_s": 15.0,
-        "phase_timeout_s": 30.0,
+        "stream_timeout_s": 30.0,
     }
     session = f"src-{token}-{name}-tx"
     source_mac = dll._random_source_mac()
@@ -789,17 +786,16 @@ def _dda_unavailable(error):
 
 
 def run_combos(api, run_dir, token, allow_dda_unavailable=False):
-    testwin = None
-    testwin_hwnd = None
     fixture_process = None
     fixture_hwnd = None
     fixture_title = FIXTURE_TITLE_PREFIX + token
     combos = []
     dda_blocked = None
     try:
-        testwin, testwin_hwnd = _start_testwin(DEFAULT_TESTWIN)
+        fixture_process, fixture_hwnd = _start_fixture(
+            fixture_title, RESIZE_TO[0] - 160, 360)
         dda_specs = (
-            ("dda-cpu-stretch", _source_config("dda", "", "stretch", False),
+            ("dda-gpu-stretch", _source_config("dda", "", "stretch", True),
              DDA_WIDTH, DDA_HEIGHT, DDA_FRAMES),
             ("dda-gpu-fill", _source_config("dda", "", "fill", True),
              DDA_WIDTH, WGC_HEIGHT, DDA_FRAMES),
@@ -828,14 +824,10 @@ def run_combos(api, run_dir, token, allow_dda_unavailable=False):
                     "source": source,
                     "dda_error": dda_blocked,
                 })
-        combos.append({"fixture": _stop_process(testwin, testwin_hwnd)})
-        testwin = None
 
-        fixture_process, fixture_hwnd = _start_fixture(
-            fixture_title, RESIZE_TO[0] - 160, 360)
         combos.append(run_combo(
-            api, run_dir, token, "wgc-cpu-crop-resize",
-            _source_config("wgc", fixture_title, "crop", False),
+            api, run_dir, token, "wgc-gpu-crop-resize",
+            _source_config("wgc", fixture_title, "crop", True),
             WGC_WIDTH, WGC_HEIGHT, RESIZE_FRAMES,
             resize={"after_frames": RESIZE_AFTER_FRAMES,
                     "width": RESIZE_TO[0], "height": RESIZE_TO[1]},
@@ -846,13 +838,12 @@ def run_combos(api, run_dir, token, allow_dda_unavailable=False):
             WGC_WIDTH, WGC_HEIGHT, WGC_FRAMES))
         combos.append(run_close_lifecycle(
             api, run_dir, token,
-            _source_config("wgc", fixture_title, "crop", False),
+            _source_config("wgc", fixture_title, "crop", True),
             (fixture_process, fixture_hwnd)))
         combos.append({"fixture_cleanup": _stop_process(fixture_process)})
         fixture_process = None
         return combos
     finally:
-        _terminate_silently(testwin)
         _terminate_silently(fixture_process)
 
 
@@ -886,7 +877,7 @@ def _print_record(value):
 
 
 def self_check():
-    source = _source_config("wgc", "Self Check Window", "crop", False)
+    source = _source_config("wgc", "Self Check Window", "crop", True)
     cfg = smoke.build_config(10, FPS, WGC_WIDTH, WGC_HEIGHT, MTU, 1)
     mac = dll._random_source_mac()
     request = _sender_request(cfg, "self-tx", source, mac,
@@ -895,10 +886,18 @@ def self_check():
     _require(set(request["source"]) == {"mode", "pattern", "output", "window",
                                         "transform", "gpu_convert"},
              "self-check: source config keys")
+    _require(source["gpu_convert"] is True,
+             "self-check: desktop capture must be GPU-only")
     _require(request["adapter"] == smoke.LOOPBACK, "self-check: adapter")
     _require(_validate_nv12_stats_selfcheck(), "self-check: NV12 statistics")
+    _require(_dda_unavailable(dll.DllError(
+                 "DDA output is not available: no outputs (0x887A0002)")),
+             "self-check: missing-DXGI-output classification")
+    _require(not _dda_unavailable(dll.DllError("WGC capture item closed")),
+             "self-check: unrelated failures must not be treated as DDA blocked")
     return {"source_keys": sorted(source), "frames": cfg["frames"],
-            "fps": cfg["fps"], "geometry": [cfg["width"], cfg["height"]]}
+            "fps": cfg["fps"], "geometry": [cfg["width"], cfg["height"]],
+            "gpu_convert": source["gpu_convert"]}
 
 
 def _validate_nv12_stats_selfcheck():
@@ -970,8 +969,8 @@ def execute(args, source_dll, run_dir, token, report):
     report["adapters_text"] = adapters_text
 
     report["scope"] = ("same-process vc_stream.dll ABI v1, same-host Npcap Loopback, "
-                       "private windows and SHM; not a 240 fps, physical-link, "
-                       "two-machine or capacity acceptance")
+                       "GPU-only desktop capture, private window and SHM; not a 240 fps, "
+                       "physical-link, two-machine or capacity acceptance")
     report["combos"] = run_combos(api, run_dir, token,
                                   allow_dda_unavailable=args.allow_dda_unavailable)
     blocked = [combo for combo in report["combos"]

@@ -1,44 +1,40 @@
-"""本地总闸：改代码必跑（无需第二台）
-默认构建+双自检+对账+pytest；--no-build跳构建，--live加回环"""
-import argparse, os, subprocess, sys
+"""Rust 本地总闸：格式、测试、Clippy、Release 与独立协议/图案参考。
 
-ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+默认不打开网卡或采集桌面；--live Loopback 显式增加本机 DLL 诊断，不能作为双机验收。
+"""
+import argparse
+from pathlib import Path
+import subprocess
+import sys
 
-
-def step(name, argv, env=None):
-    print("== %s: %s" % (name, " ".join(argv)), flush=True)
-    rc = subprocess.run(argv, cwd=ROOT, env=env).returncode
-    print("%s %s (rc=%d)" % ("PASS" if rc == 0 else "FAIL", name, rc), flush=True)
-    if rc != 0:
-        sys.exit(rc)
+ROOT = Path(__file__).resolve().parents[1]
+MANIFEST = str(ROOT / "rust/Cargo.toml")
 
 
-def exe(name):
-    # cmake VS generator writes build/Release/<name>; fall back to build/<name>.
-    for p in (os.path.join(ROOT, "build", "Release", name), os.path.join(ROOT, "build", name)):
-        if os.path.isfile(p):
-            return p
-    print("FAIL missing %s (build first: see docs/runbooks/build.md)" % name)
-    sys.exit(2)
+def step(name, argv):
+    print(f"== {name}: {subprocess.list2cmdline([str(a) for a in argv])}", flush=True)
+    code = subprocess.call([str(a) for a in argv], cwd=ROOT)
+    print(f"{'PASS' if code == 0 else 'FAIL'} {name} (rc={code})", flush=True)
+    if code:
+        raise SystemExit(code)
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--no-build", action="store_true")
-    ap.add_argument("--live", default="", help="adapter substring for live loopback tests")
-    a = ap.parse_args()
-
-    if not a.no_build:
-        step("cmake-configure", ["cmake", "-S", ".", "-B", "build"])
-        step("cmake-build", ["cmake", "--build", "build", "--config", "Release"])
-    step("sender-selftest", [exe("vc-sender.exe"), "--selftest"])
-    step("receiver-selftest", [exe("vc-receiver.exe"), "--selftest"])
-    step("pattern-ref", [sys.executable, "ctrl/pattern_ref.py"])
-    env = dict(os.environ)
-    if a.live:
-        env["VC_ADAPTER"] = a.live
-    step("pytest", [sys.executable, "-m", "pytest", "ctrl/tests", "-q"], env=env)
-    print("ALL PASS")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--no-build", action="store_true", help="省略 Release 重建，其他门禁仍执行")
+    parser.add_argument("--live", choices=["Loopback"], help="显式启用本机 Npcap Loopback 诊断")
+    args = parser.parse_args()
+    step("fmt", ["cargo", "fmt", "--manifest-path", MANIFEST, "--all", "--check"])
+    step("rust-tests", ["cargo", "test", "--manifest-path", MANIFEST, "--workspace", "--locked"])
+    step("clippy", ["cargo", "clippy", "--manifest-path", MANIFEST, "--workspace", "--all-targets", "--locked", "--", "-D", "warnings"])
+    if not args.no_build:
+        step("release", ["cargo", "build", "--manifest-path", MANIFEST, "--workspace", "--release", "--locked"])
+    step("pattern-reference", [sys.executable, "-I", ROOT / "rust/tests/reference/pattern_ref.py"])
+    step("wire-vectors", [sys.executable, "-I", ROOT / "rust/tests/transport_vectors.py", "--skip-cargo"])
+    step("dll-smoke-self-check", [sys.executable, "-I", ROOT / "rust/tests/dll_stream_smoke.py", "--self-check"])
+    if args.live:
+        step("dll-loopback", [sys.executable, "-I", ROOT / "rust/tests/dll_stream_smoke.py", "--package", ROOT / "rust/target/release"])
+    print("ALL PASS（仅表示本次执行的 Rust 门禁，未执行的硬件/GUI验收不计入）", flush=True)
 
 
 if __name__ == "__main__":

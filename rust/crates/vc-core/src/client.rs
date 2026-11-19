@@ -64,8 +64,8 @@ impl PeerClient {
             return Err(format!("{path} 请求失败：未配置被采集机地址。"));
         }
         let url = format!("{}{path}", self.base);
-        // Fresh NIC enumeration can take 10s native + 15s PowerShell, plus capability
-        // probing. Keep ordinary health/stats responsive, but let preflight finish.
+        // 刷新 NIC 枚举需 10s 原生调用 + 15s PowerShell，另加能力探测。
+        // 普通 health/stats 保持快速响应，但让 preflight 跑到完成。
         let timeout = if matches!(
             path,
             "/adapters" | "/adapters?refresh=true" | "/sender/prepare" | "/sender/start"

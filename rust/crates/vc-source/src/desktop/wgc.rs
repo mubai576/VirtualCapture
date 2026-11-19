@@ -1,4 +1,4 @@
-//! Windows Graphics Capture（`sender/wgc.h` 的 Rust 实现）。
+//! Windows Graphics Capture 与硬件 GPU 转换；旧 `sender/wgc.h` 仅保留在 Git 历史。
 //!
 //! 与 DDA 同构：帧来自 DWM 合成，窗口模式按标题子串选择（不含本进程窗口）。
 //! 帧池回调始终把最新帧放进 `pending`，采集线程最多等待 20 ms；`Closed` 或
@@ -20,9 +20,7 @@ use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, RPC_E_CHANGED_MODE};
-use windows::Win32::Graphics::Direct3D11::{
-    D3D11_BOX, D3D11_TEXTURE2D_DESC, ID3D11Device, ID3D11DeviceContext, ID3D11Texture2D,
-};
+use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Texture2D};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -38,9 +36,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
 use windows::core::{BOOL, HRESULT, IInspectable, Interface, factory};
 
 use super::gpu::GpuConverter;
-use super::util::{create_device, create_staging_texture, with_mapped_texture};
+use super::util::create_device;
 use crate::SourceConfig;
-use crate::transform::{Transform, TransformMode, bgra_to_nv12};
+use crate::transform::{Transform, TransformMode};
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(20);
 /// 重建帧池前等待在途回调退出 `pool_gate` 的上限（与 native 的 1s 一致）。
@@ -315,8 +313,6 @@ fn closed_handler(
 }
 
 pub(crate) struct WgcSource {
-    device: ID3D11Device,
-    context: ID3D11DeviceContext,
     rt_device: IDirect3DDevice,
     item: GraphicsCaptureItem,
     pool: Option<Direct3D11CaptureFramePool>,
@@ -324,15 +320,13 @@ pub(crate) struct WgcSource {
     frame_token: Option<i64>,
     closed_token: Option<i64>,
     shared: Arc<WgcSharedState>,
-    staging: Option<ID3D11Texture2D>,
-    staging_width: u32,
-    staging_height: u32,
     source_width: u32,
     source_height: u32,
     output_width: u32,
     output_height: u32,
     transform_mode: TransformMode,
-    gpu: Option<GpuConverter>,
+    /// 桌面采集固定走硬件 GPU 转换，没有 `Option` 或 CPU 兜底。
+    gpu: GpuConverter,
     adapter_name: String,
     pool_width: u32,
     pool_height: u32,
@@ -420,15 +414,11 @@ impl WgcSource {
         let source_height = item_size.Height as u32;
         Transform::new(source_width, source_height, width, height, transform_mode)?;
 
-        // GPU 转换器先于帧池/会话建立：失败时不会留下已启动的采集会话。
-        let gpu = if config.gpu_convert {
-            Some(
-                GpuConverter::new(&device.device, &device.context, width, height)
-                    .context("gpu_convert requested but WGC GPU converter initialization failed")?,
-            )
-        } else {
-            None
-        };
+        // GPU 转换器先于帧池/会话建立：失败时不会留下已启动的采集会话，
+        // 且失败即打开失败，不换 CPU/WARP。
+        let gpu = GpuConverter::new(&device.device, &device.context, width, height).context(
+            "WGC GPU 转换器初始化失败（桌面采集必须使用硬件 D3D11 GPU，不回退 CPU/WARP）",
+        )?;
 
         let shared = Arc::new(WgcSharedState::new(skipped.clone()));
         let closed_token = item.Closed(&closed_handler(&shared)).context(
@@ -453,8 +443,6 @@ impl WgcSource {
         session.StartCapture().context("WGC StartCapture failed")?;
 
         Ok(Self {
-            device: device.device,
-            context: device.context,
             rt_device,
             item,
             pool: Some(pool),
@@ -462,9 +450,6 @@ impl WgcSource {
             frame_token: Some(frame_token),
             closed_token: Some(closed_token),
             shared,
-            staging: None,
-            staging_width: 0,
-            staging_height: 0,
             source_width,
             source_height,
             output_width: width,
@@ -578,88 +563,15 @@ impl WgcSource {
         )
         .context("WGC source/output geometry is unsupported")?;
 
-        let result = if let Some(gpu) = &self.gpu {
-            gpu.convert(&texture, &transform, destination)
-                .context("gpu_convert failed; not falling back to CPU")
-        } else {
-            self.convert_cpu(
-                &texture,
-                &transform,
-                source_width,
-                source_height,
-                destination,
-            )
-        };
+        let result = self
+            .gpu
+            .convert(&texture, &transform, destination)
+            .context("WGC GPU 转换失败；桌面采集不回退 CPU/WARP");
         let _ = frame.Close();
         result?;
         self.source_width = source_width;
         self.source_height = source_height;
         Ok(true)
-    }
-
-    fn convert_cpu(
-        &mut self,
-        texture: &ID3D11Texture2D,
-        transform: &Transform,
-        source_width: u32,
-        source_height: u32,
-        destination: &mut [u8],
-    ) -> Result<()> {
-        let copy = transform.copy_rect(self.transform_mode, source_width, source_height);
-        if !copy.valid()
-            || copy
-                .x
-                .checked_add(copy.w)
-                .is_none_or(|right| right > source_width)
-            || copy
-                .y
-                .checked_add(copy.h)
-                .is_none_or(|bottom| bottom > source_height)
-        {
-            bail!("WGC frame copy rectangle falls outside the content area");
-        }
-        self.ensure_staging(copy.w, copy.h)?;
-        let staging = self
-            .staging
-            .as_ref()
-            .context("WGC staging texture missing")?;
-        let source_box = D3D11_BOX {
-            left: copy.x,
-            top: copy.y,
-            front: 0,
-            right: copy.x + copy.w,
-            bottom: copy.y + copy.h,
-            back: 1,
-        };
-        unsafe {
-            self.context
-                .CopySubresourceRegion(staging, 0, 0, 0, 0, texture, 0, Some(&source_box));
-        }
-        let identity;
-        let sampling = if self.transform_mode == TransformMode::Crop {
-            identity = Transform::identity(self.output_width, self.output_height);
-            &identity
-        } else {
-            transform
-        };
-        with_mapped_texture(&self.context, staging, copy.h, |data, pitch| {
-            bgra_to_nv12(data, pitch, sampling, destination)
-        })
-    }
-
-    fn ensure_staging(&mut self, width: u32, height: u32) -> Result<()> {
-        if self.staging.is_some() && self.staging_width == width && self.staging_height == height {
-            return Ok(());
-        }
-        self.staging = Some(create_staging_texture(
-            &self.device,
-            width,
-            height,
-            DXGI_FORMAT_B8G8R8A8_UNORM,
-        )?);
-        self.staging_width = width;
-        self.staging_height = height;
-        Ok(())
     }
 
     /// 在采集线程（不是 FrameArrived 回调）重建帧池。先撤销 FrameArrived，

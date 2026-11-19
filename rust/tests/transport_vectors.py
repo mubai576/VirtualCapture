@@ -1,173 +1,141 @@
-"""Cross-check the Rust transport crate against the real C++ wire implementation.
+"""Regenerate and cross-check the frozen vc-transport golden vectors in Python.
 
-Builds a throwaway generator against proto/vc_wire.h, common/crc32.h and common/fnv1a.h,
-writes rust/crates/vc-transport/tests/vectors.txt (with --write) and compares the output
-when the fixture already exists. Then runs the crate's Rust tests in an isolated scratch
-workspace to keep the cross-language check independent of GPUI and the rest of the
-workspace. Finally turns the same C++ packets into a temporary classic pcap under
-build/vc-transport-check/run/ and drives the standalone vc-transport CLI (inspect and
-replay, including a pcapng rejection) to prove the real diagnostic entry point.
+The oracle is standard-library-only (integer xorshift32, `zlib.crc32` and the
+independent `reference/fnv1a.py`) and needs no C++ compiler, headers or legacy
+tools.  `rust/crates/vc-transport/tests/vectors.txt` is frozen: by default this
+script regenerates the expected text and requires an exact match, and it
+refuses to overwrite an existing fixture that differs.  `--write` only creates
+a missing fixture (and leaves a matching one untouched).
+
+With cargo enabled it then runs the crate's Rust tests in an isolated scratch
+workspace, turns the same packets into a temporary classic pcap under
+build/vc-transport-check/run/, and drives the standalone vc-transport CLI
+(inspect and replay, including a pcapng rejection).  `--skip-cargo` performs
+only the pure-Python vector comparison.
 
 Run: python -I rust/tests/transport_vectors.py [--write] [--skip-cargo]
 No captures, NICs, registry or DSHOW operations are performed.
 """
 import argparse
 import json
-import os
-from pathlib import Path
-import shutil
 import struct
 import subprocess
+import sys
+from pathlib import Path
+import shutil
+import zlib
 
 ROOT = Path(__file__).resolve().parents[2]
 CRATE = ROOT / "rust/crates/vc-transport"
 FIXTURE = CRATE / "tests/vectors.txt"
-WORK = ROOT / "build/vc-transport-vectors"
 SCRATCH = ROOT / "build/vc-transport-check"
 
-GENERATOR = r"""
-#include <cstdio>
-#include <cstdint>
-#include <cstring>
-#include <string>
-#include <vector>
-#include "proto/vc_wire.h"
-#include "common/crc32.h"
-#include "common/fnv1a.h"
+REFERENCE_DIR = Path(__file__).resolve().parent / "reference"
+if str(REFERENCE_DIR) not in sys.path:
+    sys.path.insert(0, str(REFERENCE_DIR))
+from fnv1a import fnv1a64  # noqa: E402
 
-static void hex(const uint8_t* p, size_t n) {
-  for (size_t i = 0; i < n; i++) printf("%02x", p[i]);
-}
-
-static std::string hex_string(const std::vector<uint8_t>& data) {
-  static const char* dig = "0123456789abcdef";
-  std::string out;
-  out.reserve(data.size() * 2);
-  for (uint8_t b : data) { out.push_back(dig[b >> 4]); out.push_back(dig[b & 0xF]); }
-  return out;
-}
-
-static std::vector<uint8_t> xorshift_bytes(size_t n, uint32_t seed) {
-  std::vector<uint8_t> out(n);
-  uint32_t s = seed ? seed : 1;
-  for (size_t i = 0; i < n; i++) {
-    s ^= s << 13; s ^= s >> 17; s ^= s << 5;
-    out[i] = (uint8_t)(s & 0xFF);
-  }
-  return out;
-}
-
-static void checksums(const std::string& label, const std::vector<uint8_t>& data) {
-  printf("crc32 %s %08x\n", label.c_str(), vc_crc32(data.data(), data.size()));
-  printf("fnv64 %s %016llx\n", label.c_str(),
-         (unsigned long long)vc_fnv1a64(data.data(), data.size()));
-}
-
-int main() {
-  printf("# generated from proto/vc_wire.h, common/crc32.h, common/fnv1a.h\n");
-  std::vector<uint8_t> empty;
-  std::vector<uint8_t> ascii = {'1','2','3','4','5','6','7','8','9'};
-  std::vector<uint8_t> ramp(256);
-  for (int i = 0; i < 256; i++) ramp[i] = (uint8_t)i;
-  checksums("-", empty);
-  checksums(hex_string(ascii), ascii);
-  checksums(hex_string(ramp), ramp);
-
-  vc_pkt_hdr_t h{};
-  memset(&h, 0, sizeof h);
-  h.magic = VC_MAGIC; h.frame_id = 0x01020304; h.seq = 5; h.total = 69;
-  h.qpc_ns = 0x1122334455667788ull; h.payload_crc = 0xDEADBEEFu;
-  h.payload_len = 8958; h.flags = 1; h.pattern = 4;
-  printf("header %u %u %u %llu %u %u %u %u ", h.frame_id, h.seq, h.total,
-         (unsigned long long)h.qpc_ns, h.payload_crc, h.payload_len, h.flags, h.pattern);
-  hex((const uint8_t*)&h, sizeof h); printf("\n");
-
-  // 640x640 default geometry: mtu 9000 and diagnostic mtu 1500.
-  size_t b = (size_t)VC_FRAME_W * VC_FRAME_H * 3 / 2;
-  size_t p9 = 9000 - 42, p15 = 1500 - 42;
-  size_t t9 = (b + p9 - 1) / p9, t15 = (b + p15 - 1) / p15;
-  printf("geometry %d %d %zu %d %zu %zu %zu\n", VC_FRAME_W, VC_FRAME_H, b, 9000, p9, t9,
-         b - (t9 - 1) * p9);
-  printf("geometry %d %d %zu %d %zu %zu %zu\n", VC_FRAME_W, VC_FRAME_H, b, 1500, p15, t15,
-         b - (t15 - 1) * p15);
-
-  // 64x64 raw frame, fragmented exactly like the sender (mtu 1500).
-  const uint32_t fid = 77;
-  std::vector<uint8_t> frame = xorshift_bytes(64 * 64 * 3 / 2, 0x12345678u);
-  const size_t pmax = 1458;
-  const size_t total = (frame.size() + pmax - 1) / pmax;
-  printf("frame %u %zu %016llx\n", fid, frame.size(),
-         (unsigned long long)vc_fnv1a64(frame.data(), frame.size()));
-
-  struct Part { uint16_t seq; size_t len; uint32_t crc; const uint8_t* data; };
-  std::vector<Part> parts;
-  for (size_t s = 0; s < total; s++) {
-    size_t off = s * pmax;
-    size_t len = (s == total - 1) ? frame.size() - off : pmax;
-    parts.push_back(Part{(uint16_t)s, len, vc_crc32(frame.data() + off, len), frame.data() + off});
-  }
-  auto emit = [&](const char* kind, const Part& p, uint32_t crc) {
-    printf("%s %u %u %zu %zu %08x %u %u %llu ", kind, fid, p.seq, total,
-           p.len, crc, 0u, 4u, (unsigned long long)424242ull);
-    hex(p.data, p.len);
-    printf("\n");
-  };
-  // Deliberately scrambled arrival order with a bad-CRC copy and a duplicate:
-  // seq 3, bad seq 0, valid seq 0, seq 4, seq 1, duplicate seq 1, seq 2.
-  emit("packet", parts[3], parts[3].crc);
-  emit("badcrc", parts[0], parts[0].crc ^ 1u);
-  emit("packet", parts[0], parts[0].crc);
-  emit("packet", parts[4], parts[4].crc);
-  emit("packet", parts[1], parts[1].crc);
-  emit("dup", parts[1], parts[1].crc);
-  emit("packet", parts[2], parts[2].crc);
-  return 0;
-}
-"""
+# Frozen wire contract (proto/vc_wire.h): 28-byte little-endian packed header.
+VC_MAGIC = 0x56434150
+VC_FRAME_W = 640
+VC_FRAME_H = 640
+PACKET_OVERHEAD = 42  # 14-byte Ethernet + 28-byte VC header
 
 
-def find_vcvars():
-    vswhere = Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / \
-        "Microsoft Visual Studio/Installer/vswhere.exe"
-    if not vswhere.is_file():
-        raise RuntimeError("vswhere.exe not found; install Visual Studio C++ build tools")
-    out = subprocess.check_output([
-        str(vswhere), "-latest", "-products", "*",
-        "-requires", "Microsoft.VisualStudio.Component.VC.Tools.x86.x64",
-        "-property", "installationPath",
-    ], text=True).strip()
-    if not out:
-        raise RuntimeError("No Visual Studio installation with C++ tools")
-    vcvars = Path(out) / "VC/Auxiliary/Build/vcvars64.bat"
-    if not vcvars.is_file():
-        raise RuntimeError(f"vcvars64.bat not found: {vcvars}")
-    return vcvars
+def xorshift_bytes(count, seed):
+    """xorshift32 stream, one low byte per iteration, uint32 wrapping."""
+    state = seed & 0xFFFFFFFF or 1
+    out = bytearray(count)
+    for index in range(count):
+        state ^= (state << 13) & 0xFFFFFFFF
+        state ^= state >> 17
+        state ^= (state << 5) & 0xFFFFFFFF
+        state &= 0xFFFFFFFF
+        out[index] = state & 0xFF
+    return bytes(out)
 
 
-def build_and_run():
-    WORK.mkdir(parents=True, exist_ok=True)
-    source = WORK / "gen.cpp"
-    source.write_text(GENERATOR, encoding="utf-8")
-    vcvars = find_vcvars()
-    # Write a .bat to avoid cmd /c quote-unquoting issues with "Program Files (x86)".
-    batch = WORK / "build.bat"
-    batch.write_text(
-        "@echo off\r\n"
-        f'call "{vcvars}" >nul\r\n'
-        f'cl /nologo /std:c++17 /O2 /EHsc /I"{ROOT}" "{source}" '
-        f'/Fe:"{WORK / "gen.exe"}" /Fo:"{WORK / "gen.obj"}"\r\n',
-        encoding="ascii",
-        newline="\r\n",
-    )
-    built = subprocess.run(["cmd", "/c", str(batch)], cwd=WORK, capture_output=True,
-                           text=True, encoding="utf-8", errors="replace")
-    if built.returncode:
-        raise RuntimeError(f"C++ generator build failed:\n{built.stdout}\n{built.stderr}")
-    result = subprocess.run([str(WORK / "gen.exe")], cwd=WORK, capture_output=True,
-                            text=True, encoding="utf-8", errors="replace")
-    if result.returncode:
-        raise RuntimeError(f"C++ generator failed:\n{result.stderr}")
-    return result.stdout
+def crc32(data):
+    return zlib.crc32(data) & 0xFFFFFFFF
+
+
+def hex_string(data):
+    return data.hex()
+
+
+def checksums(label, data):
+    return [
+        "crc32 %s %08x" % (label, crc32(data)),
+        "fnv64 %s %016x" % (label, fnv1a64(data)),
+    ]
+
+
+def generate():
+    """Build the exact frozen vector text without any C++ involvement."""
+    lines = ["# generated from proto/vc_wire.h, common/crc32.h, common/fnv1a.h"]
+    lines += checksums("-", b"")
+    lines += checksums(hex_string(b"123456789"), b"123456789")
+    lines += checksums(hex_string(bytes(range(256))), bytes(range(256)))
+
+    header = struct.pack(
+        "<IIHHQIHBB", VC_MAGIC, 0x01020304, 5, 69,
+        0x1122334455667788, 0xDEADBEEF, 8958, 1, 4)
+    lines.append("header 16909060 5 69 1234605616436508552 3735928559 8958 1 4 "
+                 + header.hex())
+
+    frame_bytes = VC_FRAME_W * VC_FRAME_H * 3 // 2
+    for mtu in (9000, 1500):
+        payload_max = mtu - PACKET_OVERHEAD
+        total = (frame_bytes + payload_max - 1) // payload_max
+        tail = frame_bytes - (total - 1) * payload_max
+        lines.append("geometry %d %d %d %d %d %d %d"
+                     % (VC_FRAME_W, VC_FRAME_H, frame_bytes, mtu,
+                        payload_max, total, tail))
+
+    frame_id = 77
+    frame = xorshift_bytes(64 * 64 * 3 // 2, 0x12345678)
+    payload_max = 1458
+    total = (len(frame) + payload_max - 1) // payload_max
+    lines.append("frame %d %d %016x" % (frame_id, len(frame), fnv1a64(frame)))
+
+    parts = []
+    for seq in range(total):
+        offset = seq * payload_max
+        length = len(frame) - offset if seq == total - 1 else payload_max
+        part = frame[offset:offset + length]
+        parts.append((seq, length, crc32(part), part))
+
+    def emit(kind, part, crc):
+        seq, length, _part_crc, payload = part
+        lines.append("%s %d %d %d %d %08x %d %d %d %s"
+                     % (kind, frame_id, seq, total, length, crc, 0, 4, 424242,
+                        payload.hex()))
+
+    # Deliberately scrambled arrival order with a bad-CRC copy and a duplicate:
+    # seq 3, bad seq 0, valid seq 0, seq 4, seq 1, duplicate seq 1, seq 2.
+    emit("packet", parts[3], parts[3][2])
+    emit("badcrc", parts[0], parts[0][2] ^ 1)
+    emit("packet", parts[0], parts[0][2])
+    emit("packet", parts[4], parts[4][2])
+    emit("packet", parts[1], parts[1][2])
+    emit("dup", parts[1], parts[1][2])
+    emit("packet", parts[2], parts[2][2])
+    return "\n".join(lines) + "\n"
+
+
+def check_fixture(generated, write):
+    if not FIXTURE.is_file():
+        if not write:
+            raise SystemExit(f"missing frozen fixture {FIXTURE}; rerun with --write")
+        FIXTURE.write_text(generated, encoding="utf-8", newline="\n")
+        print(f"wrote {FIXTURE} ({len(generated.splitlines())} lines)")
+        return
+    existing = FIXTURE.read_text(encoding="utf-8")
+    if existing != generated:
+        raise SystemExit(
+            "Python vectors differ from the frozen rust/crates/vc-transport/tests/"
+            "vectors.txt; refusing to alter it")
+    print("Python vectors match rust/crates/vc-transport/tests/vectors.txt")
 
 
 def prepare_scratch():
@@ -191,7 +159,7 @@ def run_rust_tests(manifest):
 
 
 def golden_packets(generated):
-    """Turn the C++ packet lines into real Ethernet frames plus the expected frame hash."""
+    """Turn the packet lines into real Ethernet frames plus the expected frame hash."""
     packets = []
     expected = None
     for line in generated.splitlines():
@@ -207,14 +175,14 @@ def golden_packets(generated):
             if len(payload) != int(length):
                 raise RuntimeError(f"vector length mismatch: {line[:40]}")
             header = struct.pack(
-                "<IIHHQIHBB", 0x56434150, int(fid), int(seq), int(total),
+                "<IIHHQIHBB", VC_MAGIC, int(fid), int(seq), int(total),
                 int(qpc_ns), int(crc, 16), int(length), int(flags), int(pattern))
             ethernet = (bytes([0x02, 0, 0, 0, 0, 1]) +      # dst
                         bytes([0x02, 0, 0, 0, 0, 2]) +      # src
                         b"\x88\xb5" + header + payload)
             packets.append((kind, ethernet))
     if expected is None:
-        raise RuntimeError("C++ vectors missing frame line")
+        raise RuntimeError("vectors missing frame line")
     return packets, expected
 
 
@@ -243,7 +211,7 @@ def cargo_cli(manifest, args, expect_failure=False):
 
 
 def run_cli_roundtrip(manifest, generated):
-    """Replay the C++ golden packets through the real CLI as a temporary pcap."""
+    """Replay the golden packets through the real CLI as a temporary pcap."""
     packets, expected = golden_packets(generated)
     run_dir = SCRATCH / "run"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -311,19 +279,15 @@ def run_cli_roundtrip(manifest, generated):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--write", action="store_true", help="Rewrite tests/vectors.txt")
-    parser.add_argument("--skip-cargo", action="store_true", help="Only cross-check vectors")
+    parser.add_argument("--write", action="store_true",
+                        help="create tests/vectors.txt only if it is missing; never "
+                             "overwrite a differing frozen fixture")
+    parser.add_argument("--skip-cargo", action="store_true",
+                        help="only regenerate/compare the Python vectors")
     args = parser.parse_args()
-    generated = build_and_run()
-    if args.write or not FIXTURE.is_file():
-        FIXTURE.write_text(generated, encoding="utf-8", newline="\n")
-        print(f"wrote {FIXTURE} ({len(generated.splitlines())} lines)")
-    else:
-        existing = FIXTURE.read_text(encoding="utf-8")
-        if existing != generated:
-            raise SystemExit("C++ vectors differ from tests/vectors.txt; rerun with --write")
-        print("C++ vectors match tests/vectors.txt")
-    summary = {"ok": True, "fixture": str(FIXTURE), "generator": str(WORK / "gen.cpp")}
+    generated = generate()
+    check_fixture(generated, args.write)
+    summary = {"ok": True, "fixture": str(FIXTURE), "oracle": "python-stdlib"}
     if not args.skip_cargo:
         manifest = prepare_scratch()
         output = run_rust_tests(manifest)

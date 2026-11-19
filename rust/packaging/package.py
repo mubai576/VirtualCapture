@@ -1,13 +1,8 @@
-"""Build and verify the Rust-R3 Windows portable ZIP without replacing legacy dist.
+"""构建并验证 Rust Windows 便携包：python -I rust/packaging/package.py --allow-dirty。
 
-Run: python -I rust/packaging/package.py --allow-dirty
-
-The package contains only the Rust product plus the native runtime DLLs it
-loads.  The legacy C++ product (vc-sender/vc-receiver/vc-vcam.dll) is neither
-built nor copied here; ``python scripts/verify.py`` remains a separate legacy
-gate and is intentionally not invoked by this Rust-only packager.
-
-Development requirements: MSVC, CMake, Cargo, pytest, pefile, Pillow and Npcap.
+产品与隔离验证器均由 Cargo 构建；CMake 仅提供固定 PyroWave 第三方运行库。
+开发环境：Windows x64、MSVC、CMake、Cargo、pefile、Pillow、Npcap。
+完整门禁成功才发布到唯一 dist 目录；不替换任何既有部署。
 """
 import argparse
 from datetime import datetime, timezone
@@ -81,8 +76,8 @@ def run(argv, log, cwd=ROOT):
 
 
 def native_cmake_args():
-    """Match the repository's configured generator when one is available."""
-    cache = ROOT / "build/CMakeCache.txt"
+    """复用原生依赖构建目录的生成器，不再依赖旧工程缓存。"""
+    cache = NATIVE_BUILD / "CMakeCache.txt"
     if cache.is_file():
         for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
             if line.startswith("CMAKE_GENERATOR:INTERNAL="):
@@ -196,8 +191,7 @@ def support_files(stage):
         "the applicable Microsoft Visual Studio license terms. Windows OS DLLs, graphics "
         "drivers and the Npcap kernel driver are not redistributed in this archive. "
         "PyroWave additionally requires a Vulkan 1.3-capable graphics driver at runtime; "
-        "vulkan-1.dll is not bundled. turbojpeg.dll is the pinned libjpeg-turbo 3.1.2 "
-        "shared build used by the Rust MJPEG module.\n",
+        "vulkan-1.dll is not bundled. No CPU codec fallback is included.\n",
         encoding="utf-8")
 
 
@@ -261,8 +255,9 @@ def manifest(stage, source, version, licenses, imports, tag, checks):
         "checks": dict(checks),
         "limits": [
             "No Rust dual-PC/240fps/long-run acceptance",
-            "Raw is default; MJPEG/PyroWave require explicit opt-in and exact backend match",
-            "No MJPEG/PyroWave dual-PC or quality acceptance",
+            "Raw is default; PyroWave requires explicit opt-in and exact backend match",
+            "GPU desktop conversion only; no CPU MJPEG backend",
+            "No PyroWave dual-PC or quality acceptance",
             "No full DShow registration test",
             "Npcap driver must be installed separately",
             "PyroWave requires a Vulkan 1.3-capable driver; vulkan-1.dll is not bundled",
@@ -307,8 +302,7 @@ def main():
         if source["dirty"]:
             log.write("Reviewed dirty worktree status (--allow-dirty):\n")
             log.write("\n".join(source["status"]) + "\n\n")
-        log.write("Legacy scripts/verify.py is a separate required gate; "
-                  "this Rust package does not run or copy the C++ product.\n\n")
+        log.write("Rust 产品构建与验收；CMake 只构建第三方 PyroWave。\n\n")
         run(["cargo", "fmt", "--manifest-path", "rust/Cargo.toml", "--all", "--check"], log)
         run(["cargo", "test", "--manifest-path", "rust/Cargo.toml", "--workspace", "--locked"], log)
         run(["cargo", "clippy", "--manifest-path", "rust/Cargo.toml", "--workspace",
@@ -334,13 +328,12 @@ def main():
                 "sources": list(inventory.SOURCES),
                 "stream_abi": inventory.STREAM_ABI,
             },
-            "native_source_version": json.loads((ROOT / "version.json").read_text(encoding="utf-8")),
+            "gpu_only": True,
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
         # Stage a complete OTA-valid manifest before testing the extracted
         # candidate. Pending checks are promoted only after their command passes.
         checks = {
-            "legacy_verify": "external (scripts/verify.py)",
             "rust_tests": "passed",
             "fmt": "passed",
             "clippy": "passed",

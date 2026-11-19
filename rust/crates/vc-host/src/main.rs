@@ -107,6 +107,10 @@ struct HostApp {
     snapshot: Snapshot,
     peer_input: Entity<InputState>,
     update_token: Entity<InputState>,
+    /// 显式 MTU 输入框；点击 1500/9000 芯片时同步写入该值。
+    mtu_input: Entity<InputState>,
+    /// 输入框本地校验错误；只影响展示，不写入配置。
+    mtu_error: Option<String>,
     startup_notice: Option<String>,
     show_details: bool,
     show_updates: bool,
@@ -140,17 +144,19 @@ impl HostApp {
             theme.colors.ring = rgb(ACCENT).into();
         });
         let controller = host::spawn();
-        let (initial_peer, startup_notice) = match Config::load_root() {
+        let (initial_peer, initial_mtu, startup_notice) = match Config::load_root() {
             Ok(config) => (
                 config
                     .peer_url
                     .strip_prefix("http://")
                     .unwrap_or(&config.peer_url)
                     .to_owned(),
+                config.capture.mtu.to_string(),
                 None,
             ),
             Err(error) => (
                 String::new(),
+                "9000".to_owned(),
                 Some(format!("配置读取失败：{error}；修复文件后重新打开。")),
             ),
         };
@@ -158,6 +164,11 @@ impl HostApp {
             InputState::new(window, cx)
                 .placeholder("192.168.2.59:5143")
                 .default_value(initial_peer)
+        });
+        let mtu_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("1500..9000")
+                .default_value(initial_mtu)
         });
         let update_token = cx.new(|cx| {
             InputState::new(window, cx)
@@ -175,6 +186,8 @@ impl HostApp {
             snapshot,
             peer_input,
             update_token,
+            mtu_input,
+            mtu_error: None,
             startup_notice,
             show_details: false,
             show_updates: false,
@@ -254,6 +267,74 @@ impl HostApp {
                 .plan
                 .as_ref()
                 .is_some_and(|plan| plan.can_start)
+    }
+
+    /// 本机所选接收网卡报告的 NlMtu；未选或系统未报告时为 None。
+    fn host_nic_mtu(&self) -> Option<u32> {
+        self.snapshot
+            .host_adapters
+            .iter()
+            .find(|item| item.name == self.snapshot.host_adapter)
+            .and_then(|item| item.mtu)
+    }
+
+    /// 被采集机发送网卡的 MTU 预览：显式选择按名称匹配，自动模式只接受
+    /// 唯一 Intel I226；多张 I226 返回错误而不是猜一张。
+    fn peer_nic_mtu(&self) -> Result<Option<u32>, String> {
+        if !self.snapshot.peer_adapter.is_empty() {
+            return Ok(self
+                .snapshot
+                .peer_adapters
+                .iter()
+                .find(|item| item.name == self.snapshot.peer_adapter)
+                .and_then(|item| item.mtu));
+        }
+        Ok(vc_core::adapters::unique_i226(&self.snapshot.peer_adapters)?.and_then(|item| item.mtu))
+    }
+
+    /// 本次生效 MTU 的说明：自动模式取主机解析结果，显式模式取配置值。
+    fn effective_mtu_text(&self) -> String {
+        match (
+            self.snapshot.config.capture.mtu_auto,
+            self.snapshot.effective_mtu,
+        ) {
+            (true, Some(value)) => format!("{value}（自动）"),
+            (true, None) => "待解析".into(),
+            (false, _) => format!("{}（显式）", self.snapshot.config.capture.mtu),
+        }
+    }
+
+    /// 网卡实际 MTU 与本次生效 MTU 的说明文本，供设置区与链路预算共用。
+    fn mtu_hint(&self) -> String {
+        let host = self
+            .host_nic_mtu()
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "未知".into());
+        let peer = match self.peer_nic_mtu() {
+            Ok(Some(value)) => value.to_string(),
+            Ok(None) => "未知".into(),
+            Err(_) => "I226 不唯一".into(),
+        };
+        format!(
+            "网卡实际 MTU：本机 {host} · 被采集机 {peer}；生效 MTU：{}",
+            self.effective_mtu_text()
+        )
+    }
+
+    /// 校验输入框并写入显式 MTU；输入值不合法时只提示，不修改配置。
+    fn apply_mtu(&mut self, cx: &mut Context<Self>) {
+        let raw = self.mtu_input.read(cx).value().trim().to_string();
+        match raw.parse::<u32>() {
+            Ok(mtu) if (1500..=9000).contains(&mtu) => {
+                self.mtu_error = None;
+                self.send(Command::PatchCapture(
+                    json!({"mtu_auto": false, "mtu": mtu}),
+                ));
+            }
+            Ok(_) => self.mtu_error = Some("MTU 必须在 1500..9000 之间。".into()),
+            Err(_) => self.mtu_error = Some("MTU 必须是整数。".into()),
+        }
+        cx.notify();
     }
 
     fn header(&self, cx: &mut Context<Self>) -> Div {
@@ -500,7 +581,7 @@ impl HostApp {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(TEXT_DIM))
-                            .child("跟随设备的控制连接"),
+                            .child("优先唯一 Intel I226，否则跟随控制连接"),
                     ),
             );
         if !locked {
@@ -633,6 +714,7 @@ impl HostApp {
             )
             .child(key_value("预计线上开销", &wire))
             .child(key_value("预留后可用", &capacity))
+            .child(key_value("链路 MTU", &self.effective_mtu_text()))
             .child(key_value("虚拟采集卡", vcam))
             .child(
                 div()
@@ -1146,7 +1228,7 @@ impl HostApp {
                                 "{} / NV12 / {}",
                                 match c.codec.as_str() {
                                     "raw" => "Raw 无压缩",
-                                    "mjpeg" => "MJPEG 有损",
+                                    "mjpeg" => "MJPEG（不受支持）",
                                     "pyrowave" => "PyroWave 小波",
                                     _ => "未知编码",
                                 },
@@ -1291,28 +1373,90 @@ impl HostApp {
                             [("dda", "DDA 桌面"), ("wgc", "WGC"), ("pattern", "测试图案")]
                                 .into_iter()
                                 .map(|(value, label)| {
+                                    // 桌面来源只走 GPU 转换；测试图案是合成源，必须显式关闭。
                                     self.chip(
                                         cx,
                                         label,
                                         c.mode == value,
-                                        json!({"mode":value}),
+                                        json!({
+                                            "mode": value,
+                                            "gpu_convert": value != "pattern",
+                                        }),
                                         enabled,
                                     )
                                 }),
                         ),
                 ),
             )
+            .child(divider())
+            .child(
+                setting_row("链路 MTU").child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex()
+                                .flex_wrap()
+                                .items_center()
+                                .gap_2()
+                                .child(self.mtu_chip(
+                                    cx,
+                                    "自动（按网卡）",
+                                    c.mtu_auto,
+                                    json!({"mtu_auto": true}),
+                                    enabled,
+                                    None,
+                                ))
+                                .child(self.mtu_chip(
+                                    cx,
+                                    "1500",
+                                    !c.mtu_auto && c.mtu == 1500,
+                                    json!({"mtu_auto": false, "mtu": 1500}),
+                                    enabled,
+                                    Some(1500),
+                                ))
+                                .child(self.mtu_chip(
+                                    cx,
+                                    "9000",
+                                    !c.mtu_auto && c.mtu == 9000,
+                                    json!({"mtu_auto": false, "mtu": 9000}),
+                                    enabled,
+                                    Some(9000),
+                                ))
+                                .child(
+                                    div()
+                                        .w(px(96.))
+                                        .h(px(34.))
+                                        .child(Input::new(&self.mtu_input)),
+                                )
+                                .child(
+                                    Button::new("apply-mtu")
+                                        .label("应用")
+                                        .compact()
+                                        .disabled(!enabled)
+                                        .on_click(cx.listener(|this, _, _, cx| this.apply_mtu(cx))),
+                                ),
+                        )
+                        .when_some(self.mtu_error.clone(), |this, error| {
+                            this.child(div().text_size(px(11.)).text_color(rgb(ERR)).child(error))
+                        })
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(rgb(TEXT_DIM))
+                                .child(self.mtu_hint()),
+                        ),
+                ),
+            )
     }
 
-    fn chip(
-        &self,
-        cx: &mut Context<Self>,
-        label: &str,
-        selected: bool,
-        patch: Value,
-        enabled: bool,
-    ) -> Button {
-        let mut chip = Button::new(SharedString::from(format!("chip:{patch}")))
+    /// 芯片按钮的统一外观；点击行为由调用方附加。
+    fn chip_style(&self, label: &str, id: String, selected: bool, enabled: bool) -> Button {
+        Button::new(SharedString::from(id))
             .label(label.to_owned())
             .outline()
             .selected(selected)
@@ -1329,12 +1473,48 @@ impl HostApp {
                 ACCENT
             } else {
                 TEXT_DIM
-            }));
+            }))
+    }
+
+    fn chip(
+        &self,
+        cx: &mut Context<Self>,
+        label: &str,
+        selected: bool,
+        patch: Value,
+        enabled: bool,
+    ) -> Button {
+        let mut chip = self.chip_style(label, format!("chip:{patch}"), selected, enabled);
         if enabled {
             chip =
                 chip.on_click(cx.listener(move |this, _, _, _| {
                     this.send(Command::PatchCapture(patch.clone()))
                 }));
+        }
+        chip
+    }
+
+    /// MTU 芯片：点击时同步输入框，避免“芯片已选中但输入框仍是旧值”。
+    fn mtu_chip(
+        &self,
+        cx: &mut Context<Self>,
+        label: &str,
+        selected: bool,
+        patch: Value,
+        enabled: bool,
+        sync: Option<u32>,
+    ) -> Button {
+        let mut chip = self.chip_style(label, format!("mtu-chip:{patch}"), selected, enabled);
+        if enabled {
+            chip = chip.on_click(cx.listener(move |this, _, window, app| {
+                this.mtu_error = None;
+                if let Some(value) = sync {
+                    this.mtu_input.update(app, |state, cx| {
+                        state.set_value(value.to_string(), window, cx)
+                    });
+                }
+                this.send(Command::PatchCapture(patch.clone()));
+            }));
         }
         chip
     }
@@ -1559,7 +1739,7 @@ impl HostApp {
             );
         }
         for event in events.into_iter().take(6) {
-            // Worker timestamps use a fixed ASCII prefix, followed by the event message.
+            // 工作线程时间戳是固定长度的 ASCII 前缀，其后为事件正文。
             let (time, message) = if event.len() >= 10 && event.is_char_boundary(10) {
                 event.split_at(10)
             } else {
@@ -1946,8 +2126,8 @@ fn peer_url_from_input(raw: &str) -> Option<String> {
     let url = format!("http://{host}:{port}");
     vc_core::config::valid_peer_url(&url).then_some(url)
 }
-/// Keep the ROOT entry stable. Older helpers only install the version directory;
-/// the new host creates the missing entry before acknowledging its first frame.
+/// 保持 ROOT 图形入口稳定。旧 helper 只安装版本目录；新主机在确认首帧前
+/// 补齐缺失的 ROOT 入口。
 fn install_graphical_entry() -> Result<(), String> {
     use std::io::Write;
     let root = vc_core::paths::root();
@@ -1963,7 +2143,7 @@ fn install_graphical_entry() -> Result<(), String> {
         .parent()
         .ok_or("无法定位应用目录。")?
         .join("VirtualCapture.exe");
-    // Development/synthetic payloads predating the graphical entry remain valid.
+    // 早于图形入口的开发/合成载荷没有该文件，保持兼容而不是报错。
     if !source.is_file() {
         return Ok(());
     }
@@ -2001,8 +2181,8 @@ fn main() {
         eprintln!("启动中止：当前版本指针无效：{error}");
         std::process::exit(2);
     }
-    // Existing 0.2.0 roots only have scripts. Promote the graphical entry
-    // after the new host starts, so the fixed ROOT gains it without a reinstall.
+    // 已有 0.2.0 固定 ROOT 只有脚本入口；新主机启动后补齐图形入口，
+    // 无需重新安装即可让固定 ROOT 获得 VirtualCapture.exe。
     if let Err(error) = install_graphical_entry() {
         eprintln!("无法创建图形启动入口：{error}");
         std::process::exit(2);

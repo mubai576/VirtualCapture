@@ -17,7 +17,7 @@ ROOT = Path(__file__).resolve().parents[2]
 parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--package", type=Path, help="Exercise an extracted portable package instead of debug outputs")
 args = parser.parse_args()
-NATIVE = args.package.resolve() if args.package else ROOT / "build/Release"
+NATIVE = args.package.resolve() if args.package else ROOT / "rust/target/debug"
 HOST = NATIVE / "vc-host.exe" if args.package else ROOT / "rust/target/debug/vc-host.exe"
 RUN = ROOT / "run" / ("rust-gui-smoke-" + uuid.uuid4().hex[:10])
 RUN.mkdir(parents=True)

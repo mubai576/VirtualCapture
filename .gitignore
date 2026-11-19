@@ -15,6 +15,8 @@ prev/
 *.log
 /vc-config.json
 /vc-rust-config.json
+/update-token.json
+/update-peer-token.json
 /.claude/
 *.pdb
 thirdparty/ninja-win.zip

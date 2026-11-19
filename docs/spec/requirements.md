@@ -1,24 +1,24 @@
-# 2K240本机显示 + 640x640@240 NV12跨机采集方案
+# VirtualCapture 当前需求
 
-## Summary
-* 目标：PC1保持`2K240`正常使用，只取`640x640@240 NV12`给PC2，性能以`640@240`为下线，之后只许转NV12一次，不许二次有损压缩。
-* 链路：软采2K240 → GPU裁/缩到640 → RGB转NV12一次 → 2.5G网线直连L2裸发 → PC2重组 → 虚拟采集卡。
+## 目标与边界
 
-## Implementation Changes
-* 采集端：DXGI抓2K240 backbuffer，GPU居中裁/缩到640，矩阵与真卡对齐，输出`NV12 12 bits per pixel`，单帧`width*height*3/2`即614400B。
-* 传输：Npcap L2自定义EtherType如0x88B5，网卡不配IP，MTU 9000，`~69包/帧，16.5k pps，~1.2Gbps`；`decreases number of pps`，`Fewer packets per byte, lower CPU`；单帧不跨帧`Packets SHALL NOT include data from multiple frames`；`must use pcap to send RAW Ethernet`，经`WritePacketData`直写网线；`Defender does not see any open sockets`，`Below tcpip.sys only NDIS.sys`；跨路由不可达`not reliable path for arbitrary Layer-2 EtherType`故必须直连。
-> SUPERSEDED-NOTE 2026-10-22: the no-IP rule in the line above is void (shared-NIC, PLAN S11). Budget numbers stand - measured ~1.18Gbps (S23).
-* 接收+虚拟卡：按frame_id/timestamp重组，缺包整帧丢等下一帧；环形只留最新1帧；虚拟端暴露`YUY2,NV12,RGB24,P010,MJPEG`中的NV12 640x640 AvgTimePerFrame 41666，不跟墙钟，因`doesn't handle reference clock correctly`；DShow/MF二选一，DShow虚拟对MF不可见`DirectShow-only invisible to Media Foundation`。
-* 弃用项：MJPEG`each frame is JPEG`且`JPEG is lossy`；NDI `~15:1 visually lossless`；Moonlight`H.264/H.265 feed`，均有损出局。
-> SUPERSEDED-NOTE 2026-11-13（PLAN D21/D23）：默认与验收路径仍为 Raw，无损判据不变；D21 另行批准开发版
-> 每帧独立 MJPEG，D23 则把 H.264/H.265 从项目移除。原文的有损出局结论只代表当时需求分析。
+被采集机保持 2K240 正常使用，以 DDA/WGC 采集、硬件 GPU 裁切/缩放和 BGRA→NV12，经2.5G网线传到主机，输出 DirectShow NV12 虚拟采集卡。只负责采集与传输，不做推理或独占全屏 Hook。
 
-## Test Plan
-* 带宽/pps：9000下`69包/帧`持续240Hz无丢，`102k pps`仅作反例验证1500不可用。
-* 无损：NV12平面逐字节对比，RGB→NV12矩阵与真卡一致，无DCT。
-> SCOPE-NOTE 2026-10-23（PLAN D8）：本项目只管采集与传输，推理不在范围。下两条中"推理"相关部分作废：延迟口径改为 PC1 采集完成→PC2 重组完成；兼容验收止于虚拟卡出口（通用 DShow 客户端枚举 + 逐字节一致）。
-* 延迟：采集到推理Read<4.16ms，抖动<1帧，FIFO堆积为0。
-* 兼容：推理枚举到虚拟NV12 640@240，`raw-injected frame does not reach local socket`故必须双机联调。
+产品统一 Rust：采集后台 `vc-capture`、主机 GPUI `vc-host`、进程内 `vc_stream.dll` 与 Rust COM `vc_vcam.dll`。不得回退旧 C++/Python 产品。
 
-## Assumptions
-* 双Win，2.5G直连，全链9000，Npcap可装；NV12的420下采样可接受，之后零压缩；推理开卡方式DShow/MF/私有SDK待设备到手确认；640为居中裁默认。
+## 会话与性能约束
+
+- 默认640×640@240、Raw、DDA、GPU转换；预设416/640/720p/1080p/1440p和自定义偶数尺寸，crop/fit/fill/stretch。选项存在不代表该组合达标。
+- 桌面转换仅硬件 GPU，无 CPU/WARP 降级。PyroWave 可显式启用 Vulkan1.3 GPU 计算；CPU MJPEG 已移除。仍允许 Npcap、hash、SHM、GPU上传/回读等必要 CPU 工作，不声称全链零CPU/零拷贝。
+- 数据为 Npcap raw L2 EtherType `0x88B5`，冻结28B头；同一物理网卡保留IPv4控制，不要求移除IP。
+- 优先唯一 Intel I226；多卡歧义须选择。MTU可手动配置，新配置默认读取双端网卡有效值，不修改驱动参数。
+- Raw NV12整帧614400B（640²）、@240约1.18Gbps像素载荷；MTU9000为69包/帧。预算包含L2开销与预留；超过容量拒绝，不能偷偷改编码/尺寸/fps。
+- Raw完整像素FNV对账；有损只要求传输完整和解码/出口一致，画质单独验收。缺包不发布半帧，有界队列，停止后D12仅可重复最后好帧。
+
+## 验收
+
+冻结T0–T5与D1门限见 `.agents/skills/virtualcapture/references/test-matrix.md`。性能用motion并记录尺寸/fps/batch/adapter；跨机不相减QPC，Loopback不当双机证据。
+
+Rust完整交付仍需：物理网卡整帧发送、双机240fps/长稳、DDA实采、编码画质、完整DShow编排、GUI非空白硬门及完整包/OTA。旧双机自动编排工具已移除，Rust等价工具缺口必须补齐后才可自动判T1–T5；当前缺测不放宽门限。
+
+历史实用版本与证据保留，不因本重构自动部署或切换。现状以 PLAN 和带日期的 bring-up 报告为准。

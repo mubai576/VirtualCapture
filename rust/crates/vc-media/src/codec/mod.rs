@@ -1,17 +1,17 @@
-//! Windows 编解码控制器：Raw NV12、MJPEG（TurboJPEG）、PyroWave（Vulkan）。
+//! Windows 编解码控制器：Raw NV12 与 PyroWave（Vulkan GPU 计算）。
 //!
 //! 公开 API 只接受 [`CodecConfig`] 与会话几何；后端身份在 [`crate::validate`]
 //! 中精确校验。编码输出为既有 48B VCAU 封装 + 编码载荷；Raw 直接返回 NV12。
 //! 解码先验证封装/哈希/kind/codec/尺寸/帧号，再校验编码载荷本身。
 //! PyroWave 在 `open` 返回前用同几何合成 NV12 完成一次真实编解码预热，
 //! 强制创建 Vulkan 管线；预热帧/哈希不进入正式帧号与统计。
+//! MJPEG（wire id 3）的 CPU/SIMD 后端已移除，打开时明确拒绝。
 //! 没有任何自动回退：后端缺失、身份不符或解码失败都明确报错。
 
 mod deadline;
 mod device;
 mod dll;
 mod pyrowave;
-mod turbojpeg;
 
 pub use deadline::OperationState;
 
@@ -23,7 +23,7 @@ use serde_json::{Value, json};
 use vc_transport::Geometry;
 
 use crate::au::{AuSession, parse_au};
-use crate::config::{CodecConfig, validate};
+use crate::config::{CodecConfig, MJPEG_UNSUPPORTED, validate};
 
 use dll::DllDirectory;
 
@@ -132,8 +132,7 @@ fn warmup_pyrowave_decoder(
 
 enum EncoderKind {
     Raw,
-    Mjpeg(turbojpeg::MjpegEncoder),
-    PyroWave(pyrowave::PyroWaveEncoder),
+    PyroWave(Box<pyrowave::PyroWaveEncoder>),
 }
 
 /// 单帧编码器；同一时间只允许一帧在途（由调用方串行使用）。
@@ -209,22 +208,12 @@ impl Encoder {
         let geometry = Geometry::new(width, height)?;
         let kind = match config.codec.as_str() {
             "raw" => EncoderKind::Raw,
-            "mjpeg" => {
-                let directory = library_directory(directory)?;
-                EncoderKind::Mjpeg(turbojpeg::MjpegEncoder::open(
-                    &directory,
-                    config.jpeg_quality,
-                    config.max_au_bytes,
-                    width,
-                    height,
-                    fps,
-                )?)
-            }
+            "mjpeg" => anyhow::bail!("{MJPEG_UNSUPPORTED}"),
             "pyrowave" => {
                 let directory = library_directory(directory)?;
-                EncoderKind::PyroWave(pyrowave::PyroWaveEncoder::open(
+                EncoderKind::PyroWave(Box::new(pyrowave::PyroWaveEncoder::open(
                     &directory, config, width, height, fps, state,
-                )?)
+                )?))
             }
             other => anyhow::bail!("codec={other} 不受支持"),
         };
@@ -260,7 +249,6 @@ impl Encoder {
         );
         match &mut self.kind {
             EncoderKind::Raw => Ok(nv12.to_vec()),
-            EncoderKind::Mjpeg(codec) => codec.encode(nv12, frame_id),
             EncoderKind::PyroWave(codec) => codec.encode(nv12, frame_id),
         }
     }
@@ -279,7 +267,6 @@ impl Encoder {
                 "compression": false,
                 "experimental": false,
             }),
-            EncoderKind::Mjpeg(codec) => codec.settings(),
             EncoderKind::PyroWave(codec) => codec.settings(),
         }
     }
@@ -287,8 +274,7 @@ impl Encoder {
 
 enum DecoderKind {
     Raw,
-    Mjpeg(turbojpeg::MjpegDecoder),
-    PyroWave(pyrowave::PyroWaveDecoder),
+    PyroWave(Box<pyrowave::PyroWaveDecoder>),
 }
 
 /// 单帧解码器；每帧独立，断档时调用 [`Decoder::reset`]。
@@ -363,21 +349,12 @@ impl Decoder {
         let geometry = Geometry::new(width, height)?;
         let kind = match config.codec.as_str() {
             "raw" => DecoderKind::Raw,
-            "mjpeg" => {
-                let directory = library_directory(directory)?;
-                DecoderKind::Mjpeg(turbojpeg::MjpegDecoder::open(
-                    &directory,
-                    config.jpeg_quality,
-                    width,
-                    height,
-                    fps,
-                )?)
-            }
+            "mjpeg" => anyhow::bail!("{MJPEG_UNSUPPORTED}"),
             "pyrowave" => {
                 let directory = library_directory(directory)?;
-                DecoderKind::PyroWave(pyrowave::PyroWaveDecoder::open(
+                DecoderKind::PyroWave(Box::new(pyrowave::PyroWaveDecoder::open(
                     &directory, width, height, fps, state,
-                )?)
+                )?))
             }
             other => anyhow::bail!("codec={other} 不受支持"),
         };
@@ -417,14 +394,6 @@ impl Decoder {
                 );
                 Ok(au.to_vec())
             }
-            DecoderKind::Mjpeg(codec) => {
-                let session = AuSession::mjpeg(self.width, self.height, self.fps);
-                let unit = parse_au(au, session, frame_id, self.config.max_au_bytes)?;
-                if unit.is_eos() {
-                    return Ok(Vec::new());
-                }
-                codec.decode(unit.payload)
-            }
             DecoderKind::PyroWave(codec) => {
                 let session = AuSession::pyrowave(self.width, self.height, self.fps);
                 let unit = parse_au(au, session, frame_id, self.config.max_au_bytes)?;
@@ -440,7 +409,6 @@ impl Decoder {
     pub fn reset(&mut self) -> Result<()> {
         match &mut self.kind {
             DecoderKind::Raw => Ok(()),
-            DecoderKind::Mjpeg(codec) => codec.reset(),
             DecoderKind::PyroWave(codec) => codec.reset(),
         }
     }
@@ -459,7 +427,6 @@ impl Decoder {
                 "compression": false,
                 "experimental": false,
             }),
-            DecoderKind::Mjpeg(codec) => codec.settings(),
             DecoderKind::PyroWave(codec) => codec.settings(),
         }
     }

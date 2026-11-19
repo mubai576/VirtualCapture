@@ -1,48 +1,18 @@
-# Rust 产品路径（D26–D28，独立开发分支）
+# Rust 产品与控制契约
 
-本文件只约束 `rust/`。旧 C++/Python 产品契约不变；允许重新设计 Rust 控制 API 不等于解冻 28B wire。
-Rust 产品宿主通过版本化 `vc_stream.dll` C ABI v1 在进程内运行采集/接收，不再拉起
-`vc-sender.exe`/`vc-receiver.exe`；独立 `vc-stream.exe` 诊断入口与 DLL 复用同一 crate 实现。
-DShow 使用 Rust `vc_vcam.dll`；`vc-vcam-verify.exe` 只作隔离只读能力探测。旧 C++ 二进制不进入
-Rust 发布包，也没有运行回退。Rust-R3 仍未验收，边界见文末。
+产品仅Rust，不保留旧C++/Python运行回退。控制API重设计不解冻28B wire。当前开发验收状态见PLAN，默认Raw，显式开发编码仅PyroWave。
 
-## 拓扑与构建
+## 拓扑、入口与目录
 
-- 被采集机：`vc-capture` CLI，默认 `0.0.0.0:5143`，无 GUI；由 `vc-core` 进程内加载 `vc_stream.dll` 启动 sender。
-- 主机：`vc-host` GPUI 原生客户端，直接调用 `vc-core::host::HostController`，没有本机 REST 服务；
-  本机 receiver 与虚拟卡管理同样使用 Rust 模块。
-- `vc-core` 不依赖 GPUI，拥有配置/预算/会话/数据面模块/虚拟卡管理与主机编排。产品数据面不再是
-  sender/receiver CLI 子进程；`vc-stream` 的 cdylib 导出 C ABI v1（`vc_module_get_api`），
-  start/status/stop/destroy/capabilities，start 异步排队；stop/destroy 仅返回 0 才确认已释放，1 表示 pending 可重试。
-  destroy 的其他返回码表示句柄状态未知，不得重试或卸载 DLL，保留到进程退出。Rust ABI 不导出。`vc-core` 自身的 C ABI SDK 外观仍未实现，与 DShow DLL 用途不同。
-- `vc-source`（pattern/DDA/WGC 与四种整数变换）和 `vc-media`（Raw/MJPEG/PyroWave，动态加载固定
-  TurboJPEG/PyroWave DLL）被 `vc-stream` DLL/CLI 与产品共用；DLL 与独立 EXE 共享同一实现。
-- `vc-vcam` 是 Rust COM/DShow source filter `vc_vcam.dll`，复用兼容 CLSID/注册表语义并读取 SHM v3；
-  注册前由兼容工具 `vc-vcam-verify.exe --dll <dll> --capabilities` 隔离子进程探测，不注册 COM。
-- `cargo build --manifest-path rust/Cargo.toml --locked`；依赖锁在 `rust/Cargo.lock`。
-  Windows 产物含 `vc_stream.dll`/`vc_vcam.dll` 与 `vc-host`/`vc-capture`/`vc-updater`/`vc-stream`/
-  `vc-transport`/`vc-launcher`/`vc-vcam-diag` EXE。
-- 两个入口都支持 `--root <runtime>`、`--native-dir <native-output>`。`VC_ROOT` / `VC_NATIVE_DIR` 也可指定。
-  `--root` 优先；相对根自动沿 exe 向上找 AGENTS/version.json，便携布局回退 exe 目录。
-  数据面模块按显式目录 → Managed 当前 release → build → ROOT → exe 目录解析 `vc_stream.dll`；
-  不存在时明确失败，不搜索或回退旧 sender/receiver。
-- 独立便携ZIP由 `python -I rust/packaging/package.py --allow-dirty` 构建，唯一dist目录；载荷以
-  `rust/packaging/inventory.py` 为准：Rust EXE、`vc_stream.dll`、`vc_vcam.dll`、固定
-  `turbojpeg.dll`/`libpyrowave-shared-1.dll`、`vc-vcam-verify.exe`、app-local MSVC DLL、许可与
-  SHA-256 清单；不含Npcap驱动，也不含旧C++产品（出现即拒绝）。原生运行库由
-  `rust/packaging/native/CMakeLists.txt` 单独构建，根 CMake 旧产品不变。
-  主机日常入口`VirtualCapture.exe`（构建产物`vc-launcher.exe`）使用Windows GUI子系统与原生图标，直接解析current并拉起GPUI，
-  不调用CMD/PowerShell；支持`--root`/`--native-dir`及对应环境变量，默认根为入口所在目录；在release目录内运行时识别外层固定ROOT。
-  启动日志/不含令牌的PID回执写`<data>/run/host-*`，失败弹出原生消息框。0.2.0通过OTA进入本版时，新host首帧前补齐ROOT入口，
-  已有入口保留。原`Start-Host.cmd`/PowerShell仅兼容诊断；`Start-Capture.cmd`直接运行CLI。
-  采集启动器无参数默认`0.0.0.0:15143`，可直接传exe参数`--port`/`--bind`；exe本身与主机省略端口仍5143。
-  CLI控制台保留供Ctrl+C退出；主机Release使用Windows图形子系统，自行分配隐藏控制台，避免启动器把GPUI主窗口一起隐藏。
-  新包含`vc-updater.exe`，可通过Rust更新端点暂存；不兼容旧Python OTA，不自动部署或注册DShow。
-- `--root`始终是固定运行根。有`app/current.json`的managed根使用`app/releases/<build_id>/`程序，
-  `data/vc-rust-config.json`配置、`data/run/`证据、`updates/{staged,worker,incoming}/`与`updates/history.jsonl`更新事务。
-  无current的扁平根保留`ROOT/vc-rust-config.json`与`ROOT/run/`，首次激活只复制配置/令牌到data，旧文件不移动；
-  回滚首次更新移除指针即可恢复扁平布局，已有运行证据不迁移/覆盖。启动器按current选择程序，native-dir显式覆盖优先。
-- 不读取/迁移/覆盖旧Python `vc-config.json`。配置不存在使用默认；语法损坏/版本未知明确失败，保存同目录临时文件刷盘后原子替换。
+- 被采集机 `vc-capture` 为REST v2 CLI，直接运行默认 `0.0.0.0:5143`；便携 `Start-Capture.cmd` 无参数默认15143。主机省略端口仍5143，必须填写实际 `IPv4:端口`。
+- 主机 `vc-host` 为GPUI原生客户端，直接调用UI无关的 `vc-core::host::HostController`，没有本机REST或浏览器UI。
+- 宿主通过 `vc_module_get_api` 加载 `vc_stream.dll` C ABI v1，list_adapters/start/status/stop/destroy/capabilities；start异步排队。DLL与独立诊断 `vc-stream.exe` 共用vc-source/vc-media/vc-transport实现，不拉起旧sender/receiver。
+- DShow为Rust `vc_vcam.dll`；隔离工具 `vc-vcam-verify.exe` 也由Cargo构建，既支持只读能力探测，也支持实际COM graph验证，不注册、不回退注册枚举。vc-core自身的通用C ABI SDK外观尚未实现。
+- 产品唯一workspace/锁为 `rust/Cargo.toml` / `rust/Cargo.lock`，构建/门禁/唯一完整包见 `docs/runbooks/build.md`。CMake仅构建固定PyroWave第三方库，旧根CMake已移除。
+- 两入口接受 `--root` / `--native-dir` 与 `VC_ROOT` / `VC_NATIVE_DIR`，CLI优先。显式native目录缺文件即失败；通常按显式目录→Managed当前release→build→ROOT→exe目录查找Rust模块，不补旧产品。源码运行应显式指向Rust产物目录。
+- 日常GUI入口 `VirtualCapture.exe`（Cargo产物vc-launcher）为Windows GUI子系统+图标，直接解析current并启动GPUI，不用CMD/PowerShell。回执/日志写data/run/host-*，无令牌；错误用原生消息框。采集控制台保留供Ctrl+C退出。
+- ROOT固定。有 `app/current.json` 时：`app/releases/<build_id>/`程序、`data/vc-rust-config.json`配置、`data/run/`证据、`updates/{staged,worker,incoming}/`与history.jsonl。无current保留扁平配置/run，首次激活只复制配置/凭据，不搬动旧证据；回滚指针恢复旧布局。
+- 不读取/迁移旧Python `vc-config.json`。Rust配置缺失才用默认；语法/版本错误明确失败，保存临时文件刷盘后原子替换。入口不自动部署/接管旧服务/注册真实虚拟卡。
 
 ## REST v2
 
@@ -62,25 +32,39 @@ Rust 发布包，也没有运行回退。Rust-R3 仍未验收，边界见文末�
 | POST | `/sender/stop` | `{session_id}`；匹配后停止，错误会话不得停当前活动进程；停止后可幂等重复 |
 | GET | `/sender/stats` | 数据面 stats 合并 session_id/running/adapter/pid/exit_code；异常含 error/log_tail |
 
-SenderRequest 全部字段：
+SenderRequest示例（实际主机下发完整capture并逐字段确认，不凭缺省值确认）：
 
 ```json
 {"capture":{"mode":"pattern","pattern":"motion","gpu_convert":false,"fps":60,"frames":120,
-"mtu":9000,"width":416,"height":416,"transform":"crop","codec":"raw",
-"dst_mac":"ff:ff:ff:ff:ff:ff"},
-"session_id":"s-example","source_mac":"02:01:02:03:04:05","auto_adapter":true,"adapter":""}
+"mtu":9000,"mtu_auto":false,"width":416,"height":416,"transform":"crop","codec":"raw",
+"dst_mac":"ff:ff:ff:ff:ff:ff"},"session_id":"s-example","source_mac":"02:01:02:03:04:05",
+"auto_adapter":true,"adapter":""}
 ```
 
-capture 其他字段采用 Config 默认；主机实际下发完整 capture 并逐字段比对响应，不凭省略值确认。
-PreparedSession 为 `{capture,batch_packets,session_id,source_mac,adapter:AdapterInfo}`。`capture.batch` 已删除；Raw 物理网卡 batch 按准确尺寸/MTU计算为一整帧并一次提交，编码按实际AU整帧单次queue。Npcap Loopback 只用于显式本机诊断，因其不支持大 sendqueue，Raw 固定 batch1 并按包提交；该例外不用于产品性能或双机结论。该控制契约不兼容 API revision 1；旧C++ sender CLI 的 `--batch` 契约不变，二者不混用。
-会话号3..80 ASCII字母/数字/连字符，不接受路径；源MAC必须本地管理单播。
-两端产品列表仅保留 Windows 明确 `hardware_interface=true` 且 `virtual=false` 的设备，显式排除回环；
-元数据未知不当作物理设备。展示、自动选择、手动选择、prepare/start统一使用该列表，不允许手填隐藏设备绕过。
-主机枚举失败清空旧列表；已保存接收选择若不再合格则清除，要求手动重选，不静默换到另一张卡。
-没有合格的已选物理接收网卡不能启动。被采集机自动选择按控制连接出站IPv4唯一匹配，不选首卡。
-`vc-capture --list-adapters`保留完整诊断枚举；后台显式`--allow-loopback-diagnostics`后才允许本机回环控制器使用
-`\Device\NPF_Loopback`，不把回环速率冒充物理容量。普通GUI不会选择或启用诊断回环。
-主机先 prepare，再将确认的精确网卡名固定在 start 中，不在启动时静默换卡。
+PreparedSession为 `{capture,batch_packets,session_id,source_mac,adapter:AdapterInfo}`；capture.batch不再是配置项。会话号3..80 ASCII字母/数字/连字符，不是路径；源MAC须本地管理单播，仅隔离流，不是认证，不改系统MAC。
+
+## 网卡与MTU
+
+- AdapterInfo有 `mtu: u32|null`（IPv4 NlMtu），旧对端缺字段可反序列化但不能据此证明MTU。查询只读Get-NetAdapter/Get-NetIPInterface，不Set、不加14、不改Jumbo。
+- 产品只接受Windows明确 `hardware_interface=true` 且 `virtual=false` 的网卡，不把元数据未知当物理卡。列表/选择/prepare/start一致，不能手填隐藏设备绕过。保存的显式选择保持，失效后清除并要求重选。
+- 未明确选择时优先唯一合格Intel I226；多个I226报错，不选首卡；无I226才沿用控制连接出站IPv4的精确路由匹配。明确清空/失效选择不反复自动替换。prepare后start固定精确网卡名，不重新静默选卡。
+- 新Capture默认 `mtu_auto=true`；旧配置缺字段反序列化为false，保留旧显式mtu。自动值为 `min(本机接收NIC NlMtu, 被采集机发送NIC NlMtu, 9000)`，双端需先确定；缺报告、低于1500或Loopback均拒绝自动解析。无法预选被采集机网卡时须明确选择或使用显式MTU。
+- 手动MTU范围1500..9000，不得超过实际网卡报告；物理卡未知报告同样拒绝，不能靠手动模式猜值。GUI显示双端报告值、生效值及自动/显式状态。
+- 主机产生有效配置副本，冻结mtu并令 `mtu_auto=false`，镜像receive.mtu；保存草稿不变。预算/prepare/start/DLL批大小共用此值；响应MTU、mtu_auto、全部capture和网卡须精确确认；采集端按实际卡再次复核。
+- `vc-capture --list-adapters`仍给完整诊断枚举；仅显式 `--allow-loopback-diagnostics` 且控制器为本机回环才允许Npcap Loopback。诊断用显式MTU、Raw batch1，不冒充物理网卡容量或产品性能。
+
+## 几何、变换与预算
+
+默认DDA/硬件GPU/640²@240/Raw/crop；偶数宽高2..8192、fps整数1..1000、显示器output0..15。范围是软件校验，不是吞吐认证。WGC可指定≤128字符单行窗口子串；窗口关闭/身份失效即终止，不换替代窗口或DDA，resize重建帧池但不改会话输出。无DXGI输出是DDA BLOCKED，不能换源补PASS。
+
+- crop：居中1:1，源不能小于输出；stretch：整幅映射；fit：等比缩小活动范围、偶数尺寸/偏移、黑边Y0/UV128；fill：居中偶数裁切后铺满。
+- 全部为整数最近邻及整数BT.601；真相源vc-source/transform.rs与desktop/gpu.rs，GPU逐字节对照独立整数参考。UNORM解码例外不授权浮点图案生成。
+- DDA/WGC强制gpu_convert=true且只用硬件D3D11；pattern须false，是显式合成诊断。旧配置只改mode=pattern却遗留gpu_convert=true时启动明确拒绝，不静默修改。
+- fps是发送上限，不保证源/设备达到；无桌面更新不重放旧图制造FPS。帧开始发送间隔至少ceil(1e9/fps)ns，不补发追赶。所有QPC分段只在同机比较。
+
+Raw预算：`P=mtu−42; B=w*h*3/2; N=ceil(B/P); last=B−(N−1)*P; wire_frame_bytes=B+N*66+max(0,18−last)`；66含以太头/VC头/FCS/preamble/IFG。`wire_bps=wire_frame_bytes*8*fps`；`usable=min(host_rx,capture_tx)*(100−headroom_pct)/100`，预留默认20%。不含VLAN/其他业务，也不是实测。
+
+两端速率都已知才称fits；超过usable但未超物理为margin，超任一已知物理速度为exceeds，明确断开为down，未知只警告；exceeds/down拒绝。PyroWave按最大码率估算分包，is_estimate=true，不能证明吞吐/画质。非法几何、MTU不一致及>65535分片等均硬错误。
 
 ## Rust OTA v1（D27）
 
@@ -107,28 +91,14 @@ ZIP须单一顶层目录、`package-manifest.json` product/schema/version/build_
 旧0.1.0程序尚无OTA，首次进入新通道需要一次bootstrap；后续使用固定ROOT更新，不上传到旧Python `/update`。
 目录与事务设计见`docs/proposals/rust-ota-layout-20261114.md`。
 
-## 能力、预算与生命周期
+## 能力、批提交与生命周期
 
-- Raw 是默认；MJPEG/PyroWave 必须 `codec_experimental=true` 且两端后端精确为 `turbojpeg:cpu` /
-  `pyrowave:vulkan`，否则启动拒绝，不静默回退/换后端/降尺寸/降帧率。
-- 数据面模块能力必须声明 `stream_revision=2`、`variable_resolution=true`、`shm_version=3`、
-  `sendqueue=frame`、`codecs=[raw,mjpeg,pyrowave]`、`sources=[pattern,dda,wgc]`；实际选择的
-  codec/source 未声明时拒绝启动。独立 `vc-stream.exe` 诊断 CLI 仍是 Raw pattern 诊断；DDA/WGC
-  与编码经同一 crate 的 DLL ABI 在进程内运行。
-- Raw 由 `vc-core` 按准确几何与 MTU 计算 `batch_packets`，prepare 回显，start 就绪回显必须一致；
-  DLL 每次 sendqueue 提交一整帧。编码不发送固定 batch，DLL 按实际编码AU包数整帧提交并在帧边界
-  flush。Npcap Loopback 诊断每包提交（batch1），不得用于产品性能/双机结论。旧C++ CLI 契约不变。
-- PyroWave 在 sender/receiver 宣布 ready 前，用同几何、同后端、同帧预算的合成 NV12 显式预热；
-  接收端用临时编码器生成合法 AU，再让正式解码器真实解码，输出丢弃。冷启动预热耗时另记，
-  不进入正式帧号/hashlog/SHM/帧率统计。创建/预热/编码/解码/重置/销毁各受5秒同步看门狗覆盖；超时只把该会话 `OperationState` 置为
-  粘性超时并让后续原生调用失败，不 `process::exit`、不强制展开或 join 挂起线程。父层保留 worker、
-  句柄与 DLL；`cleanup_pending` 期间配置、OTA 与虚拟卡操作锁定；不能安全停止时不得自动卸载
-  （有意保留到进程退出），停止未确认不得当作已释放。
-- 自动注册虚拟卡前，通过 `vc-vcam-verify.exe --dll <实际DLL> --capabilities` 隔离探测相同能力，
-  不只相信文件存在；工具查找 native-dir/普通原生路径、DLL所在构建目录的兄弟vcam_verify/Release，
-  及 ROOT/build/vcam_verify/{Release,Debug}。
-- 预算沿用 `stream-config.md`；超过物理速度拒绝，侵入预留余量为 margin，未知速率警告。
-  非法几何/fps/MTU、单帧65535分片上限、两端MTU不一致等均为硬错误。
+- Raw默认不压缩；MJPEG始终明确拒绝，旧字段仅用于兼容解析/错误提示。PyroWave必须实验授权、精确pyrowave:vulkan、GOP1、实际集成/独立GPU Vulkan≥1.3，CPU/虚拟/未知设备拒绝，无后端/源/尺寸/fps静默降级。
+- 本版DLL/包声明 `stream_revision=2, variable_resolution=true, shm_version=3, pixel_format=nv12, sendqueue=frame, codecs=[raw,pyrowave], sources=[pattern,dda,wgc]`。产品还逐项检查实际选中能力；旧DLL多报MJPEG不授予启动许可。
+- Raw物理网卡batch=ceil(B/(MTU−42))，一整帧一个sendqueue；编码按实际AU整帧单次提交/边界flush，不配置固定batch。零/短发失败，无batch降级。只有显式Loopback诊断为每包提交/batch1。
+- PyroWave正式ready前以同几何/后端/帧预算合成NV12预热，接收端临时编码合法AU给正式解码器；不进入正式帧号/hashlog/SHM/FPS。每步5秒粘性看门狗不退出宿主、不展开/join挂起调用。
+- stop/destroy仅0确认释放，1表示pending可重试；destroy其他码为状态未知，不盲重试/卸载。pending保留worker/句柄/DLL，并锁配置、OTA与虚拟卡操作；不安全对象有意留至进程退出。
+- 真实注册前必须由 `native_exe("vc-vcam-verify.exe") --dll <实际DLL> --capabilities` 隔离能力探测；只用Cargo工具/正常Rust载荷路径，没有旧C++兄弟目录回退。SHM/动态格式/D12细节见docs/spec/shm-v3.md与runbooks/vcam.md。
 
 开始：验证 Rust 对端 → fresh 网卡/prepare/预算 → 注册本目录虚拟卡 → 进程内 receiver → 进程内 sender → 参数回显。
 虚拟卡归属由匹配 DLL 路径、HKCU CLSID 的 `VirtualCaptureOwner` 全局记录与本根的一份有效
@@ -166,23 +136,8 @@ ABI start 的输出文件预约或 worker spawn 失败只回滚本次新建的�
 
 ## 验证边界
 
-`python scripts/verify.py` 继续验证旧实现，不能代替 Rust tests。
-`cargo test --manifest-path rust/Cargo.toml --workspace` 验证 Rust 契约。
-`python -I rust/tests/dll_stream_smoke.py --package <解压包>` 在同一进程用 ctypes 加载真实
-`vc_stream.dll`，覆盖 C ABI v1 布局/版本、start/status/stop/destroy、Raw 与按 `--codec` 显式选择的
-MJPEG/PyroWave hash 及 SHM v3；不启动 sender/receiver/vc-stream/vc-vcam-verify 子进程，
-默认只用 Npcap Loopback。它证明本机模块功能，
-不是物理网卡、吞吐、延迟或双机验收。三编码 Release DLL 的本机 Loopback 240fps 数据和明确范围见[Rust-R3 bring-up](../../../../docs/bringup/bringup-20261119-rust-r3-local.md)。
-独立 `vc-stream.exe` 仍是不接产品控制 API 的 Raw pattern 诊断 CLI（DLL 与 CLI 共用实现）；其
-Loopback 冒烟和性能证据见[数据面 bring-up](../../../../docs/bringup/bringup-20261119-rust-data-plane.md)，
-不冒充产品/双机结论。
-`python -I rust/tests/control_smoke.py` 以 Rust `vc-capture` REST 控制面 + 同一进程内
-`vc_stream.dll` 接收端运行（不启动 sender/receiver 子进程），不由 Rust 打包默认执行
-（`--extended-smokes` 才追加）；它在随机回环端口、独立ROOT、私有SHM跑 Raw motion/batch1
-全量哈希对账，另查错误会话停止、运行中改配置、复用会话证据保留与 DLL stop/destroy 生命周期，
-不注册DShow、不碰稳定5143。`rust/tests/gui_smoke.py` 打开真实GPUI窗口、
-输入随机回环端口并点击连接，要求本机错误桩收到 `/health` 并返回503，保存初始/错误截图，正常关闭退出0；
-每次使用独立目录。
-本机回环不代替双机/240fps/长稳验收。`vc-transport` 是冻结 wire/分片/校验/有界重组的共享库；
-Rust 产品数据面已由 `vc_stream.dll` 进程内承载，`vc-source`/`vc-media`/`vc-vcam` 实现已落地，但
-物理NIC与双机性能、长稳、编码画质、完整 DShow 编排仍未完成；当前主机无 DXGI 输出，DDA实采未验证；WGC窗口实采与隔离vcam DLL场景通过但不等于完整产品编排。GUI非空白截图门失败，因此便携完整验收未通过。`vc-core` 的 C ABI SDK 外观未实现。OTA 按本节独立验证，不继承旧通道验收。
+`scripts/verify.py`现为Rust总闸：fmt/workspace tests/全target Clippy/Release/独立Python图案和wire向量/DLL self-check，默认不采集/收发/注册。专项脚本与前提见docs/runbooks/rust.md。
+
+DLL Raw/PyroWave Loopback、私有WGC GPU窗口、Rust隔离COM、REST随机端口/独立ROOT与GUI均分项验收，互不补PASS。GUI必须真实交互且截图非空白，黑屏硬失败。旧三编码报告只代表当时版本；当前CPU MJPEG已移除。
+
+旧双机自动T1–T5编排/完整取证工具已移除，Rust等价工具尚未实现；REST没有/files或receiver/report，不可声称自动完整保全双端hashlog。物理NIC/双机/长稳/画质/完整DShow与完整包/OTA仍须专项；缺测/BLOCKED/失败不算通过。历史报告不回填新结果，不自动部署或注册。

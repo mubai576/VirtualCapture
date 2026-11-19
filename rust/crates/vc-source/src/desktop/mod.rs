@@ -2,7 +2,8 @@
 //!
 //! `dda` 使用 DXGI Desktop Duplication，`wgc` 使用 Windows Graphics Capture；
 //! `pattern` 由 `vc-stream` 自行生成，本 crate 明确拒绝。两种后端失败都不
-//! 互相回退，`gpu_convert` 失败也不回退 CPU。
+//! 互相回退；BGRA→NV12 固定由硬件 D3D11 compute shader 完成，GPU 初始化或
+//! 转换失败是致命错误，不存在 CPU 转换或 WARP 软件设备回退。
 
 mod dda;
 mod gpu;
@@ -49,10 +50,11 @@ impl Backend {
     }
 }
 
-/// 桌面采集源。只接受 `dda` / `wgc`；输出帧为 packed NV12。
+/// 桌面采集源。只接受 `dda` / `wgc`；输出帧为 packed NV12，且固定由硬件
+/// D3D11 compute shader 生成。
 ///
 /// `capture` 返回 `Ok(false)` 表示在不超过 20 ms 的等待窗口内没有新图像；
-/// 任何错误（采集项关闭、帧池重建失败、GPU 转换失败等）都是致命错误，
+/// 任何错误（采集项关闭、帧池重建失败、GPU 初始化/转换失败等）都是致命错误，
 /// 调用方必须停止，不能由本类型静默换后端或换转换方式。
 pub struct DesktopSource {
     config: SourceConfig,
@@ -122,7 +124,8 @@ impl DesktopSource {
         self.width as usize * self.height as usize * 3 / 2
     }
 
-    /// 实际使用的 GPU、丢弃的源帧、源/输出尺寸与当前配置。
+    /// 实际使用的 GPU、丢弃的源帧、源/输出尺寸与当前配置。桌面模式下
+    /// `gpu_convert` 恒为 true（校验保证），`gpu` 是硬件适配器名。
     pub fn stats(&self) -> Value {
         let (source_width, source_height) = self.backend.source_dimensions();
         json!({

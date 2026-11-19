@@ -51,9 +51,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Send deterministic integer-pattern Raw NV12 frames.
+    /// 发送确定性整数图案的 Raw NV12 帧。
     Send(SendArgs),
-    /// Receive and reassemble Raw NV12 frames; optional private SHM v3 publication.
+    /// 接收并重组 Raw NV12 帧，可选发布到私有 SHM v3。
     Receive(ReceiveArgs),
 }
 
@@ -129,7 +129,7 @@ pub(crate) struct ReceiveArgs {
     pub(crate) stats: Option<PathBuf>,
     #[arg(long)]
     pub(crate) hashlog: Option<PathBuf>,
-    /// Override the legacy DShow mapping name; diagnostics should use a unique Local\\ name.
+    /// 覆盖兼容的 DShow 映射名；诊断应使用唯一的 Local\\ 名称。
     #[arg(long)]
     pub(crate) shm: Option<String>,
     #[arg(skip)]
@@ -469,7 +469,7 @@ pub(crate) fn capabilities() -> Value {
         "variable_resolution": true,
         "shm_version": 3,
         "pixel_format": "nv12",
-        "codecs": ["raw", "mjpeg", "pyrowave"],
+        "codecs": ["raw", "pyrowave"],
         "sources": ["pattern", "dda", "wgc"],
         "sendqueue": "frame",
         "encoded_batch": null,
@@ -490,11 +490,9 @@ fn loop_sleep(target_ns: u64, stop: Option<&AtomicBool>) -> bool {
         if remaining == 0 {
             return true;
         }
-        // High-resolution timer delivery can still arrive about half a
-        // millisecond late. Wake ahead of that window, then use QPC for the
-        // precision tail: relative send ceilings cannot recover oversleep by
-        // sending early on the next frame. Keep the tail below one millisecond
-        // so waiting does not consume most of the MMCSS CPU budget.
+        // 高分辨率定时器投递仍可能迟到约半毫秒。提前越过该窗口唤醒，再用
+        // QPC 完成精度尾部：相对发送上限无法靠下一帧提前发送来弥补睡过头
+        // 的时间。尾部保持在一毫秒以内，避免等待耗尽 MMCSS 的 CPU 预算。
         if remaining > 800_000 {
             scheduling::wait_for((remaining - 700_000).min(5_000_000));
         } else {
@@ -584,7 +582,7 @@ fn write_stats_file(path: Option<&Path>, file: Option<File>, value: &Value) -> a
 
 fn au_session(codec: &str, width: u32, height: u32, fps: u32) -> anyhow::Result<AuSession> {
     match codec {
-        "mjpeg" => Ok(AuSession::mjpeg(width, height, fps)),
+        "mjpeg" => bail!(vc_media::MJPEG_UNSUPPORTED),
         "pyrowave" => Ok(AuSession::pyrowave(width, height, fps)),
         _ => bail!("codec {codec} has no encoded access unit session"),
     }
@@ -689,9 +687,8 @@ impl FramePacer {
     }
 
     fn advance(&mut self, frame_start_ns: u64) {
-        // The caller records capture start, before source/encoding/transmit work.
-        // Absorb minor wake-up jitter without drifting. Rebase after a larger
-        // stall instead of trying to catch up by sending back-to-back frames.
+        // 调用方记录的是采集起点，即源/编码/发送工作之前。吸收小的唤醒抖动
+        // 而不累积漂移；遇到较大停顿时重新定基，而不是用连续背靠背发帧去追赶。
         let phase_tolerance_ns = self.offset_ns(1) / 8;
         if frame_start_ns.saturating_sub(self.next_ns) > phase_tolerance_ns {
             self.base_ns = frame_start_ns;
@@ -834,8 +831,7 @@ mod tests {
         for _ in 0..240 {
             let capture_start = pacer.next_ns;
             pacer.advance(capture_start);
-            // Representative codec work exceeds the wake-up jitter tolerance,
-            // but finishes within one period and must not reduce the frame rate.
+            // 代表性编码耗时超过唤醒抖动容差，但仍在一个周期内完成，不得降低帧率。
             let send_start = capture_start + 1_300_000;
             assert!(send_start < pacer.next_ns);
         }

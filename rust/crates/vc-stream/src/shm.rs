@@ -1,36 +1,36 @@
-//! Windows shared-memory frame publisher for the frozen vcam SHM v3 contract.
+//! 冻结 vcam SHM v3 契约的 Windows 共享内存帧发布器。
 //!
-//! This is the writer half of `vcam/vcam_shm.h` (the canonical effective layout; that
-//! header is authoritative, not `proto/`). It creates one named page-file mapping and
-//! the legacy manual-reset event pair, then publishes complete NV12 frames with the
-//! same 12-slot seqlock protocol as the C++ receiver's single writer:
+//! 本模块是该布局的写入端（规范有效布局见 `docs/spec/shm-v3.md`，它取代历史
+//! `vcam/vcam_shm.h`；`proto/` 不是该布局的真相源）。它创建一个命名页文件
+//! 映射和旧的 manual-reset 事件对，然后以历史 C++ 接收端单写者相同的 12 槽
+//! seqlock 协议发布完整 NV12 帧：
 //!
 //! ```text
 //! [0, 64)                         vc_shm_hdr_t
 //! [64, 64 + 64 * 12)              vc_shm_slot_t[12]
-//! [4096 + i * frame_bytes)        slot i frame bytes
+//! [4096 + i * frame_bytes, ...)   槽 i 的完整帧数据
 //! ```
 //!
-//! Publication protocol (one writer thread only; every method takes `&mut self`):
-//! - pick the next slot in round-robin order, never the current `latest` slot;
-//! - bump `slot.seq` to odd (filling), set the no-hash marker, copy the frame;
-//! - fill `frame_id`/`qpc_*`, bump `slot.seq` to even (ready), store `hdr.latest_slot`,
-//!   increment `hdr.latest_seq`, then `ResetEvent(evt[(n+1)&1]); SetEvent(evt[n&1])`;
-//! - after the latency-sensitive path, [`Publisher::mark_hash`] writes `slot.hash` and
-//!   then `slot.hash_fid = frame_id`. A token whose slot has already been republished
-//!   is ignored, so a late hasher can never write into a newer frame.
+//! 发布协议（只有一个写线程；每个方法都取 `&mut self`）：
+//! - 按轮转顺序挑选下一个槽，绝不选当前 `latest` 槽；
+//! - 把 `slot.seq` 递增为奇数（填充中），写入无哈希标记，拷贝帧数据；
+//! - 填充 `frame_id`/`qpc_*`，把 `slot.seq` 递增为偶数（就绪），写入
+//!   `hdr.latest_slot`，递增 `hdr.latest_seq`，然后
+//!   `ResetEvent(evt[(n+1)&1]); SetEvent(evt[n&1])`；
+//! - 在延迟敏感路径之后，[`Publisher::mark_hash`] 先写 `slot.hash`，再写
+//!   `slot.hash_fid = frame_id`。若令牌对应的槽已被重新发布，该令牌被忽略，
+//!   因此迟到的哈希器绝不会写进更新的帧。
 //!
-//! Readers (vcam/monitor/verifiers) use `latest_seq` only as a wake hint, identify a
-//! publish by `(latest_slot, slot.seq)`, and re-check `slot.seq` around the copy.
-//! `slot.hash` is valid for that copy iff `hash_fid == frame_id`. The event pair is
-//! manual-reset and session-local; a missed edge is bounded by the reader's timeout.
+//! 读取方（vcam/monitor/验证器）只把 `latest_seq` 当作唤醒提示，用
+//! `(latest_slot, slot.seq)` 标识一次发布，并在拷贝前后复查 `slot.seq`。
+//! 仅当 `hash_fid == frame_id` 时，`slot.hash` 才对该次拷贝有效。事件对是
+//! manual-reset 且会话本地的；漏掉的边沿由读取方的超时兜底。
 //!
-//! The mapping is created `PAGE_READWRITE` with the caller-supplied name (callers
-//! should use `Local\...` for a session-private object). An existing mapping is a
-//! hard error: this type never opens, resets, or otherwise disturbs another writer.
-//! Events may outlive a previous writer because a downstream reader still holds them;
-//! like the legacy writer, we create/open them, reset both, and continue. No registry,
-//! service, deployment, or network state is involved.
+//! 映射以 `PAGE_READWRITE` 和调用方提供的名称创建（会话私有对象应使用
+//! `Local\...`）。同名映射已存在即硬错误：本类型绝不打开、重置或以其他方式
+//! 干扰另一个写入端。事件可能因下游读取方仍持有句柄而由前一写入端遗留；与
+//! 旧写入端一致，我们创建/打开它们，把两者重置后继续。不涉及注册表、服务、
+//! 部署或网络状态。
 
 #![cfg(windows)]
 
@@ -51,27 +51,27 @@ use windows_sys::Win32::System::Threading::{
     CreateEventW, GetCurrentProcessId, ResetEvent, SetEvent,
 };
 
-/// `"VCA3"`, matching `VC_SHM_MAGIC`.
+/// `"VCA3"`，对应 `VC_SHM_MAGIC`。
 const MAGIC: u32 = 0x3341_4356;
-/// `VC_SHM_VERSION`.
+/// 对应 `VC_SHM_VERSION`。
 const VERSION: u32 = 3;
-/// `VC_SHM_SLOTS`.
+/// 对应 `VC_SHM_SLOTS`。
 const SLOT_COUNT: usize = 12;
-/// `VC_SHM_DATA_OFF`.
+/// 对应 `VC_SHM_DATA_OFF`。
 const DATA_OFF: usize = 4096;
-/// `sizeof(vc_shm_hdr_t)`.
+/// `vc_shm_hdr_t` 的大小（`sizeof(vc_shm_hdr_t)`）。
 const HEADER_SIZE: usize = 64;
-/// `sizeof(vc_shm_slot_t)`.
+/// `vc_shm_slot_t` 的大小（`sizeof(vc_shm_slot_t)`）。
 const SLOT_SIZE: usize = 64;
-/// `VC_SHM_HASH_NONE`; also the legacy "not hashed" marker.
+/// 对应 `VC_SHM_HASH_NONE`；同时是旧的“尚未哈希”标记。
 const HASH_NONE: u32 = 0xFFFF_FFFF;
-/// `vc_shm_valid` accepts 1..=1000.
+/// `vc_shm_valid` 接受 1..=1000。
 const MAX_FPS: u32 = 1000;
-/// Windows named-kernel-object limit (UTF-16 code units).
+/// Windows 命名内核对象上限（UTF-16 码元）。
 const MAX_OBJECT_NAME: usize = 32_767;
 
-/// `vc_shm_hdr_t`, 64 bytes. Atomic fields are only accessed atomically by the writer;
-/// readers see them through the legacy plain aligned-read contract.
+/// `vc_shm_hdr_t`，64 字节。原子字段只由写入端以原子方式访问；读取端通过
+/// 旧的普通对齐读取契约观察它们。
 #[repr(C)]
 struct ShmHeader {
     magic: u32,
@@ -88,7 +88,7 @@ struct ShmHeader {
     reserved: [u8; 20],
 }
 
-/// `vc_shm_slot_t`, 64 bytes. `seq` is the seqlock (odd = filling, even = stable).
+/// `vc_shm_slot_t`，64 字节。`seq` 是 seqlock（奇数 = 填充中，偶数 = 稳定）。
 #[repr(C)]
 struct ShmSlot {
     seq: AtomicI32,
@@ -135,13 +135,13 @@ fn mapping_size(frame_bytes: usize) -> usize {
     DATA_OFF + SLOT_COUNT * frame_bytes
 }
 
-/// Marker stored in `hash_fid` before a frame is hashed.
+/// 帧被哈希之前存放在 `hash_fid` 中的标记。
 ///
-/// The native reader's only validity test is `hash_fid == frame_id`, while the legacy
-/// marker is `HASH_NONE`. Both collide for `frame_id == u32::MAX`. Keep the legacy
-/// marker for every ordinary frame, and use `frame_id ^ HASH_NONE` (zero) only for
-/// that one frame, so an old reader never accepts an unhashed slot. After
-/// [`Publisher::mark_hash`] the real `frame_id` is stored and the hash becomes valid.
+/// 原生读取端唯一的有效性判断是 `hash_fid == frame_id`，而旧标记是
+/// `HASH_NONE`。当 `frame_id == u32::MAX` 时两者会碰撞。普通帧一律沿用旧
+/// 标记，只有那一帧使用 `frame_id ^ HASH_NONE`（零），使旧读取端绝不会把
+/// 未哈希的槽当成有效。调用 [`Publisher::mark_hash`] 后写入真实 `frame_id`，
+/// 哈希才生效。
 fn hash_marker(frame_id: u32) -> u32 {
     if frame_id == HASH_NONE {
         frame_id ^ HASH_NONE
@@ -175,8 +175,8 @@ fn wide_name(name: &str) -> io::Result<Vec<u16>> {
 }
 
 fn last_os_error(operation: &str) -> io::Error {
-    // This must be called before any other Win32 call can overwrite the thread's
-    // last-error value (in particular before CloseHandle).
+    // 必须在任何其他可能覆盖线程 last-error 的 Win32 调用之前调用（尤其是
+    // CloseHandle 之前）。
     let code = unsafe { GetLastError() };
     let detail = io::Error::from_raw_os_error(code as i32);
     io::Error::new(
@@ -187,12 +187,11 @@ fn last_os_error(operation: &str) -> io::Error {
 
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 
-/// Identifies one published slot generation.
+/// 标识一次已发布槽的“代”。
 ///
-/// The token is an owning, `Copy` value with no borrow of the publisher, so it can be
-/// moved to a hashing thread and passed back to [`Publisher::mark_hash`] later. It is
-/// only meaningful for the publisher that returned it; tokens from any other publisher
-/// (and tokens from reused slots) are ignored.
+/// 该令牌是自有（owning）的 `Copy` 值，不借用发布器，因此可以移到哈希线程，
+/// 之后传回 [`Publisher::mark_hash`]。它只对返回它的发布器有意义；来自其他
+/// 发布器的令牌（以及来自已复用槽的令牌）都会被忽略。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublishToken {
     owner: u64,
@@ -203,17 +202,16 @@ pub struct PublishToken {
 }
 
 impl PublishToken {
-    /// Frame id of the publication this token refers to.
+    /// 该令牌所指发布的帧 id。
     pub fn frame_id(&self) -> u32 {
         self.frame_id
     }
 }
 
-/// Single-writer SHM publisher.
+/// 单写者 SHM 发布器。
 ///
-/// There is intentionally no internal writer lock: `&mut self` serializes publication
-/// and [`Publisher::mark_hash`]. Do not clone or share the writer; the slot table and
-/// event parity are owned by this object.
+/// 有意不设内部写锁：发布与 [`Publisher::mark_hash`] 由 `&mut self` 串行化。
+/// 不要克隆或共享写入端；槽表与事件奇偶性都归本对象所有。
 pub struct Publisher {
     map: HANDLE,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
@@ -221,24 +219,22 @@ pub struct Publisher {
     geometry: Geometry,
     frame_bytes: usize,
     fps: u32,
-    /// Next slot to try, giving round-robin reuse.
+    /// 下一个尝试的槽，实现轮转复用。
     cursor: usize,
-    /// Slot exposed by `hdr.latest_slot`; never picked for reuse.
+    /// `hdr.latest_slot` 当前暴露的槽；绝不再被选来复用。
     latest: Option<usize>,
-    /// Per-slot publication generation (process-local), used to reject stale tokens
-    /// even if the 32-bit on-wire sequence wraps.
+    /// 每槽的发布代号（进程本地），即使 32 位在线序号回绕也能拒绝过期令牌。
     serials: [u64; SLOT_COUNT],
     published: u64,
     owner: u64,
 }
 
 impl Publisher {
-    /// Create the named mapping plus the `<name>.evt0` / `<name>.evt1` event pair.
+    /// 创建命名映射以及 `<name>.evt0` / `<name>.evt1` 事件对。
     ///
-    /// Fails closed if the mapping name already exists (another writer or a reader's
-    /// view still keeps it alive). All partially created handles are released before
-    /// an error is returned. `fps` is the immutable session rate stored in the header
-    /// and must satisfy `1..=1000`; `Geometry` already guarantees valid NV12 sizes.
+    /// 若映射名已存在（另一个写入端，或读取方的视图仍使其存活）则以失败关闭：
+    /// 返回错误前会释放所有已部分创建的句柄。`fps` 是存入头的不可变会话速率，
+    /// 必须满足 `1..=1000`；`Geometry` 已保证 NV12 尺寸有效。
     pub fn new(name: &str, geometry: Geometry, fps: u32) -> io::Result<Self> {
         if fps == 0 || fps > MAX_FPS {
             return Err(io::Error::new(
@@ -247,7 +243,7 @@ impl Publisher {
             ));
         }
 
-        // Validate/allocate every name before creating any kernel object.
+        // 创建任何内核对象之前，先校验/分配所有名称。
         let name_w = wide_name(name)?;
         let event_names = [
             wide_name(&format!("{name}.evt0"))?,
@@ -282,8 +278,8 @@ impl Publisher {
         if map.is_null() {
             return Err(last_os_error("CreateFileMappingW"));
         }
-        // Check immediately: GetLastError() is meaningful for a successful
-        // CreateFileMappingW and any intervening call would overwrite it.
+        // 立即检查：GetLastError() 对成功的 CreateFileMappingW 才有效，任何
+        // 中间调用都会覆盖它。
         if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
             unsafe { CloseHandle(map) };
             return Err(io::Error::new(
@@ -304,9 +300,8 @@ impl Publisher {
             let event = unsafe { CreateEventW(ptr::null(), 1, 0, event_name.as_ptr()) };
             if event.is_null() {
                 let err = last_os_error("CreateEventW");
-                // Release everything created so far. An event may have existed already
-                // (held by a downstream reader); closing our duplicate handle does not
-                // remove the reader's object.
+                // 释放目前创建的所有对象。事件可能早已存在（由下游读取方持有）；
+                // 关闭我们的重复句柄不会移除读取方的对象。
                 unsafe {
                     UnmapViewOfFile(view);
                     CloseHandle(map);
@@ -318,8 +313,8 @@ impl Publisher {
             }
             events[index] = event;
         }
-        // A stale event pair may have been left signaled by a previous writer. Legacy
-        // behavior is to reset both; existing handles held by a reader stay valid.
+        // 前一个写入端可能留下已置位的事件对。旧行为是把两者都重置；读取方
+        // 已持有的句柄仍然有效。
         for event in events {
             unsafe {
                 let _ = ResetEvent(event);
@@ -343,12 +338,11 @@ impl Publisher {
         Ok(publisher)
     }
 
-    /// Copy one complete frame into the next slot and publish it.
+    /// 把一帧完整拷入下一个槽并发布。
     ///
-    /// `data.len()` must equal the session `Geometry::frame_bytes()`; `first_ns` is the
-    /// caller's QPC timestamp for the first packet of the frame. `now_ns` is called
-    /// exactly once, after the copy and immediately before publication, for
-    /// `slot.qpc_pub_ns` (same-QPC-clock measurements only).
+    /// `data.len()` 必须等于会话 `Geometry::frame_bytes()`；`first_ns` 是调用方
+    /// 记录的、该帧首包的 QPC 时间戳。`now_ns` 恰好在拷贝之后、发布之前调用
+    /// 一次，用于 `slot.qpc_pub_ns`（只适用于同 QPC 时钟内的测量）。
     pub fn publish(
         &mut self,
         frame_id: u32,
@@ -371,8 +365,8 @@ impl Publisher {
         let slot = self.slot_ptr(index);
 
         unsafe {
-            // even -> odd (filling). If a previous call panicked while filling, the
-            // slot is already odd; +2 still changes the value and keeps readers out.
+            // 偶 -> 奇（填充中）。若上一次调用在填充中 panic，该槽已是奇数；
+            // +2 仍会改变值并把读取方挡在外面。
             let was_odd = (*slot).seq.load(Ordering::Relaxed) & 1 != 0;
             (*slot)
                 .seq
@@ -390,19 +384,19 @@ impl Publisher {
             (*slot).frame_id.store(frame_id, Ordering::Relaxed);
             (*slot).qpc_first_ns.store(first_ns, Ordering::Relaxed);
             (*slot).qpc_pub_ns.store(published_ns, Ordering::Relaxed);
-            // odd -> even = ready. SeqCst is the full release barrier the legacy
-            // InterlockedIncrement provided: all slot fields are visible first.
+            // 奇 -> 偶 = 就绪。SeqCst 提供旧式 InterlockedIncrement 的完整
+            // release 屏障：所有槽字段先变为可见。
             seq = (*slot).seq.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
 
             let header = self.header_ptr();
-            // Pointer first, then the monotonic publish counter (same order as C++).
+            // 先写指针，再递增单调发布计数（与 C++ 顺序一致）。
             (*header).latest_slot.store(index as i32, Ordering::SeqCst);
             let n = (*header)
                 .latest_seq
                 .fetch_add(1, Ordering::SeqCst)
                 .wrapping_add(1);
             let parity = (n as u32) & 1;
-            // Manual-reset pair: clear the other parity, then wake this publish.
+            // manual-reset 事件对：先清除另一奇偶，再唤醒本次发布。
             let _ = ResetEvent(self.events[(parity as usize) ^ 1]);
             let _ = SetEvent(self.events[parity as usize]);
         }
@@ -422,12 +416,11 @@ impl Publisher {
         })
     }
 
-    /// Publish the FNV-1a64 result for a previously published frame.
+    /// 为先前已发布的一帧发布 FNV-1a64 结果。
     ///
-    /// A stale token (slot reused, another publisher, or wrapped sequence) is silently
-    /// ignored. The hash is written before `hash_fid`, so native readers either see no
-    /// hash or the complete one. This method never blocks and never faults; it is safe
-    /// to call from the writer thread after an off-path hasher returns.
+    /// 过期令牌（槽已复用、来自其他发布器或序号已回绕）会被静默忽略。哈希先于
+    /// `hash_fid` 写入，因此原生读取端要么看不到哈希，要么看到完整的哈希。本
+    /// 方法从不阻塞也从不触发异常；在旁路哈希器返回后，从写入线程调用是安全的。
     pub fn mark_hash(&mut self, token: PublishToken, hash: u64) {
         if token.owner != self.owner {
             return;
@@ -438,7 +431,7 @@ impl Publisher {
         }
         let slot = self.slot_ptr(index);
         unsafe {
-            // The slot must still hold exactly the publication this token names.
+            // 该槽必须仍精确持有此令牌所指的那次发布。
             if (*slot).seq.load(Ordering::Acquire) != token.seq as i32 {
                 return;
             }
@@ -451,7 +444,7 @@ impl Publisher {
         }
     }
 
-    /// Number of frames successfully published through this mapping.
+    /// 通过该映射成功发布的帧数。
     pub fn published(&self) -> u64 {
         self.published
     }
@@ -459,8 +452,8 @@ impl Publisher {
     fn init_header(&self) {
         let header = self.header_ptr();
         unsafe {
-            // Invalidate the new mapping while it is initialized. A reader can open the
-            // name as soon as CreateFileMappingW succeeds and must reject magic 0.
+            // 初始化期间先让新映射无效。CreateFileMappingW 一成功，读取方就可能
+            // 打开该名称，因此它必须拒绝 magic 0。
             ptr::addr_of_mut!((*header).magic).write_volatile(0);
             ptr::addr_of_mut!((*header).version).write_volatile(VERSION);
             ptr::addr_of_mut!((*header).slots).write_volatile(SLOT_COUNT as u32);
@@ -475,8 +468,8 @@ impl Publisher {
 
             for index in 0..SLOT_COUNT {
                 let slot = self.slot_ptr(index);
-                // Fresh mappings are zero-filled; keep the legacy `seq |= 1` (odd =
-                // filling, never accepted) and the no-hash marker.
+                // 新映射为零填充；保留旧式 `seq |= 1`（奇数 = 填充中，永不接受）
+                // 与无哈希标记。
                 (*slot).seq.fetch_or(1, Ordering::SeqCst);
                 (*slot).hash_fid.store(HASH_NONE, Ordering::Relaxed);
             }
@@ -486,8 +479,8 @@ impl Publisher {
         }
     }
 
-    /// Round-robin cursor, skipping the slot currently exposed as latest. With twelve
-    /// slots and one latest there is always a candidate.
+    /// 轮转游标，跳过当前作为 latest 暴露的槽。十二个槽、仅一个 latest，因此
+    /// 始终存在候选槽。
     fn pick_slot(&self) -> usize {
         let mut index = self.cursor % SLOT_COUNT;
         for _ in 0..SLOT_COUNT {
@@ -556,13 +549,13 @@ mod tests {
     use windows_sys::Win32::System::Memory::{FILE_MAP_READ, OpenFileMappingW};
     use windows_sys::Win32::System::Threading::{OpenEventW, WaitForSingleObject};
 
-    /// `SYNCHRONIZE` from winnt.h; enabling Win32_Storage_FileSystem only for this
-    /// constant would add a dependency the publisher itself does not need.
+    /// winnt.h 中的 `SYNCHRONIZE`；只为这个常量启用 Win32_Storage_FileSystem
+    /// 会给发布器本身引入它不需要的依赖。
     const SYNCHRONIZE: u32 = 0x0010_0000;
 
     static NEXT_NAME: AtomicU32 = AtomicU32::new(0);
 
-    /// Session-private names, unique across tests and processes.
+    /// 会话私有的名称，在测试与进程之间唯一。
     fn unique_name(tag: &str) -> String {
         let pid = unsafe { GetCurrentProcessId() };
         let serial = NEXT_NAME.fetch_add(1, Ordering::Relaxed);
@@ -736,11 +729,11 @@ mod tests {
         assert_eq!(publisher.published(), 1);
         assert_eq!(token.frame_id(), 7);
 
-        // First publish: n = 1 -> evt1 set, evt0 reset.
+        // 首次发布：n = 1 -> 置位 evt1，重置 evt0。
         assert_eq!(view.u32_at(20), 0);
         assert_eq!(view.i32_at(24), 1);
-        // Legacy initializes slots odd (seq = 1), so first acquire adds 2 and the
-        // first publication becomes seq 4; every later reuse adds 3 (odd+even).
+        // 旧实现把槽初始化为奇数（seq = 1），故首次取用 +2，第一次发布后
+        // seq 为 4；此后每次复用都 +3（奇 + 偶）。
         let slot0 = view.slot_offset(0);
         assert_eq!(view.i32_at(slot0), 4, "even = stable");
         assert_eq!(view.u32_at(slot0 + 4), 7);
@@ -752,7 +745,7 @@ mod tests {
         assert!(evt1.signaled());
         assert!(!evt0.signaled());
 
-        // Manual-reset: the event remains signaled until the next publish resets it.
+        // manual-reset：事件保持置位，直到下一次发布把它重置。
         assert!(evt1.signaled());
 
         publisher.mark_hash(token, 0xDEAD_BEEF_0123_4567);
@@ -769,7 +762,7 @@ mod tests {
         assert_eq!(view.i32_at(slot1), 4);
         assert_eq!(view.u32_at(slot1 + 4), 8);
         assert_eq!(view.bytes(DATA_OFF + frame_bytes, frame_bytes), &data1[..]);
-        // Second publish: n = 2 -> evt0 set, evt1 reset.
+        // 第二次发布：n = 2 -> 置位 evt0，重置 evt1。
         assert!(evt0.signaled());
         assert!(!evt1.signaled());
 
@@ -827,7 +820,7 @@ mod tests {
         assert_eq!(old_token.slot, 0);
         assert_eq!(view.u32_at(20), 0);
 
-        // A full ring turn reuses slot 0 while the old token is still outstanding.
+        // 一整轮之后槽 0 被复用，而旧令牌仍未归还。
         let mut new_token = old_token;
         for frame_id in 101..=112u32 {
             new_token = publisher
@@ -839,12 +832,12 @@ mod tests {
         assert_eq!(view.u32_at(20), 0);
         assert_eq!(view.u32_at(view.slot_offset(0) + 4), 112);
 
-        // A late result for the old frame is ignored, including its hash marker.
+        // 旧帧的迟到结果被忽略，包括它的哈希标记。
         publisher.mark_hash(old_token, 0xAAAA_BBBB_CCCC_DDDD);
         assert_eq!(view.u64_at(view.slot_offset(0) + 24), 0);
         assert_ne!(view.u32_at(view.slot_offset(0) + 32), 100);
 
-        // The current token still applies, and a still later old result cannot clobber it.
+        // 当前令牌仍然有效，更晚到达的旧结果无法覆盖它。
         publisher.mark_hash(new_token, 0x0123_4567_89AB_CDEF);
         assert_eq!(view.u64_at(view.slot_offset(0) + 24), 0x0123_4567_89AB_CDEF);
         publisher.mark_hash(old_token, 0xFFFF_FFFF_FFFF_FFFF);
@@ -860,7 +853,7 @@ mod tests {
         let mut publisher = Publisher::new(&name, geometry, 60).unwrap();
         let view = ReadView::open(&name, mapping_size(frame_bytes));
 
-        // Ordinary frames keep the legacy 0xFFFFFFFF marker.
+        // 普通帧沿用旧标记 0xFFFFFFFF。
         let normal = publisher
             .publish(5, 0, &frame(3, frame_bytes), || 0)
             .unwrap();
@@ -870,8 +863,8 @@ mod tests {
         publisher.mark_hash(normal, 0x55);
         assert_eq!(view.u32_at(normal_slot + 32), 5);
 
-        // frame_id == HASH_NONE must not look hashed before mark_hash. The marker is
-        // frame_id ^ HASH_NONE == 0, which an old reader compares against 0xFFFFFFFF.
+        // frame_id == HASH_NONE 在 mark_hash 之前绝不能看起来已哈希。标记为
+        // frame_id ^ HASH_NONE == 0，旧读取端会拿它与 0xFFFFFFFF 比较。
         let sentinel = publisher
             .publish(HASH_NONE, 0, &frame(4, frame_bytes), || 0)
             .unwrap();
@@ -899,7 +892,7 @@ mod tests {
         let data = frame(9, frame_bytes);
         let token_a = a.publish(1, 0, &data, || 0).unwrap();
         let token_b = b.publish(1, 0, &data, || 0).unwrap();
-        // Same slot/seq/frame id/serial, different owner: collision by shape only.
+        // slot/seq/frame id/serial 全部相同、owner 不同：仅形状碰撞。
         assert_eq!(token_a.slot, token_b.slot);
         assert_eq!(token_a.seq, token_b.seq);
         assert_eq!(token_a.serial, token_b.serial);
@@ -933,7 +926,7 @@ mod tests {
         assert!(evt1.signaled(), "failed duplicate did not reset events");
         assert!(!evt0.signaled());
 
-        // The original writer is untouched and still owns the ring.
+        // 原写入端未受影响，仍拥有该环。
         first.publish(2, 11, &frame(2, frame_bytes), || 21).unwrap();
         assert!(evt0.signaled(), "n = 2 signals evt0");
         assert!(!evt1.signaled());
@@ -942,7 +935,7 @@ mod tests {
         drop(evt0);
         drop(evt1);
         drop(first);
-        // All handles are released on drop, so a fresh writer can take the name.
+        // 所有句柄都随 drop 释放，因此新的写入端可以重新占用该名称。
         let replacement = Publisher::new(&name, geometry, 60).unwrap();
         assert_eq!(replacement.published(), 0);
     }
@@ -954,8 +947,8 @@ mod tests {
         let blocker_name = format!("{name}.evt1");
         let blocker_w = wide(&blocker_name);
 
-        // Occupy the second event's name with a different kernel object type, so the
-        // publisher maps the SHM, creates evt0, then fails on evt1.
+        // 用另一种内核对象类型占用第二个事件名，使发布器先映射 SHM、创建
+        // evt0，然后在 evt1 上失败。
         let blocker = unsafe {
             CreateFileMappingW(
                 INVALID_HANDLE_VALUE,
@@ -982,7 +975,7 @@ mod tests {
         );
         unsafe { CloseHandle(blocker) };
 
-        // The base mapping, view and evt0 were released: the same name is usable now.
+        // 基映射、视图和 evt0 均已释放：现在可以重新使用该名称。
         let publisher = Publisher::new(&name, geometry, 60).unwrap();
         assert_eq!(publisher.published(), 0);
     }
@@ -1022,7 +1015,7 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
 
-        // The failed constructors left no mapping behind.
+        // 失败的构造函数没有留下任何映射。
         let mut publisher = Publisher::new(&name, geometry, 60).unwrap();
         let view = ReadView::open(&name, mapping_size(frame_bytes));
         let calls = Cell::new(0);

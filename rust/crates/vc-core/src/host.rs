@@ -46,6 +46,9 @@ pub struct Snapshot {
     pub peer_adapter: String,
     pub config: Config,
     pub plan: Option<Plan>,
+    /// 本次预算/准备/启动使用的生效 MTU：自动模式为两端网卡报告值的较小者，
+    /// 显式模式为配置值；自动解析失败时为 None。
+    pub effective_mtu: Option<u32>,
     pub sender: Value,
     pub receiver: Value,
     pub vcam: VcamStatus,
@@ -517,7 +520,9 @@ impl Worker {
                     .any(|item| item.name == self.state.peer_adapter)
             {
                 self.state.peer_adapter.clear();
-                self.event("原发送网卡已失效，已恢复按物理控制路由选择。下次启动会重新准备确认。");
+                self.event(
+                    "原发送网卡已失效，已恢复自动选择（优先唯一 Intel I226，否则按控制连接路由）。下次启动会重新准备确认。",
+                );
             }
         }
         Ok(())
@@ -573,21 +578,59 @@ impl Worker {
         else {
             return;
         };
-        if let Ok(item) = adapters::choose_local_adapter(&self.state.host_adapters, ip) {
-            self.state.host_adapter = item.name.clone();
+        match adapters::choose_auto_adapter(&self.state.host_adapters, ip) {
+            Ok(item) => self.state.host_adapter = item.name.clone(),
+            Err(error) => {
+                // 多张 I226 或路由不唯一时不静默挑一张；要求用户显式选择，
+                // 后续扫描也不再自动改选。
+                self.host_selection_needs_user = true;
+                self.event(format!("无法自动选择主机接收网卡：{error}"));
+            }
         }
+    }
+    /// 预算与自动 MTU 使用的对端发送网卡预览。
+    ///
+    /// 显式选择优先并保持原样；未选择时只接受唯一 Intel I226，多张 I226
+    /// 明确报错而不静默挑一张。没有任何 I226 时返回 None：显式 MTU 仍可
+    /// 先准备再由采集端按实际网卡复核，但自动 MTU 无法在准备前解析。
+    fn peer_preview_adapter(&self) -> Result<Option<AdapterInfo>, String> {
+        if !self.state.peer_adapter.is_empty() {
+            return adapters::resolve(&self.state.peer_adapters, &self.state.peer_adapter)
+                .map(|item| item.cloned());
+        }
+        Ok(adapters::unique_i226(&self.state.peer_adapters)?.cloned())
     }
     fn recompute(&mut self) {
         let host = adapters::resolve(&self.state.host_adapters, &self.state.host_adapter)
             .ok()
             .flatten();
-        let peer = adapters::resolve(&self.state.peer_adapters, &self.state.peer_adapter)
-            .ok()
-            .flatten();
-        self.state.plan = Some(budget::plan(&self.state.config, host, peer));
+        let peer = match self.peer_preview_adapter() {
+            Ok(item) => item,
+            Err(error) => {
+                // I226 不唯一：把错误放进预算并阻止启动，绝不猜一张。
+                let mut plan = budget::plan(&self.state.config, host, None);
+                plan.errors.push(error);
+                plan.can_start = false;
+                self.state.effective_mtu = None;
+                self.state.plan = Some(plan);
+                return;
+            }
+        };
+        let effective = budget::host_effective_config(&self.state.config, host, peer.as_ref());
+        self.state.effective_mtu = effective.as_ref().ok().map(|config| config.capture.mtu);
+        let plan_config = match &effective {
+            Ok(config) => config.clone(),
+            // 解析失败仍用原配置算展示数值；错误随后并入 can_start=false。
+            Err(_) => self.state.config.clone(),
+        };
+        let mut plan = budget::plan(&plan_config, host, peer.as_ref());
+        if let Err(error) = effective {
+            plan.errors.push(error);
+            plan.can_start = false;
+        }
+        self.state.plan = Some(plan);
     }
-    fn request(&self, host: &AdapterInfo) -> SenderRequest {
-        let mut capture = self.state.config.capture.clone();
+    fn request(&self, host: &AdapterInfo, mut capture: crate::config::Capture) -> SenderRequest {
         if let Some(mac) = &host.mac {
             capture.dst_mac = mac.replace('-', ":").to_ascii_lowercase();
         }
@@ -615,7 +658,11 @@ impl Worker {
         self.state.busy = false;
     }
     fn start_inner(&mut self) -> Result<(), String> {
-        process::validate_start_config(&self.state.config)?;
+        // 先校验保存配置的结构；生效 MTU 取决于网卡解析，稍后用有效配置再校验。
+        let errors = self.state.config.validate();
+        if !errors.is_empty() {
+            return Err(errors.join("；"));
+        }
         let peer = self.peer.clone().ok_or("尚未连接被采集机。")?;
         let health = peer.health()?;
         session::require_peer(&health)?;
@@ -630,11 +677,17 @@ impl Worker {
                 "请选择本机接收网卡。"
             })?
             .clone();
+        // 自动 MTU 必须在 prepare 前知道两端网卡：显式选择优先，否则只接受
+        // 唯一 I226；多张 I226 明确报错，绝不在启动时静默挑一张。
+        let peer_preview = self.peer_preview_adapter()?;
+        let effective =
+            budget::host_effective_config(&self.state.config, Some(&host), peer_preview.as_ref())?;
+        process::validate_start_config(&effective)?;
         // 能力门禁在向对端准备会话之前完成；模块与本次编码/来源组合必须已声明。
         let module = self.receiver.data_plane_module()?;
         let caps = process::require_capabilities(&module)?;
-        process::require_stream_selection(&caps, &self.state.config.capture.codec, None)?;
-        let mut request = self.request(&host);
+        process::require_stream_selection(&caps, &effective.capture.codec, None)?;
+        let mut request = self.request(&host, effective.capture.clone());
         let body = serde_json::to_value(&request).map_err(|e| e.to_string())?;
         let prepared: PreparedSession = serde_json::from_value(peer.prepare_sender(&body)?)
             .map_err(|e| format!("采集准备响应无效：{e}"))?;
@@ -642,10 +695,17 @@ impl Worker {
         if !prepared.adapter.is_physical_nic() {
             return Err("被采集机未确认物理发送网卡，拒绝启动。".into());
         }
+        // 响应回显的 MTU 已由 confirm 精确比对；再按实际发送网卡报告复核，
+        // 采集端自行自动选卡时也不允许超过其 NlMtu。绝不修改网卡设置。
+        budget::verify_mtu_for_adapter(
+            effective.capture.mtu,
+            Some(&prepared.adapter),
+            "被采集机发送网卡",
+        )?;
         // 固定本次准备阶段确认的网卡，启动时不再自动换卡。
         request.auto_adapter = false;
         request.adapter = prepared.adapter.name.clone();
-        let plan = budget::plan(&self.state.config, Some(&host), Some(&prepared.adapter));
+        let plan = budget::plan(&effective, Some(&host), Some(&prepared.adapter));
         if !plan.can_start {
             return Err(format!(
                 "链路预算拒绝启动：{:?} {}",
@@ -653,6 +713,7 @@ impl Worker {
                 plan.errors.join("；")
             ));
         }
+        self.state.effective_mtu = Some(effective.capture.mtu);
         self.state.plan = Some(plan);
         if self.state.config.receive.vcam_autoregister {
             let before = vcam::status();
@@ -668,7 +729,7 @@ impl Worker {
         let (stats, hashlog, _) =
             process::session_paths(&run_dir, &request.session_id, Kind::Receiver);
         let request_json = process::receiver_request(
-            &self.state.config,
+            &effective,
             &host.name,
             &request.session_id,
             &stats,
@@ -1047,8 +1108,8 @@ fn session_to_stop(stats: &Value) -> Result<Option<String>, String> {
     Ok(Some(session.to_string()))
 }
 
-/// Windows canonicalize adds the extended path prefix after helper restart.
-/// Compare remote root strings without trying to resolve them on this machine.
+/// Windows canonicalize 在 helper 重启后可能加上扩展路径前缀。
+/// 这里只比较远端根字符串，不在本机解析该路径。
 fn peer_root_matches(actual: &Value, previous: &Value) -> bool {
     fn normalized(value: &Value) -> Option<String> {
         let path = value.as_str()?.replace('/', "\\");
@@ -1158,6 +1219,109 @@ mod tests {
         assert!(!peer_root_matches(&Value::Null, &Value::Null));
     }
 
+    fn nic_with_mtu(name: &str, mtu: Option<u32>) -> AdapterInfo {
+        AdapterInfo {
+            name: name.into(),
+            description: "test nic".into(),
+            label: Some(name.into()),
+            hardware_interface: Some(true),
+            virtual_nic: Some(false),
+            mtu,
+            ..Default::default()
+        }
+    }
+
+    fn i226(name: &str, mtu: Option<u32>) -> AdapterInfo {
+        AdapterInfo {
+            description: "Intel(R) Ethernet Controller I226-V".into(),
+            ..nic_with_mtu(name, mtu)
+        }
+    }
+
+    #[test]
+    fn peer_preview_prefers_unique_i226_and_refuses_multiple_cards() {
+        let (mut worker, _tx) = test_worker("http://127.0.0.1:1");
+        worker.state.peer_adapters = vec![
+            i226(r"\Device\NPF_{A}", Some(9000)),
+            nic_with_mtu(r"\Device\NPF_{R}", Some(9000)),
+        ];
+        assert_eq!(
+            worker.peer_preview_adapter().unwrap().unwrap().name,
+            r"\Device\NPF_{A}"
+        );
+
+        worker.state.peer_adapters = vec![
+            i226(r"\Device\NPF_{A}", Some(9000)),
+            i226(r"\Device\NPF_{B}", Some(1500)),
+        ];
+        let error = worker.peer_preview_adapter().unwrap_err();
+        assert!(error.contains("2 张") && error.contains("静默"), "{error}");
+
+        // 显式选择保持原样，不被 I226 偏好改写。
+        worker.state.peer_adapter = r"\Device\NPF_{B}".into();
+        assert_eq!(
+            worker.peer_preview_adapter().unwrap().unwrap().name,
+            r"\Device\NPF_{B}"
+        );
+
+        worker.state.peer_adapter.clear();
+        worker.state.peer_adapters = vec![nic_with_mtu(r"\Device\NPF_{R}", Some(9000))];
+        assert!(worker.peer_preview_adapter().unwrap().is_none());
+    }
+
+    #[test]
+    fn recompute_uses_effective_auto_mtu_and_blocks_without_both_nics() {
+        let (mut worker, _tx) = test_worker("http://127.0.0.1:1");
+        worker.state.host_adapters = vec![nic_with_mtu(r"\Device\NPF_{H}", Some(9000))];
+        worker.state.host_adapter = r"\Device\NPF_{H}".into();
+        worker.state.peer_adapters = vec![i226(r"\Device\NPF_{P}", Some(1500))];
+
+        worker.recompute();
+        assert_eq!(worker.state.effective_mtu, Some(1500));
+        let plan = worker.state.plan.as_ref().unwrap();
+        assert!(plan.can_start, "{:?}", plan.errors);
+        assert_eq!(plan.network.payload_bytes, 1458);
+        // 生效配置只是副本；保存的配置仍保持自动模式。
+        assert!(worker.state.config.capture.mtu_auto);
+        assert_eq!(worker.state.config.capture.mtu, 9000);
+
+        // 没有可预览的对端网卡时，自动 MTU 无法解析，必须阻止启动。
+        worker.state.peer_adapters.clear();
+        worker.recompute();
+        assert_eq!(worker.state.effective_mtu, None);
+        let plan = worker.state.plan.as_ref().unwrap();
+        assert!(!plan.can_start);
+        assert!(
+            plan.errors
+                .iter()
+                .any(|error| error.contains("自动 MTU") || error.contains("尚未确定")),
+            "{:?}",
+            plan.errors
+        );
+    }
+
+    #[test]
+    fn recompute_rejects_explicit_mtu_above_reported_host_nic() {
+        let (mut worker, _tx) = test_worker("http://127.0.0.1:1");
+        worker.state.config.capture.mtu_auto = false;
+        worker.state.config.capture.mtu = 9000;
+        worker.state.host_adapters = vec![nic_with_mtu(r"\Device\NPF_{H}", Some(1500))];
+        worker.state.host_adapter = r"\Device\NPF_{H}".into();
+        worker.state.peer_adapters = vec![i226(r"\Device\NPF_{P}", Some(9000))];
+
+        worker.recompute();
+        assert_eq!(worker.state.effective_mtu, None);
+        let plan = worker.state.plan.as_ref().unwrap();
+        assert!(!plan.can_start);
+        assert!(
+            plan.errors
+                .iter()
+                .any(|error| error.contains("超过") && error.contains("1500")),
+            "{:?}",
+            plan.errors
+        );
+    }
+
     #[test]
     fn controller_shutdown_joins_without_starting_any_process() {
         let mut controller = spawn();
@@ -1165,7 +1329,7 @@ mod tests {
         assert!(!controller.shared.snapshot.lock().unwrap().running);
     }
 
-    // ---------------------------------------------------------- fake peer
+    // ---------------------------------------------------------- 模拟对端
     //
     // 这些测试只运行真实 HostController 工作线程代码和本机回环 HTTP，不启动
     // 数据面、不注册 DShow、不枚举/打开网卡。远端“采集会话”由脚本化响应模拟。
