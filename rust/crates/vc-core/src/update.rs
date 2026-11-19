@@ -46,6 +46,16 @@ impl Role {
     }
 }
 
+/// 回滚探测本版运行时 DLL 的名字；必须与 `paths::data_plane_dll`/`paths::vcam_dll` 同名。
+/// 旧 C++ 的 vc-sender.exe / vc-vcam.dll 已不在发布包内，用它们探测会静默落到 build 目录，
+/// 回滚启动时就会拿到错误（或缺失）的 DLL 目录。
+fn native_probe(role: Role) -> &'static str {
+    match role {
+        Role::Capture => "vc_stream.dll",
+        Role::Host => "vc_vcam.dll",
+    }
+}
+
 #[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct UpdateFile {
@@ -1278,11 +1288,7 @@ pub fn prepare_activation_at(
         .map(|p| p.to_string_lossy().to_string());
     // 回滚要按当前进程真实的 native 目录启动（开发时可能是 --native-dir 覆盖），
     // 不能固定写 root，否则从 managed 回滚到扁平/开发构建会找不到原生 DLL。
-    let native_probe = match request.role {
-        Role::Capture => "vc-sender.exe",
-        Role::Host => "vc-vcam.dll",
-    };
-    let previous_native_dir = paths::native_exe(native_probe)
+    let previous_native_dir = paths::native_exe(native_probe(request.role))
         .parent()
         .map(|path| path.to_string_lossy().to_string());
     if previous.is_none() {
@@ -1842,6 +1848,26 @@ mod tests {
     fn iso_time_is_well_formed() {
         assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
+
+    #[test]
+    fn rollback_native_probe_tracks_versioned_runtime_dlls() {
+        let file_name = |path: PathBuf| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_owned)
+        };
+        assert_eq!(
+            file_name(paths::data_plane_dll()).as_deref(),
+            Some(native_probe(Role::Capture))
+        );
+        assert_eq!(
+            file_name(paths::vcam_dll()).as_deref(),
+            Some(native_probe(Role::Host))
+        );
+        // 旧 C++ 名字已不在发布包内；回滚探测不能再用它们。
+        assert_ne!(native_probe(Role::Capture), "vc-sender.exe");
+        assert_ne!(native_probe(Role::Host), "vc-vcam.dll");
     }
 
     fn temp_dir(tag: &str) -> PathBuf {

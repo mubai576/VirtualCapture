@@ -1,0 +1,15 @@
+[package]
+name = "vc-media"
+description = "VirtualCapture 编解码模块：Raw NV12 直通、TurboJPEG MJPEG、PyroWave Vulkan 计算（显式开发后端，无自动回退）"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+vc-transport = { path = "../vc-transport" }
+
+[target.'cfg(windows)'.dependencies]
+libloading = "0.8"

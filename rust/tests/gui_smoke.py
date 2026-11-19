@@ -65,8 +65,14 @@ def screenshot(hwnd, name):
         origin = w.POINT(0, 0)
         assert user.ClientToScreen(hwnd, c.byref(origin))
         image = ImageGrab.grab(bbox=(origin.x, origin.y, origin.x + bounds.right, origin.y + bounds.bottom), all_screens=True)
-        assert len(image.getcolors(256) or []) > 8 or image.getcolors(256) is None, "Window screenshot was blank"
         image.save(RUN / name)
+        colors = image.getcolors(256)
+        assert colors is None or len(colors) > 8, (
+            "Window screenshot was blank", {
+                "evidence": str(RUN / name), "colors": colors,
+                "client_origin": (origin.x, origin.y), "client_size": image.size,
+                "minimized": bool(user.IsIconic(hwnd)),
+            })
         return image
     finally:
         user.SetWindowPos(hwnd, w.HWND(-2), 0, 0, 0, 0, 0x0013)

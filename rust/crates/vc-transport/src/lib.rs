@@ -23,6 +23,7 @@
 //! `docs/proposals/rust-data-plane-20261114.md`。
 
 pub mod checksum;
+pub mod encoded;
 pub mod fragment;
 pub mod pcap;
 pub mod reassembly;

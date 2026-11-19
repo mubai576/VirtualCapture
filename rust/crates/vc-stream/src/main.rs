@@ -1,9 +1,6 @@
 #[cfg(windows)]
-mod windows;
-
-#[cfg(windows)]
 fn main() -> anyhow::Result<()> {
-    windows::run()
+    vc_stream::windows::run()
 }
 
 #[cfg(not(windows))]

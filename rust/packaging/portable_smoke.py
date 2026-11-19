@@ -1,7 +1,14 @@
-"""Validate extracted release files and launchers without registering a camera."""
+"""Validate extracted Rust release files and launchers without registering a camera.
+
+The payload intentionally has no C++ sender/receiver.  This smoke checks the
+Rust DLL ABI/capability contract (raw/mjpeg/pyrowave, sources, SHM v3), the OTA
+manifest layout, the Rust DirectShow DLL through the isolated verifier,
+launchers, app-local runtime, managed-layout resolution and normal shutdown.
+"""
 import argparse
 import ctypes as c
 from ctypes import wintypes as w
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -13,6 +20,18 @@ import time
 import urllib.error
 import urllib.request
 
+ROOT = Path(__file__).resolve().parents[2]
+
+
+def load_inventory():
+    path = ROOT / "rust/packaging/inventory.py"
+    spec = importlib.util.spec_from_file_location("vc_packaging_inventory", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+inventory = load_inventory()
 
 USER = c.windll.user32
 KERNEL = c.windll.kernel32
@@ -27,6 +46,93 @@ KERNEL.GetExitCodeProcess.argtypes = [w.HANDLE, c.POINTER(w.DWORD)]
 PSAPI.EnumProcessModulesEx.argtypes = [w.HANDLE, c.POINTER(c.c_void_p), w.DWORD, c.POINTER(w.DWORD), w.DWORD]
 PSAPI.GetModuleFileNameExW.argtypes = [w.HANDLE, c.c_void_p, w.LPWSTR, w.DWORD]
 CALLBACK = c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
+
+
+class VcStreamApiV1(c.Structure):
+    _fields_ = [
+        ("abi_version", w.UINT),
+        ("struct_size", w.UINT),
+        ("list_adapters", c.c_void_p),
+        ("start_session", c.c_void_p),
+        ("session_status", c.c_void_p),
+        ("stop_session", c.c_void_p),
+        ("destroy_session", c.c_void_p),
+        ("capabilities", c.c_void_p),
+    ]
+
+
+def validate_payload(package):
+    missing = [name for name in inventory.REQUIRED_FILES if not (package / name).is_file()]
+    assert not missing, f"Missing payload files: {missing}"
+    missing_licenses = [name for name in inventory.REQUIRED_LICENSES
+                        if not (package / "licenses" / name).is_file()]
+    assert not missing_licenses, f"Missing native/legal files: {missing_licenses}"
+    missing_rust = [name for name in inventory.RUST_LICENSE_OUTPUTS
+                    if not (package / "licenses" / name).is_file()]
+    assert not missing_rust, f"Missing Rust license outputs: {missing_rust}"
+    present = {p.name.lower() for p in package.rglob("*") if p.is_file()}
+    forbidden = sorted(present & inventory.FORBIDDEN_NAMES)
+    assert not forbidden, f"Legacy C++ production binaries in payload: {forbidden}"
+
+
+def validate_manifest(package):
+    """Cross-check the OTA manifest against the actual Rust runtime layout."""
+    manifest = json.loads((package / "package-manifest.json").read_text(encoding="utf-8"))
+    assert manifest["product"] == "VirtualCapture-Rust-portable", manifest["product"]
+    assert manifest["schema"] == 1, manifest["schema"]
+    assert manifest["default_codec"] == inventory.CODECS[0], manifest
+    assert set(manifest["codecs"]) == set(inventory.CODECS), manifest
+    modules = manifest["runtime_modules"]
+    assert set(modules["in_process_dlls"]) == set(inventory.RUST_DLLS), modules
+    assert modules["codec_dlls"] == inventory.CODEC_DLLS, modules
+    assert set(modules["codecs"]) == set(inventory.CODECS), modules
+    assert set(modules["sources"]) == set(inventory.SOURCES), modules
+    assert modules["stream_abi"] == inventory.STREAM_ABI, modules
+    declared = {entry["path"] for entry in manifest["files"]}
+    missing = sorted(set(inventory.REQUIRED_FILES) - declared)
+    assert not missing, f"Manifest does not declare payload files: {missing}"
+
+
+def validate_stream_capabilities(caps):
+    """Mirror vc-core::process::validate_capabilities for the packaged DLL."""
+    assert caps["stream_revision"] == 2, caps
+    assert caps["shm_version"] == 3, caps
+    assert caps["variable_resolution"] is True, caps
+    assert caps["pixel_format"] == "nv12", caps
+    assert caps["sendqueue"] == "frame", caps
+    for codec in inventory.CODECS:
+        assert codec in caps["codecs"], caps
+    for source in inventory.SOURCES:
+        assert source in caps["sources"], caps
+
+
+def stream_capabilities(package):
+    """Exercise the versioned vc_stream.dll ABI in this process."""
+    dll_path = package / "vc_stream.dll"
+    directory = os.add_dll_directory(str(package))
+    try:
+        library = c.WinDLL(str(dll_path))
+        library.vc_module_get_api.argtypes = [w.UINT]
+        library.vc_module_get_api.restype = c.c_void_p
+        address = library.vc_module_get_api(1)
+        assert address, "vc_module_get_api(1) returned NULL"
+        assert not library.vc_module_get_api(2), "vc_stream.dll accepted an unknown ABI version"
+        api = c.cast(address, c.POINTER(VcStreamApiV1)).contents
+        assert api.abi_version == 1, api.abi_version
+        assert api.struct_size >= c.sizeof(VcStreamApiV1), api.struct_size
+        query = c.WINFUNCTYPE(
+            c.c_int, c.c_char_p, w.UINT, c.POINTER(w.UINT),
+            c.c_char_p, w.UINT, c.POINTER(w.UINT))(api.capabilities)
+        output = c.create_string_buffer(4096)
+        written = w.UINT()
+        error = c.create_string_buffer(1024)
+        error_written = w.UINT()
+        code = query(output, len(output), c.byref(written),
+                     error, len(error), c.byref(error_written))
+        assert code == 0, (code, error.value, error_written.value)
+        return json.loads(output.value)
+    finally:
+        directory.close()
 
 
 def modules(pid, package):
@@ -87,6 +193,8 @@ def main():
     package = args.package.resolve()
     evidence = args.report_dir.resolve()
     evidence.mkdir(parents=True, exist_ok=False)
+    validate_payload(package)
+    validate_manifest(package)
     if not KERNEL.GetConsoleWindow():
         KERNEL.AllocConsole()
         KERNEL.GetConsoleWindow.restype = w.HWND
@@ -117,14 +225,17 @@ def main():
     (managed / "data").mkdir()
     (managed / "data/vc-rust-config.json").write_text(json.dumps({"version": 1,
         "peer_url": "", "capture": {"fps": 120}}), encoding="utf-8")
-    for exe in ("vc-sender.exe", "vc-receiver.exe"):
-        execute([package / exe, "--selftest"])
-        capability = json.loads(execute([package / exe, "--capabilities"]))
-        assert capability["stream_revision"] == 2 and capability["shm_version"] == 3 and capability["variable_resolution"]
-    dll_caps = json.loads(execute([package / "vc-vcam-verify.exe", "--dll", package / "vc-vcam.dll", "--capabilities"]))
-    assert dll_caps["stream_revision"] == 2 and dll_caps["shm_version"] == 3 and dll_caps["variable_resolution"]
+
+    stream_caps = stream_capabilities(package)
+    validate_stream_capabilities(stream_caps)
+    # Diagnostic-only probe: --capabilities loads the DLL and reads one export,
+    # never DllRegisterServer or a filter instance.
+    dll_caps = json.loads(execute([package / "vc-vcam-verify.exe", "--dll", package / "vc_vcam.dll", "--capabilities"]))
+    assert dll_caps["stream_revision"] == 2 and dll_caps["shm_version"] == 3
+    assert dll_caps["variable_resolution"] is True and dll_caps["max_dimension"] == 8192, dll_caps
     config = json.loads(execute([package / "vc-capture.exe", "--root", evidence, "--native-dir", package, "--print-config"]))
-    assert config["capture"]["codec"] == "raw"
+    # Raw remains the default; encoded codecs require explicit selection.
+    assert config["capture"]["codec"] == inventory.CODECS[0], config
     import pefile
     for name in ("VirtualCapture.exe", "vc-host.exe"):
         pe = pefile.PE(str(package / name))
@@ -256,10 +367,15 @@ def main():
                   "managed_launcher": {"root": str(managed), "config_fps": 120,
                                        "runtime_modules": managed_modules},
                   "app_local_runtime_modules": {"capture": capture_modules, "host": host_modules},
+                  "stream_dll_capabilities": stream_caps,
                   "dll_capabilities": dll_caps,
-                  "checks": ["sanitized PATH without developer tools", "native selftests and capabilities",
-                             "actual DShow DLL capability probe without registration", "PowerShell 5.1 parser",
-                             "capture CMD launcher, health and exit zero on console break", "graphical EXE entry without CMD/PowerShell and normal close",
+                  "checks": ["payload inventory, OTA manifest and no legacy C++ production binaries",
+                             "sanitized PATH without developer tools",
+                             "vc_stream.dll ABI, codecs/sources/SHM capability contract in-process",
+                             "actual Rust DShow DLL capability probe without registration",
+                             "PowerShell 5.1 parser",
+                             "capture CMD launcher, health and exit zero on console break",
+                             "graphical EXE entry without CMD/PowerShell and normal close",
                              "Chinese and space paths", "actual app-local MSVC runtime loads",
                              "managed current.json launchers and data configuration"]}
         (evidence / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")

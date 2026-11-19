@@ -1,11 +1,12 @@
+use std::collections::VecDeque;
 use std::ffi::{CStr, c_char, c_int, c_uchar, c_uint, c_void};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::mem::{MaybeUninit, size_of};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -16,7 +17,10 @@ use libloading::os::windows::{
     LOAD_LIBRARY_SEARCH_SYSTEM32, Library,
 };
 use serde_json::{Value, json};
+use vc_media::{AuSession, CodecConfig, Decoder, Encoder, OperationState, parse_au};
+use vc_source::{DesktopSource, SourceConfig};
 use vc_transport::checksum::{fnv1a64, fnv1a64_hex};
+use vc_transport::encoded::EncodedReassembler;
 use vc_transport::fragment::{FragmentConfig, fragments, write_ethernet};
 use vc_transport::{
     Config, Geometry, PushOutcome, Reassembler, TimingSummary, payload_max_for_mtu,
@@ -26,11 +30,11 @@ use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerf
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
 
-use vc_stream::pattern::Pattern;
-use vc_stream::shm::Publisher;
+use crate::pattern::Pattern;
+use crate::shm::Publisher;
 
 const MAX_CAPTURE: usize = 1024 * 1024;
-static STOP: AtomicBool = AtomicBool::new(false);
+static CLI_STOP: AtomicBool = AtomicBool::new(false);
 static QPC_FREQ: OnceLock<u64> = OnceLock::new();
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
 
@@ -54,64 +58,94 @@ enum Command {
 }
 
 #[derive(Args)]
-struct CommonArgs {
+pub(crate) struct CommonArgs {
     #[arg(long)]
-    adapter: String,
+    pub(crate) adapter: String,
     #[arg(long, default_value_t = 640)]
-    width: u32,
+    pub(crate) width: u32,
     #[arg(long, default_value_t = 640)]
-    height: u32,
+    pub(crate) height: u32,
     #[arg(long, default_value_t = 60)]
-    fps: u32,
+    pub(crate) fps: u32,
     #[arg(long, default_value_t = 9000)]
-    mtu: usize,
+    pub(crate) mtu: usize,
     #[arg(long, default_value = "s-rust-stream")]
-    session: String,
+    pub(crate) session: String,
     #[arg(long, default_value = "0x88B5", value_parser = parse_ethertype)]
-    ethertype: u16,
+    pub(crate) ethertype: u16,
 }
 
 #[derive(Args)]
-struct SendArgs {
+pub(crate) struct SendArgs {
     #[command(flatten)]
-    common: CommonArgs,
+    pub(crate) common: CommonArgs,
     #[arg(long, default_value_t = 120)]
-    frames: u64,
-    #[arg(long, default_value_t = 1)]
-    batch: usize,
+    pub(crate) frames: u64,
+    #[arg(long)]
+    pub(crate) batch: Option<usize>,
     #[arg(long, default_value_t = 0)]
-    pacing_us: u64,
+    pub(crate) pacing_us: u64,
     #[arg(long, default_value = "motion", value_parser = parse_pattern)]
-    pattern: Pattern,
+    pub(crate) pattern: Pattern,
     #[arg(long, default_value = "02:00:00:00:00:01", value_parser = parse_mac)]
-    source_mac: [u8; 6],
+    pub(crate) source_mac: [u8; 6],
     #[arg(long, default_value = "ff:ff:ff:ff:ff:ff", value_parser = parse_mac)]
-    dst_mac: [u8; 6],
+    pub(crate) dst_mac: [u8; 6],
+    #[arg(skip)]
+    pub(crate) source: SourceConfig,
+    #[arg(skip)]
+    pub(crate) codec: CodecConfig,
     #[arg(long)]
-    stats: Option<PathBuf>,
+    pub(crate) stats: Option<PathBuf>,
     #[arg(long)]
-    hashlog: Option<PathBuf>,
+    pub(crate) hashlog: Option<PathBuf>,
+    #[arg(long, hide = true)]
+    pub(crate) ready: Option<PathBuf>,
+    #[arg(skip)]
+    pub(crate) stop: Option<Arc<AtomicBool>>,
+    #[arg(skip)]
+    pub(crate) progress: Option<Arc<Progress>>,
+    #[arg(skip)]
+    pub(crate) hash_file: Option<File>,
+    #[arg(skip)]
+    pub(crate) stats_file: Option<File>,
+    #[arg(skip)]
+    pub(crate) operation: OperationState,
 }
 
 #[derive(Args)]
-struct ReceiveArgs {
+pub(crate) struct ReceiveArgs {
     #[command(flatten)]
-    common: CommonArgs,
+    pub(crate) common: CommonArgs,
     #[arg(long, value_parser = parse_mac)]
-    source_mac: Option<[u8; 6]>,
+    pub(crate) source_mac: Option<[u8; 6]>,
     #[arg(long, default_value_t = 120)]
-    expect_frames: u64,
+    pub(crate) expect_frames: u64,
     #[arg(long, default_value_t = 30)]
-    timeout_s: u64,
+    pub(crate) timeout_s: u64,
     #[arg(long)]
-    ready: Option<PathBuf>,
+    pub(crate) ready: Option<PathBuf>,
     #[arg(long)]
-    stats: Option<PathBuf>,
+    pub(crate) stats: Option<PathBuf>,
     #[arg(long)]
-    hashlog: Option<PathBuf>,
+    pub(crate) hashlog: Option<PathBuf>,
     /// Override the legacy DShow mapping name; diagnostics should use a unique Local\\ name.
     #[arg(long)]
-    shm: Option<String>,
+    pub(crate) shm: Option<String>,
+    #[arg(skip)]
+    pub(crate) codec: CodecConfig,
+    #[arg(skip)]
+    pub(crate) transport_file: Option<File>,
+    #[arg(skip)]
+    pub(crate) stop: Option<Arc<AtomicBool>>,
+    #[arg(skip)]
+    pub(crate) progress: Option<Arc<Progress>>,
+    #[arg(skip)]
+    pub(crate) hash_file: Option<File>,
+    #[arg(skip)]
+    pub(crate) stats_file: Option<File>,
+    #[arg(skip)]
+    pub(crate) operation: OperationState,
 }
 
 #[repr(C)]
@@ -157,7 +191,7 @@ type GetErr = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type LibVersion = unsafe extern "C" fn() -> *const c_char;
 type Close = unsafe extern "C" fn(*mut c_void);
 
-struct Npcap {
+pub(crate) struct Npcap {
     _library: Library,
     find_all_devs: FindAllDevs,
     free_all_devs: FreeAllDevs,
@@ -177,7 +211,7 @@ struct Npcap {
 }
 
 impl Npcap {
-    fn load() -> anyhow::Result<Self> {
+    pub(crate) fn load() -> anyhow::Result<Self> {
         let library = load_npcap()?;
         unsafe {
             macro_rules! symbol {
@@ -218,7 +252,7 @@ impl Npcap {
             .into_owned()
     }
 
-    fn adapters(&self) -> anyhow::Result<Vec<(String, String)>> {
+    pub(crate) fn adapters(&self) -> anyhow::Result<Vec<(String, String)>> {
         let mut list = ptr::null_mut();
         let mut err = [0i8; 256];
         ensure!(
@@ -252,7 +286,7 @@ impl Npcap {
         Ok(adapters)
     }
 
-    fn select_adapter(&self, requested: &str) -> anyhow::Result<String> {
+    pub(crate) fn select_adapter(&self, requested: &str) -> anyhow::Result<String> {
         let entries = self.adapters()?;
         if requested == r"\Device\NPF_Loopback" {
             ensure!(
@@ -311,7 +345,7 @@ impl Npcap {
     }
 }
 
-struct Capture(*mut c_void, Close);
+pub(crate) struct Capture(*mut c_void, Close);
 impl Drop for Capture {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -331,8 +365,8 @@ impl Drop for SendQueue {
     }
 }
 
-pub(super) fn run() -> anyhow::Result<()> {
-    STOP.store(false, Ordering::Relaxed);
+pub fn run() -> anyhow::Result<()> {
+    CLI_STOP.store(false, Ordering::Relaxed);
     install_ctrl_handler()?;
     let frequency = query_frequency()?;
     let _ = QPC_FREQ.set(frequency);
@@ -343,378 +377,147 @@ pub(super) fn run() -> anyhow::Result<()> {
     }
 }
 
-fn send(args: SendArgs) -> anyhow::Result<()> {
-    validate_common(&args.common)?;
-    ensure!(args.frames > 0, "--frames must be positive");
-    ensure!(
-        (1..=10000).contains(&args.batch),
-        "--batch must be in 1..=10000"
-    );
-    let pattern_id = args.pattern.id();
-    let geometry = geometry(&args.common)?;
-    let frame_bytes = geometry.frame_bytes();
-    let payload_max = payload_max_for_mtu(args.common.mtu)?;
-    let total = vc_transport::packet_count(frame_bytes, payload_max)? as usize;
-    let api = Npcap::load()?;
-    let adapter = api.select_adapter(&args.common.adapter)?;
-    let handle = api.open(&adapter, 65536, 1000)?;
-    let _capture = Capture(handle, api.close);
-    println!(
-        "[vc-stream] role=send adapter={adapter} session={} mode=pattern pattern={} geometry={}x{}@{} mtu={} payload={} packets_per_frame={} batch={} npcap={}",
-        args.common.session,
-        args.pattern,
-        args.common.width,
-        args.common.height,
-        args.common.fps,
-        args.common.mtu,
-        payload_max,
-        total,
-        args.batch,
-        api.version()
-    );
-    let mut hashlog = create_writer(args.hashlog.as_ref())?;
-    let mut frame = vec![0u8; frame_bytes];
-    let mut packet = vec![0u8; 14 + 28 + payload_max];
-    let mut queue = None;
-    let mut queue_count = 0usize;
-    if args.batch > 1 {
-        let capacity = args
-            .batch
-            .min(total)
-            .saturating_mul(14 + 28 + payload_max + size_of::<PcapHeader>())
-            .max(2 * 1024 * 1024)
-            .min(u32::MAX as usize);
-        let q = unsafe { (api.queue_alloc)(capacity as u32) };
-        ensure!(!q.is_null(), "pcap_sendqueue_alloc({capacity}) failed");
-        queue = Some(SendQueue(q, api.queue_destroy));
-    }
-    let cpu_start = process_cpu_ns()?;
-    let started = Instant::now();
-    let mut pacer = FramePacer::new(args.common.fps, qpc_ns());
-    let mut sent_packets = 0u64;
-    let mut sent_bytes = 0u64;
-    let mut first_qpc = 0u64;
-    let mut last_qpc = 0u64;
-    let mut total_frame_elapsed = 0u64;
+pub(crate) struct Progress(Mutex<Value>);
 
-    for frame_id in 0..args.frames {
-        sleep_until(pacer.next_ns);
-        if STOP.load(Ordering::Relaxed) {
-            break;
-        }
-        let frame_start_ns = qpc_ns();
-        pacer.advance(frame_start_ns);
-        args.pattern.fill(geometry, frame_id as u32, &mut frame);
-        let send_ns = qpc_ns();
-        let generation_ns = send_ns.saturating_sub(frame_start_ns);
-        let config = FragmentConfig {
-            payload_max,
-            qpc_ns: frame_start_ns,
-            pattern: pattern_id,
-        };
-        for fragment in fragments(&frame, frame_id as u32, config)? {
-            let len = write_ethernet(args.dst_mac, args.source_mac, &fragment, &mut packet)
-                .map_err(|needed| anyhow::anyhow!("packet buffer requires {needed} bytes"))?;
-            if let Some(send_queue) = queue.as_ref() {
-                let header = PcapHeader {
-                    ts_sec: 0,
-                    ts_usec: 0,
-                    caplen: len as u32,
-                    len: len as u32,
-                };
-                let rc = unsafe { (api.queue_packet)(send_queue.0, &header, packet.as_ptr()) };
-                ensure!(
-                    rc == 0,
-                    "pcap_sendqueue_queue failed before frame {frame_id} packet {sent_packets}"
-                );
-                queue_count += 1;
-                if queue_count >= args.batch {
-                    transmit_queue(&api, handle, send_queue.0, queue_count)?;
-                    queue_count = 0;
-                }
-            } else {
-                let rc = unsafe { (api.send_packet)(handle, packet.as_ptr(), len as c_int) };
-                if rc != 0 {
-                    bail!(
-                        "pcap_sendpacket failed: {}",
-                        api.handle_error(handle, "send packet")
-                    );
-                }
-            }
-            sent_packets += 1;
-            sent_bytes += len as u64;
-            if args.pacing_us > 0 {
-                let delay_ns = args.pacing_us.saturating_mul(1000);
-                sleep_until(qpc_ns().saturating_add(delay_ns));
-            }
-        }
-        if let (Some(send_queue), n) = (queue.as_ref(), queue_count)
-            && n > 0
-        {
-            transmit_queue(&api, handle, send_queue.0, n)?;
-            queue_count = 0;
-        }
-        let end_ns = qpc_ns();
-        if frame_id == 0 {
-            first_qpc = send_ns;
-        }
-        last_qpc = end_ns;
-        total_frame_elapsed =
-            total_frame_elapsed.saturating_add(generation_ns + end_ns.saturating_sub(send_ns));
-        let hash = vc_transport::checksum::fnv1a64_hex(vc_transport::checksum::fnv1a64(&frame));
-        if let Some(writer) = hashlog.as_mut() {
-            writeln!(
-                writer,
-                "{{\"frame_id\":{},\"hash\":\"{}\",\"qpc_ns\":{},\"send_qpc_ns\":{}}}",
-                frame_id, hash, frame_start_ns, send_ns
-            )?;
+impl Progress {
+    pub(crate) fn new(initial: Value) -> Self {
+        Self(Mutex::new(initial))
+    }
+
+    fn update(&self, value: &Value) {
+        let mut state = self.0.lock().unwrap_or_else(|error| error.into_inner());
+        if let (Some(current), Some(fields)) = (state.as_object_mut(), value.as_object()) {
+            current.extend(
+                fields
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
         }
     }
-    if let Some(writer) = hashlog.as_mut() {
-        writer.flush()?;
+
+    pub(crate) fn snapshot(&self) -> Value {
+        self.0
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
-    let elapsed = started.elapsed().as_secs_f64().max(0.000_001);
-    let sent_frames = sent_packets / total as u64;
-    let cpu_pct =
-        (process_cpu_ns()?.saturating_sub(cpu_start) as f64 / 1_000_000_000.0) / elapsed * 100.0;
-    let stats = json!({
-        "session_id": args.common.session,
-        "adapter": adapter,
-        "running": false,
-        "frames": sent_frames,
-        "sent_frames": sent_frames,
-        "sent_packets": sent_packets,
-        "send_errors": 0,
-        "bytes": sent_bytes,
-        "pps": sent_packets as f64 / elapsed,
-        "bps": sent_bytes as f64 * 8.0 / elapsed,
-        "fps_actual": sent_frames as f64 / elapsed,
-        "fps_target": args.common.fps,
-        "first_send_qpc_ns": first_qpc,
-        "last_send_qpc_ns": last_qpc,
-        "generation_send_avg_ms": total_frame_elapsed as f64 / sent_frames.max(1) as f64 / 1_000_000.0,
-        "cpu_pct": cpu_pct,
-        "uptime_s": elapsed,
-        "pattern": args.pattern.name(),
-        "width": args.common.width,
-        "height": args.common.height,
-        "frame_bytes": frame_bytes,
-        "mtu": args.common.mtu,
-        "ethertype": format!("0x{:04x}", args.common.ethertype),
-        "batch": args.batch,
-        "pacing_us": args.pacing_us,
-        "transform": "pattern",
-        "codec": "raw",
-        "source_skipped": 0,
-        "gpu_ms": 0.0,
-    });
-    write_stats(args.stats.as_ref(), &stats)?;
-    println!("{}", stats);
-    ensure!(
-        sent_frames == args.frames || STOP.load(Ordering::Relaxed),
-        "sender stopped after {sent_frames}/{} complete frames",
-        args.frames
-    );
-    Ok(())
 }
 
-fn transmit_queue(
-    api: &Npcap,
-    handle: *mut c_void,
-    queue: *mut PcapSendQueue,
-    packets: usize,
+fn publish_progress(
+    progress: Option<&Progress>,
+    path: Option<&Path>,
+    value: &Value,
 ) -> anyhow::Result<()> {
-    let expected = unsafe { (*queue).len };
-    let actual = unsafe { (api.queue_transmit)(handle, queue, 0) };
-    ensure!(
-        actual == expected,
-        "pcap_sendqueue_transmit short send: {actual}/{expected} bytes for {packets} packets; no batch fallback"
-    );
-    unsafe {
-        (*queue).len = 0;
+    if let Some(path) = path {
+        atomic_write_json(path, value)?;
+    }
+    if let Some(progress) = progress {
+        progress.update(value);
     }
     Ok(())
 }
 
-fn receive(args: ReceiveArgs) -> anyhow::Result<()> {
+pub(crate) fn validate_sender(args: &SendArgs) -> anyhow::Result<()> {
     validate_common(&args.common)?;
-    ensure!(args.timeout_s > 0, "--timeout-s must be positive");
-    let geometry = geometry(&args.common)?;
-    let payload_max = payload_max_for_mtu(args.common.mtu)?;
-    let config = Config::new(geometry, args.common.mtu)?.with_source_mac(args.source_mac);
-    let mut reassembler = Reassembler::new(config)?;
-    let api = Npcap::load()?;
-    let adapter = api.select_adapter(&args.common.adapter)?;
-    let handle = api.open(&adapter, (MAX_CAPTURE + 14) as c_int, 1)?;
-    let _capture = Capture(handle, api.close);
-    unsafe {
-        (api.set_buff)(handle, 128 * 1024 * 1024);
-    }
-    unsafe {
-        (api.set_min_to_copy)(handle, 0);
-    }
-    let linktype = unsafe { (api.datalink)(handle) };
-    let mut publisher = match args.shm.as_deref() {
-        Some(name) => Some(
-            Publisher::new(name, geometry, args.common.fps)
-                .with_context(|| format!("create requested SHM v3 mapping {name}"))?,
-        ),
-        None => None,
-    };
-    let mut hashlog = create_writer(args.hashlog.as_ref())?;
-    let start = Instant::now();
-    let deadline = start + Duration::from_secs(args.timeout_s);
-    let mut hashes = 0u64;
-    let mut shm_published = 0u64;
-    let mut hash_mismatch = 0u64;
-    let mut last_frame_id = None;
-    let mut first_completed_ns = 0u64;
-    let mut final_completed_ns = 0u64;
-    let mut bytes = 0u64;
-    let expected_frame_bytes = geometry.frame_bytes();
-
-    let readiness = json!({ "session_id": args.common.session, "adapter": adapter, "running": true, "geometry": {"width":args.common.width,"height":args.common.height,"fps":args.common.fps}, "mtu":args.common.mtu, "ethertype":format!("0x{:04x}",args.common.ethertype), "datalink":linktype, "shm_enabled":publisher.is_some(), "shm_version":if publisher.is_some(){3}else{0}, "capture_buffer_bytes":128*1024*1024, "mintocopy":0, "npcap":api.version() });
-    write_ready(args.ready.as_ref(), &readiness)?;
-    println!(
-        "[vc-stream] role=receive adapter={adapter} session={} datalink={} width={} height={} fps={} mtu={} payload={} expect_frames={} shm={}",
-        args.common.session,
-        linktype,
-        args.common.width,
-        args.common.height,
-        args.common.fps,
-        args.common.mtu,
-        payload_max,
-        args.expect_frames,
-        publisher.is_some()
-    );
-    let cpu_start = process_cpu_ns()?;
-    let mut expected_frame = vec![0u8; expected_frame_bytes];
-
-    while !STOP.load(Ordering::Relaxed) && start.elapsed() < Duration::from_secs(args.timeout_s) {
-        if args.expect_frames > 0 && hashes >= args.expect_frames {
-            break;
-        }
-        if Instant::now() >= deadline {
-            break;
-        }
-        let mut header = ptr::null_mut();
-        let mut data = ptr::null();
-        let rc = unsafe { (api.next_ex)(handle, &mut header, &mut data) };
-        if rc == 0 {
-            continue;
-        }
-        if rc < 0 {
-            bail!(
-                "pcap_next_ex returned {rc}: {}",
-                api.handle_error(handle, "capture")
-            );
-        }
-        if header.is_null() || data.is_null() {
-            continue;
-        }
-        let caplen = unsafe { (*header).caplen as usize };
-        if !(14 + 28..=MAX_CAPTURE).contains(&caplen) {
-            continue;
-        }
-        let packet = unsafe { std::slice::from_raw_parts(data, caplen) };
-        let arrived_ns = qpc_ns();
-        bytes = bytes.saturating_add(caplen as u64);
-        if let PushOutcome::Completed(frame) =
-            reassembler.push_ethernet_timed(packet, arrived_ns, qpc_ns)
-        {
-            ensure!(
-                frame.data.len() == expected_frame_bytes,
-                "completed frame {} has {} bytes, expected {expected_frame_bytes}",
-                frame.frame_id,
-                frame.data.len()
-            );
-            let hash = fnv1a64(&frame.data);
-            let hash_text = fnv1a64_hex(hash);
-            let pattern = Pattern::from_id(frame.pattern);
-            if let Some(pattern) = pattern {
-                pattern.fill(geometry, frame.frame_id, &mut expected_frame);
-                if expected_frame != frame.data {
-                    hash_mismatch += 1;
-                }
-            }
-            let token = if let Some(shm) = publisher.as_mut() {
-                Some(shm.publish(frame.frame_id, frame.first_packet_ns, &frame.data, qpc_ns)?)
-            } else {
-                None
-            };
-            if let (Some(shm), Some(token)) = (publisher.as_mut(), token) {
-                shm.mark_hash(token, hash);
-                shm_published += 1;
-            }
-            if let Some(writer) = hashlog.as_mut() {
-                writeln!(
-                    writer,
-                    "{{\"frame_id\":{},\"hash\":\"{}\",\"qpc_ns\":{},\"first_packet_qpc_ns\":{}}}",
-                    frame.frame_id, hash_text, frame.completed_ns, frame.first_packet_ns
-                )?;
-                writer.flush()?;
-            }
-            hashes += 1;
-            if hashes == 1 {
-                first_completed_ns = frame.completed_ns;
-            }
-            final_completed_ns = frame.completed_ns;
-            last_frame_id = Some(frame.frame_id);
-        }
-    }
-    reassembler.finish();
-    let cpu_pct = (process_cpu_ns()?.saturating_sub(cpu_start) as f64 / 1_000_000_000.0)
-        / start.elapsed().as_secs_f64().max(0.000_001)
-        * 100.0;
-    if let Some(writer) = hashlog.as_mut() {
-        writer.flush()?;
-    }
-    if let Some(stats_path) = args.stats.as_ref() {
-        write_stats(
-            Some(stats_path),
-            &json!({"session_id":args.common.session,"adapter":adapter,"running":false,"complete":reassembler.stats().complete,"hash_rows":hashes,"dropped":reassembler.stats().dropped,"packets_recv":reassembler.stats().packets_recv,"packets_lost":reassembler.stats().packets_lost,"crc_errors":reassembler.stats().crc_errors,"duplicate":reassembler.stats().duplicate,"gaps":reassembler.stats().gaps,"hash_mismatch":hash_mismatch,"shm_published":shm_published,"bytes_captured":bytes,"pps":reassembler.stats().packets_recv as f64/start.elapsed().as_secs_f64().max(0.000001),"bps":bytes as f64*8.0/start.elapsed().as_secs_f64().max(0.000001),"fps_actual":hashes as f64/start.elapsed().as_secs_f64().max(0.000001),"cpu_pct":cpu_pct,"inter_arrival":timing_value(reassembler.inter_arrival_summary()),"rseg":timing_value(reassembler.rseg_summary()),"uptime_s":start.elapsed().as_secs_f64(),"width":args.common.width,"height":args.common.height,"frame_bytes":geometry.frame_bytes(),"fps_limit":args.common.fps,"mtu":args.common.mtu,"ethertype":format!("0x{:04x}",args.common.ethertype),"codec":"raw","last_frame_id":last_frame_id,"first_completed_qpc_ns":first_completed_ns,"last_completed_qpc_ns":final_completed_ns,"capture_datalink":linktype,"inflight_frames":reassembler.inflight_frames(),"inflight_bytes":reassembler.inflight_bytes()}),
-        )?;
-    }
-    let stats = reassembler.stats();
-    println!(
-        "[vc-stream] receive done adapter={adapter} session={} complete={} drops={} gaps={} hash_mismatch={}",
-        args.common.session, stats.complete, stats.dropped, stats.gaps, hash_mismatch
-    );
-    if args.expect_frames > 0 {
+    vc_source::validate(&args.source)?;
+    validate_codec(&args.codec, &args.common)?;
+    if args.source.mode == "pattern" {
         ensure!(
-            hashes == args.expect_frames,
-            "receiver got {hashes}/{} frames before timeout",
-            args.expect_frames
+            args.source.transform == "crop",
+            "pattern source does not support desktop transforms"
         );
     }
-    ensure!(
-        stats.dropped == 0 && stats.packets_lost == 0 && hash_mismatch == 0,
-        "receiver finished with drops={}, packets_lost={}, hash_mismatch={hash_mismatch}",
-        stats.dropped,
-        stats.packets_lost
-    );
+    if args.codec.codec != "raw" {
+        ensure!(
+            args.batch.is_none(),
+            "encoded streams do not accept a fixed Raw batch"
+        );
+    }
     Ok(())
 }
+
+pub(crate) fn validate_receiver(args: &ReceiveArgs) -> anyhow::Result<()> {
+    validate_common(&args.common)?;
+    Config::new(geometry(&args.common)?, args.common.mtu)?;
+    validate_codec(&args.codec, &args.common)?;
+    if let Some(name) = args.shm.as_deref() {
+        ensure!(
+            !name.is_empty() && !name.contains('\0'),
+            "SHM name must not be empty or contain NUL"
+        );
+    }
+    Ok(())
+}
+
+fn validate_codec(codec: &CodecConfig, common: &CommonArgs) -> anyhow::Result<()> {
+    vc_media::validate(codec, common.width, common.height, common.fps)
+}
+
+pub(crate) fn transport_path(hashlog: &Path) -> PathBuf {
+    hashlog.with_file_name(format!(
+        "{}.transport.jsonl",
+        hashlog
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("hashlog")
+    ))
+}
+
+pub(crate) fn capabilities() -> Value {
+    json!({
+        "stream_revision": 2,
+        "variable_resolution": true,
+        "shm_version": 3,
+        "pixel_format": "nv12",
+        "codecs": ["raw", "mjpeg", "pyrowave"],
+        "sources": ["pattern", "dda", "wgc"],
+        "sendqueue": "frame",
+        "encoded_batch": null,
+        "no_automatic_fallback": true,
+    })
+}
+
+fn stopped(stop: Option<&AtomicBool>) -> bool {
+    stop.unwrap_or(&CLI_STOP).load(Ordering::Acquire)
+}
+
+fn loop_sleep(target_ns: u64, stop: Option<&AtomicBool>) -> bool {
+    loop {
+        if stopped(stop) {
+            return false;
+        }
+        let remaining = target_ns.saturating_sub(qpc_ns());
+        if remaining == 0 {
+            return true;
+        }
+        // High-resolution timer delivery can still arrive about half a
+        // millisecond late. Wake ahead of that window, then use QPC for the
+        // precision tail: relative send ceilings cannot recover oversleep by
+        // sending early on the next frame. Keep the tail below one millisecond
+        // so waiting does not consume most of the MMCSS CPU budget.
+        if remaining > 800_000 {
+            scheduling::wait_for((remaining - 700_000).min(5_000_000));
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+#[path = "windows/receiver.rs"]
+mod receiver;
+#[path = "windows/scheduling.rs"]
+mod scheduling;
+#[path = "windows/sender.rs"]
+mod sender;
+pub(crate) use receiver::receive;
+use scheduling::ThreadPriority;
+pub(crate) use sender::send;
 
 fn timing_value(timing: TimingSummary) -> Value {
     json!({"samples":timing.samples,"avg_ms":timing.avg_ms,"p50_ms":timing.p50_ms,"p99_ms":timing.p99_ms,"max_ms":timing.max_ms})
 }
 
-fn write_ready(path: Option<&PathBuf>, value: &Value) -> anyhow::Result<()> {
-    if let Some(path) = path {
-        atomic_write_json(path, value)?;
-    }
-    Ok(())
-}
-
-fn write_stats(path: Option<&PathBuf>, value: &Value) -> anyhow::Result<()> {
-    if let Some(path) = path {
-        atomic_write_json(path, value)?;
-    }
-    Ok(())
-}
-
-fn atomic_write_json(path: &PathBuf, value: &Value) -> anyhow::Result<()> {
+fn atomic_write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("create stats directory {}", parent.display()))?;
@@ -744,20 +547,47 @@ fn atomic_write_json(path: &PathBuf, value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn create_writer(path: Option<&PathBuf>) -> anyhow::Result<Option<BufWriter<File>>> {
+fn take_writer(file: Option<File>, path: Option<&Path>) -> anyhow::Result<Option<BufWriter<File>>> {
+    if let Some(file) = file {
+        return Ok(Some(BufWriter::new(file)));
+    }
     path.map(|path| {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let file = OpenOptions::new()
-            .create(true)
-            .truncate(true)
+            .create_new(true)
             .write(true)
             .open(path)
-            .with_context(|| format!("open hashlog {}", path.display()))?;
+            .with_context(|| {
+                format!(
+                    "create evidence {} (existing evidence is never overwritten)",
+                    path.display()
+                )
+            })?;
         Ok(BufWriter::new(file))
     })
     .transpose()
+}
+
+fn write_stats_file(path: Option<&Path>, file: Option<File>, value: &Value) -> anyhow::Result<()> {
+    let Some(mut writer) = take_writer(file, path)? else {
+        return Ok(());
+    };
+    writer.seek(SeekFrom::Start(0))?;
+    writer.get_ref().set_len(0)?;
+    serde_json::to_writer(&mut writer, value)?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+    Ok(())
+}
+
+fn au_session(codec: &str, width: u32, height: u32, fps: u32) -> anyhow::Result<AuSession> {
+    match codec {
+        "mjpeg" => Ok(AuSession::mjpeg(width, height, fps)),
+        "pyrowave" => Ok(AuSession::pyrowave(width, height, fps)),
+        _ => bail!("codec {codec} has no encoded access unit session"),
+    }
 }
 
 fn parse_mac(value: &str) -> Result<[u8; 6], String> {
@@ -811,13 +641,21 @@ fn geometry(args: &CommonArgs) -> anyhow::Result<Geometry> {
     Ok(Geometry::new(args.width, args.height)?)
 }
 
+pub(crate) fn initialize_timebase() -> anyhow::Result<()> {
+    let frequency = query_frequency()?;
+    let _ = QPC_FREQ.set(frequency);
+    Ok(())
+}
+
 fn qpc_ns() -> u64 {
     let mut counter = MaybeUninit::<i64>::uninit();
     unsafe {
         QueryPerformanceCounter(counter.as_mut_ptr());
     }
     let ticks = unsafe { counter.assume_init() } as u64;
-    let freq = *QPC_FREQ.get_or_init(|| query_frequency().unwrap_or(1));
+    let freq = *QPC_FREQ.get_or_init(|| {
+        query_frequency().expect("QPC frequency must be initialized before data-plane use")
+    });
     let frequency = freq.max(1);
     ticks / frequency * 1_000_000_000 + ticks % frequency * 1_000_000_000 / frequency
 }
@@ -851,6 +689,7 @@ impl FramePacer {
     }
 
     fn advance(&mut self, frame_start_ns: u64) {
+        // The caller records capture start, before source/encoding/transmit work.
         // Absorb minor wake-up jitter without drifting. Rebase after a larger
         // stall instead of trying to catch up by sending back-to-back frames.
         let phase_tolerance_ns = self.offset_ns(1) / 8;
@@ -895,30 +734,13 @@ fn process_cpu_ns() -> anyhow::Result<u64> {
         * 100)
 }
 
-fn sleep_until(target_ns: u64) {
-    loop {
-        if STOP.load(Ordering::Relaxed) {
-            break;
-        }
-        let remaining = target_ns.saturating_sub(qpc_ns());
-        if remaining == 0 {
-            break;
-        }
-        if remaining > 2_000_000 {
-            thread::sleep(Duration::from_nanos(remaining - 1_000_000));
-        } else {
-            std::hint::spin_loop();
-        }
-    }
-}
-
 fn install_ctrl_handler() -> anyhow::Result<()> {
     use windows_sys::Win32::System::Console::{
         CTRL_BREAK_EVENT, CTRL_C_EVENT, PHANDLER_ROUTINE, SetConsoleCtrlHandler,
     };
     unsafe extern "system" fn handle(event: u32) -> i32 {
         if event == CTRL_C_EVENT || event == CTRL_BREAK_EVENT {
-            STOP.store(true, Ordering::Relaxed);
+            CLI_STOP.store(true, Ordering::Relaxed);
             1
         } else {
             0
@@ -1001,6 +823,21 @@ mod tests {
         let mut pacer = FramePacer::new(240, base);
         for _ in 0..240 {
             pacer.advance(pacer.next_ns + 5_000);
+        }
+        assert_eq!(pacer.next_ns, base + 1_000_000_000);
+    }
+
+    #[test]
+    fn frame_pacer_keeps_encoding_work_inside_the_frame_period() {
+        let base = 100;
+        let mut pacer = FramePacer::new(240, base);
+        for _ in 0..240 {
+            let capture_start = pacer.next_ns;
+            pacer.advance(capture_start);
+            // Representative codec work exceeds the wake-up jitter tolerance,
+            // but finishes within one period and must not reduce the frame rate.
+            let send_start = capture_start + 1_300_000;
+            assert!(send_start < pacer.next_ns);
         }
         assert_eq!(pacer.next_ns, base + 1_000_000_000);
     }

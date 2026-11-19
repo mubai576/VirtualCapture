@@ -9,7 +9,7 @@ pub fn set_root_override(path: impl Into<PathBuf>) {
     let _ = ROOT_OVERRIDE.set(path.into());
 }
 
-/// 原生 exe/dll 目录覆盖（开发时指向现有 C++ 构建目录）。
+/// 数据面/虚拟卡 DLL 目录覆盖（开发时可指向构建输出，不回退旧 exe）。
 pub fn set_native_dir_override(path: impl Into<PathBuf>) {
     let _ = NATIVE_DIR_OVERRIDE.set(path.into());
 }
@@ -309,10 +309,10 @@ pub fn migrate_legacy_config(root: &Path) -> std::io::Result<bool> {
     Ok(true)
 }
 
-/// 原生程序查找顺序：显式目录 → Managed 当前 release → build → ROOT → exe 目录。
+/// 数据面/虚拟卡 DLL 查找顺序：显式目录 → Managed 当前 release → build → ROOT → exe 目录。
 ///
 /// Managed 布局下优先使用 `app/current.json` 指向的 release，使仍在运行的旧主机进程
-/// 在激活后也能拉起新版本的 receiver/DLL。
+/// 在激活后也能装载新版本的 `vc_stream.dll`/`vc_vcam.dll`。
 pub fn native_exe(name: &str) -> PathBuf {
     if let Some(dir) = NATIVE_DIR_OVERRIDE.get() {
         return dir.join(name);
@@ -346,11 +346,15 @@ pub fn native_exe(name: &str) -> PathBuf {
         .unwrap_or_else(|| root.join("build").join(name))
 }
 
-pub fn vcam_dll() -> PathBuf {
-    native_exe("vc-vcam.dll")
+pub fn data_plane_dll() -> PathBuf {
+    native_exe("vc_stream.dll")
 }
 
-/// 运行 DLL 与 exe 同目录；开发布局在 build，便携包在 ROOT。
+pub fn vcam_dll() -> PathBuf {
+    native_exe("vc_vcam.dll")
+}
+
+/// 运行 DLL 与主程序同目录；开发布局在 build，便携包在 ROOT。
 pub fn runtime_dll(name: &str) -> PathBuf {
     native_exe(name)
 }
@@ -358,6 +362,18 @@ pub fn runtime_dll(name: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn product_dll_names_are_versioned_artifacts() {
+        assert_eq!(
+            data_plane_dll().file_name().and_then(|name| name.to_str()),
+            Some("vc_stream.dll")
+        );
+        assert_eq!(
+            vcam_dll().file_name().and_then(|name| name.to_str()),
+            Some("vc_vcam.dll")
+        );
+    }
 
     #[test]
     fn rust_config_uses_isolated_file_name() {

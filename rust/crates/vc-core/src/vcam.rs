@@ -1,7 +1,8 @@
-//! 虚拟采集卡（vc-vcam.dll）注册与状态。
+//! 虚拟采集卡（Rust DShow COM `vc_vcam.dll`）注册与状态。
 //!
-//! 复用现有 C++ DLL，不重写 DShow filter。注册写 HKCU\\Software\\Classes\\CLSID\\{...}，
-//! 产品固定 `FrameMap=<shm>`、`Motion=0`。
+//! 复用与 C++ 兼容的 CLSID/注册表语义，不重写 DShow filter 接口。注册写
+//! HKCU\\Software\\Classes\\CLSID\\{...}，产品固定 `FrameMap=<shm>`、`Motion=0`。
+//! 能力探测走现有隔离诊断程序 `vc-vcam-verify.exe`，不注册 COM、不接管现用设备。
 
 use std::path::PathBuf;
 
@@ -18,6 +19,9 @@ pub struct VcamStatus {
     pub registered: String,
     /// 注册项是否指向本目录 DLL。
     pub match_local: bool,
+    /// 注册表读取失败（权限/IO），不能把“读不到”当成“未注册”。
+    #[serde(default)]
+    pub registration_unknown: bool,
 }
 
 impl VcamStatus {
@@ -32,7 +36,11 @@ pub fn dll_path() -> PathBuf {
 
 pub fn status() -> VcamStatus {
     let dll = dll_path();
-    let registered = read_registered_dll().unwrap_or_default();
+    let (registered, registration_unknown) = match read_registered_dll() {
+        RegistryRead::Missing => (String::new(), false),
+        RegistryRead::Value(value) => (value, false),
+        RegistryRead::Unknown => (String::new(), true),
+    };
     let match_local = !dll.as_os_str().is_empty()
         && !registered.is_empty()
         && normalize(&registered) == normalize(&dll.display().to_string());
@@ -40,11 +48,437 @@ pub fn status() -> VcamStatus {
         dll: dll.display().to_string(),
         registered,
         match_local,
+        registration_unknown,
     }
 }
 
 fn normalize(path: &str) -> String {
-    path.replace('/', "\\").to_ascii_lowercase()
+    #[cfg(windows)]
+    let path = {
+        use std::path::Component;
+        // Existing paths also resolve junctions/aliases. Old release DLLs can be
+        // gone after OTA, so retain an absolute, lexically normalized fallback.
+        let absolute = std::fs::canonicalize(path)
+            .or_else(|_| std::path::absolute(path))
+            .unwrap_or_else(|_| PathBuf::from(path));
+        let mut normalized = PathBuf::new();
+        for component in absolute.components() {
+            match component {
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if matches!(
+                        normalized.components().next_back(),
+                        Some(Component::Normal(_))
+                    ) {
+                        normalized.pop();
+                    }
+                }
+                _ => normalized.push(component.as_os_str()),
+            }
+        }
+        normalized.to_string_lossy().into_owned()
+    };
+    let path = path.replace('/', "\\");
+    let path = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+        format!(r"\\{unc}")
+    } else {
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
+    };
+    path.trim_end_matches('\\').to_ascii_lowercase()
+}
+
+fn same_path(left: &str, right: &str) -> bool {
+    !left.is_empty() && !right.is_empty() && normalize(left) == normalize(right)
+}
+
+fn path_inside_root(path: &str, root: &str) -> bool {
+    if path.is_empty() || root.is_empty() {
+        return false;
+    }
+    let root = normalize(root);
+    let path = normalize(path);
+    !root.is_empty()
+        && path.len() > root.len()
+        && path.starts_with(&root)
+        && path.as_bytes()[root.len()] == b'\\'
+}
+
+// ---------------------------------------------------------------- 所有权记录
+//
+// `vcam_owned` 只存在于主机进程内存里；崩溃或 OTA 换版本后，注册表仍可能指向
+// 上一次注册的 DLL。HKCU CLSID 的全局 owner 必须与本运行根的一份镜像完全一致；
+// 共享 native-dir 下，DLL 路径本身不能区分运行根。镜像固定在 data/run，不随
+// Legacy/Managed 布局切换。pending 先落盘、注册表后提交，任一步失败都保留与
+// 全局记录匹配的旧镜像或 pending，绝不靠放宽不一致记录的判定来恢复。
+
+const OWNER_FILE: &str = "vcam-owned.json";
+const OWNER_PENDING_FILE: &str = "vcam-owned.pending.json";
+const OWNER_REGISTRY_VALUE: &str = "VirtualCaptureOwner";
+const OWNER_SCHEMA: u32 = 2;
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct OwnerRecord {
+    schema: u32,
+    dll: String,
+    root: String,
+    pid: u32,
+    /// 进程创建时间（FILETIME，100ns），用于区分 PID 复用。
+    start_time: u64,
+}
+
+fn owner_paths_at(root: &std::path::Path) -> [PathBuf; 3] {
+    let stable = root.join("data/run");
+    [
+        stable.join(OWNER_FILE),
+        stable.join(OWNER_PENDING_FILE),
+        // Read-only compatibility with pre-journal Legacy roots. Do not move run/.
+        root.join("run").join(OWNER_FILE),
+    ]
+}
+
+fn read_owner_file(path: &std::path::Path) -> Option<OwnerRecord> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let record: OwnerRecord = serde_json::from_str(&text).ok()?;
+    valid_owner(&record).then_some(record)
+}
+
+fn read_local_owner_at(root: &std::path::Path, global: &OwnerRecord) -> Option<OwnerRecord> {
+    owner_paths_at(root)
+        .iter()
+        .filter_map(|path| read_owner_file(path))
+        .find(|record| same_owner(record, global))
+}
+
+fn read_local_owner(global: &OwnerRecord) -> Option<OwnerRecord> {
+    read_local_owner_at(&crate::paths::root(), global)
+}
+
+fn read_registry_owner() -> Result<Option<OwnerRecord>, ()> {
+    match read_registry_string(
+        &format!(r"Software\Classes\CLSID\{CLSID}"),
+        OWNER_REGISTRY_VALUE,
+    ) {
+        RegistryRead::Missing => Ok(None),
+        RegistryRead::Unknown => Err(()),
+        RegistryRead::Value(text) => {
+            let record: OwnerRecord = serde_json::from_str(&text).map_err(|_| ())?;
+            if valid_owner(&record) {
+                Ok(Some(record))
+            } else {
+                Err(())
+            }
+        }
+    }
+}
+
+fn valid_owner(record: &OwnerRecord) -> bool {
+    record.schema == OWNER_SCHEMA
+        && !record.dll.is_empty()
+        && !record.root.is_empty()
+        && record.pid != 0
+        && record.start_time != 0
+}
+
+fn same_owner(left: &OwnerRecord, right: &OwnerRecord) -> bool {
+    left.schema == right.schema
+        && same_path(&left.dll, &right.dll)
+        && same_path(&left.root, &right.root)
+        && left.pid == right.pid
+        && left.start_time == right.start_time
+}
+
+fn write_owner(dll: &std::path::Path) -> Result<(), String> {
+    // 创建时间拿不到就不能写记录：0 会让存活判断永远失败，等于把活着的属主当残留。
+    let start_time = match process_liveness(std::process::id()) {
+        ProcessState::Alive(time) if time != 0 => time,
+        state => {
+            return Err(format!(
+                "无法确认本进程创建时间（{state:?}），拒绝写入虚拟卡所有权记录。"
+            ));
+        }
+    };
+    let root = std::fs::canonicalize(crate::paths::root())
+        .map_err(|error| format!("无法解析虚拟卡运行根：{error}"))?;
+    let dll = std::fs::canonicalize(dll).map_err(|error| format!("无法解析虚拟卡 DLL：{error}"))?;
+    let record = OwnerRecord {
+        schema: OWNER_SCHEMA,
+        dll: dll.display().to_string(),
+        root: root.display().to_string(),
+        pid: std::process::id(),
+        start_time,
+    };
+    let previous = read_registry_owner().map_err(|()| recovery_error(Recovery::Unknown))?;
+    if let Some(previous) = &previous
+        && (!same_path(&record.root, &previous.root) || read_local_owner(previous).is_none())
+    {
+        return Err(recovery_error(Recovery::Unknown));
+    }
+    write_owner_transaction(&root, &record, previous.as_ref(), |value| {
+        write_string_value(OWNER_REGISTRY_VALUE, value)
+    })
+}
+
+fn save_owner_file(path: &std::path::Path, record: &OwnerRecord) -> Result<(), String> {
+    use std::io::Write;
+    let bytes = serde_json::to_vec(record).map_err(|error| error.to_string())?;
+    let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = std::fs::File::create(&temporary)
+        .map_err(|error| format!("无法写入虚拟卡所有权记录：{error}"))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("无法刷盘虚拟卡所有权记录：{error}"))?;
+    drop(file);
+    std::fs::rename(&temporary, path).map_err(|error| format!("无法保存虚拟卡所有权记录：{error}"))
+}
+
+/// Caller holds the CLSID mutex. The callback is the only registry operation;
+/// tests inject failures at the commit boundary without touching real COM/HKCU.
+fn write_owner_transaction(
+    root: &std::path::Path,
+    record: &OwnerRecord,
+    previous: Option<&OwnerRecord>,
+    write_registry: impl FnOnce(&str) -> Result<(), String>,
+) -> Result<(), String> {
+    let [current, pending, _legacy] = owner_paths_at(root);
+    let dir = current.parent().expect("owner path has a parent");
+    std::fs::create_dir_all(dir)
+        .map_err(|error| format!("无法创建运行目录 {}：{error}", dir.display()))?;
+    // A prior interrupted commit may have only a pending/Legacy mirror. Promote
+    // its exact global proof before overwriting pending for the next attempt.
+    if let Some(previous) = previous {
+        save_owner_file(&current, previous)?;
+    }
+    save_owner_file(&pending, record)?;
+    let value = serde_json::to_string(record).map_err(|error| error.to_string())?;
+    // On error keep BOTH mirrors: current proves the old registry value; pending
+    // proves a new value if the process died just after the registry commit.
+    write_registry(&value)?;
+    std::fs::rename(&pending, &current)
+        .map_err(|error| format!("虚拟卡归属已提交，待提交镜像保留供重试：{error}"))
+}
+
+fn clear_owner() {
+    for path in owner_paths_at(&crate::paths::root()) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+fn clear_registry_owner() -> Result<(), String> {
+    delete_registry_value(OWNER_REGISTRY_VALUE)
+}
+
+/// PID 查询结果：必须区分“确认不存在”和“无法查询”，后者不能当作已退出。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessState {
+    Alive(u64),
+    Dead,
+    Unknown,
+}
+
+/// 所有权记录相对本进程的存活状态。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OwnerLiveness {
+    /// 记录就是本进程写的（同 PID 且同创建时间）。
+    SelfProcess,
+    /// 记录属主是另一个仍存活、且创建时间匹配的进程。
+    LiveElsewhere,
+    /// 确认原属主已退出，或 PID 已被其他进程复用。
+    Dead,
+    /// 无法确认属主是否存活（权限/查询失败/记录不可信）。
+    Unknown,
+}
+
+#[cfg(windows)]
+fn process_liveness(pid: u32) -> ProcessState {
+    use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, GetLastError};
+    use windows_sys::Win32::System::Threading::{
+        GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+    };
+    const ERROR_INVALID_PARAMETER: u32 = 87;
+    if pid == 0 {
+        return ProcessState::Unknown;
+    }
+    unsafe {
+        let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if handle.is_null() {
+            // 不存在的 PID 才是 Dead；拒绝访问等一律 Unknown，绝不猜成已退出。
+            return match GetLastError() {
+                ERROR_INVALID_PARAMETER => ProcessState::Dead,
+                _ => ProcessState::Unknown,
+            };
+        }
+        let mut creation = std::mem::zeroed::<FILETIME>();
+        let mut exit = std::mem::zeroed::<FILETIME>();
+        let mut kernel = std::mem::zeroed::<FILETIME>();
+        let mut user = std::mem::zeroed::<FILETIME>();
+        let ok = GetProcessTimes(handle, &mut creation, &mut exit, &mut kernel, &mut user);
+        CloseHandle(handle);
+        if ok == 0 {
+            return ProcessState::Unknown;
+        }
+        let time = (u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime);
+        if time == 0 {
+            ProcessState::Unknown
+        } else {
+            ProcessState::Alive(time)
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn process_liveness(_pid: u32) -> ProcessState {
+    ProcessState::Unknown
+}
+
+fn classify_owner(record: &OwnerRecord, current_pid: u32, state: ProcessState) -> OwnerLiveness {
+    if record.start_time == 0 {
+        return OwnerLiveness::Unknown;
+    }
+    match state {
+        ProcessState::Alive(time) if time == record.start_time => {
+            if record.pid == current_pid {
+                OwnerLiveness::SelfProcess
+            } else {
+                OwnerLiveness::LiveElsewhere
+            }
+        }
+        // PID 已被另一个进程复用：记录的属主已经不在了。
+        ProcessState::Alive(_) | ProcessState::Dead => OwnerLiveness::Dead,
+        ProcessState::Unknown => OwnerLiveness::Unknown,
+    }
+}
+
+/// 当前注册相对本运行根的归属。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// 尚无注册。
+    Fresh,
+    /// 注册指向本目录 DLL：崩溃/重启留下的本机注册，可复用。
+    Local,
+    /// 注册指向本运行根上一版本的 DLL，且原属主已不在：OTA/崩溃残留，可回收。
+    StaleOwned,
+    /// 另一个存活主机持有该全局 CLSID 注册；不得抢占。
+    Busy,
+    /// 无法证明属于本运行根；不得复用或注销。
+    Foreign,
+    /// 所有权记录缺失/不可读，或属主存活状态无法确认；保守拒绝。
+    Unknown,
+}
+
+fn decide_recovery_with_global_owner(
+    registered: &str,
+    local: &str,
+    root: &str,
+    local_owner: Option<&OwnerRecord>,
+    registry_owner: Option<&OwnerRecord>,
+    owner_liveness: OwnerLiveness,
+    inside_root: bool,
+) -> Recovery {
+    let Some(registry_owner) = registry_owner else {
+        return if registered.is_empty() {
+            Recovery::Fresh
+        } else if same_path(registered, local) {
+            Recovery::Unknown
+        } else {
+            Recovery::Foreign
+        };
+    };
+    if !valid_owner(registry_owner)
+        || (!registered.is_empty() && !same_path(registered, &registry_owner.dll))
+    {
+        return Recovery::Unknown;
+    }
+
+    // The registry record is global for this per-user CLSID. Consult it before
+    // any run-root-local record so another root cannot adopt a shared DLL.
+    if !same_path(root, &registry_owner.root) {
+        return match owner_liveness {
+            OwnerLiveness::LiveElsewhere => Recovery::Busy,
+            OwnerLiveness::SelfProcess | OwnerLiveness::Dead => Recovery::Foreign,
+            OwnerLiveness::Unknown => Recovery::Unknown,
+        };
+    }
+
+    let Some(local_owner) = local_owner else {
+        return Recovery::Unknown;
+    };
+    if !same_owner(registry_owner, local_owner) {
+        return Recovery::Unknown;
+    }
+    if owner_liveness == OwnerLiveness::LiveElsewhere {
+        return Recovery::Busy;
+    }
+    if owner_liveness == OwnerLiveness::Unknown {
+        return Recovery::Unknown;
+    }
+    if registered.is_empty() {
+        return Recovery::Fresh;
+    }
+    if same_path(registered, local) {
+        return Recovery::Local;
+    }
+    if !inside_root {
+        return Recovery::Foreign;
+    }
+    // 上一版本残留；本进程自己写下的旧 release 记录同样可以回收。
+    Recovery::StaleOwned
+}
+
+fn current_recovery(status: &VcamStatus) -> Recovery {
+    if status.registration_unknown {
+        return Recovery::Unknown;
+    }
+    let root = crate::paths::root();
+    let registry_owner = match read_registry_owner() {
+        Ok(record) => record,
+        Err(()) => return Recovery::Unknown,
+    };
+    let local_owner = registry_owner.as_ref().and_then(read_local_owner);
+    let owner_liveness = registry_owner
+        .as_ref()
+        .map(|record| classify_owner(record, std::process::id(), process_liveness(record.pid)))
+        .unwrap_or(OwnerLiveness::Unknown);
+    let inside_root = path_inside_root(&status.registered, &root.to_string_lossy());
+    decide_recovery_with_global_owner(
+        &status.registered,
+        &status.dll,
+        &root.to_string_lossy(),
+        local_owner.as_ref(),
+        registry_owner.as_ref(),
+        owner_liveness,
+        inside_root,
+    )
+}
+
+/// 供主机控制器区分：Unknown 时必须保留 `vcam_owned` 并拒绝注销。
+pub(crate) fn recovery(status: &VcamStatus) -> Recovery {
+    current_recovery(status)
+}
+
+pub(crate) fn recovery_error(recovery: Recovery) -> String {
+    match recovery {
+        Recovery::Busy => "虚拟卡正由另一台存活的主机使用；请先关闭那台主机。".into(),
+        Recovery::Foreign => {
+            "虚拟采集卡已注册到其他目录；先关闭并停用已有主机，避免覆盖稳定部署。".into()
+        }
+        Recovery::Unknown => {
+            "无法证明虚拟卡注册属于本运行根（所有权记录缺失、不可读或属主状态未知）；\
+             请确认没有其他主机在使用后手工清理注册。"
+                .into()
+        }
+        _ => "虚拟采集卡注册状态不可复用。".into(),
+    }
+}
+
+/// 启动前只读检查：只在“无注册 / 可证明属于本根的本目录注册 /
+/// 可证明属于本根的已停止残留”三种情况下放行；其他目录、存活主机或
+/// 无法证明的注册一律拒绝，不静默接管。这里只是预检；register 会在
+/// 跨进程注册锁内重新判定一次。
+pub fn check_available(status: &VcamStatus) -> Result<(), String> {
+    match current_recovery(status) {
+        Recovery::Fresh | Recovery::Local | Recovery::StaleOwned => Ok(()),
+        recovery => Err(recovery_error(recovery)),
+    }
 }
 
 /// 隔离子进程只读探测实际 DLL，不注册 COM 或接管现用设备。
@@ -95,21 +529,183 @@ pub fn require_capabilities() -> Result<(), String> {
     Ok(())
 }
 
+// ---------------------------------------------------------------- 跨运行根互斥
+//
+// CLSID 写在本用户的 HKCU，是整机唯一的注册资源；运行根目录里的锁文件挡不住
+// 另一个安装目录（另一个运行根）的主机。register/unregister 的“检查 → 写记录
+// → regsvr → 复核”必须在同一把跨进程锁内完成，否则两个主机可能同时通过检查
+// 并互相覆盖注册。锁拿不到时宁可失败，也不做没有串行化的注册变更。
+
+/// 锁名与运行根无关：不同 release/运行根的主机必须抢同一把锁。
+fn registration_mutex_name() -> String {
+    format!(r"Global\VirtualCapture.VcamClsid.{CLSID}")
+}
+
+/// 等待上限覆盖最坏情况的一次注册变更（regsvr 超时 10s，最多两段）。
+const REGISTRATION_LOCK_TIMEOUT_MS: u32 = 30_000;
+
+#[cfg(windows)]
+struct RegistrationLock {
+    handle: windows_sys::Win32::Foundation::HANDLE,
+}
+
+#[cfg(windows)]
+impl RegistrationLock {
+    fn acquire(name: &str, timeout_ms: u32) -> Result<Self, String> {
+        use windows_sys::Win32::Foundation::{
+            CloseHandle, WAIT_ABANDONED, WAIT_OBJECT_0, WAIT_TIMEOUT,
+        };
+        use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+        let name = wide(name);
+        let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+        if handle.is_null() {
+            return Err(format!(
+                "无法创建虚拟卡注册互斥体（{}）；为避免与其他主机并发覆盖注册，拒绝本次操作。",
+                std::io::Error::last_os_error()
+            ));
+        }
+        match unsafe { WaitForSingleObject(handle, timeout_ms) } {
+            // 上一属主崩溃时互斥体被遗弃；随后的 status/恢复检查会重新判定归属。
+            WAIT_OBJECT_0 | WAIT_ABANDONED => Ok(Self { handle }),
+            WAIT_TIMEOUT => {
+                unsafe { CloseHandle(handle) };
+                Err("另一台主机的虚拟卡注册变更仍未结束；为避免并发覆盖注册，拒绝本次操作，请稍后重试。".into())
+            }
+            _ => {
+                let error = std::io::Error::last_os_error();
+                unsafe { CloseHandle(handle) };
+                Err(format!(
+                    "等待虚拟卡注册互斥体失败（{error}）；为避免并发覆盖注册，拒绝本次操作。"
+                ))
+            }
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for RegistrationLock {
+    fn drop(&mut self) {
+        use windows_sys::Win32::{Foundation::CloseHandle, System::Threading::ReleaseMutex};
+        unsafe {
+            ReleaseMutex(self.handle);
+            CloseHandle(self.handle);
+        }
+    }
+}
+
+#[cfg(not(windows))]
+struct RegistrationLock;
+
+#[cfg(not(windows))]
+impl RegistrationLock {
+    fn acquire(_name: &str, _timeout_ms: u32) -> Result<Self, String> {
+        Err("虚拟采集卡仅支持 Windows。".into())
+    }
+}
+
+/// 拿不到锁就失败：注册变更不能在没有串行化的情况下继续。
+fn lock_registration() -> Result<RegistrationLock, String> {
+    RegistrationLock::acquire(&registration_mutex_name(), REGISTRATION_LOCK_TIMEOUT_MS)
+}
+
 /// 注册本目录 DLL，并写入产品固定 FrameMap/Motion。
+///
+/// 崩溃重启后可复用指向本目录 DLL 的既有注册；OTA 后如注册仍指向本运行根
+/// 上一版本且原属主已退出，则先回收该残留再注册。其他目录或存活主机的注册
+/// 一律拒绝，绝不接管/注销。整个“检查 → 写记录 → regsvr → 复核”序列在
+/// 全机互斥体内完成，避免其他运行根的主机同时通过检查。
 pub fn register(shm: &str) -> Result<VcamStatus, String> {
     let dll = dll_path();
     if !dll.exists() {
-        return Err(format!("找不到 vc-vcam.dll：{}", dll.display()));
+        return Err(format!("找不到 vc_vcam.dll：{}", dll.display()));
     }
-    let regsvr = std::env::var("SystemRoot")
-        .map(|root| format!("{root}\\System32\\regsvr32.exe"))
-        .unwrap_or_else(|_| r"C:\Windows\System32\regsvr32.exe".into());
+    let _guard = lock_registration()?;
     let current = status();
-    if !current.registered.is_empty() && !current.match_local {
-        return Err("虚拟采集卡已注册到其他目录；先关闭并停用已有主机，避免覆盖稳定部署。".into());
+    match current_recovery(&current) {
+        Recovery::Fresh | Recovery::Local => {}
+        Recovery::StaleOwned => unregister_stale_owned()?,
+        recovery => return Err(recovery_error(recovery)),
     }
+    // 先写所有权记录再注册：这样即便 regsvr/FrameMap 失败，后续清理也能
+    // 证明这条同目录注册是本进程刚写的，而不是另一台主机的。
+    write_owner(&dll)?;
+    regsvr_register(&dll)?;
+    write_string_value("FrameMap", shm)?;
+    write_dword_value("Motion", 0)?;
+    let status = status();
+    if status.registration_unknown {
+        return Err(recovery_error(Recovery::Unknown));
+    }
+    if !status.match_local {
+        return Err(format!(
+            "注册完成但 InprocServer32 未指向本目录 DLL（当前：{}）。",
+            status.registered
+        ));
+    }
+    if current_recovery(&status) != Recovery::Local {
+        return Err(recovery_error(current_recovery(&status)));
+    }
+    Ok(status)
+}
+
+/// 只回收本目录匹配的注册，不碰其他目录。
+///
+/// 本运行根上一版本、且所有权记录证明属主已退出的残留也允许回收（OTA 清理）；
+/// 存活主机或其他目录的注册仍然拒绝。整个“检查 → regsvr /u → 复核 → 清记录”
+/// 序列在全机互斥体内完成，避免与其他运行根的主机并发覆盖。
+pub fn unregister() -> Result<VcamStatus, String> {
+    let _guard = lock_registration()?;
+    let current = status();
+    if current.registration_unknown {
+        return Err(recovery_error(Recovery::Unknown));
+    }
+    if current.registered.is_empty() {
+        if let Some(owner) = read_registry_owner()
+            .map_err(|()| recovery_error(Recovery::Unknown))?
+            .filter(|owner| same_path(&owner.root, &crate::paths::root().to_string_lossy()))
+        {
+            let local_owner =
+                read_local_owner(&owner).ok_or_else(|| recovery_error(Recovery::Unknown))?;
+            let liveness = classify_owner(&owner, std::process::id(), process_liveness(owner.pid));
+            if !same_owner(&owner, &local_owner)
+                || !matches!(liveness, OwnerLiveness::SelfProcess | OwnerLiveness::Dead)
+            {
+                return Err(recovery_error(match liveness {
+                    OwnerLiveness::LiveElsewhere => Recovery::Busy,
+                    _ => Recovery::Unknown,
+                }));
+            }
+            clear_registry_owner()?;
+        }
+        clear_owner();
+        return Ok(current);
+    }
+    match current_recovery(&current) {
+        Recovery::Local | Recovery::StaleOwned => {}
+        recovery => return Err(recovery_error(recovery)),
+    }
+    regsvr_unregister()?;
+    let after = status();
+    if after.registration_unknown {
+        return Err(recovery_error(Recovery::Unknown));
+    }
+    if !after.registered.is_empty() {
+        return Err("注销后虚拟采集卡注册仍存在，需重试停止。".into());
+    }
+    // DllUnregisterServer removed the entire CLSID key, including its global owner value.
+    clear_owner();
+    Ok(after)
+}
+
+fn regsvr_path() -> String {
+    std::env::var("SystemRoot")
+        .map(|root| format!("{root}\\System32\\regsvr32.exe"))
+        .unwrap_or_else(|_| r"C:\Windows\System32\regsvr32.exe".into())
+}
+
+fn regsvr_register(dll: &std::path::Path) -> Result<(), String> {
     let output = crate::process::run_bounded(
-        std::process::Command::new(&regsvr).arg("/s").arg(&dll),
+        std::process::Command::new(regsvr_path()).arg("/s").arg(dll),
         std::time::Duration::from_secs(10),
     )?;
     if !output.status.success() {
@@ -119,35 +715,14 @@ pub fn register(shm: &str) -> Result<VcamStatus, String> {
             String::from_utf8_lossy(&output.stderr).trim()
         ));
     }
-    write_string_value("FrameMap", shm)?;
-    write_dword_value("Motion", 0)?;
-    let status = status();
-    if !status.match_local {
-        return Err(format!(
-            "注册完成但 InprocServer32 未指向本目录 DLL（当前：{}）。",
-            status.registered
-        ));
-    }
-    Ok(status)
+    Ok(())
 }
 
-/// 只回收本目录匹配的注册，不碰其他目录。
-pub fn unregister() -> Result<VcamStatus, String> {
-    let current = status();
-    if current.registered.is_empty() {
-        return Ok(current);
-    }
-    if !current.match_local {
-        return Err("虚拟采集卡注册路径不符，未回收其他目录的注册。".into());
-    }
-    let dll = dll_path();
-    let regsvr = std::env::var("SystemRoot")
-        .map(|root| format!("{root}\\System32\\regsvr32.exe"))
-        .unwrap_or_else(|_| r"C:\Windows\System32\regsvr32.exe".into());
+fn regsvr_unregister() -> Result<(), String> {
     let output = crate::process::run_bounded(
-        std::process::Command::new(&regsvr)
+        std::process::Command::new(regsvr_path())
             .args(["/s", "/u"])
-            .arg(&dll),
+            .arg(dll_path()),
         std::time::Duration::from_secs(10),
     )?;
     if !output.status.success() {
@@ -156,30 +731,60 @@ pub fn unregister() -> Result<VcamStatus, String> {
             output.status.code()
         ));
     }
-    let after = status();
-    if !after.registered.is_empty() {
-        return Err("注销后虚拟采集卡注册仍存在，需重试停止。".into());
+    Ok(())
+}
+
+/// 回收已证明属于本运行根、且原属主已退出的上一版本注册。
+///
+/// 只由 `register` 在持有注册锁时调用；不要单独加锁，否则会改变调用者的序列。
+fn unregister_stale_owned() -> Result<(), String> {
+    let recovery = current_recovery(&status());
+    if recovery != Recovery::StaleOwned {
+        return Err(recovery_error(recovery));
     }
-    Ok(after)
+    // DllUnregisterServer 删除共享 CLSID 键，与注册时使用的 release 无关；
+    // 用当前 DLL 执行即可，不加载/执行上一版本二进制。
+    regsvr_unregister()?;
+    let after = status();
+    if after.registration_unknown {
+        return Err(recovery_error(Recovery::Unknown));
+    }
+    if !after.registered.is_empty() {
+        return Err("旧版本虚拟卡注册未能清除，已停止启动；请手动检查注册表。".into());
+    }
+    // The CLSID owner value was removed together with the server registration.
+    clear_owner();
+    Ok(())
+}
+
+/// 注册表读取结果：读失败不能当成“未注册”，否则会静默覆盖别人的注册。
+enum RegistryRead {
+    Missing,
+    Value(String),
+    Unknown,
 }
 
 #[cfg(windows)]
-fn read_registered_dll() -> Option<String> {
+fn read_registry_string(subkey: &str, value_name: &str) -> RegistryRead {
     use windows_sys::Win32::System::Registry::{
         HKEY_CURRENT_USER, KEY_READ, REG_SZ, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
     };
-    let subkey = format!(r"Software\Classes\CLSID\{CLSID}\InprocServer32");
-    let subkey = wide(&subkey);
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    let subkey = wide(subkey);
     let mut key = std::ptr::null_mut();
     let opened =
         unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, subkey.as_ptr(), 0, KEY_READ, &mut key) };
     if opened != 0 {
-        return None;
+        return if opened == ERROR_FILE_NOT_FOUND {
+            RegistryRead::Missing
+        } else {
+            RegistryRead::Unknown
+        };
     }
-    let name = wide("");
+    let name = wide(value_name);
     let mut kind = 0u32;
     let mut size = 0u32;
-    let mut ok = unsafe {
+    let query = unsafe {
         RegQueryValueExW(
             key,
             name.as_ptr(),
@@ -188,14 +793,22 @@ fn read_registered_dll() -> Option<String> {
             std::ptr::null_mut(),
             &mut size,
         )
-    } == 0;
-    if !ok || kind != REG_SZ || size == 0 {
+    };
+    if query != 0 {
         unsafe { RegCloseKey(key) };
-        return None;
+        return if query == ERROR_FILE_NOT_FOUND {
+            RegistryRead::Missing
+        } else {
+            RegistryRead::Unknown
+        };
+    }
+    if kind != REG_SZ || size == 0 {
+        unsafe { RegCloseKey(key) };
+        return RegistryRead::Unknown;
     }
     let mut buffer = vec![0u16; (size / 2) as usize + 1];
     let mut size = (buffer.len() * 2) as u32;
-    ok = unsafe {
+    let query = unsafe {
         RegQueryValueExW(
             key,
             name.as_ptr(),
@@ -204,17 +817,35 @@ fn read_registered_dll() -> Option<String> {
             buffer.as_mut_ptr() as *mut u8,
             &mut size,
         )
-    } == 0;
+    };
     unsafe { RegCloseKey(key) };
-    if !ok {
-        return None;
+    if query != 0 {
+        return RegistryRead::Unknown;
     }
-    Some(from_wide(&buffer))
+    let value = from_wide(&buffer);
+    if value.is_empty() {
+        RegistryRead::Unknown
+    } else {
+        RegistryRead::Value(value)
+    }
+}
+
+#[cfg(windows)]
+fn read_registered_dll() -> RegistryRead {
+    read_registry_string(
+        &format!(r"Software\Classes\CLSID\{CLSID}\InprocServer32"),
+        "",
+    )
 }
 
 #[cfg(not(windows))]
-fn read_registered_dll() -> Option<String> {
-    None
+fn read_registry_string(_subkey: &str, _value_name: &str) -> RegistryRead {
+    RegistryRead::Missing
+}
+
+#[cfg(not(windows))]
+fn read_registered_dll() -> RegistryRead {
+    RegistryRead::Missing
 }
 
 #[cfg(windows)]
@@ -281,6 +912,44 @@ fn write_dword_value(_name: &str, _value: u32) -> Result<(), String> {
 }
 
 #[cfg(windows)]
+fn delete_registry_value(name: &str) -> Result<(), String> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY_CURRENT_USER, KEY_SET_VALUE, RegCloseKey, RegDeleteValueW, RegOpenKeyExW,
+    };
+    const ERROR_FILE_NOT_FOUND: u32 = 2;
+    let subkey = wide(&format!(r"Software\Classes\CLSID\{CLSID}"));
+    let mut key = std::ptr::null_mut();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            subkey.as_ptr(),
+            0,
+            KEY_SET_VALUE,
+            &mut key,
+        )
+    };
+    if opened == ERROR_FILE_NOT_FOUND {
+        return Ok(());
+    }
+    if opened != 0 {
+        return Err(format!("无法打开虚拟卡所有权注册表键（错误 {opened}）。"));
+    }
+    let name = wide(name);
+    let removed = unsafe { RegDeleteValueW(key, name.as_ptr()) };
+    unsafe { RegCloseKey(key) };
+    if removed == 0 || removed == ERROR_FILE_NOT_FOUND {
+        Ok(())
+    } else {
+        Err(format!("无法清除虚拟卡所有权注册表值（错误 {removed}）。"))
+    }
+}
+
+#[cfg(not(windows))]
+fn delete_registry_value(_name: &str) -> Result<(), String> {
+    Err("虚拟采集卡仅支持 Windows。".into())
+}
+
+#[cfg(windows)]
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -289,4 +958,594 @@ fn wide(text: &str) -> Vec<u16> {
 fn from_wide(buffer: &[u16]) -> String {
     let end = buffer.iter().position(|c| *c == 0).unwrap_or(buffer.len());
     String::from_utf16_lossy(&buffer[..end])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn owner(dll: &str) -> OwnerRecord {
+        OwnerRecord {
+            schema: OWNER_SCHEMA,
+            dll: dll.into(),
+            root: r"D:\Root".into(),
+            pid: 1234,
+            start_time: 5678,
+        }
+    }
+
+    fn owner_at(dll: &str, root: &str, pid: u32) -> OwnerRecord {
+        OwnerRecord {
+            root: root.into(),
+            pid,
+            ..owner(dll)
+        }
+    }
+
+    fn decide_recovery(
+        registered: &str,
+        local: &str,
+        owner: Option<&OwnerRecord>,
+        owner_liveness: OwnerLiveness,
+        inside_root: bool,
+    ) -> Recovery {
+        let root = owner
+            .map(|record| record.root.as_str())
+            .unwrap_or(r"D:\Root");
+        decide_recovery_with_global_owner(
+            registered,
+            local,
+            root,
+            owner,
+            owner,
+            owner_liveness,
+            inside_root,
+        )
+    }
+
+    struct OwnerTestRoot(PathBuf);
+
+    impl OwnerTestRoot {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static NEXT: AtomicU32 = AtomicU32::new(0);
+            let stamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+            let root = std::env::temp_dir().join(format!(
+                "vc-owner-test-{}-{stamp}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+            std::fs::create_dir(&root).unwrap();
+            Self(root)
+        }
+
+        fn record(&self, pid: u32) -> OwnerRecord {
+            owner_at(
+                &self.0.join("app/releases/b1/vc_vcam.dll").to_string_lossy(),
+                &self.0.to_string_lossy(),
+                pid,
+            )
+        }
+    }
+
+    impl Drop for OwnerTestRoot {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn owner_proof_survives_first_activation_and_layout_rollback() {
+        let root = OwnerTestRoot::new();
+        let previous = root.record(1234);
+        let next = root.record(2222);
+        let [current, _pending, legacy] = owner_paths_at(&root.0);
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        save_owner_file(&legacy, &previous).unwrap();
+        assert_eq!(
+            crate::paths::layout_at(&root.0),
+            crate::paths::Layout::Legacy
+        );
+        assert_eq!(
+            read_local_owner_at(&root.0, &previous),
+            Some(previous.clone())
+        );
+
+        let pointer = root.0.join("app/current.json");
+        std::fs::create_dir_all(pointer.parent().unwrap()).unwrap();
+        std::fs::write(&pointer, r#"{"schema":1,"build_id":"b2"}"#).unwrap();
+        assert_eq!(
+            crate::paths::layout_at(&root.0),
+            crate::paths::Layout::Managed
+        );
+        assert_eq!(owner_paths_at(&root.0)[0], current);
+        assert_eq!(
+            read_local_owner_at(&root.0, &previous),
+            Some(previous.clone())
+        );
+        write_owner_transaction(&root.0, &next, Some(&previous), |_| Ok(())).unwrap();
+
+        std::fs::remove_file(pointer).unwrap();
+        assert_eq!(
+            crate::paths::layout_at(&root.0),
+            crate::paths::Layout::Legacy
+        );
+        assert_eq!(read_local_owner_at(&root.0, &next), Some(next));
+        assert_eq!(
+            read_owner_file(&legacy),
+            Some(previous),
+            "do not move old run evidence"
+        );
+    }
+
+    #[test]
+    fn failed_registry_commit_keeps_the_previous_local_proof() {
+        let root = OwnerTestRoot::new();
+        let previous = root.record(1234);
+        let next = root.record(2222);
+        write_owner_transaction(&root.0, &previous, None, |_| Ok(())).unwrap();
+        let error = write_owner_transaction(&root.0, &next, Some(&previous), |_| {
+            Err("injected registry write failure".into())
+        })
+        .unwrap_err();
+        assert!(error.contains("injected"));
+        let [current, pending, _legacy] = owner_paths_at(&root.0);
+        assert_eq!(read_owner_file(&current), Some(previous.clone()));
+        assert_eq!(read_owner_file(&pending), Some(next));
+        assert_eq!(read_local_owner_at(&root.0, &previous), Some(previous));
+    }
+
+    #[test]
+    fn interrupted_commit_and_its_retry_keep_a_matching_proof() {
+        let root = OwnerTestRoot::new();
+        let previous = root.record(1234);
+        let next = root.record(2222);
+        let retry = root.record(3333);
+        write_owner_transaction(&root.0, &previous, None, |_| Ok(())).unwrap();
+        let mut global = previous.clone();
+        // Simulate process death immediately after the global write, before the
+        // final rename. No real registry operations are executed in these tests.
+        write_owner_transaction(&root.0, &next, Some(&previous), |value| {
+            global = serde_json::from_str(value).unwrap();
+            Err("injected interruption after global commit".into())
+        })
+        .unwrap_err();
+        assert_eq!(read_local_owner_at(&root.0, &global), Some(next.clone()));
+        let [current, pending, _legacy] = owner_paths_at(&root.0);
+        assert_eq!(read_owner_file(&current), Some(previous));
+        assert_eq!(read_owner_file(&pending), Some(next.clone()));
+
+        // A retry must promote the authoritative pending record FIRST. Another
+        // interruption before its registry write must not destroy that proof.
+        write_owner_transaction(&root.0, &retry, Some(&next), |_| {
+            assert_eq!(read_owner_file(&current), Some(next.clone()));
+            Err("injected retry failure before global commit".into())
+        })
+        .unwrap_err();
+        assert_eq!(read_local_owner_at(&root.0, &global), Some(next));
+        assert_eq!(read_owner_file(&pending), Some(retry));
+    }
+
+    #[test]
+    fn failed_final_rename_leaves_the_committed_pending_proof_readable() {
+        let root = OwnerTestRoot::new();
+        let record = root.record(2222);
+        let [current, pending, _legacy] = owner_paths_at(&root.0);
+        let mut global = None;
+        write_owner_transaction(&root.0, &record, None, |value| {
+            global = Some(serde_json::from_str::<OwnerRecord>(value).unwrap());
+            // A directory at the destination makes the final rename fail.
+            std::fs::create_dir(&current).unwrap();
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(read_owner_file(&pending), global);
+        assert_eq!(
+            read_local_owner_at(&root.0, global.as_ref().unwrap()),
+            global
+        );
+    }
+
+    #[test]
+    fn missing_corrupt_or_foreign_local_files_never_prove_ownership() {
+        let root = OwnerTestRoot::new();
+        let global = root.record(2222);
+        let [current, _pending, _legacy] = owner_paths_at(&root.0);
+        assert_eq!(read_local_owner_at(&root.0, &global), None);
+        std::fs::create_dir_all(current.parent().unwrap()).unwrap();
+        std::fs::write(&current, "broken JSON").unwrap();
+        assert_eq!(read_local_owner_at(&root.0, &global), None);
+        let foreign = OwnerRecord {
+            root: r"D:\Other".into(),
+            ..global.clone()
+        };
+        save_owner_file(&current, &foreign).unwrap();
+        assert_eq!(read_local_owner_at(&root.0, &global), None);
+        let mismatched_pid = OwnerRecord {
+            pid: global.pid + 1,
+            ..global.clone()
+        };
+        save_owner_file(&current, &mismatched_pid).unwrap();
+        assert_eq!(read_local_owner_at(&root.0, &global), None);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn equivalent_root_spellings_recover_the_same_registration() {
+        let dll = r"D:\Root\app\releases\b1\vc_vcam.dll";
+        let record = owner_at(dll, r"D:\Root\.", 1234);
+        for root in [r"\\?\D:\Root", "D:/Root/child/..", r"D:\Root\."] {
+            assert!(same_path(root, &record.root), "{root}");
+            assert_eq!(
+                decide_recovery_with_global_owner(
+                    dll,
+                    dll,
+                    root,
+                    Some(&record),
+                    Some(&record),
+                    OwnerLiveness::Dead,
+                    true,
+                ),
+                Recovery::Local,
+                "{root}",
+            );
+        }
+        assert!(!same_path(r"D:\Root2\.", &record.root));
+    }
+
+    #[test]
+    fn owner_reservation_is_not_fresh_for_another_host() {
+        let shared = r"D:\Build\vc_vcam.dll";
+        let record = owner_at(shared, r"D:\RuntimeA", 2222);
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                "",
+                shared,
+                r"D:\RuntimeB",
+                None,
+                Some(&record),
+                OwnerLiveness::LiveElsewhere,
+                false,
+            ),
+            Recovery::Busy,
+        );
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                "",
+                shared,
+                r"D:\RuntimeA",
+                Some(&record),
+                Some(&record),
+                OwnerLiveness::SelfProcess,
+                false,
+            ),
+            Recovery::Fresh,
+        );
+    }
+
+    #[test]
+    fn same_path_registration_requires_a_matching_owner_record() {
+        let local = r"D:\Root\app\releases\b2\vc_vcam.dll";
+        assert_eq!(
+            decide_recovery("", local, None, OwnerLiveness::Unknown, true),
+            Recovery::Fresh
+        );
+        // 同路径但没有记录/记录不符：无法证明属于本根，保守拒绝。
+        assert_eq!(
+            decide_recovery(local, local, None, OwnerLiveness::Unknown, true),
+            Recovery::Unknown
+        );
+        assert_eq!(
+            decide_recovery(
+                local,
+                local,
+                Some(&owner(r"D:\Root\app\releases\b1\vc_vcam.dll")),
+                OwnerLiveness::Dead,
+                true
+            ),
+            Recovery::Unknown
+        );
+        let record = owner(local);
+        assert_eq!(
+            decide_recovery(
+                local,
+                local,
+                Some(&record),
+                OwnerLiveness::SelfProcess,
+                true
+            ),
+            Recovery::Local
+        );
+        assert_eq!(
+            decide_recovery(local, local, Some(&record), OwnerLiveness::Dead, true),
+            Recovery::Local,
+            "crashed owner with a matching record may be reused"
+        );
+        // A live host from this root still owns the same registration.
+        assert_eq!(
+            decide_recovery(
+                local,
+                local,
+                Some(&record),
+                OwnerLiveness::LiveElsewhere,
+                true
+            ),
+            Recovery::Busy
+        );
+        assert_eq!(
+            decide_recovery(local, local, Some(&record), OwnerLiveness::Unknown, true),
+            Recovery::Unknown,
+            "unknown liveness must never be treated as dead"
+        );
+    }
+
+    #[test]
+    fn ota_leftover_is_recoverable_only_when_recorded_and_owner_dead() {
+        let local = r"D:\Root\app\releases\b2\vc_vcam.dll";
+        let previous = r"D:\Root\app\releases\b1\vc_vcam.dll";
+        let record = owner(previous);
+        assert_eq!(
+            decide_recovery(previous, local, Some(&record), OwnerLiveness::Dead, true),
+            Recovery::StaleOwned
+        );
+        // 本进程自己写下的上一版本记录（例如运行期切换 current release）也可回收。
+        assert_eq!(
+            decide_recovery(
+                previous,
+                local,
+                Some(&record),
+                OwnerLiveness::SelfProcess,
+                true
+            ),
+            Recovery::StaleOwned
+        );
+        // Old release still running: do not steal its card.
+        assert_eq!(
+            decide_recovery(
+                previous,
+                local,
+                Some(&record),
+                OwnerLiveness::LiveElsewhere,
+                true
+            ),
+            Recovery::Busy
+        );
+        // Liveness unknown: fail closed rather than assuming the owner is dead.
+        assert_eq!(
+            decide_recovery(previous, local, Some(&record), OwnerLiveness::Unknown, true),
+            Recovery::Unknown
+        );
+        // No ownership record or a mismatched one: never touch it.
+        assert_eq!(
+            decide_recovery(previous, local, None, OwnerLiveness::Unknown, true),
+            Recovery::Foreign
+        );
+        let foreign_record = owner_at(previous, r"D:\Other", 1234);
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                previous,
+                local,
+                r"D:\Root",
+                Some(&foreign_record),
+                Some(&foreign_record),
+                OwnerLiveness::Dead,
+                false,
+            ),
+            Recovery::Foreign
+        );
+        // A recorded path outside this runtime root is another installation.
+        assert_eq!(
+            decide_recovery(previous, local, Some(&record), OwnerLiveness::Dead, false),
+            Recovery::Foreign
+        );
+    }
+
+    #[test]
+    fn shared_dll_cannot_be_claimed_from_another_run_root() {
+        let shared = r"D:\Build\Release\vc_vcam.dll";
+        let root_a = r"D:\RuntimeA";
+        let root_b = r"D:\RuntimeB";
+        let active_a = owner_at(shared, root_a, 2222);
+        let stale_b = owner_at(shared, root_b, 1234);
+
+        // Runtime B's old per-root record cannot override the global live owner A.
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                shared,
+                shared,
+                root_b,
+                Some(&stale_b),
+                Some(&active_a),
+                OwnerLiveness::LiveElsewhere,
+                false,
+            ),
+            Recovery::Busy
+        );
+        // Once A exits, B still cannot unregister/adopt A's owner: root mismatch wins.
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                shared,
+                shared,
+                root_b,
+                Some(&stale_b),
+                Some(&active_a),
+                OwnerLiveness::Dead,
+                false,
+            ),
+            Recovery::Foreign
+        );
+        // A corrupt/missing local mirror cannot be used to recover the global record.
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                shared,
+                shared,
+                root_a,
+                None,
+                Some(&active_a),
+                OwnerLiveness::Dead,
+                false,
+            ),
+            Recovery::Unknown
+        );
+    }
+
+    #[test]
+    fn owner_liveness_distinguishes_dead_reuse_and_unknown() {
+        let local = r"D:\Root\vc_vcam.dll";
+        let record = owner(local);
+        assert_eq!(
+            classify_owner(&record, record.pid, ProcessState::Alive(record.start_time)),
+            OwnerLiveness::SelfProcess
+        );
+        assert_eq!(
+            classify_owner(
+                &record,
+                record.pid + 1,
+                ProcessState::Alive(record.start_time)
+            ),
+            OwnerLiveness::LiveElsewhere
+        );
+        assert_eq!(
+            classify_owner(
+                &record,
+                record.pid,
+                ProcessState::Alive(record.start_time + 1)
+            ),
+            OwnerLiveness::Dead,
+            "PID reuse with a different creation time means the recorded owner is gone"
+        );
+        assert_eq!(
+            classify_owner(&record, record.pid, ProcessState::Dead),
+            OwnerLiveness::Dead
+        );
+        assert_eq!(
+            classify_owner(&record, record.pid, ProcessState::Unknown),
+            OwnerLiveness::Unknown
+        );
+        let unverifiable = OwnerRecord {
+            start_time: 0,
+            ..owner(local)
+        };
+        assert_eq!(
+            classify_owner(
+                &unverifiable,
+                unverifiable.pid,
+                ProcessState::Alive(record.start_time)
+            ),
+            OwnerLiveness::Unknown,
+            "a zero creation time can never prove liveness"
+        );
+    }
+
+    #[test]
+    fn unrecorded_foreign_registration_is_never_adopted() {
+        let local = r"D:\Root\vc_vcam.dll";
+        assert_eq!(
+            decide_recovery(
+                r"D:\Other\vc_vcam.dll",
+                local,
+                None,
+                OwnerLiveness::Unknown,
+                true
+            ),
+            Recovery::Foreign
+        );
+    }
+
+    #[test]
+    fn root_containment_uses_component_boundaries() {
+        assert!(path_inside_root(
+            r"\\?\D:\Root\app\releases\b1\vc_vcam.dll",
+            "D:/Root/"
+        ));
+        assert!(!path_inside_root(r"D:\Root2\vc_vcam.dll", r"D:\Root"));
+        assert!(!path_inside_root(r"D:\Root", r"D:\Root"));
+        assert!(!path_inside_root("", r"D:\Root"));
+        // Empty inputs must not become the working directory during normalization.
+        let cwd = std::env::current_dir().unwrap();
+        assert!(!path_inside_root(
+            &cwd.join("vc_vcam.dll").to_string_lossy(),
+            ""
+        ));
+        if let Some(parent) = cwd.parent() {
+            assert!(!path_inside_root("", &parent.to_string_lossy()));
+        }
+        assert!(same_path(r"\\?\D:\Root\vc_vcam.dll", "d:/root/vc_vcam.dll"));
+    }
+
+    #[test]
+    fn registration_mutex_name_is_global_and_clsid_scoped() {
+        // 互斥体不能落在运行根目录里，否则不同 release/安装目录挡不住彼此。
+        let name = registration_mutex_name();
+        assert!(name.starts_with(r"Global\"), "{name}");
+        assert!(name.contains(CLSID), "{name}");
+    }
+
+    #[cfg(windows)]
+    fn test_mutex_name(tag: &str) -> String {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        format!(
+            r"Global\VirtualCapture.Test.{tag}.{}.{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        )
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registration_lock_excludes_another_thread_until_released() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+
+        let name = test_mutex_name("excludes");
+        let (ready, wait_ready) = mpsc::channel();
+        let release = Arc::new(AtomicBool::new(false));
+        let holder_release = release.clone();
+        let holder_name = name.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = RegistrationLock::acquire(&holder_name, 5_000).expect("holder acquires");
+            ready.send(()).expect("holder signals");
+            while !holder_release.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        wait_ready.recv().expect("holder ready");
+        let started = Instant::now();
+        let error = match RegistrationLock::acquire(&name, 100) {
+            Ok(_) => panic!("second acquisition must fail while the mutex is held"),
+            Err(error) => error,
+        };
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "acquisition returned before the timeout"
+        );
+        assert!(error.contains("拒绝本次操作"), "{error}");
+        release.store(true, Ordering::SeqCst);
+        holder.join().expect("holder joins");
+        // 释放后同一把锁必须可以再取得。
+        let _guard = RegistrationLock::acquire(&name, 5_000).expect("lock is released");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registration_lock_recovers_an_abandoned_mutex() {
+        // 属主线程直接退出（未 Release）时互斥体会被遗弃；下一个属主必须能继续，
+        // 否则一次崩溃会让所有主机的虚拟卡注册永久失败。
+        let name = test_mutex_name("abandoned");
+        let holder_name = name.clone();
+        std::thread::spawn(move || {
+            let guard = RegistrationLock::acquire(&holder_name, 5_000).expect("thread acquires");
+            // 句柄随线程结束泄漏，互斥体仍归已退出的线程所有。
+            std::mem::forget(guard);
+        })
+        .join()
+        .expect("holder joins");
+        let _guard = RegistrationLock::acquire(&name, 5_000).expect("abandoned mutex is acquired");
+    }
 }

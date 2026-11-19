@@ -1,12 +1,13 @@
 //! VirtualCapture 控制面核心库。
 //!
-//! 主机与被采集机共用：配置、链路预算、原生进程槽位、网卡枚举、虚拟卡注册、对端 HTTP 客户端。
-//! 数据面（L2/Npcap、采集、DShow）暂由现有 C++ 二进制承担。
+//! 主机与被采集机共用：配置、链路预算、数据面会话槽位、网卡枚举、虚拟卡注册、对端 HTTP 客户端。
+//! 数据面（L2/Npcap、采集、DShow）通过版本化 `vc_stream.dll` 模块在进程内运行。
 
 pub mod adapters;
 pub mod budget;
 pub mod client;
 pub mod config;
+pub mod dataplane;
 pub mod host;
 pub mod paths;
 pub mod process;

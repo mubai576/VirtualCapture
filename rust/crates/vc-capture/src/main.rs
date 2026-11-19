@@ -1,4 +1,4 @@
-//! 被采集机无界面后台：REST 控制 API，拉起并监管原生 `vc-sender.exe`。
+//! 被采集机无界面后台：REST 控制 API，装载并监管进程内 `vc_stream.dll` 数据面会话。
 
 mod api;
 mod state;
@@ -26,7 +26,7 @@ struct Cli {
     /// 运行根目录，默认自动探测（含 version.json 的仓库/便携包根）。
     #[arg(long)]
     root: Option<std::path::PathBuf>,
-    /// 原生 exe/dll 目录（开发时指向 C++ 构建输出）。
+    /// 数据面/虚拟卡 DLL 目录（开发时可指向构建输出）。
     #[arg(long)]
     native_dir: Option<std::path::PathBuf>,
     /// 打印当前配置后退出。
@@ -72,8 +72,8 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
     if cli.list_adapters {
-        let exe = vc_core::paths::native_exe("vc-sender.exe");
-        let items = vc_core::adapters::enumerate(&exe).map_err(anyhow::Error::msg)?;
+        let module = vc_core::dataplane::load().map_err(anyhow::Error::msg)?;
+        let items = vc_core::adapters::enumerate(&module).map_err(anyhow::Error::msg)?;
         println!("{}", serde_json::to_string_pretty(&items)?);
         return Ok(());
     }

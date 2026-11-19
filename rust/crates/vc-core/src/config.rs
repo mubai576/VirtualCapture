@@ -2,8 +2,8 @@
 //! 不读写旧 Python agent 的 vc-config.json）。
 //!
 //! 硬边界：损坏的 JSON 必须报错，不能静默回退默认值；保存必须是同目录临时文件 +
-//! 原子替换，避免半截配置。编码草案可以保存在配置里，但 Rust R1 运行时只接受 raw
-//! （`validate_raw`）。
+//! 原子替换，避免半截配置。编码草案可以保存在配置里，但启动必须显式启用
+//! （`validate_start`），未声明后端或未开启实验开关时明确拒绝。
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -50,7 +50,6 @@ pub struct Capture {
     pub pattern: String,
     pub gpu_convert: bool,
     pub fps: u32,
-    pub batch: u32,
     pub mtu: u32,
     pub dst_mac: String,
     /// DDA/WGC 显示器编号 0..15。
@@ -67,7 +66,7 @@ pub struct Capture {
     pub max_bitrate_mbps: u32,
     pub jpeg_quality: u32,
     pub frames: u64,
-    /// 编码链路必须显式启用（开发功能）。草案可保存，Rust R1 仍拒绝启动编码。
+    /// 编码链路必须显式启用（开发功能）；草案可保存，启动门限见 `validate_start`。
     pub codec_experimental: bool,
     pub encoder_backend: String,
     pub decoder_backend: String,
@@ -82,7 +81,6 @@ impl Default for Capture {
             pattern: "motion".into(),
             gpu_convert: true,
             fps: 240,
-            batch: 69,
             mtu: 9000,
             dst_mac: "ff:ff:ff:ff:ff:ff".into(),
             output: 0,
@@ -219,7 +217,7 @@ impl Config {
     }
 
     /// 结构/取值范围校验。编码草案（codec=mjpeg/pyrowave）在参数合法时允许保存；
-    /// Rust R1 能否启动由 [`Self::validate_raw`] 判定。
+    /// 能否启动由 [`Self::validate_start`] 判定。
     pub fn validate(&self) -> Vec<String> {
         let mut errors = Vec::new();
         let c = &self.capture;
@@ -262,9 +260,6 @@ impl Config {
         }
         if !(1..=1000).contains(&c.fps) {
             errors.push("capture.fps 必须是 1..1000。".into());
-        }
-        if !(1..=1000).contains(&c.batch) {
-            errors.push("capture.batch 必须是 1..1000。".into());
         }
         if !(1500..=9000).contains(&c.mtu) {
             errors.push("capture.mtu 必须是 1500..9000。".into());
@@ -337,15 +332,39 @@ impl Config {
         errors
     }
 
-    /// Rust R1 运行时门限：先做完整结构校验，再强制只允许 raw。
-    /// 配置可以保存编码草案，但 Rust 控制面不得启动编码链路。
-    pub fn validate_raw(&self) -> Vec<String> {
+    /// 运行时启动门限：完整结构校验 + 两端 MTU 一致 + 编码显式启用且后端精确匹配。
+    ///
+    /// 编码配置可以保存为草案；但启动时不接受空后端、不自动替换后端，也不允许
+    /// 未设置 `codec_experimental=true` 的编码会话。
+    pub fn validate_start(&self) -> Vec<String> {
         let mut errors = self.validate();
-        if self.capture.codec != "raw" {
-            errors.push(format!(
-                "Rust 控制面第一版只支持 raw，不能启动 codec={}；请使用现有 agent，或把 codec 改回 raw。",
-                self.capture.codec
-            ));
+        let c = &self.capture;
+        if c.mtu != self.receive.mtu {
+            errors.push("采集与接收 MTU 不一致，不能用不同切包参数启动。".into());
+        }
+        let expected_backend = match c.codec.as_str() {
+            "mjpeg" => Some("turbojpeg:cpu"),
+            "pyrowave" => Some("pyrowave:vulkan"),
+            _ => None,
+        };
+        if let Some(expected) = expected_backend {
+            if !c.codec_experimental {
+                errors.push(format!(
+                    "codec={} 是开发功能，必须显式设置 codec_experimental=true 才能启动。",
+                    c.codec
+                ));
+            }
+            for (name, value) in [
+                ("encoder_backend", c.encoder_backend.as_str()),
+                ("decoder_backend", c.decoder_backend.as_str()),
+            ] {
+                if value != expected {
+                    errors.push(format!(
+                        "codec={} 启动时 capture.{name} 必须显式为 {expected}（当前 {:?}），不做自动回退。",
+                        c.codec, value
+                    ));
+                }
+            }
         }
         errors
     }
@@ -484,7 +503,7 @@ mod tests {
         assert_eq!(config.capture.transform, "crop");
         assert_eq!(config.capture.codec, "raw");
         assert!(config.validate().is_empty());
-        assert!(config.validate_raw().is_empty());
+        assert!(config.validate_start().is_empty());
     }
 
     #[test]
@@ -500,6 +519,12 @@ mod tests {
         assert_eq!(config.capture.height, 416);
         assert_eq!(config.capture.fps, 240);
         assert_eq!(config.transport.headroom_pct, 30);
+        assert!(
+            !serde_json::to_value(&config).unwrap()["capture"]
+                .as_object()
+                .unwrap()
+                .contains_key("batch")
+        );
     }
 
     #[test]
@@ -512,7 +537,7 @@ mod tests {
         assert!(errors.iter().any(|e| e.contains("height")));
         assert_eq!(config.capture.width, 640);
 
-        // 编码草案参数合法时可以保存，但 Rust R1 运行时门限拒绝启动。
+        // 编码草案参数合法时可以保存，但未显式启用时启动门限拒绝。
         let errors = config.apply_patch(&json!({
             "capture": {
                 "codec": "mjpeg",
@@ -524,10 +549,39 @@ mod tests {
         assert_eq!(config.capture.codec, "mjpeg");
         assert!(
             config
-                .validate_raw()
+                .validate_start()
                 .iter()
-                .any(|e| e.contains("只支持 raw"))
+                .any(|e| e.contains("codec_experimental"))
         );
+
+        // 显式启用后同一配置可以启动，不需要自动替换后端。
+        let errors = config.apply_patch(&json!({
+            "capture": {"codec_experimental": true}
+        }));
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            config.validate_start().is_empty(),
+            "{:?}",
+            config.validate_start()
+        );
+
+        // 后端为空或与编码不匹配时启动仍必须明确拒绝。
+        config.capture.decoder_backend.clear();
+        assert!(
+            config
+                .validate_start()
+                .iter()
+                .any(|e| e.contains("decoder_backend") && e.contains("turbojpeg:cpu"))
+        );
+    }
+
+    #[test]
+    fn start_requires_matching_mtu() {
+        let mut config = Config::default();
+        config.capture.mtu = 9000;
+        config.receive.mtu = 1500;
+        assert!(config.validate().is_empty());
+        assert!(config.validate_start().iter().any(|e| e.contains("MTU")));
     }
 
     #[test]
@@ -632,7 +686,6 @@ mod tests {
         let mut config = Config::default();
         config.capture.output = 16;
         config.capture.pattern = "bogus".into();
-        config.capture.batch = 0;
         config.receive.mtu = 42;
         config.capture.dst_mac = "gg:00:00:00:00:00".into();
         config.receive.shm = "BadName".into();
@@ -641,7 +694,6 @@ mod tests {
         for needle in [
             "output",
             "pattern",
-            "batch",
             "receive.mtu",
             "dst_mac",
             "receive.shm",

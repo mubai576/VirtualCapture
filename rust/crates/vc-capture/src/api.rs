@@ -1,4 +1,4 @@
-//! Rust REST v1；阻塞的原生探测/进程操作在 blocking pool 执行。
+//! Rust REST v2；阻塞的数据面/网卡探测在 blocking pool 执行。
 //!
 //! `/update/*` 由本地更新令牌保护；`/health` 等只读/控制接口保持协议不变。
 use crate::state::Agent;

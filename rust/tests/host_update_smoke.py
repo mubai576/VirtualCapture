@@ -196,8 +196,8 @@ def resolve_binaries(args):
     bin_dir = (args.bin or package or ROOT / "rust/target/debug").resolve()
     native = args.native or package
     if native is None:
-        for candidate in (ROOT / "build/Release", ROOT / "build", bin_dir):
-            if (candidate / "vc-sender.exe").is_file():
+        for candidate in (bin_dir, ROOT / "build/Release", ROOT / "build"):
+            if (candidate / "vc_stream.dll").is_file():
                 native = candidate
                 break
     if native is None:
@@ -207,11 +207,14 @@ def resolve_binaries(args):
     if missing:
         raise SmokeError(
             f"missing {', '.join(missing)} in {bin_dir}; build the rust workspace or pass --package")
-    sender = native / "vc-sender.exe"
-    if not sender.is_file():
+    missing_native = [
+        name for name in ("vc_stream.dll", "vc_vcam.dll") if not (native / name).is_file()
+    ]
+    if missing_native:
         raise SmokeError(
-            f"missing vc-sender.exe in {native}; pass --package <extracted release> or --native <dir> "
-            "(the peer /adapters refresh needs the native sender)")
+            f"missing {', '.join(missing_native)} in {native}; pass --package <extracted release> "
+            "or --native <dir> (the peer capture needs vc_stream.dll; the new host needs both "
+            "vc_stream.dll and vc_vcam.dll)")
     return bin_dir, native
 
 
@@ -311,7 +314,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, help="extracted Rust portable Release directory")
     parser.add_argument("--bin", type=Path, help="directory containing vc-host/vc-capture/vc-updater")
-    parser.add_argument("--native", type=Path, help="directory containing vc-sender.exe")
+    parser.add_argument("--native", type=Path, help="directory containing vc_stream.dll and vc_vcam.dll")
     args = parser.parse_args()
 
     RUN.mkdir(parents=True)
@@ -342,20 +345,19 @@ def main():
                 "version.json": version_json(local_version),
             }
             local_files.update(native_runtime_files(native_dir))
-            vcam = native_dir / "vc-vcam.dll"
-            if vcam.is_file():
-                local_files["vc-vcam.dll"] = vcam.read_bytes()
+            for name in ("vc_stream.dll", "vc_vcam.dll"):
+                local_files[name] = (native_dir / name).read_bytes()
             make_package(local_zip, local_build, local_version, local_files)
 
         # The peer package is intentionally minimal, but a capture release is
         # launched with --native-dir pointing at its own release directory, so
-        # vc-sender and its runtime DLLs must travel with it.
+        # vc_stream.dll and its runtime DLLs must travel with it.
         peer_build = "peer-" + uuid.uuid4().hex[:8]
         peer_version = local_version if args.package else "0.1.1"
         peer_files = {
             "vc-capture.exe": (bin_dir / "vc-capture.exe").read_bytes(),
             "vc-updater.exe": (bin_dir / "vc-updater.exe").read_bytes(),
-            "vc-sender.exe": (native_dir / "vc-sender.exe").read_bytes(),
+            "vc_stream.dll": (native_dir / "vc_stream.dll").read_bytes(),
             "version.json": version_json(peer_version),
         }
         peer_files.update(native_runtime_files(native_dir))
@@ -415,10 +417,13 @@ def main():
         assert capture.poll() is not None, "old capture process still running"
         peer_pointer = read_json(peer_root / "app/current.json")
         assert peer_pointer["build_id"] == peer_build, peer_pointer
-        assert (peer_root / "app/releases" / peer_build / "vc-capture.exe").is_file()
+        peer_release = peer_root / "app/releases" / peer_build
+        assert (peer_release / "vc-capture.exe").is_file()
+        assert (peer_release / "vc_stream.dll").is_file(), (
+            "peer capture release must carry the real vc_stream.dll")
         assert any(entry.get("build_id") == peer_build and entry.get("state") == "active"
                    for entry in history(peer_root)), history(peer_root)
-        checks.append("peer helper switched capture to the staged build and restarted it")
+        checks.append("peer helper switched capture to the staged build and restarted it with vc_stream.dll")
 
         jobs = sorted((host_root / "updates/worker").glob("job-*.json"))
         assert jobs, "host helper job not created"
@@ -434,8 +439,11 @@ def main():
         assert Path(ready["root"]).samefile(host_root), ready
         pointer = read_json(host_root / "app/current.json")
         assert pointer["build_id"] == local_build, pointer
-        assert (host_root / "app/releases" / local_build / "vc-host.exe").is_file()
-        checks.append("vc-updater helper installed local build and new vc-host wrote first-frame ready marker")
+        host_release = host_root / "app/releases" / local_build
+        assert (host_release / "vc-host.exe").is_file()
+        assert (host_release / "vc_stream.dll").is_file(), "host release must carry vc_stream.dll"
+        assert (host_release / "vc_vcam.dll").is_file(), "host release must carry vc_vcam.dll"
+        checks.append("vc-updater helper installed local build with vc_stream.dll/vc_vcam.dll and new vc-host wrote first-frame ready marker")
 
         windows = wait_for(lambda: windows_for_pid(host_pid) or None, 30, "new GPUI window")
         titles = [title for _hwnd, title in windows]

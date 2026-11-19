@@ -4,7 +4,7 @@ use crate::{
     adapters::{self, AdapterInfo},
     budget::{self, Plan},
     client::PeerClient,
-    process::{self, Kind, NativeSlot},
+    process::{self, BatchEcho, Kind, NativeSlot, StopOutcome},
     session::{self, PreparedSession, SenderRequest},
     vcam::{self, VcamStatus},
 };
@@ -51,6 +51,9 @@ pub struct Snapshot {
     pub vcam: VcamStatus,
     pub running: bool,
     pub cleanup_pending: bool,
+    /// 远端仍有本机持有或显式 Stop 尚未确认的会话（含只知有会话但读不到
+    /// session_id 的情况）。UI 用它决定是否提供“停止/重试停止”。
+    pub remote_pending: bool,
     pub busy: bool,
     pub peer_update: Value,
     pub local_update: Value,
@@ -76,6 +79,8 @@ pub enum Command {
     PatchTransport(Value),
     Start,
     Stop,
+    /// 只清理本机接收/虚拟卡；绝不探测或停止远端会话。
+    CleanupLocal,
     SetPeerUpdateToken(String),
     RefreshUpdates,
     StagePeerUpdate(std::path::PathBuf),
@@ -130,6 +135,12 @@ struct Worker {
     receiver: NativeSlot,
     sender_pending: bool,
     session_id: String,
+    /// 只有显式 Stop 可以按 stats 发现远端会话后记下这个精确 session_id；
+    /// 后续显式 Stop 在 stats 不可用时可重试它。轮询、关闭、启动失败都不得使用。
+    discovered_sender: Option<String>,
+    /// 显式 Stop 尚未确认远端已停止；即使还不知道精确 session_id 也要保留，
+    /// 以便 UI 可重试并阻止连接/OTA。自动路径只读核对，不得据此停止远端。
+    remote_stop_pending: bool,
     vcam_owned: bool,
     config_error: bool,
     /// 已保存的接收网卡因不再合格而被清除后置位：后续扫描不再自动改选，
@@ -164,6 +175,8 @@ impl Worker {
             receiver: NativeSlot::new(Kind::Receiver),
             sender_pending: false,
             session_id: String::new(),
+            discovered_sender: None,
+            remote_stop_pending: false,
             vcam_owned: false,
             config_error,
             host_selection_needs_user: false,
@@ -188,7 +201,9 @@ impl Worker {
         }
     }
     fn publish(&mut self) {
-        self.state.cleanup_pending = self.sender_pending || self.vcam_owned;
+        self.state.remote_pending =
+            self.sender_pending || self.remote_stop_pending || self.discovered_sender.is_some();
+        self.state.cleanup_pending = self.cleanup_pending();
         if let Ok(mut state) = self.shared.snapshot.lock() {
             *state = self.state.clone();
         }
@@ -216,8 +231,16 @@ impl Worker {
         self.state.busy = false;
         self.publish();
     }
+    /// 远端发送、本机接收或虚拟卡仍有未确认清理的资源。
+    fn cleanup_pending(&self) -> bool {
+        self.sender_pending
+            || self.remote_stop_pending
+            || self.discovered_sender.is_some()
+            || self.receiver.cleanup_pending()
+            || self.vcam_owned
+    }
     fn blocked(&self) -> bool {
-        self.state.running || self.sender_pending || self.vcam_owned
+        self.state.running || self.cleanup_pending()
     }
     fn save(&mut self) {
         if let Err(e) = self.state.config.save_root() {
@@ -228,14 +251,23 @@ impl Worker {
         if self.state.restart_requested && !matches!(command, Command::Stop | Command::Shutdown) {
             return;
         }
-        if self.config_error && !matches!(command, Command::Stop | Command::Shutdown) {
+        if self.config_error
+            && !matches!(
+                command,
+                Command::Stop | Command::CleanupLocal | Command::Shutdown
+            )
+        {
             self.publish();
             return;
         }
         if self.blocked()
             && !matches!(
                 command,
-                Command::Stop | Command::Start | Command::Shutdown | Command::Refresh
+                Command::Stop
+                    | Command::CleanupLocal
+                    | Command::Start
+                    | Command::Shutdown
+                    | Command::Refresh
             )
         {
             self.fail("会话运行中或仍待清理，先停止再修改连接或配置。".into());
@@ -243,6 +275,7 @@ impl Worker {
         }
         match command {
             Command::Shutdown => {}
+            Command::CleanupLocal => self.stop_inner(false),
             Command::Connect(url) => self.connect(url),
             Command::Refresh => {
                 if let Err(e) = self.refresh() {
@@ -282,7 +315,7 @@ impl Worker {
             Command::PatchCapture(patch) => self.apply_patch("capture", patch),
             Command::PatchTransport(patch) => self.apply_patch("transport", patch),
             Command::Start => self.start(),
-            Command::Stop => self.stop(),
+            Command::Stop => self.stop_explicit(),
             Command::SetPeerUpdateToken(token) => {
                 match crate::update::save_peer_token(token.trim()) {
                     Ok(()) => {
@@ -435,6 +468,11 @@ impl Worker {
             self.fail("请输入有效的被采集机 IPv4 地址。".into());
             return;
         }
+        // 远端停止未确认时不允许换连接把重试目标冲掉；先重试停止或退出主机。
+        if self.sender_pending || self.remote_stop_pending || self.discovered_sender.is_some() {
+            self.fail("远端停止尚未确认，先重试停止再修改连接。".into());
+            return;
+        }
         self.state.busy = true;
         self.state.error = None;
         self.publish();
@@ -487,7 +525,11 @@ impl Worker {
     /// 枚举本机网卡并只保留可确认的物理设备；枚举失败时清空旧列表，
     /// 避免用过期或含虚拟网卡的结果启动。
     fn scan_host_adapters(&mut self) -> Result<(), String> {
-        let items = match adapters::enumerate(&crate::paths::native_exe("vc-sender.exe")) {
+        let result = self
+            .receiver
+            .data_plane_module()
+            .and_then(|module| adapters::enumerate(&module));
+        let items = match result {
             Ok(items) => items,
             Err(error) => {
                 self.state.host_adapters.clear();
@@ -573,7 +615,7 @@ impl Worker {
         self.state.busy = false;
     }
     fn start_inner(&mut self) -> Result<(), String> {
-        process::validate_raw_config(&self.state.config)?;
+        process::validate_start_config(&self.state.config)?;
         let peer = self.peer.clone().ok_or("尚未连接被采集机。")?;
         let health = peer.health()?;
         session::require_peer(&health)?;
@@ -588,7 +630,10 @@ impl Worker {
                 "请选择本机接收网卡。"
             })?
             .clone();
-        process::require_raw_capabilities(Kind::Receiver)?;
+        // 能力门禁在向对端准备会话之前完成；模块与本次编码/来源组合必须已声明。
+        let module = self.receiver.data_plane_module()?;
+        let caps = process::require_capabilities(&module)?;
+        process::require_stream_selection(&caps, &self.state.config.capture.codec, None)?;
         let mut request = self.request(&host);
         let body = serde_json::to_value(&request).map_err(|e| e.to_string())?;
         let prepared: PreparedSession = serde_json::from_value(peer.prepare_sender(&body)?)
@@ -611,9 +656,10 @@ impl Worker {
         self.state.plan = Some(plan);
         if self.state.config.receive.vcam_autoregister {
             let before = vcam::status();
-            if !before.registered.is_empty() {
-                return Err("已有虚拟卡注册；先停止现有主机，避免接管其会话。".into());
-            }
+            // 崩溃重启后注册表可能仍指向本目录 DLL；OTA 后可能指向上一个
+            // release。只有可证明属于本运行根且原属主已退出的注册才允许复用/
+            // 回收，其他目录或存活主机一律拒绝，绝不静默接管。
+            vcam::check_available(&before)?;
             vcam::require_capabilities()?;
             self.vcam_owned = true; // 即使注册部分失败，也尝试回收。
             self.state.vcam = vcam::register(&self.state.config.receive.shm)?;
@@ -621,18 +667,24 @@ impl Worker {
         let run_dir = crate::paths::run_dir();
         let (stats, hashlog, _) =
             process::session_paths(&run_dir, &request.session_id, Kind::Receiver);
-        let args = process::receiver_args(
+        let request_json = process::receiver_request(
             &self.state.config,
             &host.name,
             &request.session_id,
             &stats,
             &hashlog,
-            Some(&request.source_mac),
-        );
-        self.receiver
-            .start(&args, &host.name, &request.session_id, &run_dir)?;
+            &request.source_mac,
+        )?;
+        self.receiver.start(
+            &request_json,
+            &host.name,
+            &request.session_id,
+            &run_dir,
+            BatchEcho::Ignore,
+        )?;
         self.session_id = request.session_id.clone();
         self.sender_pending = true; // HTTP 超时也可能已经开始，必须按会话停止。
+        self.discovered_sender = None;
         let response =
             peer.sender_start(&serde_json::to_value(&request).map_err(|e| e.to_string())?)?;
         let confirmed: PreparedSession =
@@ -642,41 +694,268 @@ impl Worker {
         self.event("采集已开始，等待首帧。");
         Ok(())
     }
+    /// 自动回收/窗口关闭路径：只清理本控制器拥有的资源。
+    ///
+    /// 即使对端仍有采集会话也绝不在这里探测或停止：它可能属于另一个主机或
+    /// 用户，只有显式 Stop 才允许发现并停止当前会话。
     fn stop(&mut self) {
+        self.stop_inner(false);
+    }
+    /// 用户显式点击停止：允许查询远端 stats，并在确认后停止其精确 session_id。
+    fn stop_explicit(&mut self) {
+        self.stop_inner(true);
+    }
+    fn stop_inner(&mut self, discover_remote: bool) {
         self.state.busy = true;
         self.publish();
-        if self.sender_pending
-            && let Some(peer) = &self.peer
-        {
-            match peer.sender_stop_for(&self.session_id) {
-                Ok(_) => {
-                    self.sender_pending = false;
-                    self.event("被采集机已停止。");
-                }
-                Err(e) => self.event(format!("被采集机停止未确认；继续清理本机，可重试：{e}")),
-            }
-        }
-        self.receiver.stop();
-        if self.vcam_owned {
-            let status = vcam::status();
-            if status.registered.is_empty() {
-                self.vcam_owned = false;
-            } else if status.match_local {
-                match vcam::unregister() {
-                    Ok(_) => self.vcam_owned = false,
-                    Err(e) => self.event(format!("虚拟卡回收失败，可重试停止：{e}")),
+        // 顺序保持：先停远端发送，再停本机接收，最后才允许注销虚拟卡。
+        let mut remote_joined = false;
+        if self.sender_pending {
+            if let Some(peer) = self.peer.clone() {
+                match peer.sender_stop_for(&self.session_id) {
+                    Ok(_) => {
+                        self.sender_pending = false;
+                        self.remote_stop_pending = false;
+                        remote_joined = true;
+                        self.event("被采集机已停止。");
+                    }
+                    Err(e) => {
+                        // 409/超时都可能是“远端已被别的会话占用”。只读 stats 对账：
+                        // 会话不是本机的就清除本机 claim，绝不继续追着别人的会话停止。
+                        match self.probe_sender_claim(&peer) {
+                            SenderClaim::Ours => self.event(format!(
+                                "被采集机停止未确认；会话仍由本机持有，可重试停止：{e}"
+                            )),
+                            SenderClaim::Idle => {
+                                self.sender_pending = false;
+                                self.remote_stop_pending = false;
+                                self.discovered_sender = None;
+                                remote_joined = true;
+                                self.event(format!("远端采集已结束，清除本机待停止标记：{e}"));
+                            }
+                            SenderClaim::Replaced(id) => {
+                                self.sender_pending = false;
+                                self.remote_stop_pending = false;
+                                self.discovered_sender = None;
+                                remote_joined = true;
+                                self.event(format!(
+                                    "远端会话已更换为 {id}（非本机创建），不再停止该会话；回收本机资源：{e}"
+                                ));
+                            }
+                            SenderClaim::Unknown => self.event(format!(
+                                "被采集机停止未确认；保留会话与虚拟卡，可重试停止：{e}"
+                            )),
+                        }
+                    }
                 }
             } else {
-                self.vcam_owned = false;
-                self.event("虚拟卡已被其他目录接管，不注销其他注册。");
+                self.event("被采集机连接已断开，无法确认远端停止；保留待清理状态。");
+            }
+        } else if discover_remote {
+            match self.stop_discovered_sender() {
+                Ok(RemoteStop::Idle) => {
+                    remote_joined = true;
+                }
+                Ok(RemoteStop::Stopped(session)) => {
+                    remote_joined = true;
+                    self.state.sender = Value::Null;
+                    self.event(format!("已停止被采集机的采集会话 {session}。"));
+                }
+                Err(error) => {
+                    remote_joined = false;
+                    self.event(format!(
+                        "被采集机停止未确认；保留待清理会话，可再次停止重试：{error}"
+                    ));
+                }
+            }
+        } else {
+            // 自动/本地清理绝不联系远端；若仍有未确认的远端停止，保留虚拟卡。
+            remote_joined = self.discovered_sender.is_none() && !self.remote_stop_pending;
+        }
+        let receiver_outcome = self.receiver.stop();
+        let receiver_joined = matches!(receiver_outcome, Ok(StopOutcome::Stopped));
+        match receiver_outcome {
+            Ok(StopOutcome::Stopped) => {}
+            Ok(StopOutcome::Pending) => {
+                self.event("本机接收停止未确认；数据面会话句柄已保留，可重试停止。");
+            }
+            Err(e) => self.event(format!("本机接收停止失败，句柄保留待重试：{e}")),
+        }
+        if self.vcam_owned {
+            if !(remote_joined && receiver_joined) {
+                self.event("采集或接收会话尚未确认停止，暂不注销虚拟卡；重试停止后继续清理。");
+            } else {
+                let status = vcam::status();
+                if status.registration_unknown {
+                    self.event("虚拟卡注册状态不可读，保留待清理；请稍后重试停止。");
+                } else if status.registered.is_empty() {
+                    self.vcam_owned = false;
+                } else {
+                    match vcam::recovery(&status) {
+                        vcam::Recovery::Local | vcam::Recovery::StaleOwned => {
+                            match vcam::unregister() {
+                                Ok(_) => self.vcam_owned = false,
+                                Err(e) => self.event(format!("虚拟卡回收失败，可重试停止：{e}")),
+                            }
+                        }
+                        recovery @ (vcam::Recovery::Busy | vcam::Recovery::Foreign) => {
+                            self.vcam_owned = false;
+                            self.event(format!(
+                                "{}；不注销其他注册。",
+                                vcam::recovery_error(recovery)
+                            ));
+                        }
+                        vcam::Recovery::Unknown => {
+                            // 无法证明归属时保留 vcam_owned，避免悄悄放弃或误删别人的注册。
+                            self.event(
+                                "无法证明虚拟卡注册属于本运行根，保留待清理；不会注销该注册。",
+                            );
+                        }
+                        vcam::Recovery::Fresh => self.vcam_owned = false,
+                    }
+                }
             }
         }
         self.state.running = false;
-        self.state.sender = Value::Null;
-        self.state.receiver = Value::Null;
+        if remote_joined {
+            self.state.sender = Value::Null;
+        }
+        if receiver_joined {
+            self.state.receiver = Value::Null;
+        } else {
+            self.state.receiver = self.receiver.stats();
+        }
         self.state.vcam = vcam::status();
         self.state.busy = false;
         self.publish();
+    }
+    /// 显式 Stop 专用：先用 stats 发现当前 sender，再只停止其精确 session_id。
+    ///
+    /// 每次都以最新 stats 为准刷新目标，避免远端换了会话后仍追着旧号重试；
+    /// stats/health 暂时不可读时，才重试此前显式 Stop 已确认过的精确会话号。
+    fn stop_discovered_sender(&mut self) -> Result<RemoteStop, String> {
+        let Some(peer) = self.peer.clone() else {
+            self.discovered_sender = None;
+            self.remote_stop_pending = false;
+            return Ok(RemoteStop::Idle);
+        };
+        // 只要显式 Stop 尝试后没有确认“远端已无会话/已停止”，就保留 pending；
+        // 即使还读不到 session_id，也不能让 UI 退回“开始采集”。
+        self.remote_stop_pending = true;
+        let (target, discovery_error) = match self.discover_remote_session(&peer) {
+            Ok(Some(session)) => {
+                self.discovered_sender = Some(session.clone());
+                (Some(session), None)
+            }
+            Ok(None) => {
+                self.discovered_sender = None;
+                self.remote_stop_pending = false;
+                return Ok(RemoteStop::Idle);
+            }
+            Err(error) => (self.discovered_sender.clone(), Some(error)),
+        };
+        let Some(session) = target else {
+            return Err(
+                discovery_error.unwrap_or_else(|| "被采集机状态不可读，未停止任何会话。".into())
+            );
+        };
+        match peer.sender_stop_for(&session) {
+            Ok(_) => {
+                self.discovered_sender = None;
+                self.remote_stop_pending = false;
+                Ok(RemoteStop::Stopped(session))
+            }
+            Err(stop_error) => {
+                self.discovered_sender = Some(session.clone());
+                Err(match discovery_error {
+                    Some(error) => format!("{error}；重试上次会话 {session} 也失败：{stop_error}"),
+                    None => stop_error,
+                })
+            }
+        }
+    }
+    /// 只读 stats，判断本机持有的 sender claim 是否仍是远端当前会话。
+    fn probe_sender_claim(&mut self, peer: &PeerClient) -> SenderClaim {
+        match peer.sender_stats() {
+            Ok(stats) => {
+                self.state.sender = stats.clone();
+                // running 缺失/类型错误时无法证明会话已结束，保留本机 claim。
+                let Some(running) = stats.get("running").and_then(Value::as_bool) else {
+                    return SenderClaim::Unknown;
+                };
+                let id = stats["session_id"].as_str().unwrap_or("").trim();
+                if !running {
+                    SenderClaim::Idle
+                } else if id.is_empty() {
+                    SenderClaim::Unknown
+                } else if id == self.session_id {
+                    SenderClaim::Ours
+                } else {
+                    SenderClaim::Replaced(id.to_string())
+                }
+            }
+            Err(_) => SenderClaim::Unknown,
+        }
+    }
+    /// 只读取并校验 Rust 采集后台后返回当前运行中的会话号；不产生停止副作用。
+    fn discover_remote_session(&mut self, peer: &PeerClient) -> Result<Option<String>, String> {
+        let health = peer.health()?;
+        session::require_peer(&health)?;
+        match health.get("running").and_then(Value::as_bool) {
+            Some(true) => {}
+            Some(false) => return Ok(None),
+            None => {
+                return Err("被采集机 health 缺少可确认的 running 布尔值；未停止任何会话。".into());
+            }
+        }
+        let stats = peer.sender_stats()?;
+        self.state.sender = stats.clone();
+        session_to_stop(&stats)
+    }
+    /// 只读 stats 对账本机 claim/discovered 目标；绝不在这里停止远端。
+    ///
+    /// 返回 true 表示至少有一个远端 claim 已被确认结束或被其他会话替代，
+    /// 调用方应回收本机接收/虚拟卡资源。stats 缺少 `running` 布尔值时不做
+    /// 任何结论，保持 fail-closed。
+    fn reconcile_claims(&mut self, stats: &Value) -> bool {
+        let Some(running) = stats.get("running").and_then(Value::as_bool) else {
+            return false;
+        };
+        let id = stats["session_id"].as_str().unwrap_or("").trim();
+        let mut resolved = false;
+        if self.sender_pending {
+            if !running {
+                self.sender_pending = false;
+                resolved = true;
+                self.event("远端采集已结束，清除本机待停止标记。");
+            } else if !id.is_empty() && id != self.session_id {
+                self.sender_pending = false;
+                resolved = true;
+                self.event(format!(
+                    "远端采集会话已更换为 {id}（非本机创建），本机停止重试已取消。"
+                ));
+            }
+        }
+        if let Some(target) = self.discovered_sender.clone() {
+            if !running {
+                self.discovered_sender = None;
+                resolved = true;
+                self.event("远端目标会话已结束，清除重试标记。");
+            } else if !id.is_empty() && id != target {
+                // 远端同一时刻只有一个采集会话；精确目标已被别的会话替换，
+                // 说明要停的会话已经不在了。只清本机重试目标，绝不停止新会话。
+                self.discovered_sender = None;
+                self.remote_stop_pending = false;
+                resolved = true;
+                self.event("远端目标会话已更换，不再按旧 session_id 重试停止。");
+            }
+        }
+        if self.remote_stop_pending && !running {
+            self.remote_stop_pending = false;
+            resolved = true;
+            self.event("远端采集已结束，清除待重试停止标记。");
+        }
+        resolved
     }
     fn poll(&mut self) {
         let Some(peer) = self.peer.clone() else {
@@ -690,11 +969,18 @@ impl Worker {
                 self.state.peer_online = true;
                 match peer.sender_stats() {
                     Ok(stats) => {
-                        let stopped = self.state.running && stats["running"] != true;
-                        self.state.sender = stats;
-                        if stopped {
-                            self.event("采集进程已退出，回收会话。");
-                            self.stop();
+                        let was_running = self.state.running;
+                        self.state.sender = stats.clone();
+                        // running 缺失/类型错误时不做回收结论，保持待清理状态。
+                        if let Some(remote_running) = stats.get("running").and_then(Value::as_bool)
+                        {
+                            let resolved = self.reconcile_claims(&stats);
+                            if (was_running && !remote_running) || resolved {
+                                if was_running && !remote_running {
+                                    self.event("采集会话已结束，回收会话。");
+                                }
+                                self.stop();
+                            }
                         }
                     }
                     Err(e) => {
@@ -712,15 +998,53 @@ impl Worker {
                 }
             }
         }
-        if self.state.running {
+        let receiver_running = self.receiver.running();
+        if self.state.running || receiver_running || self.receiver.cleanup_pending() {
             self.state.receiver = self.receiver.stats();
-            if !self.receiver.running() {
-                self.event("本机接收进程已退出，停止并回收会话。");
+            if self.state.running && !receiver_running {
+                self.event("本机接收会话已结束，停止并回收会话。");
                 self.stop();
             }
         }
         self.publish();
     }
+}
+
+/// 本机 sender claim 与远端当前 stats 的关系。
+enum SenderClaim {
+    Ours,
+    Idle,
+    Replaced(String),
+    Unknown,
+}
+
+/// 显式 Stop 的远端发现结果。
+enum RemoteStop {
+    /// 对端没有运行中的采集会话。
+    Idle,
+    /// 已按精确会话号停止。
+    Stopped(String),
+}
+
+/// stats 中可停止的会话号。运行中却缺少会话号时必须拒绝，不能盲停；
+/// `running` 缺失/类型错误同样视为未知，不能当作“已结束”。
+fn session_to_stop(stats: &Value) -> Result<Option<String>, String> {
+    match stats.get("running").and_then(Value::as_bool) {
+        Some(true) => {}
+        Some(false) => return Ok(None),
+        None => {
+            return Err("被采集机 stats 缺少可确认的 running 布尔值；未停止任何会话。".into());
+        }
+    }
+    let session = stats
+        .get("session_id")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if session.is_empty() {
+        return Err("被采集机报告采集运行中，但未提供可确认的 session_id；未停止任何会话。".into());
+    }
+    Ok(Some(session.to_string()))
 }
 
 /// Windows canonicalize adds the extended path prefix after helper restart.
@@ -839,5 +1163,559 @@ mod tests {
         let mut controller = spawn();
         controller.shutdown();
         assert!(!controller.shared.snapshot.lock().unwrap().running);
+    }
+
+    // ---------------------------------------------------------- fake peer
+    //
+    // 这些测试只运行真实 HostController 工作线程代码和本机回环 HTTP，不启动
+    // 数据面、不注册 DShow、不枚举/打开网卡。远端“采集会话”由脚本化响应模拟。
+
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+
+    fn test_worker(peer_url: &str) -> (Worker, Sender<Command>) {
+        let (tx, rx) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            snapshot: Mutex::new(Snapshot::default()),
+        });
+        let mut worker = Worker::new(shared, rx);
+        worker.config_error = false;
+        worker.state.config = Config::default();
+        worker.state.config.receive.vcam_autoregister = false;
+        worker.state.restart_requested = false;
+        worker.state.connected = true;
+        worker.state.peer_url = peer_url.into();
+        worker.peer = Some(PeerClient::new(peer_url));
+        (worker, tx)
+    }
+
+    fn health_body(running: bool) -> String {
+        json!({
+            "ok": true,
+            "implementation": session::IMPLEMENTATION,
+            "api_revision": session::API_REVISION,
+            "role": "capture",
+            "running": running
+        })
+        .to_string()
+    }
+
+    fn http_response(status: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    fn read_request(stream: &mut TcpStream) -> String {
+        let mut request = Vec::new();
+        let mut buffer = [0u8; 4096];
+        let header_end = loop {
+            let read = stream.read(&mut buffer).unwrap_or(0);
+            if read == 0 {
+                break None;
+            }
+            request.extend_from_slice(&buffer[..read]);
+            if let Some(position) = request.windows(4).position(|window| window == b"\r\n\r\n") {
+                break Some(position + 4);
+            }
+        };
+        if let Some(header_end) = header_end {
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            let content_length = headers
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buffer).unwrap_or(0);
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&buffer[..read]);
+            }
+        }
+        String::from_utf8_lossy(&request).into_owned()
+    }
+
+    /// 脚本化 fake peer：按顺序回放响应，脚本耗尽后对任何多余请求返回 500，
+    /// 并把收到的完整请求交给测试断言。
+    struct FakePeer {
+        base: String,
+        requests: Receiver<String>,
+        stop: Sender<()>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl FakePeer {
+        fn start(responses: Vec<String>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let (request_tx, requests) = mpsc::channel();
+            let (stop, stop_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                let mut remaining = responses.into_iter();
+                loop {
+                    if stop_rx.try_recv().is_ok() {
+                        break;
+                    }
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(5)))
+                                .unwrap();
+                            let request = read_request(&mut stream);
+                            let _ = request_tx.send(request);
+                            let response = remaining.next().unwrap_or_else(|| {
+                                http_response(
+                                    "500 Internal Server Error",
+                                    r#"{"error":"unexpected request"}"#,
+                                )
+                            });
+                            let _ = stream.write_all(response.as_bytes());
+                            let _ = stream.flush();
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
+            Self {
+                base,
+                requests,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn take(&self, count: usize) -> Vec<String> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut out = Vec::new();
+            while out.len() < count && Instant::now() < deadline {
+                match self.requests.recv_timeout(Duration::from_millis(100)) {
+                    Ok(request) => out.push(request),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            out
+        }
+
+        fn assert_no_more(&self) {
+            assert!(
+                self.requests.try_recv().is_err(),
+                "unexpected extra request to fake peer"
+            );
+        }
+    }
+
+    impl Drop for FakePeer {
+        fn drop(&mut self) {
+            let _ = self.stop.send(());
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    #[test]
+    fn explicit_stop_discovers_and_stops_the_exact_session() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(true)),
+            http_response(
+                "200 OK",
+                &json!({"running":true,"session_id":"s-remote"}).to_string(),
+            ),
+            http_response(
+                "200 OK",
+                &json!({"stopped":true,"session_id":"s-remote"}).to_string(),
+            ),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.handle(Command::Stop);
+        let requests = peer.take(3);
+        assert_eq!(requests.len(), 3, "{requests:?}");
+        assert!(requests[0].starts_with("GET /health "));
+        assert!(requests[1].starts_with("GET /sender/stats "));
+        assert!(requests[2].starts_with("POST /sender/stop "));
+        assert!(requests[2].contains("\"s-remote\""), "{}", requests[2]);
+        assert!(worker.discovered_sender.is_none());
+        assert!(worker.state.sender.is_null());
+        assert!(!worker.state.running);
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn explicit_stop_refreshes_the_target_instead_of_chasing_an_old_id() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(true)),
+            http_response(
+                "200 OK",
+                &json!({"running":true,"session_id":"s-old"}).to_string(),
+            ),
+            http_response("409 Conflict", r#"{"error":"session mismatch"}"#),
+            http_response("200 OK", &health_body(true)),
+            http_response(
+                "200 OK",
+                &json!({"running":true,"session_id":"s-new"}).to_string(),
+            ),
+            http_response(
+                "200 OK",
+                &json!({"stopped":true,"session_id":"s-new"}).to_string(),
+            ),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.handle(Command::Stop);
+        assert_eq!(worker.discovered_sender.as_deref(), Some("s-old"));
+        worker.handle(Command::Stop);
+        assert!(worker.discovered_sender.is_none());
+        let requests = peer.take(6);
+        assert_eq!(requests.len(), 6, "{requests:?}");
+        assert!(requests[2].contains("\"s-old\""), "{}", requests[2]);
+        assert!(requests[5].contains("\"s-new\""), "{}", requests[5]);
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn explicit_stop_retries_the_last_exact_session_when_stats_are_unavailable() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(true)),
+            http_response(
+                "200 OK",
+                &json!({"running":true,"session_id":"s-remote"}).to_string(),
+            ),
+            http_response("500 Internal Server Error", r#"{"error":"stop failed"}"#),
+            http_response("503 Service Unavailable", r#"{"error":"offline"}"#),
+            http_response(
+                "200 OK",
+                &json!({"stopped":true,"session_id":"s-remote"}).to_string(),
+            ),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.handle(Command::Stop);
+        assert_eq!(worker.discovered_sender.as_deref(), Some("s-remote"));
+        worker.handle(Command::Stop);
+        assert!(worker.discovered_sender.is_none());
+        let requests = peer.take(5);
+        assert_eq!(requests.len(), 5, "{requests:?}");
+        assert!(requests[2].starts_with("POST /sender/stop "));
+        assert!(requests[2].contains("\"s-remote\""));
+        assert!(requests[4].starts_with("POST /sender/stop "));
+        assert!(requests[4].contains("\"s-remote\""));
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn explicit_stop_refuses_a_running_session_without_identity() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(true)),
+            http_response("200 OK", r#"{"running":true,"session_id":""}"#),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.handle(Command::Stop);
+        let requests = peer.take(2);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(worker.discovered_sender.is_none());
+        assert!(
+            worker
+                .state
+                .events
+                .iter()
+                .any(|event| event.contains("session_id")),
+            "{:?}",
+            worker.state.events
+        );
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn failed_start_never_stops_the_running_remote() {
+        let peer = FakePeer::start(vec![http_response("200 OK", &health_body(true))]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.handle(Command::Start);
+        assert!(
+            worker
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("已有采集会话")),
+            "{:?}",
+            worker.state.error
+        );
+        let requests = peer.take(1);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].starts_with("GET /health "));
+        assert!(worker.discovered_sender.is_none());
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn automatic_stop_and_shutdown_never_contact_the_remote() {
+        let peer = FakePeer::start(vec![]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        let events = worker.state.events.len();
+        // 自动回收路径（窗口关闭、轮询清理、启动失败都走这里）。
+        worker.stop();
+        assert_eq!(worker.state.events.len(), events);
+        assert!(worker.discovered_sender.is_none());
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn session_to_stop_requires_running_flag_and_exact_identity() {
+        assert_eq!(
+            session_to_stop(&json!({"running":true,"session_id":"s-1"})).unwrap(),
+            Some("s-1".into())
+        );
+        assert_eq!(
+            session_to_stop(&json!({"running":false,"session_id":"s-1"})).unwrap(),
+            None
+        );
+        // 缺少 running 不是“已结束”，必须按未知拒绝。
+        assert!(session_to_stop(&json!({})).is_err());
+        assert!(session_to_stop(&json!({"running":"yes"})).is_err());
+        assert!(session_to_stop(&json!({"running":true})).is_err());
+        assert!(session_to_stop(&json!({"running":true,"session_id":"  "})).is_err());
+    }
+
+    #[test]
+    fn automatic_stop_uses_only_the_exact_own_session() {
+        let peer = FakePeer::start(vec![http_response(
+            "200 OK",
+            r#"{"stopped":true,"session_id":"s-own"}"#,
+        )]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.sender_pending = true;
+        worker.session_id = "s-own".into();
+        worker.state.running = true;
+        worker.stop(); // 自动回收路径（关窗/失联/启动失败共用）
+        let requests = peer.take(1);
+        assert_eq!(requests.len(), 1, "{requests:?}");
+        assert!(requests[0].starts_with("POST /sender/stop "));
+        assert!(requests[0].contains("\"s-own\""), "{}", requests[0]);
+        assert!(!worker.sender_pending);
+        assert!(!worker.state.running);
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn stop_conflict_releases_own_claim_without_stopping_the_other_session() {
+        let peer = FakePeer::start(vec![
+            http_response("409 Conflict", r#"{"error":"session mismatch"}"#),
+            http_response("200 OK", r#"{"running":true,"session_id":"s-other"}"#),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.sender_pending = true;
+        worker.session_id = "s-own".into();
+        worker.state.running = true;
+        worker.stop_explicit();
+        let requests = peer.take(2);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[0].starts_with("POST /sender/stop "));
+        assert!(requests[0].contains("\"s-own\""), "{}", requests[0]);
+        assert!(requests[1].starts_with("GET /sender/stats "));
+        // 绝不把停止请求转给远端当前（他人的）会话。
+        assert!(!requests.iter().any(|request| request.contains("s-other")));
+        assert!(!worker.sender_pending);
+        assert!(!worker.cleanup_pending());
+        assert!(!worker.state.running);
+        assert!(
+            worker
+                .state
+                .events
+                .iter()
+                .any(|event| event.contains("非本机创建")),
+            "{:?}",
+            worker.state.events
+        );
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn unconfirmed_stop_keeps_pending_and_blocks_connect() {
+        let peer = FakePeer::start(vec![
+            http_response("409 Conflict", r#"{"error":"session mismatch"}"#),
+            http_response(
+                "503 Service Unavailable",
+                r#"{"error":"stats unavailable"}"#,
+            ),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.sender_pending = true;
+        worker.session_id = "s-own".into();
+        worker.state.running = true;
+        worker.stop_explicit();
+        let requests = peer.take(2);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(worker.sender_pending);
+        assert!(worker.cleanup_pending());
+        assert!(worker.state.cleanup_pending);
+        assert!(worker.state.remote_pending);
+        assert!(!worker.state.running);
+        // 连接被待清理拦截，不会把重试目标冲掉。
+        worker.handle(Command::Connect("http://127.0.0.1:1".into()));
+        assert!(
+            worker
+                .state
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("先停止")),
+            "{:?}",
+            worker.state.error
+        );
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn unknown_discovery_stop_surfaces_pending_without_an_id() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(true)),
+            http_response(
+                "503 Service Unavailable",
+                r#"{"error":"stats unavailable"}"#,
+            ),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.handle(Command::Stop);
+        let requests = peer.take(2);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(worker.remote_stop_pending);
+        assert!(worker.discovered_sender.is_none());
+        assert!(worker.state.remote_pending);
+        assert!(worker.state.cleanup_pending);
+        assert!(
+            worker
+                .state
+                .events
+                .iter()
+                .any(|event| event.contains("可再次停止重试")),
+            "{:?}",
+            worker.state.events
+        );
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn poll_clears_pending_only_after_stats_confirm_the_target_is_gone() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(true)),
+            http_response(
+                "200 OK",
+                &json!({"running":true,"session_id":"s-remote"}).to_string(),
+            ),
+            http_response("500 Internal Server Error", r#"{"error":"stop failed"}"#),
+            http_response("200 OK", &health_body(false)),
+            http_response("200 OK", r#"{"running":false,"session_id":null}"#),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.handle(Command::Stop);
+        assert!(worker.discovered_sender.is_some());
+        assert!(worker.remote_stop_pending);
+        let setup = peer.take(3);
+        assert_eq!(setup.len(), 3, "{setup:?}");
+        assert!(setup[2].starts_with("POST /sender/stop "));
+        assert!(setup[2].contains("\"s-remote\""), "{}", setup[2]);
+        worker.poll();
+        let requests = peer.take(2);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[0].starts_with("GET /health "));
+        assert!(requests[1].starts_with("GET /sender/stats "));
+        assert!(worker.discovered_sender.is_none());
+        assert!(!worker.remote_stop_pending);
+        assert!(!worker.cleanup_pending());
+        assert!(!worker.state.remote_pending);
+        assert!(!worker.state.running);
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn poll_never_stops_a_replaced_remote_session() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(true)),
+            http_response(
+                "200 OK",
+                &json!({"running":true,"session_id":"s-other"}).to_string(),
+            ),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.sender_pending = true;
+        worker.session_id = "s-own".into();
+        worker.state.running = true;
+        worker.poll();
+        let requests = peer.take(2);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[0].starts_with("GET /health "));
+        assert!(requests[1].starts_with("GET /sender/stats "));
+        assert!(!requests.iter().any(|request| request.starts_with("POST ")));
+        assert!(!worker.sender_pending);
+        assert!(!worker.cleanup_pending());
+        assert!(!worker.state.running);
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn poll_malformed_stats_keeps_the_claim() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(true)),
+            http_response("200 OK", r#"{"session_id":"s-own"}"#),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.sender_pending = true;
+        worker.session_id = "s-own".into();
+        worker.poll();
+        let requests = peer.take(2);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        // running 不可确认时不能当作会话已结束，本机 claim 必须保留。
+        assert!(worker.sender_pending);
+        assert!(worker.cleanup_pending());
+        assert!(worker.state.remote_pending);
+        assert!(!requests.iter().any(|request| request.starts_with("POST ")));
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn poll_releases_a_replaced_explicit_target_without_stopping_the_new_session() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(true)),
+            http_response(
+                "200 OK",
+                &json!({"running":true,"session_id":"s-new"}).to_string(),
+            ),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.discovered_sender = Some("s-old".into());
+        worker.remote_stop_pending = true;
+        worker.poll();
+        let requests = peer.take(2);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        assert!(requests[0].starts_with("GET /health "));
+        assert!(requests[1].starts_with("GET /sender/stats "));
+        // 精确目标已被替换就说明它已停止；只回收本机资源，绝不停止新会话。
+        assert!(!requests.iter().any(|request| request.starts_with("POST ")));
+        assert!(worker.discovered_sender.is_none());
+        assert!(!worker.remote_stop_pending);
+        assert!(!worker.cleanup_pending());
+        assert!(!worker.state.remote_pending);
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn local_cleanup_never_contacts_the_remote() {
+        let peer = FakePeer::start(vec![]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.discovered_sender = Some("s-stale".into());
+        worker.handle(Command::CleanupLocal);
+        // 本地清理保留重试目标，但不发任何远端请求（尤其不停止其他会话）。
+        assert_eq!(worker.discovered_sender.as_deref(), Some("s-stale"));
+        assert!(worker.cleanup_pending());
+        assert!(!worker.state.running);
+        peer.assert_no_more();
     }
 }

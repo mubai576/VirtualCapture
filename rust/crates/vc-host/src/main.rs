@@ -243,7 +243,6 @@ impl HostApp {
         self.snapshot.connected
             && self.snapshot.peer_online
             && !self.locked()
-            && self.snapshot.config.capture.codec == "raw"
             && self.snapshot.host_scan == HostScan::Ready
             && self
                 .snapshot
@@ -971,32 +970,43 @@ impl HostApp {
     fn capture_action(&self, cx: &mut Context<Self>) -> Button {
         let running = self.snapshot.running;
         let cleanup = self.snapshot.cleanup_pending;
+        let remote_pending = self.snapshot.remote_pending;
+        let remote_running = self.snapshot.connected
+            && self.snapshot.peer_online
+            && self.snapshot.sender["running"] == true
+            && self.snapshot.sender["session_id"]
+                .as_str()
+                .is_some_and(|id| !id.trim().is_empty());
         let busy = self.snapshot.busy;
+        let intent = capture_intent(running, cleanup, remote_pending, remote_running);
+        let stop_available = intent != CaptureIntent::Start;
         let label = if busy {
             "正在处理…"
-        } else if running {
-            "停止采集"
-        } else if cleanup {
-            "清理残留"
         } else {
-            "开始采集"
+            match intent {
+                CaptureIntent::Start => "开始采集",
+                CaptureIntent::CleanupLocal => "清理本地残留",
+                CaptureIntent::StopRemote if running => "停止采集",
+                CaptureIntent::StopRemote if remote_running => "停止远端采集",
+                CaptureIntent::StopRemote => "重试停止",
+            }
         };
         let mut action = Button::new("toggle")
             .label(label)
             .h(px(42.))
             .px_5()
-            .disabled(busy || (!running && !cleanup && !self.can_start()))
+            .disabled(busy || (intent == CaptureIntent::Start && !self.can_start()))
             .loading(busy);
-        action = if running || cleanup {
+        action = if stop_available {
             action.danger()
         } else {
             action.primary()
         };
         action.on_click(cx.listener(move |this, _, _, _| {
-            this.send(if running || cleanup {
-                Command::Stop
-            } else {
-                Command::Start
+            this.send(match intent {
+                CaptureIntent::Start => Command::Start,
+                CaptureIntent::StopRemote => Command::Stop,
+                CaptureIntent::CleanupLocal => Command::CleanupLocal,
             });
         }))
     }
@@ -1008,13 +1018,6 @@ impl HostApp {
             .or(self.snapshot.error.as_ref())
         {
             return Some(("暂时无法继续".into(), error.clone(), ERR));
-        }
-        if self.snapshot.config.capture.codec != "raw" {
-            return Some((
-                "当前编码暂不支持".into(),
-                "本版本仅运行 Raw，请修改配置后重新开始。".into(),
-                WARN,
-            ));
         }
         if self.snapshot.connected && !self.snapshot.peer_online {
             return Some((
@@ -1141,10 +1144,11 @@ impl HostApp {
                             .text_color(rgb(STAGE_MUTED))
                             .child(format!(
                                 "{} / NV12 / {}",
-                                if c.codec == "raw" {
-                                    "Raw 无压缩"
-                                } else {
-                                    "编码草稿"
+                                match c.codec.as_str() {
+                                    "raw" => "Raw 无压缩",
+                                    "mjpeg" => "MJPEG 有损",
+                                    "pyrowave" => "PyroWave 小波",
+                                    _ => "未知编码",
                                 },
                                 transform_label(&c.transform)
                             )),
@@ -1454,7 +1458,7 @@ impl HostApp {
             .child(stat_row(
                 "实际帧率",
                 field(sender, "fps_actual", sl, num),
-                field(receiver, "fps", running, num),
+                field_any(receiver, &["fps", "fps_actual"], running, num),
             ))
             .child(stat_row(
                 "完成帧数",
@@ -1479,7 +1483,12 @@ impl HostApp {
             .child(stat_row(
                 "到帧间隔 p99",
                 "—".into(),
-                field(receiver, "inter_arrival_p99_ms", running, ms),
+                field_any(
+                    receiver,
+                    &["inter_arrival_p99_ms", "inter_arrival.p99_ms"],
+                    running,
+                    ms,
+                ),
             ))
             .child(stat_row(
                 "采集转换 p99",
@@ -1494,7 +1503,7 @@ impl HostApp {
             .child(stat_row(
                 "重组分段 p99",
                 "—".into(),
-                field(receiver, "rseg_p99_ms", running, ms),
+                field_any(receiver, &["rseg_p99_ms", "rseg.p99_ms"], running, ms),
             ))
             .child(stat_row(
                 "虚拟卡交付 p99",
@@ -1504,7 +1513,7 @@ impl HostApp {
             .child(stat_row(
                 "GPU / 虚拟卡交付",
                 field(sender, "gpu_ms", sl, ms),
-                field(receiver, "vcam_delivered", running, num),
+                field_any(receiver, &["vcam_delivered", "shm_published"], running, num),
             ))
             .child(stat_row(
                 "退出码",
@@ -1797,6 +1806,21 @@ fn field(stats: &Value, key: &str, enabled: bool, format: fn(&Value) -> String) 
         "—".into()
     }
 }
+/// 依次尝试多个兼容键；点号表示读取嵌套对象（如 `rseg.p99_ms`）。
+fn field_any(stats: &Value, keys: &[&str], enabled: bool, format: fn(&Value) -> String) -> String {
+    if !enabled {
+        return "—".into();
+    }
+    keys.iter()
+        .find_map(|key| {
+            let mut value = stats;
+            for part in key.split('.') {
+                value = value.get(part)?;
+            }
+            Some(format(value))
+        })
+        .unwrap_or_else(|| "—".into())
+}
 fn update_line(label: &str, build: &Option<UpdateBuild>) -> Div {
     div()
         .flex()
@@ -1832,8 +1856,34 @@ fn plan_label(plan: &Plan) -> (&'static str, u32) {
         PlanStatus::Unknown => ("等待检测", TEXT_DIM),
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CaptureIntent {
+    Start,
+    /// 显式停止/重试停止：允许发现并按精确 session_id 停止远端会话。
+    StopRemote,
+    /// 只清理本机接收/虚拟卡：绝不探测或停止远端会话。
+    CleanupLocal,
+}
+
+fn capture_intent(
+    running: bool,
+    cleanup: bool,
+    remote_pending: bool,
+    remote_running: bool,
+) -> CaptureIntent {
+    if running || remote_pending || remote_running {
+        CaptureIntent::StopRemote
+    } else if cleanup {
+        CaptureIntent::CleanupLocal
+    } else {
+        CaptureIntent::Start
+    }
+}
+
 fn vcam_label(status: &VcamStatus) -> (&'static str, u32) {
-    if status.managed() {
+    if status.registration_unknown {
+        ("虚拟卡状态不可读", WARN)
+    } else if status.managed() {
         ("已就绪", OK)
     } else if !status.registered.is_empty() {
         ("其他目录已注册", WARN)
@@ -1980,4 +2030,35 @@ fn main() {
             })
             .expect("无法打开主窗口");
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn capture_intent_distinguishes_local_cleanup_from_remote_stop() {
+        // 运行中/显式 Stop 未确认/远端有会话：必须走显式 Stop（精确会话）。
+        assert_eq!(
+            capture_intent(true, true, true, true),
+            CaptureIntent::StopRemote
+        );
+        assert_eq!(
+            capture_intent(false, true, true, false),
+            CaptureIntent::StopRemote
+        );
+        assert_eq!(
+            capture_intent(false, false, false, true),
+            CaptureIntent::StopRemote
+        );
+        // 只有本地残留、远端无 claim：绝不能借清理按钮触发远端发现/停止。
+        assert_eq!(
+            capture_intent(false, true, false, false),
+            CaptureIntent::CleanupLocal
+        );
+        assert_eq!(
+            capture_intent(false, false, false, false),
+            CaptureIntent::Start
+        );
+    }
 }

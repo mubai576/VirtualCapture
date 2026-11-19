@@ -1,6 +1,6 @@
 [package]
 name = "vc-capture"
-description = "被采集机无界面后台：REST 控制 API，拉起并监管原生 vc-sender"
+description = "被采集机无界面后台：REST 控制 API，装载并监管进程内 vc_stream.dll 数据面会话"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

@@ -20,7 +20,7 @@ import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
 EXE = ROOT / "rust/target/debug/vc-capture.exe"
-NATIVE = ROOT / "build/Release"
+NATIVE = ROOT / "rust/target/debug"
 RUN = ROOT / "run" / ("rust-adapter-smoke-" + uuid.uuid4().hex[:10])
 RUN.mkdir(parents=True)
 LOOPBACK = r"\Device\NPF_Loopback"
@@ -95,7 +95,8 @@ def main():
     if args.package:
         NATIVE = args.package.resolve()
         EXE = NATIVE / "vc-capture.exe"
-    assert EXE.is_file(), f"Missing {EXE}; build rust workspace first"
+    assert EXE.is_file() and (NATIVE / "vc_stream.dll").is_file(), (
+        f"Missing {EXE} or {NATIVE / 'vc_stream.dll'}; build rust workspace first")
     listed = subprocess.run(
         [str(EXE), "--root", str(RUN), "--native-dir", str(NATIVE), "--list-adapters"],
         capture_output=True, encoding="utf-8", timeout=45, check=True,
@@ -114,7 +115,7 @@ def main():
         # explicit diagnostics flag this must be refused before any process starts.
         capture = get(port, "/config")["capture"]
         capture.update({"mode": "pattern", "pattern": "motion", "fps": 60,
-                        "width": 416, "height": 416, "batch": 1, "gpu_convert": False})
+                        "width": 416, "height": 416, "gpu_convert": False})
         status, refused = post(port, "/sender/prepare", {
             "capture": capture, "session_id": "s-adapter-probe",
             "source_mac": "02:14:11:26:00:02", "auto_adapter": True, "adapter": "",

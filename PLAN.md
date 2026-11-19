@@ -106,17 +106,27 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 ### 1.7 PC1 Raw 长运行诊断（2026-11-08 增量）
 独立 `scripts/longrun_diagnostics.py` 默认每秒/6小时，只 GET 双端 stats、观察系统/下游资源并留全量样本；`--mark/--stop` 只标记/结束记录器。候选 Raw receiver/vcam 通过进程环境 `VC_DIAG=1` 提供固定有界 `Local\VirtualCapture.Diag.<pid>` 旁路计时（stats准备/写盘、hash写盘、GetBuffer、Receive）；不改现有 wire、帧 SHM、rseg/vseg 语义或验收门限。契约见 skill `references/longrun-diagnostics.md`，操作见 `docs/runbooks/longrun-diagnostics.md`。
 
-### 1.8 Rust 控制面开发版（D26）
+### 1.8 Rust 产品路径开发版（D26–D28）
 
-独立 `rust` 分支：`vc-capture` CLI 后台 + `vc-host` GPUI主机客户端；主机编排抽入不依赖UI的 `vc-core`。
-R1复用原生发收端/DShow，28B包头/SHM/性能判据不改；控制API允许重设计，Rust身份与显式会话回显，
-不与旧Python后台混跑。配置独立 `vc-rust-config.json`；仅Raw可运行，编码草稿明确拒绝启动。
-会话号重复不覆盖运行证据；自动注册前隔离探测实际DShow DLL能力，拒绝接管已有注册。
+独立 `rust` 分支：`vc-capture` CLI后台 + `vc-host` GPUI主机客户端；编排/配置/预算/OTA在UI无关的 `vc-core`。
+D26控制面、D27 OTA与运行布局、D28全面Rust授权；控制API允许重新设计，Rust身份与显式会话回显，不与旧Python后台混跑。
+Rust产品宿主**进程内加载版本化 `vc_stream.dll` C ABI v1**（start/status/stop/destroy/capabilities）运行采集/接收，
+不再以 `vc-sender.exe`/`vc-receiver.exe` CLI 拼装本机数据面；独立 `vc-stream.exe` 诊断入口与DLL复用同一crate实现。
+`vc-source`提供pattern/DDA/WGC与crop/fit/fill/stretch整数变换；`vc-media`动态加载固定TurboJPEG/PyroWave运行库，
+仅支持NV12 Raw、MJPEG、PyroWave；`vc-vcam`为Rust COM `vc_vcam.dll`，外部`vc-vcam-verify.exe`只做隔离只读探测。
+Raw启动按准确尺寸/MTU计算一帧一个batch（`ceil(B/(mtu-42))`），编码按实际AU整帧单次queue；Npcap Loopback仅显式本机诊断，
+固定batch1并按包提交，不作为产品性能/双机结论。28B包头、wire、Raw逐帧判据与旧C++/Python契约不改；旧C++产品不进入Rust包。
+PyroWave在ready前以同几何/后端/帧预算合成NV12显式预热，丢弃输出、不进入正式帧号/统计；创建/预热/编码/解码/重置/销毁的5秒看门狗只置会话`OperationState`粘性超时，不`process::exit`；挂起时保留worker/句柄/DLL，
+pending期间锁配置/OTA/虚拟卡，不能安全停止时不得自动卸载。
+配置独立`vc-rust-config.json`；MJPEG/PyroWave必须显式`codec_experimental=true`且两端后端精确匹配，未协商组合拒绝启动。
+会话号重复不覆盖运行证据；自动注册前隔离探测实际DShow DLL能力。虚拟卡归属由HKCU CLSID `VirtualCaptureOwner`与本根精确匹配的schema 2证明共同确定（DLL/运行根/PID/进程创建时间一致）；current/pending固定在`ROOT/data/run/vcam-owned{,.pending}.json`，兼容读取旧`ROOT/run/vcam-owned.json`，不受Legacy/Managed/OTA回滚影响；Windows等价根路径规范化。持CLSID全局mutex先保全旧证明、刷盘pending，再提交注册表并提升current，写失败/进程中断仍保留精确证明，不放宽不一致记录判定。只允许本根本进程或确认已退出属主恢复；跨根、其他存活属主、旧注册缺少全局owner或状态未知均拒绝接管/注销，空注册的全局预约也不能被另一宿主接管。
 两端产品列表/选卡/prepare/start仅接受系统明确硬件且非虚拟的物理网卡，未知与回环不入普通列表；失效接收选择清除后须手动重选。
 采集CLI全枚举保留，后台仅显式`--allow-loopback-diagnostics`允许本地回环诊断。
-D27新增Rust OTA：独立令牌配对、ZIP清单校验暂存、停止状态helper激活/就绪失败回滚；固定ROOT分离app/releases、data、updates，legacy配置保留。
-独立绿色包入口`rust/packaging/package.py`，新建唯一dist目录与ZIP，不替换旧产品；主机日常双击带图标的`VirtualCapture.exe`直接按current打开GPUI，无CMD/PowerShell；采集CLI启动器默认15143（exe/省略端口仍5143），不含Npcap驱动，不兼容旧Python OTA。
-后端Rust迁移仍以`vc-transport`冻结28B解析/分片/校验/有界重组为产品集成起点。独立`vc-stream`已提供Windows Npcap Raw发送/接收诊断与可选SHM v3发布，仅作互操作探针，未接入`vc-core`、控制器、产品运行路径、便携包或OTA；实际产品采集/Npcap/SHM/DShow仍由原生实现。Loopback证据与边界见[Raw数据面诊断记录](docs/bringup/bringup-20261119-rust-data-plane.md)；延迟反馈仍须同配置同机分段核验。
+D27 Rust OTA：独立令牌配对、ZIP清单校验暂存、停止状态helper激活/就绪失败回滚；固定ROOT分离app/releases、data、updates，legacy配置保留。
+独立绿色包入口`rust/packaging/package.py`，载荷以`rust/packaging/inventory.py`为准，新建唯一dist目录与ZIP，不替换旧产品；
+主机日常双击带图标的`VirtualCapture.exe`直接按current打开GPUI，无CMD/PowerShell；采集CLI启动器默认15143（exe/省略端口仍5143），
+不含Npcap驱动，不兼容旧Python OTA。
+实现已落地但Rust-R3仍IN PROGRESS：三编码Release DLL在同机Loopback各2400帧 motion/640²@240 的cadence与<10ms延迟门通过；WGC窗口实采和隔离vcam DLL场景通过。该次Rust DDA smoke因无DXGI输出受阻，便携包GUI非空白截图门失败；完整打包未验收。物理网卡整帧batch、双机、长稳、画质与完整DShow编排仍未验收；不部署。证据：[Rust-R3本机验证](docs/bringup/bringup-20261119-rust-r3-local.md)、[Raw数据面诊断](docs/bringup/bringup-20261119-rust-data-plane.md)。
 CLI/API/生命周期完整契约见[skill Rust控制面](.agents/skills/virtualcapture/references/rust-control.md)。
 
 ## 2. 决策记录与待决事项
@@ -150,6 +160,7 @@ CLI/API/生命周期完整契约见[skill Rust控制面](.agents/skills/virtualc
 | D25 | P6 review修正版提交/打包/部署 | ✅owner（2026-11-13）：“提交 打包 部署”。批准本轮修复提交、生成0.5.0便携包并切换双端；保留旧目录、配置与运行证据，编码仍须显式启用。0.5.0已提交/打包并在本机host启动；PC2预检为0.4.1 host/receive错误角色，按切换门禁未执行远端部署；最终发现本轮之外已将PC2更新为0.5.0 capture，并将双端改为活动PyroWave，停止进一步部署操作，不覆盖并发状态；远端包manifest未核验。证据见[发布记录](docs/bringup/bringup-20261113-release-0.5.0.md)；双机/长稳/画质仍未验收 | P6-R1发布 |
 | D26 | Rust + GPUI 重构 | ✅owner（2026-11-14）：在新 `rust` 分支开发、现有实现先不动；首期Rust控制面复用C++二进制，主机GPUI内嵌逻辑、被采集机CLI后台，允许重新设计API。后续软件集成先保留UI无关核心；C ABI DLL后续实现。28B头不因控制面授权自动解冻，不自动部署。设计见 docs/proposals/rust-rewrite-20261114.md | Rust-R1 |
 | D27 | Rust后端、OTA与运行布局 | ✅owner（2026-11-14）：OTA最高优先级，恢复自动更新通道；重新规划工作/更新目录，开始后端Rust迁移，并行处理双端物理网卡、UI冗余与应用图标。反馈切换后约增加10ms，按同配置/同机分段排查，不预判根因；28B头/Raw判据保留，旧部署与运行证据不自动覆盖。 | Rust-R2 |
+| D28 | 全面转 Rust 产品路径 | ✅owner（2026-11-19）：目标全面转Rust；产品宿主通过版本化DLL模块在进程内连接数据面，不再以sender/receiver EXE CLI拼装本机数据面；模块可编译DLL与独立EXE并复用同一实现；仅NV12 Raw/MJPEG/PyroWave。Raw启动按尺寸/MTU计算一帧一个batch；编码按实际AU整帧单次queue；Loopback仅显式诊断且固定batch1例外。旧C++/Python契约与稳定部署不改、不自动替换；Rust-R3保持IN PROGRESS，实测验收前不标DONE。 | Rust-R3 |
 
 ## 3. 任务卡
 
@@ -263,6 +274,13 @@ D27并行完成双端物理网卡、精简UI/原生图标、固定ROOT版本布�
 ### Rust-R2a 独立 Raw Npcap 互操作探针 — DONE（Loopback 功能与本机性能测量，2026-11-19）
 
 新增不接产品控制面的`vc-stream` Windows Npcap Raw L2发送/接收工具与可选SHM v3 writer；Release版本与C++双向交叉收发，640×640@60、MTU9000、69包/帧、batch1、motion，每方向120帧，六条hashlog全量一致且Python参考120/120一致，接收零丢片/CRC/hash错，SHM v3 frame 119有效。另以双Rust进程、640×640@240、2400帧、motion、batch1在Npcap Loopback测得发送steady cadence 239.999996 fps、接收完成cadence 240.001583 fps，发送hashlog `send_qpc_ns` 到重组完成 `qpc_ns` 延迟 p99 4.3892 ms、最大4.4946 ms，2400帧均低于10ms、hash全匹配；requested cadence/latency目标通过。T0 CPU门禁未过：sender 37.51%（要求<25%），receiver 23.95%（要求<30%）；因此不标T0全通过。Loopback不是物理网卡/双机验收；batch69对照短发送失败且无fallback；不接控制器、产品包/OTA。证据：[Raw数据面诊断记录](docs/bringup/bringup-20261119-rust-data-plane.md)。
+
+### Rust-R3 模块化全 Rust 产品路径 — IN PROGRESS
+
+目标拓扑与模块接口见[Rust 重构提案](docs/proposals/rust-rewrite-20261114.md)：产品宿主使用 Rust crates/版本化 DLL，不再以 sender/receiver CLI 子进程拼接本机数据面；独立 EXE 与 DLL 共享同一 crate 实现，双机间保留版本化控制 API；仅 NV12 Raw、MJPEG、PyroWave。
+已落地（开发实现）：`vc-core` 进程内加载 `vc_stream.dll` C ABI v1（`vc_module_get_api`；start/status/stop/destroy/capabilities）；`vc-stream` 的 DLL 与 CLI 复用同一实现；`vc-source` 提供 pattern/DDA/WGC 与 crop/fit/fill/stretch 整数变换；`vc-media` 安全搜索动态加载固定 `turbojpeg.dll`/`libpyrowave-shared-1.dll`，三编码显式后端、无静默回退；`vc-vcam` 为 Rust COM `vc_vcam.dll`，发布包仅保留外部 `vc-vcam-verify.exe` 做隔离只读探测，旧 C++ 产品不进入 Rust 包。Raw 启动按尺寸/MTU 整帧一个 batch（Loopback 诊断固定 batch1 例外），编码按实际 AU 整帧单次 queue。PyroWave 原生 5 秒看门狗以会话 `OperationState` 粘性超时报告，不 `process::exit`；挂起时保留 worker/句柄/DLL，pending 期间锁配置/OTA/虚拟卡，不能安全停止时不得自动卸载。旧 C++ CLI/协议契约不变。
+本机证据：[Rust-R3验证记录](docs/bringup/bringup-20261119-rust-r3-local.md)。Release DLL 三编码各2400帧 motion/640×640@240 Loopback性能门通过，source-start→RX p99 Raw/MJPEG/PyroWave分别0.9700/3.4589/6.6164ms，均无≥10ms帧，TX/RX完整对账；owner修复后workspace 279 tests、Clippy/build及legacy verify 303 passed / 6 skipped通过（先前首轮计时用例失败与复跑均保留）。WGC窗口采集/缩放/关闭生命周期通过；该次Rust DDA smoke无DXGI输出为BLOCKED；vcam DLL隔离7场景通过且未注册。便携候选前三项smoke通过，但GUI截图全黑导致硬门禁失败，候选无完整验收。
+Rust-R3仍未DONE：物理网卡整帧batch、双机、长稳、画质、完整包/OTA与完整DShow编排未验收；Loopback不冒充双机/物理网卡结论。虚拟卡全局owner与每根稳定current/pending精确证明修复共享native-dir跨根接管、布局切换及写入中断风险；含等价根路径与故障注入的16项owner回归及Rust构建验证通过，未操作真实注册表/DShow。
 
 ### P6-4 组合验收与交付 — TODO
 

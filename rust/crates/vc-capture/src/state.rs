@@ -40,7 +40,7 @@ impl Agent {
         }
     }
     pub fn running(&mut self) -> bool {
-        self.slot.running()
+        self.slot.running() || self.slot.cleanup_pending()
     }
     /// 对外列表只含可确认的物理网卡；诊断模式额外列出回环。
     pub fn adapters(&mut self, refresh: bool) -> Result<Vec<AdapterInfo>, String> {
@@ -50,7 +50,8 @@ impl Agent {
         {
             return Ok(items.clone());
         }
-        let all = vc_core::adapters::enumerate(&vc_core::paths::native_exe("vc-sender.exe"))?;
+        let module = self.slot.data_plane_module()?;
+        let all = vc_core::adapters::enumerate(&module)?;
         let items = selectable_adapters(&all, self.loopback_diagnostics);
         self.adapters_cache = Some((Instant::now(), items.clone()));
         Ok(items)
@@ -70,7 +71,7 @@ impl Agent {
         let mut config = self.config.clone();
         config.capture = request.capture.clone();
         config.receive.mtu = request.capture.mtu;
-        process::validate_raw_config(&config)?;
+        process::validate_start_config(&config)?;
         // 先做网卡门禁再探测能力：虚拟/未知/未授权的回环不能进入启动路径。
         let items = self.adapters(true)?;
         if items.is_empty() {
@@ -96,13 +97,20 @@ impl Agent {
         if !adapter_permitted(&adapter, self.loopback_diagnostics, controller_ip) {
             return Err("回环网卡只允许在显式本地诊断时使用。".into());
         }
-        process::require_raw_capabilities(Kind::Sender)?;
+        let module = self.slot.data_plane_module()?;
+        let caps = process::require_capabilities(&module)?;
+        process::require_stream_selection(
+            &caps,
+            &config.capture.codec,
+            Some(&config.capture.mode),
+        )?;
         let plan = vc_core::budget::plan(&config, None, Some(&adapter));
         if !plan.can_start {
             return Err(format!("发送网卡预算拒绝启动：{:?}", plan.network.status));
         }
         Ok(PreparedSession {
             capture: request.capture.clone(),
+            batch_packets: process::expected_batch_packets(&request.capture, &adapter.name)?,
             session_id: request.session_id.clone(),
             source_mac: request.source_mac.clone(),
             adapter,
@@ -119,16 +127,21 @@ impl Agent {
         let run_dir = vc_core::paths::run_dir();
         let (stats, hashlog, _) =
             process::session_paths(&run_dir, &request.session_id, Kind::Sender);
-        let args = process::sender_args(
+        let request_json = process::sender_request(
             &config,
             &prepared.adapter.name,
             &request.session_id,
             &stats,
             &hashlog,
-            Some(&request.source_mac),
+            &request.source_mac,
         )?;
-        self.slot
-            .start(&args, &prepared.adapter.name, &request.session_id, &run_dir)?;
+        self.slot.start(
+            &request_json,
+            &prepared.adapter.name,
+            &request.session_id,
+            &run_dir,
+            process::BatchEcho::Expect(prepared.batch_packets),
+        )?;
         self.slot.mark_mode(
             Some(request.capture.mode.clone()),
             Some(request.capture.pattern.clone()),
@@ -143,9 +156,17 @@ impl Agent {
         {
             return Err("session_id 与正在运行的采集会话不符，未停止其他会话。".into());
         }
-        let session = self.slot.stop();
-        self.active_request = None;
-        Ok(json!({"stopped":true,"session_id":session}))
+        let session = self.slot.session_id.clone();
+        match self.slot.stop() {
+            Ok(process::StopOutcome::Stopped) => {
+                self.active_request = None;
+                Ok(json!({"stopped":true,"session_id":session}))
+            }
+            Ok(process::StopOutcome::Pending) => {
+                Err("停止未确认：数据面会话句柄已保留，未释放；请重试停止。".into())
+            }
+            Err(error) => Err(format!("停止失败，数据面会话句柄已保留待重试：{error}")),
+        }
     }
 }
 
@@ -267,7 +288,7 @@ mod tests {
         assert!(agent.slot.session_id.is_none());
     }
     #[test]
-    fn unsupported_codec_is_rejected_before_loading_native_program() {
+    fn encoded_start_requires_explicit_experimental_opt_in() {
         let mut agent = Agent::new(Config::default());
         let capture = vc_core::config::Capture {
             codec: "mjpeg".into(),
@@ -280,7 +301,8 @@ mod tests {
             auto_adapter: true,
             adapter: String::new(),
         };
-        assert!(agent.prepare(&request, "127.0.0.1").is_err());
+        let error = agent.prepare(&request, "127.0.0.1").unwrap_err();
+        assert!(error.contains("codec_experimental"), "{error}");
         assert!(agent.slot.session_id.is_none());
     }
 }

@@ -1,16 +1,16 @@
-//! 网卡枚举：Npcap 设备列表（原生 `--list-adapters`）+ Windows 网卡元数据（PowerShell）。
+//! 网卡枚举：Npcap 设备列表（进程内 `vc_stream.dll` 查询）+ Windows 网卡元数据（PowerShell）。
 //!
 //! 不启动采集。速率单位为 bit/s；虚拟网卡、回环与未知速率不冒充物理容量。
-//! 两个子进程都必须有超时与输出上限，避免 PowerShell/Npcap 卡死或输出失控拖住控制面。
+//! PowerShell 子进程必须有超时与输出上限，避免卡死或输出失控拖住控制面。
 
 use std::io::Read;
-use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-const LIST_DEVICES_TIMEOUT: Duration = Duration::from_secs(10);
+use crate::dataplane::Module;
+
 const METADATA_TIMEOUT: Duration = Duration::from_secs(15);
 const OUTPUT_CAP: usize = 1024 * 1024;
 const POLL_INTERVAL: Duration = Duration::from_millis(10);
@@ -85,41 +85,9 @@ pub fn physical_host_nics(items: &[AdapterInfo]) -> Vec<AdapterInfo> {
     physical_nics(items)
 }
 
-/// 运行 `exe --list-adapters` 并与系统网卡元数据合并。
-pub fn enumerate(exe: &Path) -> Result<Vec<AdapterInfo>, String> {
-    if !exe.exists() {
-        return Err(format!("找不到原生程序：{}", exe.display()));
-    }
-    let mut command = Command::new(exe);
-    command.arg("--list-adapters");
-    let output = run_bounded(command, LIST_DEVICES_TIMEOUT)
-        .map_err(|error| format!("无法运行 {}：{error}", exe.display()))?;
-    let text = format!(
-        "{}\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    if output.timed_out {
-        return Err(format!(
-            "网卡枚举超时（{} 秒）；已终止子进程。",
-            LIST_DEVICES_TIMEOUT.as_secs()
-        ));
-    }
-    if output.truncated {
-        return Err(format!(
-            "网卡枚举输出超过 {} MiB 上限；拒绝基于不完整列表选择网卡。",
-            OUTPUT_CAP / (1024 * 1024)
-        ));
-    }
-    let mut items = parse_list(&text);
-    if items.is_empty()
-        && !output
-            .status
-            .map(|status| status.success())
-            .unwrap_or(false)
-    {
-        return Err(format!("网卡枚举失败：{}", text.trim()));
-    }
+/// 通过已装载的数据面模块枚举 Npcap 设备，并与系统网卡元数据合并。
+pub fn enumerate(module: &Module) -> Result<Vec<AdapterInfo>, String> {
+    let mut items = from_listing(module.list_adapters()?);
     let metadata = windows_nic_metadata();
     for item in &mut items {
         if let Some(guid) = npf_guid(&item.name)
@@ -149,26 +117,11 @@ fn npf_guid(name: &str) -> Option<String> {
     Some(inner.to_ascii_lowercase())
 }
 
-fn parse_list(text: &str) -> Vec<AdapterInfo> {
+fn from_listing(entries: Vec<(String, String)>) -> Vec<AdapterInfo> {
     let mut items = Vec::new();
-    for line in text.lines() {
-        let line = line.trim();
-        let Some(rest) = line.strip_prefix("adapter[") else {
-            continue;
-        };
-        let Some((index, rest)) = rest.split_once(']') else {
-            continue;
-        };
-        if index.parse::<u32>().is_err() {
-            continue;
-        }
-        let Some((_index, desc)) = rest.split_once("name=") else {
-            continue;
-        };
-        let (name, desc) = match desc.split_once(" desc=") {
-            Some((name, desc)) => (name.trim(), desc.trim()),
-            None => (desc.trim(), ""),
-        };
+    for (name, description) in entries {
+        let name = name.trim();
+        let description = description.trim();
         if name.is_empty() || name == "(null)" {
             continue;
         }
@@ -177,7 +130,7 @@ fn parse_list(text: &str) -> Vec<AdapterInfo> {
         }
         items.push(AdapterInfo {
             name: name.to_string(),
-            description: desc.to_string(),
+            description: description.to_string(),
             ..Default::default()
         });
     }
@@ -224,6 +177,10 @@ $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
     if output.timed_out || output.truncated {
         return map;
     }
+    // 只接受成功退出的输出；PowerShell 失败时的半截文本不能当作网卡元数据。
+    if !output.status.is_some_and(|status| status.success()) {
+        return map;
+    }
     let text = String::from_utf8_lossy(&output.stdout);
     let Ok(value) = serde_json::from_str::<serde_json::Value>(text.trim()) else {
         return map;
@@ -250,6 +207,8 @@ $ips = @(Get-NetIPAddress -AddressFamily IPv4 -ErrorAction SilentlyContinue)
 struct BoundedOutput {
     status: Option<std::process::ExitStatus>,
     stdout: Vec<u8>,
+    /// 保留子进程错误输出，便于诊断时查看；当前没有消费方。
+    #[allow(dead_code)]
     stderr: Vec<u8>,
     timed_out: bool,
     truncated: bool,
@@ -432,22 +391,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_native_listing() {
-        let text = "adapter[0] name=\\Device\\NPF_{AAA} desc=Intel I226-V\nadapter[1] name=\\Device\\NPF_Loopback desc=Adapter for loopback\nadapter: (none found)\n";
-        let items = parse_list(text);
+    fn converts_module_listing_and_skips_null_and_duplicates() {
+        let items = from_listing(vec![
+            (r"\Device\NPF_{AAA}".into(), "Intel I226-V".into()),
+            (
+                r"\Device\NPF_Loopback".into(),
+                "Adapter for loopback".into(),
+            ),
+            ("(null)".into(), "bad".into()),
+            (r"\Device\NPF_{AAA}".into(), "second".into()),
+            ("  ".into(), "blank".into()),
+        ]);
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].description, "Intel I226-V");
         assert_eq!(items[1].name, r"\Device\NPF_Loopback");
-    }
-
-    #[test]
-    fn parse_list_skips_null_and_duplicate_names() {
-        let text = "adapter[0] name=(null) desc=bad\n\
-                    adapter[1] name=\\Device\\NPF_{AAA} desc=first\n\
-                    adapter[2] name=\\Device\\NPF_{AAA} desc=second\n";
-        let items = parse_list(text);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].description, "first");
     }
 
     #[test]

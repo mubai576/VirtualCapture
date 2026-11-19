@@ -1,9 +1,9 @@
 """End-to-end OTA smoke test on a private temporary root and random port.
 
-Copies the debug `vc-capture.exe`/`vc-updater.exe` into synthetic portable ZIPs,
-stages them through the real REST API (token protected), activates, rolls back and
-forces a failed activation to verify automatic rollback. No registry, Npcap capture
-or deployed installation is touched.
+Copies the debug `vc-capture.exe`/`vc-updater.exe`/`vc_stream.dll` into synthetic
+portable ZIPs, stages them through the real REST API (token protected), activates,
+rolls back and forces a failed activation to verify automatic rollback. No registry,
+Npcap capture or deployed installation is touched.
 """
 import argparse
 import hashlib
@@ -154,13 +154,14 @@ def candidate_package(zip_path, work_root):
     )
 
 
-def capture_package(build_id, version, capture_bytes, updater_bytes):
+def capture_package(build_id, version, capture_bytes, updater_bytes, stream_bytes):
     root_name = f"VirtualCapture-Rust-{version}-windows-x64-{build_id}"
     return package_path(
         root_name,
         {
             "vc-capture.exe": capture_bytes,
             "vc-updater.exe": updater_bytes,
+            "vc_stream.dll": stream_bytes,
             "version.json": json.dumps({"product": "VirtualCapture-Rust", "version": version}).encode(),
         },
         build_id,
@@ -232,9 +233,12 @@ def main(package_dir=None, candidate=None):
     PORT = free_port()
     capture_exe = BIN / "vc-capture.exe"
     updater_exe = BIN / "vc-updater.exe"
-    assert capture_exe.is_file() and updater_exe.is_file(), "build the workspace first"
+    stream_dll = BIN / "vc_stream.dll"
+    assert capture_exe.is_file() and updater_exe.is_file() and stream_dll.is_file(), (
+        "build the workspace first (need vc-capture.exe, vc-updater.exe and vc_stream.dll)")
     capture_bytes = capture_exe.read_bytes()
     updater_bytes = updater_exe.read_bytes()
+    stream_bytes = stream_dll.read_bytes()
     legacy_config = {"version": 1, "peer_url": "", "capture": {"fps": 77, "mode": "pattern"}}
     (RUN / "vc-rust-config.json").write_text(json.dumps(legacy_config), encoding="utf-8")
     checks = []
@@ -272,6 +276,7 @@ def main(package_dir=None, candidate=None):
         launch_root.mkdir()
         shutil.copy2(capture_exe, launch_root / "vc-capture.exe")
         shutil.copy2(updater_exe, launch_root / "vc-updater.exe")
+        shutil.copy2(stream_dll, launch_root / "vc_stream.dll")
         launch_port = free_port()
         launcher = subprocess.Popen(
             [str(updater_exe), "launch", "--root", str(launch_root), "--role", "capture",
@@ -290,7 +295,7 @@ def main(package_dir=None, candidate=None):
                 f"real candidate re-zipped from extracted tree ({candidate_files} files, {candidate_version})"
             )
         else:
-            valid1 = capture_package("ota-b1-" + uuid.uuid4().hex[:6], "0.1.0", capture_bytes, updater_bytes)
+            valid1 = capture_package("ota-b1-" + uuid.uuid4().hex[:6], "0.1.0", capture_bytes, updater_bytes, stream_bytes)
             b1 = json.loads(zipfile.ZipFile(io.BytesIO(valid1)).read(
                 [n for n in zipfile.ZipFile(io.BytesIO(valid1)).namelist() if n.endswith("package-manifest.json")][0]
             ))["build_id"]
@@ -315,12 +320,14 @@ def main(package_dir=None, candidate=None):
         manifest_files = [
             {"path": "vc-capture.exe", "bytes": len(capture_bytes), "sha256": sha(capture_bytes)},
             {"path": "vc-updater.exe", "bytes": len(updater_bytes), "sha256": sha(updater_bytes)},
+            {"path": "vc_stream.dll", "bytes": len(stream_bytes), "sha256": sha(stream_bytes)},
             {"path": "version.json", "bytes": 2, "sha256": "0" * 64},
         ]
         mismatch = package_path(
             "pkg", {
                 "vc-capture.exe": capture_bytes,
                 "vc-updater.exe": updater_bytes,
+                "vc_stream.dll": stream_bytes,
                 "version.json": b"{}",
             },
             "ota-bad-hash", "0.1.0", manifest_files,
@@ -343,6 +350,9 @@ def main(package_dir=None, candidate=None):
         assert "vc-rust-config.json" in names, names
         assert not names & {"app", "data", "updates", "run"}, names
         assert baseline["exe"] and baseline["native_dir"], baseline
+        baseline_native = Path(baseline["native_dir"])
+        assert (baseline_native / "vc_stream.dll").is_file(), baseline
+        checks.append("legacy rollback baseline native_dir carries vc_stream.dll")
         checks.append("legacy rollback baseline recorded without copying data/config/run")
         checks.append("activation accepted")
 
@@ -351,12 +361,15 @@ def main(package_dir=None, candidate=None):
         pids.add(second["pid"])
         assert proc.poll() is not None, "old capture should exit after activation"
         assert json.loads((RUN / "app/current.json").read_text(encoding="utf-8"))["build_id"] == b1
+        assert (RUN / "app/releases" / b1 / "vc_stream.dll").is_file(), (
+            "activated release must carry vc_stream.dll")
         migrated = json.loads((RUN / "data/vc-rust-config.json").read_text(encoding="utf-8"))
         assert migrated["capture"]["fps"] == 77, migrated
         assert token_from(RUN / "data/update-token.json") == token
         _, config = request("/config", token=token)
         assert config["capture"]["fps"] == 77, config
         checks.append("atomic switch, config and token migration")
+        checks.append("activated release contains vc_stream.dll")
 
         managed_port = free_port()
         managed_launcher = subprocess.Popen(
@@ -370,7 +383,7 @@ def main(package_dir=None, candidate=None):
         wait_for(lambda: health_at(managed_port) is None, 15, label="managed launcher exit")
         checks.append("vc-updater launch resolves active release")
 
-        valid2 = capture_package("ota-b2-" + uuid.uuid4().hex[:6], "0.1.1", capture_bytes, updater_bytes)
+        valid2 = capture_package("ota-b2-" + uuid.uuid4().hex[:6], "0.1.1", capture_bytes, updater_bytes, stream_bytes)
         b2 = json.loads(zipfile.ZipFile(io.BytesIO(valid2)).read(
             [n for n in zipfile.ZipFile(io.BytesIO(valid2)).namelist() if n.endswith("package-manifest.json")][0]
         ))["build_id"]
@@ -403,7 +416,7 @@ def main(package_dir=None, candidate=None):
         pids.add(fourth["pid"])
         checks.append("explicit rollback to previous release")
 
-        valid3 = capture_package("ota-b3-" + uuid.uuid4().hex[:6], "0.1.2", b"not a windows executable", updater_bytes)
+        valid3 = capture_package("ota-b3-" + uuid.uuid4().hex[:6], "0.1.2", b"not a windows executable", updater_bytes, stream_bytes)
         b3 = json.loads(zipfile.ZipFile(io.BytesIO(valid3)).read(
             [n for n in zipfile.ZipFile(io.BytesIO(valid3)).namelist() if n.endswith("package-manifest.json")][0]
         ))["build_id"]
@@ -428,7 +441,7 @@ def main(package_dir=None, candidate=None):
         pointer_path = RUN / "app/current.json"
         pointer_path.chmod(stat.S_IREAD)
         try:
-            valid4 = capture_package("ota-b4-" + uuid.uuid4().hex[:6], "0.1.3", b"not a windows executable", updater_bytes)
+            valid4 = capture_package("ota-b4-" + uuid.uuid4().hex[:6], "0.1.3", b"not a windows executable", updater_bytes, stream_bytes)
             b4 = json.loads(zipfile.ZipFile(io.BytesIO(valid4)).read(
                 [n for n in zipfile.ZipFile(io.BytesIO(valid4)).namelist() if n.endswith("package-manifest.json")][0]
             ))["build_id"]
@@ -473,7 +486,7 @@ if __name__ == "__main__":
         "--package",
         type=Path,
         default=None,
-        help="含 vc-capture.exe/vc-updater.exe 的目录（默认 rust/target/debug）",
+        help="含 vc-capture.exe/vc-updater.exe/vc_stream.dll 的目录（默认 rust/target/debug）",
     )
     parser.add_argument(
         "--candidate",

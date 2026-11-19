@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::adapters::AdapterInfo;
 use crate::config::Config;
+use crate::process::{raw_frame_batch_from_capture, raw_send_batch_for_adapter};
 
 const NPF_LOOPBACK: &str = r"\Device\NPF_Loopback";
 const MAX_PLAUSIBLE_LINK_BPS: u64 = 1_000_000_000_000_000;
@@ -117,6 +118,8 @@ pub struct NetworkBudget {
     pub capture: Link,
     pub payload_bytes: u64,
     pub packets_per_frame: u64,
+    /// Raw 固定几何时一帧一批（Npcap 回环为 1）；编码流在每帧编码完成后按实际包数确定。
+    pub batch_packets: Option<u32>,
     pub wire_bps: u64,
     /// 线速需求（含预留余量），仅用于展示；状态判定用 `wire_bps` 对物理线速/usable。
     pub required_bps: u64,
@@ -145,7 +148,7 @@ pub fn plan(
     capture_adapter: Option<&AdapterInfo>,
 ) -> Plan {
     let c = &config.capture;
-    let mut errors = config.validate();
+    let mut errors = config.validate_start();
     let mut warnings = Vec::new();
 
     // 校验错误已记录在 errors；这里的 max(1) 只防止畸形配置让预算数学除零/溢出。
@@ -212,15 +215,8 @@ pub fn plan(
     if packets > u64::from(u16::MAX) {
         errors.push("单帧包数超过冻结包头 uint16 上限，接收端无法重组。".into());
     }
-    if c.mtu != config.receive.mtu {
-        errors.push("采集与接收 MTU 不一致，不能用不同切包参数启动。".into());
-    }
     if encoded {
-        // Rust R1 只接 raw；配置可以保留编码草案，但不得据此启动。
-        errors.push(format!(
-            "Rust 控制面第一版只支持 raw，不能启动 codec={}。",
-            c.codec
-        ));
+        // 编码链路必须显式启用并由 validate_start 校验后端；这里只保留估算边界。
         warnings.push("编码链路为估算：最大码率均摊不保证单帧突发、编码吞吐或画质。".into());
     }
     if c.mode == "dda" {
@@ -238,6 +234,19 @@ pub fn plan(
         usable_bps
             .filter(|usable| *usable > 0)
             .map(|usable| usable / (wire_frame_bytes.saturating_mul(8)).max(1))
+    };
+    // 必须按 Npcap 设备名（AdapterInfo.name）而不是 Link 显示名判断回环：
+    // 真实回环没有 GUID 元数据，label 为空时显示名来自 description，
+    // 与启动时 `expected_batch_packets` 的判定不一致。畸形配置已在 errors 中；
+    // 这里退回饱和估算，保证纯展示的预算计算不 panic。
+    let batch_packets = if encoded {
+        None
+    } else {
+        let batch = match capture_adapter {
+            Some(adapter) => raw_send_batch_for_adapter(c, &adapter.name),
+            None => raw_frame_batch_from_capture(c),
+        };
+        Some(batch.unwrap_or_else(|_| u32::try_from(packets).unwrap_or(u32::MAX)))
     };
 
     Plan {
@@ -257,6 +266,7 @@ pub fn plan(
             capture,
             payload_bytes: payload,
             packets_per_frame: packets,
+            batch_packets,
             wire_bps,
             required_bps,
             link_bps,
@@ -314,6 +324,7 @@ mod tests {
         let (host, capture) = both(2_500_000_000);
         let plan = plan(&config, Some(&host), Some(&capture));
         assert_eq!(plan.network.packets_per_frame, 69);
+        assert_eq!(plan.network.batch_packets, Some(69));
         assert_eq!(plan.network.wire_bps, 1_188_391_680);
         assert_eq!(plan.video.raw_frame_bytes, 614_400);
         assert_eq!(plan.network.status, PlanStatus::Fits);
@@ -399,7 +410,19 @@ mod tests {
         };
         let missing = AdapterInfo::default();
 
-        for item in [virtual_nic, loopback, missing] {
+        // 回归：真实 Npcap 回环没有 GUID 元数据，label 为空时显示名来自
+        // description，不能用 Link.name 判定回环。预算的 batch 必须与启动时的
+        // expected_batch_packets 一致，按 AdapterInfo.name 算成 1。
+        let loopback_link = Link::from_adapter(Some(&loopback), Direction::Transmit);
+        assert_ne!(loopback_link.name, NPF_LOOPBACK);
+        let loopback_plan = plan(
+            &config,
+            Some(&adapter(2_500_000_000, 2_500_000_000)),
+            Some(&loopback),
+        );
+        assert_eq!(loopback_plan.network.batch_packets, Some(1));
+
+        for item in [virtual_nic, loopback.clone(), missing] {
             let link = Link::from_adapter(Some(&item), Direction::Receive);
             assert_eq!(link.state, LinkState::Unknown, "{item:?}");
             let plan = plan(
@@ -447,17 +470,37 @@ mod tests {
     }
 
     #[test]
-    fn encoded_draft_is_rejected_by_rust_r1() {
+    fn encoded_draft_is_rejected_until_explicitly_enabled() {
         let mut config = Config::default();
         config.capture.codec = "mjpeg".into();
         config.capture.encoder_backend = "turbojpeg:cpu".into();
         config.capture.decoder_backend = "turbojpeg:cpu".into();
         let (host, capture) = both(2_500_000_000);
-        let plan = plan(&config, Some(&host), Some(&capture));
-        assert!(plan.network.is_estimate);
-        assert!(plan.errors.iter().any(|e| e.contains("只支持 raw")));
-        assert!(!plan.can_start);
-        assert_eq!(plan.network.max_raw_fps, None);
+        let draft = plan(&config, Some(&host), Some(&capture));
+        assert!(draft.network.is_estimate);
+        assert!(
+            draft
+                .errors
+                .iter()
+                .any(|e| e.contains("codec_experimental"))
+        );
+        assert!(!draft.can_start);
+        assert_eq!(draft.network.max_raw_fps, None);
+        assert_eq!(draft.network.batch_packets, None);
+
+        // 显式启用后预算允许启动，但仍标注为估算且不伪造固定 batch。
+        config.capture.codec_experimental = true;
+        let enabled = plan(&config, Some(&host), Some(&capture));
+        assert!(enabled.errors.is_empty(), "{:?}", enabled.errors);
+        assert!(enabled.can_start);
+        assert!(enabled.network.is_estimate);
+        assert_eq!(enabled.network.batch_packets, None);
+        assert!(
+            enabled
+                .warnings
+                .iter()
+                .any(|w| w.contains("编码链路为估算"))
+        );
     }
 
     #[test]
@@ -496,6 +539,7 @@ mod tests {
         let plan = plan(&config, Some(&host), Some(&capture));
         assert!(!plan.can_start);
         assert!(!plan.errors.is_empty());
+        assert_eq!(plan.network.batch_packets, None);
         // 只要求不 panic；数值可能因饱和而很大。
         assert!(plan.network.packets_per_frame > 0);
     }

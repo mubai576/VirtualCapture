@@ -41,7 +41,7 @@ MJPEG 开发链路已接通 L2/解码/SHM/DShow 与显式 GUI 后端选择，须
 | 路径 | 内容 | 归属/规则 |
 |---|---|---|
 | `CMakeLists.txt` + `cmake/` | 根构建编排、统一编译/输出规则、Npcap SDK 查找、long-path manifest、MJPEG/PyroWave 固定依赖 ExternalProject | 从根目录配置；产物跟随 `-B` |
-| `rust/` | D26/D27独立开发版：`vc-core` UI无关编排/配置/OTA，`vc-capture` CLI后台，`vc-host` GPUI，`vc-updater`版本切换助手；`vc-transport`冻结wire/分片/重组迁移起点；独立 `vc-stream` 提供 Windows Npcap Raw 双向诊断与可选 SHM v3，未接入产品控制面/打包/OTA；实际产品采集仍复用C++且仅Raw；运行布局分app/data/updates，legacy配置保留 | 构建/独立绿色ZIP见 `docs/runbooks/rust.md`（`rust/packaging/package.py`），契约见 skill `references/rust-control.md`；不自动部署 |
+| `rust/` | D26–D28开发版与全面Rust迁移目标：`vc-core` UI无关编排/配置/OTA，**进程内加载版本化 `vc_stream.dll` C ABI v1**（`vc_module_get_api`；start/status/stop/destroy/capabilities）运行采集/接收，不再拉起 sender/receiver CLI；`vc-capture` REST后台、`vc-host` GPUI、`vc-updater`；`vc-stream` DLL与诊断CLI复用同一crate，`vc-source`提供pattern/DDA/WGC与四种整数变换，`vc-media`动态加载固定`turbojpeg.dll`/`libpyrowave-shared-1.dll`（仅NV12 Raw/MJPEG/PyroWave），`vc-vcam`为Rust COM `vc_vcam.dll`，`vc-vcam-verify.exe`仅隔离只读探测；Raw按尺寸/MTU整帧一批，编码按实际AU整帧单次queue，Loopback诊断固定batch1；独立EXE与DLL共享模块实现；绿色包仅含Rust产品与原生运行库（载荷以`rust/packaging/inventory.py`为准），不含旧C++产品；运行布局分app/data/updates，legacy配置保留 | 本机三编码240fps DLL Loopback性能及WGC窗口/隔离vcam验证证据见 `docs/bringup/bringup-20261119-rust-r3-local.md`；GUI截图门失败、便携完整验收未过；物理网卡/双机/长稳/画质仍未验收；Rust-R3保持IN PROGRESS，不自动部署 |
 | `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mjpeg_codec.h`、`pyrowave_codec.h`、`access_unit.h`/`codec_session.h` 编码载荷与会话（`vc-common` CMake target） | 算法只保留一份；MJPEG依赖/许可证见`docs/runbooks/mjpeg.md`，PyroWave见`docs/runbooks/pyrowave.md` |
 | `proto/vc_wire.h` | 28B 包头，**冻结** | 仅 owner 可改 |
 | `sender/` | `vc-sender.exe`（pattern/file/dda/wgc，`--batch`，`pattern.h` 整数测试源，`dda.h`/`wgc.h` 桌面采集） | C++17 |

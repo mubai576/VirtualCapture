@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub const IMPLEMENTATION: &str = "virtualcapture-rust";
-pub const API_REVISION: u32 = 1;
+pub const API_REVISION: u32 = 2;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -21,6 +21,8 @@ pub struct SenderRequest {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PreparedSession {
     pub capture: Capture,
+    /// Raw 为按实际网卡与几何计算的精确值；编码会话为 None（DLL 按帧动态切包）。
+    pub batch_packets: Option<u32>,
     pub session_id: String,
     pub source_mac: String,
     pub adapter: AdapterInfo,
@@ -47,7 +49,10 @@ impl SenderRequest {
     }
 
     pub fn confirm(&self, response: &PreparedSession) -> Result<(), String> {
+        let expected_batch =
+            crate::process::expected_batch_packets(&self.capture, &response.adapter.name)?;
         if self.capture != response.capture
+            || expected_batch != response.batch_packets
             || self.session_id != response.session_id
             || self.source_mac != response.source_mac
             || (!self.adapter.is_empty() && self.adapter != response.adapter.name)
@@ -106,5 +111,44 @@ mod tests {
         request.source_mac = "02:01:02:03:04:05".into();
         request.session_id = "../../evidence".into();
         assert!(request.validate_identity().is_err());
+    }
+
+    #[test]
+    fn confirm_requires_exact_raw_batch_and_null_for_encoded() {
+        let request = SenderRequest {
+            capture: Capture::default(),
+            session_id: "s-test".into(),
+            source_mac: "02:01:02:03:04:05".into(),
+            auto_adapter: true,
+            adapter: String::new(),
+        };
+        let adapter = AdapterInfo {
+            name: r"\Device\NPF_{A}".into(),
+            ..Default::default()
+        };
+        let mut response = PreparedSession {
+            capture: request.capture.clone(),
+            batch_packets: Some(69),
+            session_id: request.session_id.clone(),
+            source_mac: request.source_mac.clone(),
+            adapter: adapter.clone(),
+        };
+        assert!(request.confirm(&response).is_ok());
+        response.batch_packets = Some(68);
+        assert!(request.confirm(&response).is_err());
+
+        let mut encoded_request = request.clone();
+        encoded_request.capture.codec = "mjpeg".into();
+        encoded_request.capture.codec_experimental = true;
+        encoded_request.capture.encoder_backend = "turbojpeg:cpu".into();
+        encoded_request.capture.decoder_backend = "turbojpeg:cpu".into();
+        let mut encoded_response = PreparedSession {
+            capture: encoded_request.capture.clone(),
+            batch_packets: None,
+            ..response
+        };
+        assert!(encoded_request.confirm(&encoded_response).is_ok());
+        encoded_response.batch_packets = Some(1);
+        assert!(encoded_request.confirm(&encoded_response).is_err());
     }
 }
