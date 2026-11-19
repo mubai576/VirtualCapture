@@ -7,8 +7,8 @@
 - 开发全面转Rust，产品宿主进程内加载vc_stream.dll；旧C++/Python产品树和旧运维脚本从工作树移除，只保留Git历史。独立Python测试参考与打包协调不是产品后台，继续保留。
 - 当前编码Raw/显式PyroWave；DDA/WGC仅硬件GPU转换，CPU MJPEG移除。必要CPU上传/回读/Npcap/hash/SHM仍存在，不宣称零CPU或零拷贝。
 - I226优先、可配置MTU默认读取网卡；本次仅只读查询与产品逻辑，不修改物理网卡、不操作PC2、不注册真实虚拟卡。
-- Rust-R3保持IN PROGRESS。本轮 Rust 总门、Raw/PyroWave DLL Loopback、GPU DDA/WGC、隔离 DirectShow、控制面、适配器、CLI 与 GUI smoke 均有本机证据；GUI 本轮窗口非黑屏。历史三编码与GUI黑屏仅代表当时版本，不覆盖本轮结果；完整便携包尚未验收，硬门不能绕过。
-- 物理网卡/双机/长稳/画质/完整DShow编排与完整包验收仍待专项。旧双机自动T1–T5工具已移除，Rust等价编排/完整取证工具尚缺，门限不变。
+- Rust-R3保持IN PROGRESS。本轮 Rust 总门、Raw/PyroWave DLL Loopback、GPU DDA/WGC、隔离 DirectShow、控制面、适配器、CLI 与 GUI smoke 均有本机证据；GUI 本轮窗口非黑屏。后续从干净提交生成0.2.1便携包，完整及扩展本机门禁通过，见[打包记录](docs/bringup/bringup-20261119-rust-r3a-package.md)；历史三编码与GUI黑屏仍只代表当时版本，不回填通过。
+- 物理网卡/双机/长稳/画质/完整DShow编排仍待专项；本机便携包与隔离OTA通过不等于硬件或部署验收。旧双机自动T1–T5工具已移除，Rust等价编排/完整取证工具尚缺，门限不变。
 - 已用部署不因本重构改变。角色按实际运行状态，不从旧PC编号推断；历史封存见 docs/bringup/bringup-20261102.md，后续部署观测见 docs/bringup/bringup-20261113-release-0.5.0.md。
 
 ## 1. 当前契约
@@ -63,20 +63,21 @@ D1–D28为历史决策原记录，涉及已移除实现的路径/命令只在Gi
 | D27 | Rust后端、OTA与运行布局 | ✅owner（2026-11-14）：OTA最高优先级，恢复自动更新通道；重新规划工作/更新目录，开始后端Rust迁移，并行处理双端物理网卡、UI冗余与应用图标。反馈切换后约增加10ms，按同配置/同机分段排查，不预判根因；28B头/Raw判据保留，旧部署与运行证据不自动覆盖。 | Rust-R2 |
 | D28 | 全面转 Rust 产品路径 | ✅owner（2026-11-19）：目标全面转Rust；产品宿主通过版本化DLL模块在进程内连接数据面，不再以sender/receiver EXE CLI拼装本机数据面；模块可编译DLL与独立EXE并复用同一实现；仅NV12 Raw/MJPEG/PyroWave。Raw启动按尺寸/MTU计算一帧一个batch；编码按实际AU整帧单次queue；Loopback仅显式诊断且固定batch1例外。旧C++/Python契约与稳定部署不改、不自动替换；Rust-R3保持IN PROGRESS，实测验收前不标DONE。 | Rust-R3 |
 | D29 | Rust-only、I226/可配置MTU、仅GPU与中文文档 | owner（2026-11-19）要求：“使用网卡 i226；可配置mtu 默认读取网卡参数；统一迁移到 rust；只做GPU 降级到CPU无法满足我的性能需求”，并要求移除非Rust工程产品代码、简化文档、Rust注释中文化。执行为旧产品只留Git、保留独立测试/构建工具、删除CPU MJPEG/转换降级；不自动部署/提交/push，不解冻wire或放宽验收。I226多卡拒绝与MTU双端最小是实现默认，不冒充额外owner批示。 | Rust-R3结构收拢 |
+| D30 | Rust-R3a 提交与打包 | owner（2026-11-19）要求“提交打包”：提交已审阅的Rust-only改动，从干净提交生成0.2.1便携包并执行完整及扩展隔离本机门禁；未授权push、部署、PC2、物理网卡变更或真实DShow注册。源码提交a918e4f，产物与边界见[打包记录](docs/bringup/bringup-20261119-rust-r3a-package.md)。 | Rust-R3a包 |
 
 ## 3. 当前任务卡
 
 ### Rust-R3 模块化全Rust产品 — IN PROGRESS
 
-已实现版本化进程内DLL、Rust采集/编解码/Npcap/SHM/COM、OTA及精确owner恢复。历史本机证据：[Rust-R3](docs/bringup/bringup-20261119-rust-r3-local.md)、[Raw诊断](docs/bringup/bringup-20261119-rust-data-plane.md)。Rust-R3a 收拢与 GPU/MTU 子卡已通过本机总门，证据见[本轮收拢记录](docs/bringup/bringup-20261119-rust-r3a-restructure.md)。Rust-R3 整体仍需 Rust-R3b 的双机矩阵工具及物理链路、长稳、画质、完整包与 OTA 验收；不以历史292 tests或本机Loopback结果代替。
+已实现版本化进程内DLL、Rust采集/编解码/Npcap/SHM/COM、OTA及精确owner恢复。历史本机证据：[Rust-R3](docs/bringup/bringup-20261119-rust-r3-local.md)、[Raw诊断](docs/bringup/bringup-20261119-rust-data-plane.md)。Rust-R3a 收拢与 GPU/MTU 子卡已通过本机总门，证据见[本轮收拢记录](docs/bringup/bringup-20261119-rust-r3a-restructure.md)。本机便携包与隔离 OTA 门禁已补齐，见[打包记录](docs/bringup/bringup-20261119-rust-r3a-package.md)。Rust-R3 整体仍需 Rust-R3b 的双机矩阵工具及物理链路、长稳、画质、目标桌面与完整 DShow 编排验收；不以历史292 tests、本机Loopback或包门禁代替。
 
 ### Rust-R3a 仓库收拢与GPU/MTU — DONE
 
-旧产品/根CMake/退休工具仅从工作树移除并保留 Git 历史；Cargo提供隔离vcam verifier，独立Python图案/向量参考迁入rust/tests/reference。当前文档统一Rust入口；中文注释、GPU-only、I226与MTU实现通过总门（fmt、22组/312项测试、Clippy、Release、独立参考与DLL自检）。详细专项证据与未验收边界见[本轮bring-up](docs/bringup/bringup-20261119-rust-r3a-restructure.md)。
+旧产品/根CMake/退休工具仅从工作树移除并保留 Git 历史；Cargo提供隔离vcam verifier，独立Python图案/向量参考迁入rust/tests/reference。当前文档统一Rust入口；中文注释、GPU-only、I226与MTU实现通过总门（fmt、22组/312项测试、Clippy、Release、独立参考与DLL自检）。详细专项证据与未验收边界见[本轮bring-up](docs/bringup/bringup-20261119-rust-r3a-restructure.md)。已提交a918e4f并生成0.2.1便携包，10项包门禁全通过，来源/哈希见[打包记录](docs/bringup/bringup-20261119-rust-r3a-package.md)。
 
 ### Rust-R3b 双机矩阵替代与产品验收 — TODO
 
-补Rust控制面的双机编排/完整hashlog保全工具，再在单独授权下按冻结T1/T2等执行；物理NIC整帧batch、双机240fps/长稳、画质、DDA、完整DShow与完整包/OTA分别验收。失败/BLOCKED/未跑保持原结论。
+补Rust控制面的双机编排/完整hashlog保全工具，再在单独授权下按冻结T1/T2等执行；物理NIC整帧batch、双机240fps/长稳、画质、目标桌面DDA与完整DShow分别验收。本机便携包/隔离OTA已通过，不替代上述专项；历史失败/BLOCKED/未跑保持原结论。
 
 ## 历史证据入口
 
