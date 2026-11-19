@@ -1,0 +1,14 @@
+[package]
+name = "host-update-fixture"
+version = "0.0.0"
+edition = "2024"
+publish = false
+description = "Standalone driver for rust/tests/host_update_smoke.py; links vc-core only"
+
+# This package lives inside the rust/ checkout but is not a workspace member.
+# Declaring an empty workspace keeps `cargo build --manifest-path` here from
+# touching rust/Cargo.toml or its lockfile.
+[workspace]
+
+[dependencies]
+vc-core = { path = "../../crates/vc-core" }

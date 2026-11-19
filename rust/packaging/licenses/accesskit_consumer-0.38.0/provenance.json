@@ -1,0 +1,17 @@
+{
+  "crate": "accesskit_consumer",
+  "version": "0.38.0",
+  "files": [
+    {
+      "path": "LICENSE.chromium",
+      "kind": "license",
+      "license_ids": [
+        "BSD-3-Clause"
+      ],
+      "url": "https://raw.githubusercontent.com/AccessKit/accesskit/c88605b96d04431f9c3c792464a0f2f253480e94/LICENSE.chromium",
+      "commit": "c88605b96d04431f9c3c792464a0f2f253480e94",
+      "sha256": "845022e0c1db1abb41a6ba4cd3c4b674ec290f3359d9d3c78ae558d4c0ed9308",
+      "note": "The crate archive references LICENSE.chromium but does not include it. Copied verbatim from the same upstream repository at the release VCS SHA."
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+{
+  "crate": "lyon_tessellation",
+  "version": "1.0.23",
+  "exclusions": [
+    {
+      "license_id": "ISC",
+      "scope": "test-only",
+      "release_binary": false,
+      "path": "src/earcut_tests.rs",
+      "evidence": "crates/tessellation/src/lib.rs declares `#[cfg(test)] mod earcut_tests;` at lines 210-212, so release builds do not compile this module.",
+      "url": "https://raw.githubusercontent.com/nical/lyon/db98d26a1a90076a7a894262dcb51117eef643c8/crates/tessellation/src/lib.rs",
+      "commit": "db98d26a1a90076a7a894262dcb51117eef643c8",
+      "note": "The ISC text in src/earcut_tests.rs covers imported Mapbox Earcut test fixtures, has no copyright line, and does not apply to the distributed release binary."
+    }
+  ]
+}

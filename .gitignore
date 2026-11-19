@@ -14,5 +14,9 @@ prev/
 *.zip
 *.log
 /vc-config.json
+/vc-rust-config.json
+/.claude/
+*.pdb
 thirdparty/ninja-win.zip
 .tmp-ota-test/
+rust/target/

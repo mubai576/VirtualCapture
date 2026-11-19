@@ -106,6 +106,19 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 ### 1.7 PC1 Raw 长运行诊断（2026-11-08 增量）
 独立 `scripts/longrun_diagnostics.py` 默认每秒/6小时，只 GET 双端 stats、观察系统/下游资源并留全量样本；`--mark/--stop` 只标记/结束记录器。候选 Raw receiver/vcam 通过进程环境 `VC_DIAG=1` 提供固定有界 `Local\VirtualCapture.Diag.<pid>` 旁路计时（stats准备/写盘、hash写盘、GetBuffer、Receive）；不改现有 wire、帧 SHM、rseg/vseg 语义或验收门限。契约见 skill `references/longrun-diagnostics.md`，操作见 `docs/runbooks/longrun-diagnostics.md`。
 
+### 1.8 Rust 控制面开发版（D26）
+
+独立 `rust` 分支：`vc-capture` CLI 后台 + `vc-host` GPUI主机客户端；主机编排抽入不依赖UI的 `vc-core`。
+R1复用原生发收端/DShow，28B包头/SHM/性能判据不改；控制API允许重设计，Rust身份与显式会话回显，
+不与旧Python后台混跑。配置独立 `vc-rust-config.json`；仅Raw可运行，编码草稿明确拒绝启动。
+会话号重复不覆盖运行证据；自动注册前隔离探测实际DShow DLL能力，拒绝接管已有注册。
+两端产品列表/选卡/prepare/start仅接受系统明确硬件且非虚拟的物理网卡，未知与回环不入普通列表；失效接收选择清除后须手动重选。
+采集CLI全枚举保留，后台仅显式`--allow-loopback-diagnostics`允许本地回环诊断。
+D27新增Rust OTA：独立令牌配对、ZIP清单校验暂存、停止状态helper激活/就绪失败回滚；固定ROOT分离app/releases、data、updates，legacy配置保留。
+独立绿色包入口`rust/packaging/package.py`，新建唯一dist目录与ZIP，不替换旧产品；主机日常双击带图标的`VirtualCapture.exe`直接按current打开GPUI，无CMD/PowerShell；采集CLI启动器默认15143（exe/省略端口仍5143），不含Npcap驱动，不兼容旧Python OTA。
+后端Rust迁移仍以`vc-transport`冻结28B解析/分片/校验/有界重组为产品集成起点。独立`vc-stream`已提供Windows Npcap Raw发送/接收诊断与可选SHM v3发布，仅作互操作探针，未接入`vc-core`、控制器、产品运行路径、便携包或OTA；实际产品采集/Npcap/SHM/DShow仍由原生实现。Loopback证据与边界见[Raw数据面诊断记录](docs/bringup/bringup-20261119-rust-data-plane.md)；延迟反馈仍须同配置同机分段核验。
+CLI/API/生命周期完整契约见[skill Rust控制面](.agents/skills/virtualcapture/references/rust-control.md)。
+
 ## 2. 决策记录与待决事项
 
 | # | 事项 | 建议 | 解锁 |
@@ -135,6 +148,8 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 | D23 | 移除 H.264/H.265 | ✅owner（2026-11-13）：这种编解码方式不适合当前项目。移除 Media Foundation H.264/HEVC、原生 NVENC、`vc-codec-probe`/`vc-codec-roundtrip` 及全部相关测试结果/报告/开发包；保留 Raw 与 D21 的 MJPEG。不自动替换稳定部署；契约与 PLAN/AGENTS/skill 同批更新 | P6-3/P6-4 |
 | D24 | 接入 PyroWave | ✅owner（2026-11-13）：“开始 PyroWave 接入”。新增显式开发编码 `pyrowave:vulkan`（MIT，Vulkan 1.3 计算小波，intra-only），保留 Raw/MJPEG；阶段一只做 CPU 上传/回读，不做 D3D11 互操作；每帧预算=min(max_bitrate÷8÷fps, max_au−48, NV12 帧字节)，无质量旋钮；不自动回退/替换部署；双机/长稳/画质未验收。构建与限制见 `docs/runbooks/pyrowave.md` | P6-3 |
 | D25 | P6 review修正版提交/打包/部署 | ✅owner（2026-11-13）：“提交 打包 部署”。批准本轮修复提交、生成0.5.0便携包并切换双端；保留旧目录、配置与运行证据，编码仍须显式启用。0.5.0已提交/打包并在本机host启动；PC2预检为0.4.1 host/receive错误角色，按切换门禁未执行远端部署；最终发现本轮之外已将PC2更新为0.5.0 capture，并将双端改为活动PyroWave，停止进一步部署操作，不覆盖并发状态；远端包manifest未核验。证据见[发布记录](docs/bringup/bringup-20261113-release-0.5.0.md)；双机/长稳/画质仍未验收 | P6-R1发布 |
+| D26 | Rust + GPUI 重构 | ✅owner（2026-11-14）：在新 `rust` 分支开发、现有实现先不动；首期Rust控制面复用C++二进制，主机GPUI内嵌逻辑、被采集机CLI后台，允许重新设计API。后续软件集成先保留UI无关核心；C ABI DLL后续实现。28B头不因控制面授权自动解冻，不自动部署。设计见 docs/proposals/rust-rewrite-20261114.md | Rust-R1 |
+| D27 | Rust后端、OTA与运行布局 | ✅owner（2026-11-14）：OTA最高优先级，恢复自动更新通道；重新规划工作/更新目录，开始后端Rust迁移，并行处理双端物理网卡、UI冗余与应用图标。反馈切换后约增加10ms，按同配置/同机分段排查，不预判根因；28B头/Raw判据保留，旧部署与运行证据不自动覆盖。 | Rust-R2 |
 
 ## 3. 任务卡
 
@@ -220,6 +235,34 @@ capabilities/codec-check/descriptor、48B VCAU（codec=4）、有界解码与 GU
 ### P6-R2 编码指标与设备身份 — DONE（本机回归，2026-11-13）
 
 补编码pc1_seg/rseg、PyroWave只读Vulkan类别与实际设备身份；总闸303 passed / 6 skipped，本机motion/Loopback/batch1的MJPEG、PyroWave及显式丢片恢复通过，实测编解码设备RTX 4070。未提交/打包/部署。证据：[修复记录](docs/bringup/bringup-20261113-pyrowave-metrics.md)。
+
+### Rust-R1 控制面 + GPUI — DONE（开发实现与本机功能验证，2026-11-14）
+
+D26独立rust分支：UI无关vc-core、vc-capture CLI/REST、vc-host GPUI，复用C++且仅Raw；Rust51项测试、fmt/Clippy/build通过，原总闸303 passed / 6 skipped，motion/416²@60/batch1/Loopback120帧全量FNV一致，真实窗口连接错误与正常退出通过。DShow完整编排/双机/长稳与SDK DLL未验/未实现，不部署。证据：[Rust开发记录](docs/bringup/bringup-20261114-rust-control.md)，入口：[Rust runbook](docs/runbooks/rust.md)。
+
+### Rust-UI1 采集工作台视觉重做 — DONE（2026-11-14）
+
+浅色设备侧栏、深蓝输出画幅示意、主区设置与可折叠明细；真实窗口预设持久化/错误展示/1080宽布局/正常退出通过，Rust51项与Clippy/build通过，原总闸303 passed / 6 skipped。证据：[Rust开发记录](docs/bringup/bringup-20261114-rust-control.md#rust-ui1-界面重做2026-11-14)，设计：[UI提案](docs/proposals/rust-ui-20261114.md)。
+
+### Rust-P1 绿色运行包 — DONE（2026-11-14）
+
+Rust Release独立ZIP约16.5MB，包含原生数据面/MSVC运行库/许可、主机与CLI启动器、逐文件SHA-256；中文/空格路径解压、两CMD/health/实际运行库加载/真实GPUI及motion416²@60/batch1/Loopback120帧全量FNV通过，Rust56项与原总闸303 passed / 6 skipped通过。不替换稳定部署，未提交。证据：[Rust交付记录](docs/bringup/bringup-20261114-rust-control.md#rust-p1-绿色运行包2026-11-14)，入口：[Rust runbook](docs/runbooks/rust.md#绿色运行压缩包)。
+
+### Rust-UI2 主区布局与物理接收网卡 — DONE（2026-11-14）
+
+统一四行设置与紧凑输出/操作栏；核心统一过滤本机物理接收设备，失效选择清除后手动重选。真实窗口枚举14项保留3项、隐藏11项，预设/错误/窄窗口通过；Rust56项、fmt/Clippy/build、原总闸303 passed / 6 skipped及CLI回环120帧全量FNV回归通过。未提交/部署。证据：[Rust开发记录](docs/bringup/bringup-20261114-rust-control.md#rust-ui2-主区调整与物理接收网卡2026-11-14)。
+
+### Rust-R2 OTA与后端迁移起点 — DONE（开发实现与本机功能验证，2026-11-14）
+
+D27并行完成双端物理网卡、精简UI/原生图标、固定ROOT版本布局、Rust OTA及vc-transport冻结wire/重组；0.2.0独立ZIP已交付，Rust116项、原总闸303 passed / 6 skipped、Release解压/GUI/120帧全量FNV/完整候选OTA与HostController重启通过。未提交/部署；生产数据面仍C++，约10ms增加尚未定位，双机/长稳未验收。证据：[Rust-R2交付记录](docs/bringup/bringup-20261114-rust-control.md#rust-r2-ota布局与后端迁移起点d272026-11-14)。
+
+### Rust-UI3 主机图形启动入口 — DONE（本机功能与交付验证，2026-11-14）
+
+0.2.1已交付，主机双击带图标的VirtualCapture.exe直接进入OTA当前版本；Release完整门禁与旧0.2.0真实GUI选ZIP/应用/重启、ROOT入口生成/再次打开、配置保留通过。被采集端仍CLI，旧包保留，未提交/部署。证据：[图形入口交付记录](docs/bringup/bringup-20261114-rust-control.md#rust-ui3-主机图形启动入口2026-11-14)。
+
+### Rust-R2a 独立 Raw Npcap 互操作探针 — DONE（Loopback 功能与本机性能测量，2026-11-19）
+
+新增不接产品控制面的`vc-stream` Windows Npcap Raw L2发送/接收工具与可选SHM v3 writer；Release版本与C++双向交叉收发，640×640@60、MTU9000、69包/帧、batch1、motion，每方向120帧，六条hashlog全量一致且Python参考120/120一致，接收零丢片/CRC/hash错，SHM v3 frame 119有效。另以双Rust进程、640×640@240、2400帧、motion、batch1在Npcap Loopback测得发送steady cadence 239.999996 fps、接收完成cadence 240.001583 fps，发送hashlog `send_qpc_ns` 到重组完成 `qpc_ns` 延迟 p99 4.3892 ms、最大4.4946 ms，2400帧均低于10ms、hash全匹配；requested cadence/latency目标通过。T0 CPU门禁未过：sender 37.51%（要求<25%），receiver 23.95%（要求<30%）；因此不标T0全通过。Loopback不是物理网卡/双机验收；batch69对照短发送失败且无fallback；不接控制器、产品包/OTA。证据：[Raw数据面诊断记录](docs/bringup/bringup-20261119-rust-data-plane.md)。
 
 ### P6-4 组合验收与交付 — TODO
 

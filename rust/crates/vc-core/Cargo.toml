@@ -1,0 +1,18 @@
+[package]
+name = "vc-core"
+description = "VirtualCapture 控制面核心：配置、链路预算、原生进程管理、网卡、虚拟卡注册、对端客户端"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+sha2.workspace = true
+hex.workspace = true
+zip.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

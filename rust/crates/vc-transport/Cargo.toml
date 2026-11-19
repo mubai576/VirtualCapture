@@ -1,0 +1,9 @@
+[package]
+name = "vc-transport"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "VirtualCapture frozen 28-byte wire, checksums, NV12 fragmentation and bounded reassembly"
+
+[dependencies]
+# 刻意只依赖 std：这是未来 Rust sender/receiver 的数据面基础，便于独立审计和嵌入。

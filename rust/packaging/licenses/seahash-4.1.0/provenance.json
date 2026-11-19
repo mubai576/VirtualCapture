@@ -1,0 +1,17 @@
+{
+  "crate": "seahash",
+  "version": "4.1.0",
+  "files": [
+    {
+      "path": "LICENSE",
+      "kind": "license",
+      "license_ids": [
+        "MIT"
+      ],
+      "url": "https://gitlab.redox-os.org/redox-os/seahash/-/raw/3088c5c912b70b586d27bf553fbe964e025a2c89/LICENSE",
+      "commit": "3088c5c912b70b586d27bf553fbe964e025a2c89",
+      "sha256": "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3",
+      "note": "The 4.1.0 release SHA 94b632aeac099031c373599313d5b5f0acbbaec0 has no LICENSE file. Upstream added this MIT text in 3088c5c912b70b586d27bf553fbe964e025a2c89. The upstream text has no separate copyright line; Cargo.toml lists the authors as ticki and Tom Almeida."
+    }
+  ]
+}

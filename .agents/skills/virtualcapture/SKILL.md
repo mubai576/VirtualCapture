@@ -45,6 +45,7 @@ early docs with dated SUPERSEDED notes). This skill holds the domain knowledge +
 | `sender/pattern.h` | Test-source suite (5 patterns, integer-only, seed=`frame_id`). C++/Python bit-exact by construction (no float/sin). Mirror: `ctrl/pattern_ref.py`. |
 | `common/crc32.h`, `common/fnv1a.h`, `common/stream.h` | Shared checksums, session geometry, integer transforms and frame cap; sender/receiver link `vc-common`. Legacy vectors unchanged. |
 | `references/wire-protocol.md` | L2 layout, MTU/pacing math, `--batch` sendqueue semantics. |
+| `references/rust-control.md` | D26 Rust分支控制面v1、CLI/GPUI拓扑、会话与生命周期；旧PythonAPI不变。独立`vc-stream` Raw Npcap Loopback诊断与边界见[bring-up](../../../docs/bringup/bringup-20261119-rust-data-plane.md)。 |
 | `references/agent-api.md` | Agent REST contract (/adapters, /files paging, /update stage + /activate). |
 | `references/test-matrix.md` | T0–T5 definitions, D1 gates, triage. |
 | `references/packaging.md` | One-command portable package, contents, output replacement and verification. |

@@ -1,0 +1,17 @@
+{
+  "crate": "taffy",
+  "version": "0.15.1",
+  "files": [
+    {
+      "path": "LICENSE",
+      "kind": "license",
+      "license_ids": [
+        "MIT"
+      ],
+      "url": "https://raw.githubusercontent.com/DioxusLabs/taffy/0064bd54cbe38bf1d8bcd6ec6ab0704d45fb048a/LICENSE",
+      "commit": "0064bd54cbe38bf1d8bcd6ec6ab0704d45fb048a",
+      "sha256": "f97daf1a0124413dccf399a4e6626b4b74acd05282f80b6d64ac82225650b77a",
+      "note": "The crate archive omits the MIT text. Copied verbatim from the same upstream repository at the release VCS SHA."
+    }
+  ]
+}

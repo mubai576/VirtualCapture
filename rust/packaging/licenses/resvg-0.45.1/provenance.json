@@ -1,0 +1,28 @@
+{
+  "crate": "resvg",
+  "version": "0.45.1",
+  "files": [
+    {
+      "path": "LICENSE-BSD-2-Clause.txt",
+      "kind": "license",
+      "license_ids": [
+        "BSD-2-Clause"
+      ],
+      "url": "https://raw.githubusercontent.com/thouis/fastblur/82d837cc3ff3b5c09f599213e64db94a2156e3cd/BSD_simplified.txt",
+      "commit": "82d837cc3ff3b5c09f599213e64db94a2156e3cd",
+      "sha256": "9b43b7619db4689b223ecd931b4f15189b6b021ed02b490421a56b5d8a6aa9e2",
+      "note": "resvg's crates/resvg/src/filter/iir_blur.rs points to http://www.getreuer.info/home/gaussianiir and states that the code is licensed under the Simplified BSD License. resvg does not ship that text. The license and copyright notice are copied verbatim from the Getreuer Gaussian IIR source mirror at the recorded commit. Scope source: https://raw.githubusercontent.com/linebender/resvg/1b6c2fddbcbeffa8135df4323b02aaae84890907/crates/resvg/src/filter/iir_blur.rs"
+    },
+    {
+      "path": "COPYRIGHT.txt",
+      "kind": "notice",
+      "license_ids": [],
+      "url": "https://raw.githubusercontent.com/thouis/fastblur/82d837cc3ff3b5c09f599213e64db94a2156e3cd/basic.c",
+      "commit": "82d837cc3ff3b5c09f599213e64db94a2156e3cd",
+      "sha256": "a4b40f5fa55d8e525a8c3a302af5d65faffb1f3aee606e03f724e5cf37d95043",
+      "source_sha256": "6dc7a8906cb41cd330d107ac822e807c58be3833053a18d23940438eeddd3676",
+      "source_lines": "6-12",
+      "note": "Verbatim copyright and license notice from basic.c. Leading C comment prefixes and the closing comment marker were removed; wording is unchanged."
+    }
+  ]
+}

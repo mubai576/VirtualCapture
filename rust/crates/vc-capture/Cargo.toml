@@ -1,0 +1,18 @@
+[package]
+name = "vc-capture"
+description = "被采集机无界面后台：REST 控制 API，拉起并监管原生 vc-sender"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+vc-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true
+axum.workspace = true
+tokio.workspace = true
+http-body-util.workspace = true
+sha2.workspace = true
+hex.workspace = true

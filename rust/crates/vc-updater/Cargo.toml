@@ -1,0 +1,13 @@
+[package]
+name = "vc-updater"
+description = "VirtualCapture OTA helper：旧进程退出后原子切换版本、启动并确认就绪，失败回滚"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+
+[dependencies]
+vc-core.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

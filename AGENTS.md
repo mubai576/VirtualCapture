@@ -41,6 +41,7 @@ MJPEG 开发链路已接通 L2/解码/SHM/DShow 与显式 GUI 后端选择，须
 | 路径 | 内容 | 归属/规则 |
 |---|---|---|
 | `CMakeLists.txt` + `cmake/` | 根构建编排、统一编译/输出规则、Npcap SDK 查找、long-path manifest、MJPEG/PyroWave 固定依赖 ExternalProject | 从根目录配置；产物跟随 `-B` |
+| `rust/` | D26/D27独立开发版：`vc-core` UI无关编排/配置/OTA，`vc-capture` CLI后台，`vc-host` GPUI，`vc-updater`版本切换助手；`vc-transport`冻结wire/分片/重组迁移起点；独立 `vc-stream` 提供 Windows Npcap Raw 双向诊断与可选 SHM v3，未接入产品控制面/打包/OTA；实际产品采集仍复用C++且仅Raw；运行布局分app/data/updates，legacy配置保留 | 构建/独立绿色ZIP见 `docs/runbooks/rust.md`（`rust/packaging/package.py`），契约见 skill `references/rust-control.md`；不自动部署 |
 | `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mjpeg_codec.h`、`pyrowave_codec.h`、`access_unit.h`/`codec_session.h` 编码载荷与会话（`vc-common` CMake target） | 算法只保留一份；MJPEG依赖/许可证见`docs/runbooks/mjpeg.md`，PyroWave见`docs/runbooks/pyrowave.md` |
 | `proto/vc_wire.h` | 28B 包头，**冻结** | 仅 owner 可改 |
 | `sender/` | `vc-sender.exe`（pattern/file/dda/wgc，`--batch`，`pattern.h` 整数测试源，`dda.h`/`wgc.h` 桌面采集） | C++17 |

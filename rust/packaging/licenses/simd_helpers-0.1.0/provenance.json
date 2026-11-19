@@ -1,0 +1,17 @@
+{
+  "crate": "simd_helpers",
+  "version": "0.1.0",
+  "files": [
+    {
+      "path": "LICENSE",
+      "kind": "license",
+      "license_ids": [
+        "MIT"
+      ],
+      "url": "https://raw.githubusercontent.com/lu-zero/simd_helpers/82040194cd05affb060bf94d6f19f82a771d07fb/LICENSE",
+      "commit": "82040194cd05affb060bf94d6f19f82a771d07fb",
+      "sha256": "d69f24ad84ec2ade64c0b68bdb31b41170e997b158370342056918329cc9af1e",
+      "note": "The 0.1.0 release SHA ca1a2f84aa386d758e98f8a609d990263932fb85 has no LICENSE file. Upstream added this MIT text with copyright (c) 2019 Luca Barbato in 82040194cd05affb060bf94d6f19f82a771d07fb."
+    }
+  ]
+}
