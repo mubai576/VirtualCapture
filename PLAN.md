@@ -119,7 +119,7 @@ Raw启动按准确尺寸/MTU计算一帧一个batch（`ceil(B/(mtu-42))`），�
 PyroWave在ready前以同几何/后端/帧预算合成NV12显式预热，丢弃输出、不进入正式帧号/统计；创建/预热/编码/解码/重置/销毁的5秒看门狗只置会话`OperationState`粘性超时，不`process::exit`；挂起时保留worker/句柄/DLL，
 pending期间锁配置/OTA/虚拟卡，不能安全停止时不得自动卸载。
 配置独立`vc-rust-config.json`；MJPEG/PyroWave必须显式`codec_experimental=true`且两端后端精确匹配，未协商组合拒绝启动。
-会话号重复不覆盖运行证据；自动注册前隔离探测实际DShow DLL能力。虚拟卡归属由HKCU CLSID `VirtualCaptureOwner`与本根精确匹配的schema 2证明共同确定（DLL/运行根/PID/进程创建时间一致）；current/pending固定在`ROOT/data/run/vcam-owned{,.pending}.json`，兼容读取旧`ROOT/run/vcam-owned.json`，不受Legacy/Managed/OTA回滚影响；Windows等价根路径规范化。持CLSID全局mutex先保全旧证明、刷盘pending，再提交注册表并提升current，写失败/进程中断仍保留精确证明，不放宽不一致记录判定。只允许本根本进程或确认已退出属主恢复；跨根、其他存活属主、旧注册缺少全局owner或状态未知均拒绝接管/注销，空注册的全局预约也不能被另一宿主接管。
+会话号重复不覆盖运行证据；自动注册前隔离探测实际DShow DLL能力。虚拟卡归属由HKCU CLSID `VirtualCaptureOwner`与本根精确匹配的schema 2证明共同确定（DLL/运行根/PID/进程创建时间一致）；current/pending固定在`ROOT/data/run/vcam-owned{,.pending}.json`，兼容读取旧`ROOT/run/vcam-owned.json`，不受Legacy/Managed/OTA回滚影响；Windows路径以现存路径或最深存在祖先canonicalize后拼回缺失后缀，恢复已删除旧DLL的junction别名；仅`NotFound`可向上，访问错误/悬空重解析点/歧义verbatim路径拒绝恢复。规范owner支持盘符、UNC与合法`\\?\Volume{GUID}\`文件系统路径；若 Windows 将卷GUID路径规范化为已分配盘符，必须查询盘符根对应的卷GUID并确认重建后的完整路径一致，否则拒绝。全局DLL/根必须保持规范拼写。持CLSID全局mutex先保全旧证明、刷盘pending，再提交注册表并提升current，写失败/进程中断仍保留精确证明，不放宽不一致记录判定。只允许本根本进程或确认已退出属主恢复；跨根、其他存活属主、旧注册缺少全局owner或状态未知均拒绝接管/注销，空注册的全局预约也不能被另一宿主接管。
 两端产品列表/选卡/prepare/start仅接受系统明确硬件且非虚拟的物理网卡，未知与回环不入普通列表；失效接收选择清除后须手动重选。
 采集CLI全枚举保留，后台仅显式`--allow-loopback-diagnostics`允许本地回环诊断。
 D27 Rust OTA：独立令牌配对、ZIP清单校验暂存、停止状态helper激活/就绪失败回滚；固定ROOT分离app/releases、data、updates，legacy配置保留。
@@ -279,8 +279,8 @@ D27并行完成双端物理网卡、精简UI/原生图标、固定ROOT版本布�
 
 目标拓扑与模块接口见[Rust 重构提案](docs/proposals/rust-rewrite-20261114.md)：产品宿主使用 Rust crates/版本化 DLL，不再以 sender/receiver CLI 子进程拼接本机数据面；独立 EXE 与 DLL 共享同一 crate 实现，双机间保留版本化控制 API；仅 NV12 Raw、MJPEG、PyroWave。
 已落地（开发实现）：`vc-core` 进程内加载 `vc_stream.dll` C ABI v1（`vc_module_get_api`；start/status/stop/destroy/capabilities）；`vc-stream` 的 DLL 与 CLI 复用同一实现；`vc-source` 提供 pattern/DDA/WGC 与 crop/fit/fill/stretch 整数变换；`vc-media` 安全搜索动态加载固定 `turbojpeg.dll`/`libpyrowave-shared-1.dll`，三编码显式后端、无静默回退；`vc-vcam` 为 Rust COM `vc_vcam.dll`，发布包仅保留外部 `vc-vcam-verify.exe` 做隔离只读探测，旧 C++ 产品不进入 Rust 包。Raw 启动按尺寸/MTU 整帧一个 batch（Loopback 诊断固定 batch1 例外），编码按实际 AU 整帧单次 queue。PyroWave 原生 5 秒看门狗以会话 `OperationState` 粘性超时报告，不 `process::exit`；挂起时保留 worker/句柄/DLL，pending 期间锁配置/OTA/虚拟卡，不能安全停止时不得自动卸载。旧 C++ CLI/协议契约不变。
-本机证据：[Rust-R3验证记录](docs/bringup/bringup-20261119-rust-r3-local.md)。Release DLL 三编码各2400帧 motion/640×640@240 Loopback性能门通过，source-start→RX p99 Raw/MJPEG/PyroWave分别0.9700/3.4589/6.6164ms，均无≥10ms帧，TX/RX完整对账；owner修复后workspace 279 tests、Clippy/build及legacy verify 303 passed / 6 skipped通过（先前首轮计时用例失败与复跑均保留）。WGC窗口采集/缩放/关闭生命周期通过；该次Rust DDA smoke无DXGI输出为BLOCKED；vcam DLL隔离7场景通过且未注册。便携候选前三项smoke通过，但GUI截图全黑导致硬门禁失败，候选无完整验收。
-Rust-R3仍未DONE：物理网卡整帧batch、双机、长稳、画质、完整包/OTA与完整DShow编排未验收；Loopback不冒充双机/物理网卡结论。虚拟卡全局owner与每根稳定current/pending精确证明修复共享native-dir跨根接管、布局切换及写入中断风险；含等价根路径与故障注入的16项owner回归及Rust构建验证通过，未操作真实注册表/DShow。
+本机证据：[Rust-R3验证记录](docs/bringup/bringup-20261119-rust-r3-local.md)。Release DLL 三编码各2400帧 motion/640×640@240 Loopback性能门通过，source-start→RX p99 Raw/MJPEG/PyroWave分别0.9700/3.4589/6.6164ms，均无≥10ms帧，TX/RX完整对账；最新 owner 路径修复轮 workspace 292 tests（vc-core 132、owner 29）、fmt/Clippy/Release build通过；legacy verify 303 passed / 0 failed / 6 skipped（逐项跳过原因未捕获，历史失败与中间尝试均保留）。WGC窗口采集/缩放/关闭生命周期通过；该次Rust DDA smoke无DXGI输出为BLOCKED；vcam DLL隔离7场景通过且未注册。便携候选前三项smoke通过，但GUI截图全黑导致硬门禁失败，候选无完整验收。
+Rust-R3仍未DONE：物理网卡整帧batch、双机、长稳、画质、完整包/OTA与完整DShow编排未验收；Loopback不冒充双机/物理网卡结论。虚拟卡全局owner与每根稳定current/pending精确证明修复共享native-dir跨根接管、布局切换及写入中断风险；后续路径别名修复与本机验证进度见bring-up记录，未操作真实注册表/DShow。
 
 ### P6-4 组合验收与交付 — TODO
 

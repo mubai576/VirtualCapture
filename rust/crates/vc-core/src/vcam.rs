@@ -41,9 +41,7 @@ pub fn status() -> VcamStatus {
         RegistryRead::Value(value) => (value, false),
         RegistryRead::Unknown => (String::new(), true),
     };
-    let match_local = !dll.as_os_str().is_empty()
-        && !registered.is_empty()
-        && normalize(&registered) == normalize(&dll.display().to_string());
+    let match_local = same_path(&registered, &dll.display().to_string());
     VcamStatus {
         dll: dll.display().to_string(),
         registered,
@@ -52,54 +50,175 @@ pub fn status() -> VcamStatus {
     }
 }
 
-fn normalize(path: &str) -> String {
+fn normalize(path: &str) -> Option<String> {
+    if path.is_empty() {
+        return None;
+    }
     #[cfg(windows)]
-    let path = {
-        use std::path::Component;
-        // Existing paths also resolve junctions/aliases. Old release DLLs can be
-        // gone after OTA, so retain an absolute, lexically normalized fallback.
-        let absolute = std::fs::canonicalize(path)
-            .or_else(|_| std::path::absolute(path))
-            .unwrap_or_else(|_| PathBuf::from(path));
-        let mut normalized = PathBuf::new();
-        for component in absolute.components() {
-            match component {
-                Component::CurDir => {}
-                Component::ParentDir => {
-                    if matches!(
-                        normalized.components().next_back(),
-                        Some(Component::Normal(_))
-                    ) {
-                        normalized.pop();
-                    }
+    let path = normalize_windows(path, canonicalize_for_owner)?;
+    Some(owner_path_key(&path))
+}
+
+fn owner_path_key(path: &str) -> String {
+    let path = path.replace('/', "\\").to_ascii_lowercase();
+    let path = if let Some(unc) = path.strip_prefix(r"\\?\unc\") {
+        format!(r"\\{unc}")
+    } else if path.as_bytes().get(5..7) == Some(b":\\") {
+        // Only a DOS drive loses its verbatim prefix. A volume GUID must keep
+        // its namespace so the key cannot alias a relative "Volume{...}" path.
+        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
+    } else {
+        path
+    };
+    path.trim_end_matches('\\').to_owned()
+}
+
+#[cfg(windows)]
+fn canonicalize_for_owner(path: &std::path::Path) -> std::io::Result<PathBuf> {
+    canonicalize_for_owner_using(
+        path,
+        |candidate| std::fs::canonicalize(candidate),
+        |candidate| std::fs::symlink_metadata(candidate).map(|_| ()),
+    )
+}
+
+#[cfg(windows)]
+fn canonicalize_for_owner_using(
+    path: &std::path::Path,
+    canonicalize: impl FnOnce(&std::path::Path) -> std::io::Result<PathBuf>,
+    symlink_metadata: impl FnOnce(&std::path::Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    match canonicalize(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            // A dangling junction/symlink is not a deleted lexical component.
+            // Do not climb past an existing entry whose target cannot be resolved.
+            match symlink_metadata(path) {
+                Ok(_) => Err(std::io::Error::other("existing owner path is unresolved")),
+                Err(metadata_error) if metadata_error.kind() != std::io::ErrorKind::NotFound => {
+                    Err(metadata_error)
                 }
-                _ => normalized.push(component.as_os_str()),
+                Err(_) => Err(error),
             }
         }
-        normalized.to_string_lossy().into_owned()
+        result => result,
+    }
+}
+
+#[cfg(windows)]
+fn normalize_windows(
+    path: &str,
+    canonicalize: impl Fn(&std::path::Path) -> std::io::Result<PathBuf>,
+) -> Option<String> {
+    use std::path::{Component, Prefix};
+    if path.is_empty() {
+        return None;
+    }
+    let input = std::path::Path::new(path);
+    if let Some(Component::Prefix(prefix)) = input.components().next() {
+        let verbatim = match prefix.kind() {
+            Prefix::Disk(_) | Prefix::UNC(_, _) => false,
+            Prefix::VerbatimDisk(_) | Prefix::VerbatimUNC(_, _) => true,
+            Prefix::Verbatim(name) if volume_guid_namespace(name) && input.is_absolute() => true,
+            _ => return None,
+        };
+        // Verbatim traversal has different rules. Never reinterpret literal
+        // separators or dot components as ordinary Win32 traversal.
+        if verbatim
+            && (path.contains('/') || path.split('\\').any(|part| matches!(part, "." | "..")))
+        {
+            return None;
+        }
+    }
+    let absolute = std::path::absolute(input).ok()?;
+    let mut lexical = PathBuf::new();
+    for component in absolute.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(lexical.components().next_back(), Some(Component::Normal(_))) {
+                    lexical.pop();
+                }
+            }
+            _ => lexical.push(component.as_os_str()),
+        }
+    }
+    // A removed OTA release DLL cannot itself be canonicalized. Resolve the
+    // deepest existing ancestor so junction aliases still map to the real root.
+    // Only NotFound may add a missing suffix; all other errors remain unproven.
+    let resolved = canonicalize_with_existing_ancestor(&lexical, &canonicalize)?;
+    Some(resolved.to_string_lossy().into_owned())
+}
+
+fn volume_guid_namespace(name: &std::ffi::OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
     };
-    let path = path.replace('/', "\\");
-    let path = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
-        format!(r"\\{unc}")
-    } else {
-        path.strip_prefix(r"\\?\").unwrap_or(&path).to_owned()
-    };
-    path.trim_end_matches('\\').to_ascii_lowercase()
+    let bytes = name.as_bytes();
+    bytes.len() == 44
+        && bytes[..7].eq_ignore_ascii_case(b"Volume{")
+        && bytes[43] == b'}'
+        && bytes[7..43].iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_hexdigit()
+            }
+        })
+}
+
+#[cfg(windows)]
+fn canonicalize_with_existing_ancestor(
+    path: &std::path::Path,
+    canonicalize: &impl Fn(&std::path::Path) -> std::io::Result<PathBuf>,
+) -> Option<PathBuf> {
+    let mut ancestor = path;
+    let mut missing = Vec::new();
+    loop {
+        match canonicalize(ancestor) {
+            Ok(mut resolved) => {
+                for component in missing.iter().rev() {
+                    resolved.push(component);
+                }
+                return Some(resolved);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return None,
+        }
+        let name = ancestor.file_name()?;
+        if name.to_str()?.contains([':', '/', '\\']) {
+            return None;
+        }
+        missing.push(name.to_os_string());
+        ancestor = ancestor.parent()?;
+    }
 }
 
 fn same_path(left: &str, right: &str) -> bool {
-    !left.is_empty() && !right.is_empty() && normalize(left) == normalize(right)
+    same_path_using(left, right, &normalize)
+}
+
+fn same_path_using(
+    left: &str,
+    right: &str,
+    normalize_path: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    match (normalize_path(left), normalize_path(right)) {
+        (Some(left), Some(right)) => left == right,
+        _ => false,
+    }
 }
 
 fn path_inside_root(path: &str, root: &str) -> bool {
-    if path.is_empty() || root.is_empty() {
-        return false;
+    match (normalize(path), normalize(root)) {
+        (Some(path), Some(root)) => path_inside_normalized_root(&path, &root),
+        _ => false,
     }
-    let root = normalize(root);
-    let path = normalize(path);
+}
+
+fn path_inside_normalized_root(path: &str, root: &str) -> bool {
     !root.is_empty()
         && path.len() > root.len()
-        && path.starts_with(&root)
+        && path.starts_with(root)
         && path.as_bytes()[root.len()] == b'\\'
 }
 
@@ -172,14 +291,117 @@ fn read_registry_owner() -> Result<Option<OwnerRecord>, ()> {
 }
 
 fn valid_owner(record: &OwnerRecord) -> bool {
+    valid_owner_using(record, &normalize)
+}
+
+fn valid_owner_using(
+    record: &OwnerRecord,
+    normalize_path: &impl Fn(&str) -> Option<String>,
+) -> bool {
     record.schema == OWNER_SCHEMA
-        && !record.dll.is_empty()
-        && !record.root.is_empty()
+        && canonical_owner_path(&record.dll, normalize_path)
+        && canonical_owner_path(&record.root, normalize_path)
         && record.pid != 0
         && record.start_time != 0
 }
 
+fn canonical_owner_path(path: &str, normalize_path: &impl Fn(&str) -> Option<String>) -> bool {
+    canonical_owner_path_with_volume_lookup(path, normalize_path, &volume_guid_for_dos_root)
+}
+
+fn canonical_owner_path_with_volume_lookup(
+    path: &str,
+    normalize_path: &impl Fn(&str) -> Option<String>,
+    volume_guid_for_root: &impl Fn(&str) -> Option<String>,
+) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let Some(normalized) = normalize_path(path) else {
+        return false;
+    };
+    let normalized = owner_path_key(&normalized);
+    if normalized == owner_path_key(path) {
+        return true;
+    }
+    let Some(_) = volume_guid_path_parts(path) else {
+        return false;
+    };
+    let bytes = normalized.as_bytes();
+    if bytes.len() < 2 || !bytes[0].is_ascii_alphabetic() || bytes[1] != b':' {
+        return false;
+    }
+    let suffix_start = match bytes.get(2) {
+        Some(b'\\') => 3,
+        None => 2,
+        _ => return false,
+    };
+    let dos_root = format!("{}:\\", &normalized[..1]);
+    let Some(volume_root) = volume_guid_for_root(&dos_root) else {
+        return false;
+    };
+    let Some(_) = volume_guid_path_parts(&volume_root) else {
+        return false;
+    };
+    let suffix = &normalized[suffix_start..];
+    let volume_path = if suffix.is_empty() {
+        volume_root
+    } else {
+        format!("{}\\{suffix}", volume_root.trim_end_matches('\\'))
+    };
+    owner_path_key(&volume_path) == owner_path_key(path)
+}
+
+fn volume_guid_path_parts(path: &str) -> Option<()> {
+    if !path.get(..4)?.eq_ignore_ascii_case(r"\\?\") {
+        return None;
+    }
+    let name = path.get(4..48)?;
+    if !volume_guid_namespace(std::ffi::OsStr::new(name)) {
+        return None;
+    }
+    match path.as_bytes().get(48) {
+        Some(b'\\') | None => Some(()),
+        _ => None,
+    }
+}
+
+fn volume_guid_for_dos_root(root: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::Storage::FileSystem::GetVolumeNameForVolumeMountPointW;
+
+        let root: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut volume = [0u16; 128];
+        let ok = unsafe {
+            GetVolumeNameForVolumeMountPointW(
+                root.as_ptr(),
+                volume.as_mut_ptr(),
+                volume.len() as u32,
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let length = volume.iter().position(|unit| *unit == 0)?;
+        String::from_utf16(&volume[..length]).ok()
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = root;
+        None
+    }
+}
+
 fn same_owner(left: &OwnerRecord, right: &OwnerRecord) -> bool {
+    same_owner_using(left, right, &same_path)
+}
+
+fn same_owner_using(
+    left: &OwnerRecord,
+    right: &OwnerRecord,
+    same_path: &impl Fn(&str, &str) -> bool,
+) -> bool {
     left.schema == right.schema
         && same_path(&left.dll, &right.dll)
         && same_path(&left.root, &right.root)
@@ -365,6 +587,13 @@ pub(crate) enum Recovery {
     Unknown,
 }
 
+struct RecoveryPaths<'a> {
+    registered: &'a str,
+    local: &'a str,
+    root: &'a str,
+    inside_root: bool,
+}
+
 fn decide_recovery_with_global_owner(
     registered: &str,
     local: &str,
@@ -374,6 +603,34 @@ fn decide_recovery_with_global_owner(
     owner_liveness: OwnerLiveness,
     inside_root: bool,
 ) -> Recovery {
+    decide_recovery_with_global_owner_using(
+        RecoveryPaths {
+            registered,
+            local,
+            root,
+            inside_root,
+        },
+        local_owner,
+        registry_owner,
+        owner_liveness,
+        &normalize,
+    )
+}
+
+fn decide_recovery_with_global_owner_using(
+    paths: RecoveryPaths<'_>,
+    local_owner: Option<&OwnerRecord>,
+    registry_owner: Option<&OwnerRecord>,
+    owner_liveness: OwnerLiveness,
+    normalize_path: &impl Fn(&str) -> Option<String>,
+) -> Recovery {
+    let same_path = |left: &str, right: &str| same_path_using(left, right, normalize_path);
+    let RecoveryPaths {
+        registered,
+        local,
+        root,
+        inside_root,
+    } = paths;
     let Some(registry_owner) = registry_owner else {
         return if registered.is_empty() {
             Recovery::Fresh
@@ -383,7 +640,7 @@ fn decide_recovery_with_global_owner(
             Recovery::Foreign
         };
     };
-    if !valid_owner(registry_owner)
+    if !valid_owner_using(registry_owner, normalize_path)
         || (!registered.is_empty() && !same_path(registered, &registry_owner.dll))
     {
         return Recovery::Unknown;
@@ -402,7 +659,7 @@ fn decide_recovery_with_global_owner(
     let Some(local_owner) = local_owner else {
         return Recovery::Unknown;
     };
-    if !same_owner(registry_owner, local_owner) {
+    if !same_owner_using(registry_owner, local_owner, &same_path) {
         return Recovery::Unknown;
     }
     if owner_liveness == OwnerLiveness::LiveElsewhere {
@@ -964,21 +1221,13 @@ fn from_wide(buffer: &[u16]) -> String {
 mod tests {
     use super::*;
 
-    fn owner(dll: &str) -> OwnerRecord {
+    fn owner_at(dll: &str, root: &str, pid: u32) -> OwnerRecord {
         OwnerRecord {
             schema: OWNER_SCHEMA,
             dll: dll.into(),
-            root: r"D:\Root".into(),
-            pid: 1234,
-            start_time: 5678,
-        }
-    }
-
-    fn owner_at(dll: &str, root: &str, pid: u32) -> OwnerRecord {
-        OwnerRecord {
             root: root.into(),
             pid,
-            ..owner(dll)
+            start_time: 5678,
         }
     }
 
@@ -989,9 +1238,7 @@ mod tests {
         owner_liveness: OwnerLiveness,
         inside_root: bool,
     ) -> Recovery {
-        let root = owner
-            .map(|record| record.root.as_str())
-            .unwrap_or(r"D:\Root");
+        let root = owner.map(|record| record.root.as_str()).unwrap_or("");
         decide_recovery_with_global_owner(
             registered,
             local,
@@ -1019,15 +1266,19 @@ mod tests {
                 NEXT.fetch_add(1, Ordering::Relaxed)
             ));
             std::fs::create_dir(&root).unwrap();
-            Self(root)
+            Self(std::fs::canonicalize(root).unwrap())
+        }
+
+        fn path(&self, relative: &str) -> String {
+            self.0.join(relative).to_string_lossy().into_owned()
+        }
+
+        fn owner(&self, relative: &str, pid: u32) -> OwnerRecord {
+            owner_at(&self.path(relative), &self.0.to_string_lossy(), pid)
         }
 
         fn record(&self, pid: u32) -> OwnerRecord {
-            owner_at(
-                &self.0.join("app/releases/b1/vc_vcam.dll").to_string_lossy(),
-                &self.0.to_string_lossy(),
-                pid,
-            )
+            self.owner("app/releases/b1/vc_vcam.dll", pid)
         }
     }
 
@@ -1158,8 +1409,9 @@ mod tests {
         std::fs::create_dir_all(current.parent().unwrap()).unwrap();
         std::fs::write(&current, "broken JSON").unwrap();
         assert_eq!(read_local_owner_at(&root.0, &global), None);
+        let foreign_root = OwnerTestRoot::new();
         let foreign = OwnerRecord {
-            root: r"D:\Other".into(),
+            root: foreign_root.0.to_string_lossy().into_owned(),
             ..global.clone()
         };
         save_owner_file(&current, &foreign).unwrap();
@@ -1174,37 +1426,454 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
+    fn deleted_alias_dll_recovers_against_its_canonical_owner_record() {
+        use std::path::Path;
+
+        let root = OwnerTestRoot::new();
+        let real_root = root.0.clone();
+        std::fs::create_dir_all(root.0.join("app/releases/b2")).unwrap();
+        // A unique missing alias inside the private fixture. Never a fixed host
+        // path such as C:\Alias that could exist on this machine.
+        let alias_prefix = root.0.join("missing-alias");
+        let alias_root = alias_prefix.to_string_lossy().into_owned();
+        let registered = alias_prefix
+            .join("app/releases/b1/vc_vcam.dll")
+            .to_string_lossy()
+            .into_owned();
+        let local = root
+            .0
+            .join("app/releases/b2/vc_vcam.dll")
+            .to_string_lossy()
+            .into_owned();
+        let expected_dll = real_root
+            .join("app/releases/b1/vc_vcam.dll")
+            .to_string_lossy()
+            .into_owned();
+        let expected_root = real_root.to_string_lossy().into_owned();
+        let record = owner_at(&expected_dll, &expected_root, 1234);
+        // The same owner serialized with the alias spelling: it is only equal
+        // through the injected comparison, never through the global normalizer.
+        let alias_record = owner_at(&registered, &alias_root, 1234);
+        let canonicalize_alias = |candidate: &Path| -> std::io::Result<PathBuf> {
+            if let Ok(relative) = candidate.strip_prefix(&alias_prefix) {
+                std::fs::canonicalize(real_root.join(relative))
+            } else {
+                std::fs::canonicalize(candidate)
+            }
+        };
+        let normalize_alias = |path: &str| {
+            normalize_windows(path, canonicalize_alias).map(|resolved| owner_path_key(&resolved))
+        };
+        assert!(!same_owner(&record, &alias_record));
+        assert!(same_owner_using(
+            &record,
+            &alias_record,
+            &|left: &str, right: &str| same_path_using(left, right, &normalize_alias)
+        ));
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                &registered,
+                &local,
+                &expected_root,
+                Some(&record),
+                Some(&record),
+                OwnerLiveness::Dead,
+                true,
+            ),
+            Recovery::Unknown,
+            "without resolving the alias, the global owner mismatch fails closed"
+        );
+        assert_eq!(
+            decide_recovery_with_global_owner_using(
+                RecoveryPaths {
+                    registered: &registered,
+                    local: &local,
+                    root: &alias_root,
+                    inside_root: true,
+                },
+                Some(&alias_record),
+                Some(&record),
+                OwnerLiveness::Dead,
+                &normalize_alias,
+            ),
+            Recovery::StaleOwned,
+            "resolving the alias and using the same comparison restores recovery"
+        );
+        let normalized_registered = normalize_alias(&registered).unwrap();
+        let normalized_root = normalize_alias(&alias_root).unwrap();
+        assert!(valid_owner_using(&record, &normalize_alias));
+        assert!(path_inside_normalized_root(
+            &normalized_registered,
+            &normalized_root
+        ));
+        assert!(!path_inside_normalized_root(
+            &format!("{}2\\vc_vcam.dll", normalized_root),
+            &normalized_root
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn unresolved_alias_path_errors_do_not_fall_back_to_lexical_ownership() {
+        use std::path::Path;
+
+        let path = r"Q:\MissingAlias\app\old\vc_vcam.dll";
+        let resolved = normalize_windows(path, |candidate| {
+            if candidate == Path::new(path) || candidate == Path::new(r"Q:\MissingAlias\app\old") {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }
+        });
+        assert_eq!(resolved, None);
+    }
+
+    #[cfg(windows)]
+    #[test]
     fn equivalent_root_spellings_recover_the_same_registration() {
-        let dll = r"D:\Root\app\releases\b1\vc_vcam.dll";
-        let record = owner_at(dll, r"D:\Root\.", 1234);
-        for root in [r"\\?\D:\Root", "D:/Root/child/..", r"D:\Root\."] {
-            assert!(same_path(root, &record.root), "{root}");
+        let root = OwnerTestRoot::new();
+        let dll = root.path("app/releases/b1/vc_vcam.dll");
+        let canonical_root = root.0.to_string_lossy().into_owned();
+        let plain_root = canonical_root
+            .strip_prefix(r"\\?\UNC\")
+            .map(|unc| format!(r"\\{unc}"))
+            .or_else(|| {
+                canonical_root
+                    .strip_prefix(r"\\?\")
+                    .filter(|plain| plain.as_bytes().get(1..3) == Some(b":\\"))
+                    .map(str::to_owned)
+            });
+        let record = owner_at(&dll, &canonical_root, 1234);
+        let equivalent = match plain_root.as_deref() {
+            Some(plain) if plain.starts_with(r"\\") => [
+                canonical_root.clone(),
+                format!(r"{plain}\child\.."),
+                format!(r"{plain}\."),
+            ],
+            Some(plain) => [
+                format!(r"\\?\{plain}"),
+                format!(r"{plain}\child\.."),
+                format!(r"{plain}\."),
+            ],
+            None => [
+                canonical_root.clone(),
+                canonical_root.clone(),
+                canonical_root.clone(),
+            ],
+        };
+        for alias_root in &equivalent {
+            assert!(same_path(alias_root, &record.root), "{alias_root}");
             assert_eq!(
                 decide_recovery_with_global_owner(
-                    dll,
-                    dll,
-                    root,
+                    &dll,
+                    &dll,
+                    alias_root,
                     Some(&record),
                     Some(&record),
                     OwnerLiveness::Dead,
                     true,
                 ),
                 Recovery::Local,
-                "{root}",
+                "{alias_root}",
             );
         }
-        assert!(!same_path(r"D:\Root2\.", &record.root));
+        if let Some(plain_root) = plain_root {
+            // Verbatim traversal is literal, not ordinary Win32 traversal.
+            let verbatim_traversal = format!(r"{}\child\..", equivalent[0]);
+            assert_eq!(normalize(&verbatim_traversal), None, "{verbatim_traversal}");
+            let outside = format!(r"{plain_root}2\.");
+            assert!(!same_path(&outside, &record.root));
+            assert!(!path_inside_root(&dll, &outside));
+        }
+    }
+
+    #[test]
+    fn owner_records_must_use_canonical_path_spellings() {
+        let record = owner_at(r"C:\Alias\app\vc_vcam.dll", r"C:\Alias", 1234);
+        let canonicalize_alias = |path: &str| {
+            let canonical = path
+                .strip_prefix(r"C:\Alias")
+                .map(|suffix| format!(r"D:\Root{suffix}"))
+                .unwrap_or_else(|| path.to_owned());
+            Some(canonical.replace('/', "\\").to_ascii_lowercase())
+        };
+        assert!(!valid_owner_using(&record, &canonicalize_alias));
+
+        let canonical_record = owner_at(r"D:\Root\app\vc_vcam.dll", r"D:\Root", 1234);
+        assert!(valid_owner_using(&canonical_record, &canonicalize_alias));
+    }
+
+    #[test]
+    fn volume_guid_owner_accepts_only_same_volume_and_same_path() {
+        let volume = r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\";
+        let owner_path = format!(r"{volume}app\vc_vcam.dll");
+        let normalize_drive = |_: &str| Some(owner_path_key(r"\\?\C:\app\vc_vcam.dll"));
+        let same_volume = |root: &str| root.eq_ignore_ascii_case(r"C:\").then(|| volume.to_owned());
+        assert!(canonical_owner_path_with_volume_lookup(
+            &owner_path,
+            &normalize_drive,
+            &same_volume,
+        ));
+
+        let wrong_volume =
+            |_: &str| Some(r"\\?\Volume{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}\".to_owned());
+        assert!(!canonical_owner_path_with_volume_lookup(
+            &owner_path,
+            &normalize_drive,
+            &wrong_volume,
+        ));
+
+        let wrong_path = |_: &str| Some(owner_path_key(r"\\?\C:\other\vc_vcam.dll"));
+        assert!(!canonical_owner_path_with_volume_lookup(
+            &owner_path,
+            &wrong_path,
+            &same_volume,
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn real_volume_guid_owner_round_trips_after_drive_canonicalization() {
+        let executable = std::fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
+        let drive_path = owner_path_key(&executable.display().to_string());
+        let drive_root = format!("{}:\\", &drive_path[..1]);
+        let volume_root = volume_guid_for_dos_root(&drive_root).expect("current volume GUID");
+        let relative = drive_path
+            .strip_prefix(&drive_root)
+            .expect("executable on drive");
+        let root = format!("{volume_root}VirtualCapture-owner-path-test");
+        let dll = format!("{root}\\app\\releases\\b1\\vc_vcam.dll");
+        let local = format!("{root}\\app\\releases\\b2\\vc_vcam.dll");
+        let registered = owner_at(&dll, &root, 1234);
+        let normalize_drive_tree = |path: &str| {
+            let suffix = path.strip_prefix(&root).unwrap_or("");
+            Some(owner_path_key(&format!(
+                r"\\?\{drive_root}VirtualCapture-owner-path-test{suffix}"
+            )))
+        };
+        assert!(valid_owner(&owner_at(
+            &format!("{volume_root}{relative}"),
+            &volume_root,
+            1234,
+        )));
+        assert_eq!(
+            decide_recovery_with_global_owner_using(
+                RecoveryPaths {
+                    registered: &dll,
+                    local: &local,
+                    root: &root,
+                    inside_root: true,
+                },
+                Some(&registered),
+                Some(&registered),
+                OwnerLiveness::Dead,
+                &normalize_drive_tree,
+            ),
+            Recovery::StaleOwned
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_normalization_rejects_unrecognized_verbatim_namespaces() {
+        use std::cell::Cell;
+
+        for path in [
+            r"\\?\GLOBALROOT\Device\HarddiskVolume1\app\vc_vcam.dll",
+            r"\\?\PIPE\vc-owner",
+            r"\\?\Device\Harddisk0\DR0",
+            r"\\.\pipe\vc-owner",
+            r"\\?\Volume{not-a-guid}\app\vc_vcam.dll",
+            r"\\?\Volume{12345678-1234-1234-1234}\app\vc_vcam.dll",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc",
+            r"\\?\Volume{zzzzzzzz-zzzz-zzzz-zzzz-zzzzzzzzzzzz}\app\vc_vcam.dll",
+            r"\\?\Volume{1234-56781234-1234-1234-123456789abc}\app\vc_vcam.dll",
+        ] {
+            let calls = Cell::new(0);
+            let resolved = normalize_windows(path, |_| {
+                calls.set(calls.get() + 1);
+                Ok(PathBuf::from(r"\\?\C:\unexpected"))
+            });
+            assert_eq!(resolved, None, "{path}");
+            assert_eq!(calls.get(), 0, "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn owner_normalization_rejects_verbatim_traversal_spellings() {
+        for path in [
+            r"\\?\C:\app/vc_vcam.dll",
+            r"\\?\C:\app\..\vc_vcam.dll",
+            r"\\?\C:\app\.\vc_vcam.dll",
+            r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\..\vc_vcam.dll",
+        ] {
+            let resolved = normalize_windows(path, |_| {
+                panic!("canonicalize must not run for verbatim traversal: {path}")
+            });
+            assert_eq!(resolved, None, "{path}");
+        }
+    }
+
+    #[test]
+    fn volume_namespace_stays_part_of_the_owner_key() {
+        let volume_key =
+            owner_path_key(r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\app\vc_vcam.dll");
+        assert!(volume_key.starts_with(r"\\?\volume{"), "{volume_key}");
+        let relative_key =
+            owner_path_key(r"Volume{12345678-1234-1234-1234-123456789abc}\app\vc_vcam.dll");
+        assert!(!relative_key.starts_with(r"\\?\"), "{relative_key}");
+        assert_ne!(volume_key, relative_key);
+        // A DOS drive still loses its verbatim prefix so spellings compare equal.
+        assert_eq!(
+            owner_path_key(r"\\?\C:\Root\vc_vcam.dll"),
+            owner_path_key(r"C:\Root\vc_vcam.dll")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_for_owner_rejects_dangling_existing_entries() {
+        use std::path::Path;
+
+        let path = Path::new(r"Q:\VirtualCapture\owner\vc_vcam.dll");
+        let error = canonicalize_for_owner_using(
+            path,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            |_| Ok(()),
+        )
+        .unwrap_err();
+        assert_ne!(
+            error.kind(),
+            std::io::ErrorKind::NotFound,
+            "a dangling existing entry must stay unresolved"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn dangling_or_unreadable_entries_do_not_climb_to_an_existing_ancestor() {
+        use std::cell::Cell;
+        use std::path::Path;
+
+        let path = r"Q:\VirtualCapture\owner\vc_vcam.dll";
+        for (tag, metadata_kind) in [
+            ("dangling", None),
+            ("access-denied", Some(std::io::ErrorKind::PermissionDenied)),
+        ] {
+            let canonicalize_calls = Cell::new(0);
+            let metadata_calls = Cell::new(0);
+            let canonicalize = |candidate: &Path| {
+                canonicalize_calls.set(canonicalize_calls.get() + 1);
+                assert_eq!(candidate, Path::new(path), "{tag}");
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            };
+            let metadata = |candidate: &Path| {
+                metadata_calls.set(metadata_calls.get() + 1);
+                assert_eq!(candidate, Path::new(path), "{tag}");
+                match metadata_kind {
+                    None => Ok(()),
+                    Some(kind) => Err(std::io::Error::from(kind)),
+                }
+            };
+            let normalized = normalize_windows(path, |candidate| {
+                canonicalize_for_owner_using(candidate, canonicalize, metadata)
+            });
+            assert_eq!(normalized, None, "{tag} must not climb");
+            assert_eq!(canonicalize_calls.get(), 1, "{tag}");
+            assert_eq!(metadata_calls.get(), 1, "{tag}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn truly_missing_entries_may_climb_to_their_existing_ancestor() {
+        use std::cell::Cell;
+        use std::path::Path;
+
+        let path = r"Q:\VirtualCapture\owner\releases\b1\vc_vcam.dll";
+        let existing = Path::new(r"Q:\VirtualCapture\owner");
+        let canonicalize_calls = Cell::new(0);
+        let canonicalize = |candidate: &Path| {
+            canonicalize_calls.set(canonicalize_calls.get() + 1);
+            if candidate == existing {
+                Ok(existing.to_path_buf())
+            } else {
+                Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+            }
+        };
+        let metadata = |_: &Path| Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        let normalized = normalize_windows(path, |candidate| {
+            canonicalize_for_owner_using(candidate, canonicalize, metadata)
+        });
+        assert_eq!(
+            normalized.as_deref(),
+            Some(r"Q:\VirtualCapture\owner\releases\b1\vc_vcam.dll")
+        );
+        assert_eq!(canonicalize_calls.get(), 4);
+        let absent = canonicalize_for_owner_using(
+            Path::new(path),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+        )
+        .unwrap_err();
+        assert_eq!(absent.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn canonicalize_permission_errors_never_probe_metadata_or_fall_back() {
+        use std::cell::Cell;
+        use std::path::Path;
+
+        let path = Path::new(r"Q:\VirtualCapture\owner\vc_vcam.dll");
+        let metadata_calls = Cell::new(0);
+        let error = canonicalize_for_owner_using(
+            path,
+            |_| Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied)),
+            |_| {
+                metadata_calls.set(metadata_calls.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(metadata_calls.get(), 0);
+        assert_eq!(
+            normalize_windows(r"Q:\VirtualCapture\owner\vc_vcam.dll", |_| {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            }),
+            None
+        );
+    }
+
+    #[test]
+    fn unresolved_paths_never_prove_equality_or_ownership() {
+        let unresolved = |_: &str| None;
+        assert!(!same_path_using(
+            r"C:\Root\vc_vcam.dll",
+            r"C:\Root\vc_vcam.dll",
+            &unresolved
+        ));
+        let record = owner_at(r"C:\Root\vc_vcam.dll", r"C:\Root", 1234);
+        assert!(!valid_owner_using(&record, &unresolved));
+        assert!(!path_inside_root("", ""));
     }
 
     #[test]
     fn owner_reservation_is_not_fresh_for_another_host() {
-        let shared = r"D:\Build\vc_vcam.dll";
-        let record = owner_at(shared, r"D:\RuntimeA", 2222);
+        let shared_root = OwnerTestRoot::new();
+        let runtime_a = OwnerTestRoot::new();
+        let runtime_b = OwnerTestRoot::new();
+        let shared = shared_root.path("build/vc_vcam.dll");
+        let root_a = runtime_a.0.to_string_lossy().into_owned();
+        let root_b = runtime_b.0.to_string_lossy().into_owned();
+        let record = owner_at(&shared, &root_a, 2222);
         assert_eq!(
             decide_recovery_with_global_owner(
                 "",
-                shared,
-                r"D:\RuntimeB",
+                &shared,
+                &root_b,
                 None,
                 Some(&record),
                 OwnerLiveness::LiveElsewhere,
@@ -1215,8 +1884,8 @@ mod tests {
         assert_eq!(
             decide_recovery_with_global_owner(
                 "",
-                shared,
-                r"D:\RuntimeA",
+                &shared,
+                &root_a,
                 Some(&record),
                 Some(&record),
                 OwnerLiveness::SelfProcess,
@@ -1228,31 +1897,27 @@ mod tests {
 
     #[test]
     fn same_path_registration_requires_a_matching_owner_record() {
-        let local = r"D:\Root\app\releases\b2\vc_vcam.dll";
+        let root = OwnerTestRoot::new();
+        let local = root.path("app/releases/b2/vc_vcam.dll");
         assert_eq!(
-            decide_recovery("", local, None, OwnerLiveness::Unknown, true),
+            decide_recovery("", &local, None, OwnerLiveness::Unknown, true),
             Recovery::Fresh
         );
         // 同路径但没有记录/记录不符：无法证明属于本根，保守拒绝。
         assert_eq!(
-            decide_recovery(local, local, None, OwnerLiveness::Unknown, true),
+            decide_recovery(&local, &local, None, OwnerLiveness::Unknown, true),
             Recovery::Unknown
         );
+        let previous = root.owner("app/releases/b1/vc_vcam.dll", 1234);
         assert_eq!(
-            decide_recovery(
-                local,
-                local,
-                Some(&owner(r"D:\Root\app\releases\b1\vc_vcam.dll")),
-                OwnerLiveness::Dead,
-                true
-            ),
+            decide_recovery(&local, &local, Some(&previous), OwnerLiveness::Dead, true),
             Recovery::Unknown
         );
-        let record = owner(local);
+        let record = root.owner("app/releases/b2/vc_vcam.dll", 1234);
         assert_eq!(
             decide_recovery(
-                local,
-                local,
+                &local,
+                &local,
                 Some(&record),
                 OwnerLiveness::SelfProcess,
                 true
@@ -1260,15 +1925,15 @@ mod tests {
             Recovery::Local
         );
         assert_eq!(
-            decide_recovery(local, local, Some(&record), OwnerLiveness::Dead, true),
+            decide_recovery(&local, &local, Some(&record), OwnerLiveness::Dead, true),
             Recovery::Local,
             "crashed owner with a matching record may be reused"
         );
         // A live host from this root still owns the same registration.
         assert_eq!(
             decide_recovery(
-                local,
-                local,
+                &local,
+                &local,
                 Some(&record),
                 OwnerLiveness::LiveElsewhere,
                 true
@@ -1276,7 +1941,7 @@ mod tests {
             Recovery::Busy
         );
         assert_eq!(
-            decide_recovery(local, local, Some(&record), OwnerLiveness::Unknown, true),
+            decide_recovery(&local, &local, Some(&record), OwnerLiveness::Unknown, true),
             Recovery::Unknown,
             "unknown liveness must never be treated as dead"
         );
@@ -1284,18 +1949,19 @@ mod tests {
 
     #[test]
     fn ota_leftover_is_recoverable_only_when_recorded_and_owner_dead() {
-        let local = r"D:\Root\app\releases\b2\vc_vcam.dll";
-        let previous = r"D:\Root\app\releases\b1\vc_vcam.dll";
-        let record = owner(previous);
+        let root = OwnerTestRoot::new();
+        let local = root.path("app/releases/b2/vc_vcam.dll");
+        let previous = root.path("app/releases/b1/vc_vcam.dll");
+        let record = root.owner("app/releases/b1/vc_vcam.dll", 1234);
         assert_eq!(
-            decide_recovery(previous, local, Some(&record), OwnerLiveness::Dead, true),
+            decide_recovery(&previous, &local, Some(&record), OwnerLiveness::Dead, true),
             Recovery::StaleOwned
         );
         // 本进程自己写下的上一版本记录（例如运行期切换 current release）也可回收。
         assert_eq!(
             decide_recovery(
-                previous,
-                local,
+                &previous,
+                &local,
                 Some(&record),
                 OwnerLiveness::SelfProcess,
                 true
@@ -1305,8 +1971,8 @@ mod tests {
         // Old release still running: do not steal its card.
         assert_eq!(
             decide_recovery(
-                previous,
-                local,
+                &previous,
+                &local,
                 Some(&record),
                 OwnerLiveness::LiveElsewhere,
                 true
@@ -1315,20 +1981,27 @@ mod tests {
         );
         // Liveness unknown: fail closed rather than assuming the owner is dead.
         assert_eq!(
-            decide_recovery(previous, local, Some(&record), OwnerLiveness::Unknown, true),
+            decide_recovery(
+                &previous,
+                &local,
+                Some(&record),
+                OwnerLiveness::Unknown,
+                true
+            ),
             Recovery::Unknown
         );
         // No ownership record or a mismatched one: never touch it.
         assert_eq!(
-            decide_recovery(previous, local, None, OwnerLiveness::Unknown, true),
+            decide_recovery(&previous, &local, None, OwnerLiveness::Unknown, true),
             Recovery::Foreign
         );
-        let foreign_record = owner_at(previous, r"D:\Other", 1234);
+        let foreign_root = OwnerTestRoot::new();
+        let foreign_record = owner_at(&previous, &foreign_root.0.to_string_lossy(), 1234);
         assert_eq!(
             decide_recovery_with_global_owner(
-                previous,
-                local,
-                r"D:\Root",
+                &previous,
+                &local,
+                &root.0.to_string_lossy(),
                 Some(&foreign_record),
                 Some(&foreign_record),
                 OwnerLiveness::Dead,
@@ -1338,25 +2011,28 @@ mod tests {
         );
         // A recorded path outside this runtime root is another installation.
         assert_eq!(
-            decide_recovery(previous, local, Some(&record), OwnerLiveness::Dead, false),
+            decide_recovery(&previous, &local, Some(&record), OwnerLiveness::Dead, false),
             Recovery::Foreign
         );
     }
 
     #[test]
     fn shared_dll_cannot_be_claimed_from_another_run_root() {
-        let shared = r"D:\Build\Release\vc_vcam.dll";
-        let root_a = r"D:\RuntimeA";
-        let root_b = r"D:\RuntimeB";
-        let active_a = owner_at(shared, root_a, 2222);
-        let stale_b = owner_at(shared, root_b, 1234);
+        let shared_root = OwnerTestRoot::new();
+        let runtime_a = OwnerTestRoot::new();
+        let runtime_b = OwnerTestRoot::new();
+        let shared = shared_root.path("build/Release/vc_vcam.dll");
+        let root_a = runtime_a.0.to_string_lossy().into_owned();
+        let root_b = runtime_b.0.to_string_lossy().into_owned();
+        let active_a = owner_at(&shared, &root_a, 2222);
+        let stale_b = owner_at(&shared, &root_b, 1234);
 
         // Runtime B's old per-root record cannot override the global live owner A.
         assert_eq!(
             decide_recovery_with_global_owner(
-                shared,
-                shared,
-                root_b,
+                &shared,
+                &shared,
+                &root_b,
                 Some(&stale_b),
                 Some(&active_a),
                 OwnerLiveness::LiveElsewhere,
@@ -1367,9 +2043,9 @@ mod tests {
         // Once A exits, B still cannot unregister/adopt A's owner: root mismatch wins.
         assert_eq!(
             decide_recovery_with_global_owner(
-                shared,
-                shared,
-                root_b,
+                &shared,
+                &shared,
+                &root_b,
                 Some(&stale_b),
                 Some(&active_a),
                 OwnerLiveness::Dead,
@@ -1380,9 +2056,9 @@ mod tests {
         // A corrupt/missing local mirror cannot be used to recover the global record.
         assert_eq!(
             decide_recovery_with_global_owner(
-                shared,
-                shared,
-                root_a,
+                &shared,
+                &shared,
+                &root_a,
                 None,
                 Some(&active_a),
                 OwnerLiveness::Dead,
@@ -1394,8 +2070,8 @@ mod tests {
 
     #[test]
     fn owner_liveness_distinguishes_dead_reuse_and_unknown() {
-        let local = r"D:\Root\vc_vcam.dll";
-        let record = owner(local);
+        let local = r"Q:\OwnerLiveness\vc_vcam.dll";
+        let record = owner_at(local, r"Q:\OwnerLiveness", 1234);
         assert_eq!(
             classify_owner(&record, record.pid, ProcessState::Alive(record.start_time)),
             OwnerLiveness::SelfProcess
@@ -1427,7 +2103,7 @@ mod tests {
         );
         let unverifiable = OwnerRecord {
             start_time: 0,
-            ..owner(local)
+            ..owner_at(local, r"Q:\OwnerLiveness", 1234)
         };
         assert_eq!(
             classify_owner(
@@ -1442,28 +2118,39 @@ mod tests {
 
     #[test]
     fn unrecorded_foreign_registration_is_never_adopted() {
-        let local = r"D:\Root\vc_vcam.dll";
+        let root = OwnerTestRoot::new();
+        let local = root.path("vc_vcam.dll");
+        let other = root.path("other/vc_vcam.dll");
         assert_eq!(
-            decide_recovery(
-                r"D:\Other\vc_vcam.dll",
-                local,
-                None,
-                OwnerLiveness::Unknown,
-                true
-            ),
+            decide_recovery(&other, &local, None, OwnerLiveness::Unknown, true),
             Recovery::Foreign
         );
     }
 
     #[test]
     fn root_containment_uses_component_boundaries() {
-        assert!(path_inside_root(
-            r"\\?\D:\Root\app\releases\b1\vc_vcam.dll",
-            "D:/Root/"
-        ));
-        assert!(!path_inside_root(r"D:\Root2\vc_vcam.dll", r"D:\Root"));
-        assert!(!path_inside_root(r"D:\Root", r"D:\Root"));
-        assert!(!path_inside_root("", r"D:\Root"));
+        let root = OwnerTestRoot::new();
+        let canonical_root = root.0.to_string_lossy().into_owned();
+        let plain_root = canonical_root
+            .strip_prefix(r"\\?\UNC\")
+            .map(|unc| format!(r"\\{unc}"))
+            .or_else(|| {
+                canonical_root
+                    .strip_prefix(r"\\?\")
+                    .filter(|plain| plain.as_bytes().get(1..3) == Some(b":\\"))
+                    .map(str::to_owned)
+            });
+        let dll = format!(r"{canonical_root}\app\releases\b1\vc_vcam.dll");
+        assert!(path_inside_root(&dll, &canonical_root));
+        assert!(path_inside_root(&dll, &format!("{canonical_root}\\")));
+        if let Some(plain_root) = &plain_root {
+            assert!(!path_inside_root(
+                &format!("{plain_root}2\\vc_vcam.dll"),
+                &canonical_root
+            ));
+        }
+        assert!(!path_inside_root(&canonical_root, &canonical_root));
+        assert!(!path_inside_root("", &canonical_root));
         // Empty inputs must not become the working directory during normalization.
         let cwd = std::env::current_dir().unwrap();
         assert!(!path_inside_root(
@@ -1473,7 +2160,9 @@ mod tests {
         if let Some(parent) = cwd.parent() {
             assert!(!path_inside_root("", &parent.to_string_lossy()));
         }
-        assert!(same_path(r"\\?\D:\Root\vc_vcam.dll", "d:/root/vc_vcam.dll"));
+        if let Some(plain_root) = &plain_root {
+            assert!(same_path(&canonical_root, &plain_root.replace('\\', "/")));
+        }
     }
 
     #[test]

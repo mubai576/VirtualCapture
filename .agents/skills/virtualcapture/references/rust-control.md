@@ -136,7 +136,10 @@ ZIP须单一顶层目录、`package-manifest.json` product/schema/version/build_
 `ROOT/data/run/vcam-owned.json`（current）与 `ROOT/data/run/vcam-owned.pending.json`，不随
 Legacy/Managed 布局或 OTA 激活/回滚切换；查找兼容旧 `ROOT/run/vcam-owned.json`，不搬动旧 run 证据。
 只选择与全局 owner 完全一致的记录，不因两端属主均已退出而接受不一致记录。Windows 路径比较
-消解 `.`/`..`、分隔符和 verbatim 前缀；存在的路径先 canonicalize，新记录写入规范化的运行根/DLL。
+对普通 Win32 路径消解 `.`/`..` 与分隔符；现存路径 canonicalize，OTA 删除的旧 DLL 通过最深存在祖先 canonicalize 后拼接缺失后缀，以匹配 junction 等根路径别名。
+只有 `NotFound` 可按缺失组件继续向上；访问错误、悬空重解析点及含 `/`、`.`、`..` 的歧义 verbatim 路径保持未证明并拒绝恢复，不退回词法相等。
+支持盘符、UNC 与合法 `\\?\Volume{GUID}\` 文件系统路径；比较时仅折叠盘符/UNC 的 verbatim 前缀，卷 GUID 保留完整命名空间，不接受任意设备命名空间。若 Windows 将卷 GUID 路径规范化为已分配盘符，必须查询盘符根对应的卷 GUID，并确认重建后的完整路径一致；查询失败或路径不同均拒绝。
+全局 owner 的 DLL/根路径必须仍是规范拼写，新记录写入 canonicalize 得到的运行根/DLL。
 共享 `--native-dir` 下 DLL 路径不代表运行根相同。其他运行根、其他存活宿主或无法确定归属/进程存活/
 注册表读取结果时均拒绝接管或注销；尚无 InprocServer32 的全局 owner 预约也不能被另一宿主当作空闲。
 缺少全局 owner 值的旧注册不自动恢复。同运行根的本进程或确认已退出属主可恢复。

@@ -124,7 +124,7 @@ Release 构建改用 `rust/target/release`。
   （无用户可调 batch），Npcap Loopback 诊断固定 batch1；可变尺寸要求偶数。
   MJPEG/PyroWave 必须显式 `codec_experimental=true` 且后端精确匹配，否则 Rust 启动明确拒绝，不静默降级。
 - 产品启动不拉起 sender/receiver 子进程；`vc_stream.dll` 缺失、ABI/能力不符时明确失败，不回退旧程序。
-- 虚拟卡归属由 HKCU CLSID `VirtualCaptureOwner` 与本根精确匹配的 schema 2 证明确定（DLL、运行根、PID、进程创建时间）。current/pending 固定在 `ROOT/data/run/vcam-owned.json`、`ROOT/data/run/vcam-owned.pending.json`，兼容读取旧 `ROOT/run/vcam-owned.json`，不随 Legacy/Managed/OTA 回滚改变位置，也不移动旧 run 证据。Windows 等价根路径先规范化；共享 `--native-dir` 不允许不同运行根互相接管，缺少全局 owner 值的旧注册不自动恢复。
+- 虚拟卡归属由 HKCU CLSID `VirtualCaptureOwner` 与本根精确匹配的 schema 2 证明确定（DLL、运行根、PID、进程创建时间）。current/pending 固定在 `ROOT/data/run/vcam-owned.json`、`ROOT/data/run/vcam-owned.pending.json`，兼容读取旧 `ROOT/run/vcam-owned.json`，不随 Legacy/Managed/OTA 回滚改变位置，也不移动旧 run 证据。Windows 等价根路径先规范化；旧 release DLL 已被 OTA 删除时，以最深存在祖先 canonicalize 并拼接缺失后缀，恢复 junction 别名一致性。仅 `NotFound` 允许继续向上解析，其他路径错误、悬空重解析点及含 `/`、`.`、`..` 的歧义 verbatim 路径保持未证明并拒绝恢复，不退回词法相等。支持盘符、UNC 与合法 `\\?\Volume{GUID}\` 文件系统路径；卷 GUID 保留命名空间，不接受任意设备路径。若 Windows 将卷 GUID 路径规范化为已分配盘符，须查询盘符根对应卷 GUID 并确认重建后的完整路径一致；全局 owner DLL/根记录须保持规范拼写。共享 `--native-dir` 不允许不同运行根互相接管，缺少全局 owner 值的旧注册不自动恢复。
 - owner 更新先保全旧全局证明，再刷盘新 pending、提交注册表、提升 current；注册表写失败或提交后进程中断仍保留一份精确证明，重试不放宽记录一致性要求。该机制不是断电时跨文件系统/注册表的原子事务；未知状态仍拒绝自动接管/注销，详细顺序见 [Rust 控制契约](../../.agents/skills/virtualcapture/references/rust-control.md)。
 - 数据面模块必须报告 stream revision 2、可变尺寸、SHM v3、sendqueue=frame 与 codecs/sources；
   虚拟卡注册前用 `vc-vcam-verify.exe --dll ... --capabilities` 隔离探测；已有注册必须证明属于本根本进程或确认已退出属主，不能接管其他根、其他存活属主或未知注册。
