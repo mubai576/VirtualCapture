@@ -2,8 +2,7 @@
 
 LAUNCHERS = ("VirtualCapture.exe",)
 RUST_EXES = (
-    "vc-host.exe", "vc-capture.exe", "vc-updater.exe",
-    "vc-stream.exe", "vc-transport.exe", "vc-vcam-verify.exe",
+    "vc-host.exe", "vc-capture.exe", "vc-updater.exe", "vc-vcam-verify.exe",
 )
 RUST_DLLS = ("vc_stream.dll", "vc_vcam.dll")
 # 上游 PyroWave 为 Vulkan 第三方运行库，不含本项目 C++ 产品实现。
@@ -20,10 +19,10 @@ FORBIDDEN_NAMES = frozenset(name.lower() for name in (
     "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "vc-monitor.exe",
     "vc-monitor-diag.exe", "vc-testwin.exe", "vc-vcam-lifecycle.exe", "turbojpeg.dll",
 ))
-REQUIRED_LICENSES = (
+NATIVE_LICENSE_AUDIT_FILES = (
     "pyrowave-LICENSE.txt", "granite-LICENSE.txt", "volk-LICENSE.md",
     "Vulkan-Headers-LICENSE.md", "Vulkan-Headers-LICENSES/Apache-2.0.txt",
     "Vulkan-Headers-LICENSES/MIT.txt", "MSVC-runtime.txt",
 )
-RUST_LICENSE_OUTPUTS = ("rust/inventory.json", "rust/THIRD-PARTY-NOTICES.md")
+RUST_LICENSE_AUDIT_OUTPUTS = ("inventory.json", "THIRD-PARTY-NOTICES.md")
 EXPECTED_PE_NAMES = frozenset(name.lower() for name in REQUIRED_FILES)

@@ -21,9 +21,9 @@ pub enum HostScan {
     /// 尚未枚举网卡。
     #[default]
     NotScanned,
-    /// 枚举成功；`host_adapters` 只含可确认的物理网卡。
+    /// 枚举成功；`host_adapters` 只含已连接的物理网卡。
     Ready,
-    /// 枚举成功但没有可确认的物理网卡。
+    /// 枚举成功但没有已连接的物理网卡。
     NoPhysical,
     /// 枚举失败；旧列表已清空，不能用于启动。
     Failed,
@@ -35,7 +35,7 @@ pub struct Snapshot {
     pub peer_online: bool,
     pub peer_version: String,
     pub error: Option<String>,
-    /// 只含可确认的物理网卡；虚拟网卡、回环和元数据未知的条目不会出现在这里。
+    /// 只含已连接的物理网卡；虚拟、回环、未连接和元数据未知的条目不会出现在这里。
     pub host_adapters: Vec<AdapterInfo>,
     /// 最近一次本机网卡枚举的结果，供 UI 区分“未扫描/无物理网卡/扫描失败”。
     pub host_scan: HostScan,
@@ -294,7 +294,7 @@ impl Worker {
                         .iter()
                         .any(|item| item.name == name)
                 {
-                    self.fail("该网卡不是可确认的物理设备，或列表已刷新；请重新选择。".into());
+                    self.fail("该网卡未连接、不是物理设备或列表已刷新；请重新选择。".into());
                     return;
                 }
                 self.state.host_adapter = name.clone();
@@ -308,9 +308,9 @@ impl Worker {
                         .state
                         .peer_adapters
                         .iter()
-                        .any(|item| item.name == name && item.is_physical_nic())
+                        .any(|item| item.name == name && item.is_connected_physical_nic())
                 {
-                    self.fail("请选择当前列表中的物理发送网卡。".into());
+                    self.fail("请选择当前列表中的已连接物理发送网卡。".into());
                     return;
                 }
                 self.state.peer_adapter = name;
@@ -521,13 +521,13 @@ impl Worker {
             {
                 self.state.peer_adapter.clear();
                 self.event(
-                    "原发送网卡已失效，已恢复自动选择（优先唯一 Intel I226，否则按控制连接路由）。下次启动会重新准备确认。",
+                    "原发送网卡已失效，已清除选择；仅剩一张已连接物理网卡时自动预览，多张请手动选择。",
                 );
             }
         }
         Ok(())
     }
-    /// 枚举本机网卡并只保留可确认的物理设备；枚举失败时清空旧列表，
+    /// 枚举本机网卡并只保留已连接的物理设备；枚举失败时清空旧列表，
     /// 避免用过期或含虚拟网卡的结果启动。
     fn scan_host_adapters(&mut self) -> Result<(), String> {
         let result = self
@@ -563,7 +563,7 @@ impl Worker {
                 self.state.config.adapter.clear();
                 self.host_selection_needs_user = true;
                 self.save();
-                self.event("原接收网卡不是可确认的物理设备或已不存在，已清除；请重新选择。");
+                self.event("原接收网卡未连接、不是物理设备或已不存在，已清除；请重新选择。");
             }
         }
         Ok(())
@@ -581,7 +581,7 @@ impl Worker {
         match adapters::choose_auto_adapter(&self.state.host_adapters, ip) {
             Ok(item) => self.state.host_adapter = item.name.clone(),
             Err(error) => {
-                // 多张 I226 或路由不唯一时不静默挑一张；要求用户显式选择，
+                // 控制连接路由不唯一时不静默挑一张；要求用户显式选择，
                 // 后续扫描也不再自动改选。
                 self.host_selection_needs_user = true;
                 self.event(format!("无法自动选择主机接收网卡：{error}"));
@@ -590,15 +590,19 @@ impl Worker {
     }
     /// 预算与自动 MTU 使用的对端发送网卡预览。
     ///
-    /// 显式选择优先并保持原样；未选择时只接受唯一 Intel I226，多张 I226
-    /// 明确报错而不静默挑一张。没有任何 I226 时返回 None：显式 MTU 仍可
-    /// 先准备再由采集端按实际网卡复核，但自动 MTU 无法在准备前解析。
+    /// 显式选择优先并保持原样；未选择时只有唯一已连接物理网卡可自动预览，
+    /// 多张时要求显式选择。没有候选时返回 None：显式 MTU 仍可先准备再由
+    /// 采集端按实际网卡复核，但自动 MTU 无法在准备前解析。
     fn peer_preview_adapter(&self) -> Result<Option<AdapterInfo>, String> {
         if !self.state.peer_adapter.is_empty() {
-            return adapters::resolve(&self.state.peer_adapters, &self.state.peer_adapter)
-                .map(|item| item.cloned());
+            let adapter = adapters::resolve(&self.state.peer_adapters, &self.state.peer_adapter)?
+                .ok_or_else(|| "请选择当前列表中的已连接物理发送网卡。".to_string())?;
+            if !adapter.is_connected_physical_nic() {
+                return Err("所选发送网卡未连接或不是物理设备，请重新选择。".into());
+            }
+            return Ok(Some(adapter.clone()));
         }
-        Ok(adapters::unique_i226(&self.state.peer_adapters)?.cloned())
+        Ok(adapters::unique_connected_physical(&self.state.peer_adapters)?.cloned())
     }
     fn recompute(&mut self) {
         let host = adapters::resolve(&self.state.host_adapters, &self.state.host_adapter)
@@ -607,7 +611,7 @@ impl Worker {
         let peer = match self.peer_preview_adapter() {
             Ok(item) => item,
             Err(error) => {
-                // I226 不唯一：把错误放进预算并阻止启动，绝不猜一张。
+                // 对端有多张候选：要求明确选择，不能猜一张用于预算。
                 let mut plan = budget::plan(&self.state.config, host, None);
                 plan.errors.push(error);
                 plan.can_start = false;
@@ -672,13 +676,13 @@ impl Worker {
         self.refresh()?;
         let host = adapters::resolve(&self.state.host_adapters, &self.state.host_adapter)?
             .ok_or(if self.state.host_adapters.is_empty() {
-                "未找到可确认的物理接收网卡；请检查 Npcap 与网卡连接后刷新。"
+                "未找到已连接的物理接收网卡；请检查 Npcap 与网卡连接后刷新。"
             } else {
                 "请选择本机接收网卡。"
             })?
             .clone();
-        // 自动 MTU 必须在 prepare 前知道两端网卡：显式选择优先，否则只接受
-        // 唯一 I226；多张 I226 明确报错，绝不在启动时静默挑一张。
+        // 自动 MTU 必须在 prepare 前知道两端网卡：显式选择优先；对端只有一张
+        // 已连接物理网卡时才自动预览，多张必须显式选择。
         let peer_preview = self.peer_preview_adapter()?;
         let effective =
             budget::host_effective_config(&self.state.config, Some(&host), peer_preview.as_ref())?;
@@ -692,8 +696,8 @@ impl Worker {
         let prepared: PreparedSession = serde_json::from_value(peer.prepare_sender(&body)?)
             .map_err(|e| format!("采集准备响应无效：{e}"))?;
         request.confirm(&prepared)?;
-        if !prepared.adapter.is_physical_nic() {
-            return Err("被采集机未确认物理发送网卡，拒绝启动。".into());
+        if !prepared.adapter.is_connected_physical_nic() {
+            return Err("被采集机未确认已连接的物理发送网卡，拒绝启动。".into());
         }
         // 响应回显的 MTU 已由 confirm 精确比对；再按实际发送网卡报告复核，
         // 采集端自行自动选卡时也不允许超过其 NlMtu。绝不修改网卡设置。
@@ -1129,7 +1133,7 @@ enum HostSelection {
     Keep,
     /// 原本没有选择且无需用户介入，可按控制连接自动选卡。
     Auto,
-    /// 原选择不是合格物理网卡或已不存在：清除，且不自动改选。
+    /// 原选择未连接、不是物理网卡或已不存在：清除，且不自动改选。
     Clear,
 }
 
@@ -1159,6 +1163,7 @@ mod tests {
         AdapterInfo {
             name: name.into(),
             description: "test nic".into(),
+            status: Some("Up".into()),
             hardware_interface: Some(true),
             virtual_nic: Some(false),
             ..Default::default()
@@ -1199,7 +1204,7 @@ mod tests {
             reconcile_host_selection("", &physical, true),
             HostSelection::Keep
         );
-        // 没有任何物理网卡时同样无从自动选择。
+        // 没有任何已连接物理网卡时同样无从自动选择。
         assert_eq!(
             reconcile_host_selection("", &[], false),
             HostSelection::Auto
@@ -1221,51 +1226,36 @@ mod tests {
 
     fn nic_with_mtu(name: &str, mtu: Option<u32>) -> AdapterInfo {
         AdapterInfo {
-            name: name.into(),
-            description: "test nic".into(),
             label: Some(name.into()),
-            hardware_interface: Some(true),
-            virtual_nic: Some(false),
             mtu,
-            ..Default::default()
-        }
-    }
-
-    fn i226(name: &str, mtu: Option<u32>) -> AdapterInfo {
-        AdapterInfo {
-            description: "Intel(R) Ethernet Controller I226-V".into(),
-            ..nic_with_mtu(name, mtu)
+            ..nic(name)
         }
     }
 
     #[test]
-    fn peer_preview_prefers_unique_i226_and_refuses_multiple_cards() {
+    fn peer_preview_accepts_any_single_connected_physical_nic_and_refuses_multiple() {
         let (mut worker, _tx) = test_worker("http://127.0.0.1:1");
-        worker.state.peer_adapters = vec![
-            i226(r"\Device\NPF_{A}", Some(9000)),
-            nic_with_mtu(r"\Device\NPF_{R}", Some(9000)),
-        ];
+        let mut intel = nic_with_mtu(r"\Device\NPF_{A}", Some(9000));
+        intel.description = "Intel I226-V".into();
+        let mut realtek = nic_with_mtu(r"\Device\NPF_{R}", Some(1500));
+        realtek.description = "Realtek 2.5GbE".into();
+        worker.state.peer_adapters = vec![realtek.clone()];
         assert_eq!(
             worker.peer_preview_adapter().unwrap().unwrap().name,
-            r"\Device\NPF_{A}"
+            realtek.name
         );
 
-        worker.state.peer_adapters = vec![
-            i226(r"\Device\NPF_{A}", Some(9000)),
-            i226(r"\Device\NPF_{B}", Some(1500)),
-        ];
+        worker.state.peer_adapters = vec![intel, realtek.clone()];
         let error = worker.peer_preview_adapter().unwrap_err();
         assert!(error.contains("2 张") && error.contains("静默"), "{error}");
 
-        // 显式选择保持原样，不被 I226 偏好改写。
-        worker.state.peer_adapter = r"\Device\NPF_{B}".into();
-        assert_eq!(
-            worker.peer_preview_adapter().unwrap().unwrap().name,
-            r"\Device\NPF_{B}"
-        );
-
+        // 多卡时保留显式选择，不按厂商或列表顺序改写。
+        worker.state.peer_adapter = realtek.name.clone();
+        assert_eq!(worker.peer_preview_adapter().unwrap().unwrap(), realtek);
+        worker.state.peer_adapters[1].status = Some("Disconnected".into());
+        assert!(worker.peer_preview_adapter().is_err());
         worker.state.peer_adapter.clear();
-        worker.state.peer_adapters = vec![nic_with_mtu(r"\Device\NPF_{R}", Some(9000))];
+        worker.state.peer_adapters.clear();
         assert!(worker.peer_preview_adapter().unwrap().is_none());
     }
 
@@ -1274,7 +1264,7 @@ mod tests {
         let (mut worker, _tx) = test_worker("http://127.0.0.1:1");
         worker.state.host_adapters = vec![nic_with_mtu(r"\Device\NPF_{H}", Some(9000))];
         worker.state.host_adapter = r"\Device\NPF_{H}".into();
-        worker.state.peer_adapters = vec![i226(r"\Device\NPF_{P}", Some(1500))];
+        worker.state.peer_adapters = vec![nic_with_mtu(r"\Device\NPF_{P}", Some(1500))];
 
         worker.recompute();
         assert_eq!(worker.state.effective_mtu, Some(1500));
@@ -1307,7 +1297,7 @@ mod tests {
         worker.state.config.capture.mtu = 9000;
         worker.state.host_adapters = vec![nic_with_mtu(r"\Device\NPF_{H}", Some(1500))];
         worker.state.host_adapter = r"\Device\NPF_{H}".into();
-        worker.state.peer_adapters = vec![i226(r"\Device\NPF_{P}", Some(9000))];
+        worker.state.peer_adapters = vec![nic_with_mtu(r"\Device\NPF_{P}", Some(9000))];
 
         worker.recompute();
         assert_eq!(worker.state.effective_mtu, None);

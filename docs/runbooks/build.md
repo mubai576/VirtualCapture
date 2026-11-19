@@ -40,7 +40,7 @@ cmake --build build/rust-package-native --config Release
 cmake --install build/rust-package-native --config Release --prefix build/rust-native-runtime --component Runtime
 ```
 
-固定提交及SHA256在 `rust/packaging/native/Pyrowave.cmake`，下载档案进入该构建目录 `_deps/downloads/` 并校验，缺失/错误就失败；不改 `thirdparty/`。产物为 `libpyrowave-shared-1.dll`、MSVC DLL及原始许可。运行PyroWave还需显卡驱动提供 Vulkan1.3；不需构建机安装Vulkan SDK，不再依赖TurboJPEG/NASM。
+固定提交及SHA256在 `rust/packaging/native/Pyrowave.cmake`，下载档案进入该构建目录 `_deps/downloads/` 并校验，缺失/错误就失败；不改 `thirdparty/`。Runtime组件安装 `libpyrowave-shared-1.dll` 与MSVC DLL；独立 `LicenseAudit` 组件只将上游许可文本装入构建审计目录，不属于Runtime，也不进入便携包。运行PyroWave还需显卡驱动提供 Vulkan1.3；不需构建机安装Vulkan SDK，不再依赖TurboJPEG/NASM。
 
 ## 完整便携包
 
@@ -54,7 +54,7 @@ python scripts/package.py
 python scripts/package.py --allow-dirty
 ```
 
-唯一实现 `rust/packaging/package.py`，精确载荷 `inventory.py`。自动fmt/tests/Clippy/Release/native install、许可/PE审计、解压运行、DLL/网卡/GUI/OTA隔离门；`--extended-smokes`追加control/host_update。GUI黑屏不可绕过，任一失败不发布最终包。
+唯一实现 `rust/packaging/package.py`，精确载荷 `inventory.py`。自动fmt/tests/Clippy/Release/native install、构建期许可/PE审计、解压运行、DLL/网卡/GUI/OTA隔离门；审计文本留在构建验证目录，不进入便携包。独立 `vc-stream.exe`/`vc-transport.exe` 仅供构建树诊断，包内保留运行时所需 `vc-vcam-verify.exe`。`--extended-smokes`追加control/host_update。GUI黑屏不可绕过，任一失败不发布最终包。
 
 输出唯一 `dist/VirtualCapture-Rust-<版本>-windows-x64-<时间>-<id>/`、ZIP和SHA256，不覆盖已用 `dist/VirtualCapture`；日志/候选在 `build/rust-package/<build_id>/`。构建过程中源码改变即失败；来源/载荷不得收录现有凭据、配置、证据或未审阅并发改动。
 

@@ -222,6 +222,7 @@ def main():
         adapters = json.loads(listed.stdout)
         physical = [item for item in adapters if item.get("hardware_interface") is True
                     and item.get("virtual") is False
+                    and (item.get("status") or "").strip().lower() == "up"
                     and item["name"].lower() != r"\Device\NPF_Loopback".lower()]
         (RUN / "adapters.json").write_text(json.dumps({"all": adapters, "physical": physical}, ensure_ascii=False, indent=2), encoding="utf-8")
         # A saved virtual selection must be cleared, never quietly replaced.

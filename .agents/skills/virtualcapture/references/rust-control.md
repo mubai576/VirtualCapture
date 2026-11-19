@@ -46,8 +46,8 @@ PreparedSession为 `{capture,batch_packets,session_id,source_mac,adapter:Adapter
 ## 网卡与MTU
 
 - AdapterInfo有 `mtu: u32|null`（IPv4 NlMtu），旧对端缺字段可反序列化但不能据此证明MTU。查询只读Get-NetAdapter/Get-NetIPInterface，不Set、不加14、不改Jumbo。
-- 产品只接受Windows明确 `hardware_interface=true` 且 `virtual=false` 的网卡，不把元数据未知当物理卡。列表/选择/prepare/start一致，不能手填隐藏设备绕过。保存的显式选择保持，失效后清除并要求重选。
-- 未明确选择时优先唯一合格Intel I226；多个I226报错，不选首卡；无I226才沿用控制连接出站IPv4的精确路由匹配。明确清空/失效选择不反复自动替换。prepare后start固定精确网卡名，不重新静默选卡。
+- 产品只接受Windows明确 `hardware_interface=true`、`virtual=false` 且 `Status=Up` 的网卡，不把元数据未知当物理卡或已连接。列表/选择/prepare/start一致，不能手填隐藏设备绕过。保存的显式选择保持，失效后清除并要求重选。
+- 不按厂商或型号偏置。采集端及本机主机按控制连接的出站IPv4精确匹配自动选择；对端仅在唯一已连接物理网卡时自动预览，多候选要求明确选择。明确清空/失效选择不反复自动替换。prepare后start固定精确网卡名，不重新静默选卡。
 - 新Capture默认 `mtu_auto=true`；旧配置缺字段反序列化为false，保留旧显式mtu。自动值为 `min(本机接收NIC NlMtu, 被采集机发送NIC NlMtu, 9000)`，双端需先确定；缺报告、低于1500或Loopback均拒绝自动解析。无法预选被采集机网卡时须明确选择或使用显式MTU。
 - 手动MTU范围1500..9000，不得超过实际网卡报告；物理卡未知报告同样拒绝，不能靠手动模式猜值。GUI显示双端报告值、生效值及自动/显式状态。
 - 主机产生有效配置副本，冻结mtu并令 `mtu_auto=false`，镜像receive.mtu；保存草稿不变。预算/prepare/start/DLL批大小共用此值；响应MTU、mtu_auto、全部capture和网卡须精确确认；采集端按实际卡再次复核。

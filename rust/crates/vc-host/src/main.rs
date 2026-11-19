@@ -279,17 +279,24 @@ impl HostApp {
     }
 
     /// 被采集机发送网卡的 MTU 预览：显式选择按名称匹配，自动模式只接受
-    /// 唯一 Intel I226；多张 I226 返回错误而不是猜一张。
+    /// 唯一已连接物理网卡；多张时要求明确选择。
     fn peer_nic_mtu(&self) -> Result<Option<u32>, String> {
         if !self.snapshot.peer_adapter.is_empty() {
-            return Ok(self
+            let adapter = self
                 .snapshot
                 .peer_adapters
                 .iter()
                 .find(|item| item.name == self.snapshot.peer_adapter)
-                .and_then(|item| item.mtu));
+                .ok_or_else(|| "所选发送网卡不在当前已连接网卡列表中。".to_string())?;
+            if !adapter.is_connected_physical_nic() {
+                return Err("所选发送网卡未连接或不是物理设备，请重新选择。".into());
+            }
+            return Ok(adapter.mtu);
         }
-        Ok(vc_core::adapters::unique_i226(&self.snapshot.peer_adapters)?.and_then(|item| item.mtu))
+        Ok(
+            vc_core::adapters::unique_connected_physical(&self.snapshot.peer_adapters)?
+                .and_then(|item| item.mtu),
+        )
     }
 
     /// 本次生效 MTU 的说明：自动模式取主机解析结果，显式模式取配置值。
@@ -313,7 +320,7 @@ impl HostApp {
         let peer = match self.peer_nic_mtu() {
             Ok(Some(value)) => value.to_string(),
             Ok(None) => "未知".into(),
-            Err(_) => "I226 不唯一".into(),
+            Err(error) => error,
         };
         format!(
             "网卡实际 MTU：本机 {host} · 被采集机 {peer}；生效 MTU：{}",
@@ -521,12 +528,13 @@ impl HostApp {
         let mut section = div().flex().flex_col().gap_2();
         if self.snapshot.host_adapters.is_empty() {
             let (title, detail) = match self.snapshot.host_scan {
-                HostScan::NotScanned => ("等待识别物理网卡", "连接设备或点击刷新后识别。"),
-                HostScan::NoPhysical => {
-                    ("未发现可用物理网卡", "请检查 Npcap 和系统网卡信息后刷新。")
-                }
+                HostScan::NotScanned => ("等待识别已连接网卡", "连接设备或点击刷新后识别。"),
+                HostScan::NoPhysical => (
+                    "未发现已连接的物理网卡",
+                    "请检查 Npcap 和系统网卡连接状态后刷新。",
+                ),
                 HostScan::Failed => ("网卡识别失败", "请检查本机环境后点击刷新重试。"),
-                HostScan::Ready => ("请选择物理网卡", "点击刷新重新识别网卡。"),
+                HostScan::Ready => ("请选择接收网卡", "点击刷新重新识别网卡。"),
             };
             section = section.child(empty_hint(title, detail));
         }
@@ -534,7 +542,7 @@ impl HostApp {
             div()
                 .text_size(px(11.))
                 .text_color(rgb(TEXT_DIM))
-                .child("仅显示物理网卡，已隐藏虚拟设备与回环。"),
+                .child("仅显示已连接的物理网卡，虚拟设备、未连接设备与回环已隐藏。"),
         );
         for item in &self.snapshot.host_adapters {
             section = section.child(self.adapter_row(
@@ -581,7 +589,7 @@ impl HostApp {
                         div()
                             .text_size(px(11.))
                             .text_color(rgb(TEXT_DIM))
-                            .child("优先唯一 Intel I226，否则跟随控制连接"),
+                            .child("仅限已连接物理网卡；多张请手动选择"),
                     ),
             );
         if !locked {
@@ -593,6 +601,12 @@ impl HostApp {
                 }));
         }
         let mut section = div().flex().flex_col().gap_2().child(auto);
+        if self.snapshot.connected && self.snapshot.peer_adapters.is_empty() {
+            section = section.child(empty_hint(
+                "未发现已连接的物理网卡",
+                "请检查被采集机 Npcap 和网卡连接后刷新。",
+            ));
+        }
         for item in &self.snapshot.peer_adapters {
             section = section.child(self.adapter_row(
                 cx,

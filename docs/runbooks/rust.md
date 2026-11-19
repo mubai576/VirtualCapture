@@ -19,7 +19,7 @@
 
 Ctrl+C正常退出采集后台；GUI停止/正常关窗按精确会话停远端、本机DLL和本次管理的虚拟卡。真实注册操作必须单独授权；测试优先使用下述不注册的隔离工具。
 
-配置独立 `vc-rust-config.json`，不导入旧Python配置。CLI `--root/--native-dir` 优先于环境变量；显式native目录缺文件就失败，不从旧构建补齐。默认DDA/硬件GPU/640²@240/Raw/crop；pattern是显式合成诊断。普通产品只允许已识别物理网卡，默认优先唯一I226；多I226须选定，失效选择需重选。MTU默认读取双端值，可切手动，不能超过已报告网卡限制；不修改驱动Jumbo。
+配置独立 `vc-rust-config.json`，不导入旧Python配置。CLI `--root/--native-dir` 优先于环境变量；显式native目录缺文件就失败，不从旧构建补齐。默认DDA/硬件GPU/640²@240/Raw/crop；pattern是显式合成诊断。普通产品枚举状态为Up的物理非虚拟网卡，不按厂商或型号偏置；本机按控制连接路由自动选择，对端多候选须手动选择，失效选择需重选。MTU默认读取双端值，可切手动，不能超过已报告网卡限制；不修改驱动Jumbo。
 
 PyroWave需显式授权开发编码、精确双端 `pyrowave:vulkan` 与Vulkan1.3真实GPU；不支持MJPEG/CPU转换，无自动降级。深蓝画幅只是尺寸比例示意，不是实时预览。
 

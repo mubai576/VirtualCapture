@@ -13,7 +13,7 @@ description: VirtualCapture Rust 采集、GPU NV12 转换、Npcap L2 传输、SH
 | 任务 | 契约 |
 |---|---|
 | 冻结 28B 包头、MTU、批提交、会话隔离 | `references/wire-protocol.md` |
-| REST v2、I226/MTU、预算、模块生命周期、OTA/归属 | `references/rust-control.md` |
+| REST v2、网卡/MTU、预算、模块生命周期、OTA/归属 | `references/rust-control.md` |
 | PyroWave、48B VCAU、有界解码与有损对账 | `references/encoded-stream.md` |
 | T0–T5、D1、不允许放宽的门限 | `references/test-matrix.md` |
 | 便携载荷、来源与硬门禁 | `references/packaging.md` |
@@ -23,7 +23,7 @@ description: VirtualCapture Rust 采集、GPU NV12 转换、Npcap L2 传输、SH
 ## 不变量
 
 - 范围仅采集与传输。主机 `vc-host` GPUI 接收，被采集机 `vc-capture` REST v2 发送；角色以实际运行状态为准，不从历史 PC 编号推断。
-- 两端同网卡承载 L2 数据与 IPv4 控制，保留控制 IP；不改系统 MAC。普通产品仅接受系统明确物理/非虚拟网卡。
+- 两端同网卡承载 L2 数据与 IPv4 控制，保留控制 IP；不改系统 MAC。普通产品仅接受 Windows 明确标记为 Up 的物理/非虚拟网卡，不偏置厂商或型号；路由自动选择，多候选需明确选择。
 - `proto/vc_wire.h` 冻结 28B、EtherType `0x88B5`；改动必须先获 owner 批准。
 - `vc_stream.dll` 在宿主进程内运行，与诊断 EXE 共享实现；不回退已移除的产品进程。
 - DDA/WGC 必须硬件 GPU 转换，无 WARP/CPU 降级；`pattern` 是独立合成诊断。编码仅 Raw 与显式 PyroWave；旧 MJPEG 拒绝启动。

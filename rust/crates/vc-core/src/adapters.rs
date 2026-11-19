@@ -62,7 +62,16 @@ impl AdapterInfo {
             && !is_loopback_device(self)
     }
 
-    /// 兼容旧名：主机接收网卡与采集网卡共用同一物理判定。
+    /// 产品候选必须是已连接的物理网卡；未知状态不能当作已连接。
+    pub fn is_connected_physical_nic(&self) -> bool {
+        self.is_physical_nic()
+            && self
+                .status
+                .as_deref()
+                .is_some_and(|status| status.trim().eq_ignore_ascii_case("up"))
+    }
+
+    /// 兼容旧名：只判断物理身份，不包含连接状态。
     pub fn is_physical_host_nic(&self) -> bool {
         self.is_physical_nic()
     }
@@ -75,11 +84,12 @@ pub fn is_loopback_device(item: &AdapterInfo) -> bool {
 
 const NPF_LOOPBACK: &str = r"\Device\NPF_Loopback";
 
-/// 过滤出可确认的物理网卡，保持原有顺序；虚拟、回环与元数据未知都不进入。
+/// 过滤出已连接的物理网卡，保持枚举顺序；不按厂商或型号优先。
+/// 虚拟、回环、未连接与元数据未知设备都不进入产品列表。
 pub fn physical_nics(items: &[AdapterInfo]) -> Vec<AdapterInfo> {
     items
         .iter()
-        .filter(|item| item.is_physical_nic())
+        .filter(|item| item.is_connected_physical_nic())
         .cloned()
         .collect()
 }
@@ -373,6 +383,14 @@ pub fn choose_local_adapter<'a>(
         .local_addr()
         .map_err(|error| format!("无法读取本机出站地址：{error}"))?
         .ip();
+    adapter_for_local_ip(items, local_ip)
+}
+
+/// 路由匹配只接受已连接物理网卡；回环仅供上层显式诊断门禁使用。
+fn adapter_for_local_ip(
+    items: &[AdapterInfo],
+    local_ip: std::net::IpAddr,
+) -> Result<&AdapterInfo, String> {
     if local_ip.is_loopback() {
         return items
             .iter()
@@ -382,69 +400,43 @@ pub fn choose_local_adapter<'a>(
     let local = local_ip.to_string();
     let matches: Vec<&AdapterInfo> = items
         .iter()
-        .filter(|item| item.addresses.iter().any(|address| address.ip == local))
+        .filter(|item| {
+            item.is_connected_physical_nic()
+                && item.addresses.iter().any(|address| address.ip == local)
+        })
         .collect();
     match matches.len() {
         1 => Ok(matches[0]),
         0 => Err(format!(
-            "无法把本机出站地址 {local} 匹配到采集网卡，请检查网口 IPv4 配置。"
+            "无法把本机出站地址 {local} 匹配到已连接的物理网卡，请检查网口 IPv4 配置或明确选择网卡。"
         )),
         _ => Err(format!(
-            "本机出站地址 {local} 匹配到 {} 张网卡，无法唯一选择。",
+            "本机出站地址 {local} 匹配到 {} 张已连接的物理网卡，无法唯一选择。",
             matches.len()
         )),
     }
 }
 
-/// Intel I226 标记：只看系统名称/描述，大小写无关。
-fn is_i226(item: &AdapterInfo) -> bool {
-    item.description.to_ascii_lowercase().contains("i226")
-        || item
-            .label
-            .as_deref()
-            .is_some_and(|label| label.to_ascii_lowercase().contains("i226"))
-}
-
-/// 可确认物理网卡中的唯一 Intel I226。
-///
-/// 0 张返回 `Ok(None)`；多于 1 张返回错误而不是静默挑第一张，调用方必须要求
-/// 显式选择。虚拟网卡、回环与元数据未知的设备永远不参与 I226 优选。
-pub fn unique_i226(items: &[AdapterInfo]) -> Result<Option<&AdapterInfo>, String> {
-    let matches: Vec<&AdapterInfo> = items
-        .iter()
-        .filter(|item| item.is_physical_nic() && is_i226(item))
-        .collect();
-    match matches.len() {
-        0 => Ok(None),
-        1 => Ok(Some(matches[0])),
+/// 对端预览无法从本机查询远端路由，只在已连接物理网卡唯一时自动确认。
+/// 没有候选返回 None；多张要求手动选择，任何厂商/型号都一视同仁。
+pub fn unique_connected_physical(items: &[AdapterInfo]) -> Result<Option<&AdapterInfo>, String> {
+    let mut candidates = items.iter().filter(|item| item.is_connected_physical_nic());
+    let first = candidates.next();
+    let count = usize::from(first.is_some()) + candidates.count();
+    match count {
+        0 | 1 => Ok(first),
         count => Err(format!(
-            "检测到 {count} 张可确认的 Intel I226 物理网卡，无法自动唯一选择；请在配置中显式指定网卡，绝不静默挑一张。"
+            "检测到 {count} 张已连接的物理网卡，请手动选择发送网卡；不会按厂商或型号静默挑选。"
         )),
     }
 }
 
-/// 未显式选择网卡时的自动选择：非回环控制器优先唯一 Intel I226，
-/// 否则沿用按控制连接出站 IPv4 精确匹配的路由选择。
-///
-/// 回环控制器（本机诊断）始终走 Npcap 回环，不因机器上存在 I226 而改选物理网卡。
-/// 多张 I226 直接报错；显式选择不经过本函数，保持原样。
+/// 自动选择按控制连接出站 IPv4 精确匹配，不优先任何厂商或型号。
+/// 回环控制器仅返回 Npcap 回环，上层仍须核对显式诊断授权。
 pub fn choose_auto_adapter<'a>(
     items: &'a [AdapterInfo],
     controller_ip: &str,
 ) -> Result<&'a AdapterInfo, String> {
-    let ip: std::net::Ipv4Addr = controller_ip
-        .trim()
-        .parse()
-        .map_err(|_| format!("无效的主机 IPv4 地址：{controller_ip}"))?;
-    if ip.is_loopback() {
-        return items
-            .iter()
-            .find(|item| is_loopback_device(item))
-            .ok_or_else(|| "找不到 Npcap 回环设备（\\Device\\NPF_Loopback）。".to_string());
-    }
-    if let Some(i226) = unique_i226(items)? {
-        return Ok(i226);
-    }
     choose_local_adapter(items, controller_ip)
 }
 
@@ -547,6 +539,7 @@ mod tests {
         AdapterInfo {
             name: name.into(),
             description: "test nic".into(),
+            status: Some("Up".into()),
             hardware_interface: hardware,
             virtual_nic,
             ..Default::default()
@@ -572,12 +565,21 @@ mod tests {
     }
 
     #[test]
-    fn physical_host_nics_keeps_only_eligible_items_in_order() {
+    fn physical_host_nics_keeps_only_connected_physical_items_in_order() {
+        let mut disconnected = nic(r"\Device\NPF_{D}", Some(true), Some(false));
+        disconnected.status = Some("Disconnected".into());
+        let mut unknown_status = nic(r"\Device\NPF_{S}", Some(true), Some(false));
+        unknown_status.status = None;
+        let mut disabled = nic(r"\Device\NPF_{X}", Some(true), Some(false));
+        disabled.status = Some("Disabled".into());
         let items = vec![
             nic(r"\Device\NPF_{B}", Some(true), Some(false)),
             nic(r"\Device\NPF_{V}", Some(true), Some(true)),
             nic(r"\Device\NPF_{U}", None, None),
             nic(r"\Device\NPF_Loopback", Some(true), Some(false)),
+            disconnected,
+            unknown_status,
+            disabled,
             nic(r"\Device\NPF_{A}", Some(true), Some(false)),
         ];
         let names: Vec<String> = physical_host_nics(&items)
@@ -585,6 +587,19 @@ mod tests {
             .map(|item| item.name)
             .collect();
         assert_eq!(names, vec![r"\Device\NPF_{B}", r"\Device\NPF_{A}"]);
+    }
+
+    #[test]
+    fn connected_physical_requires_status_up_and_physical_metadata() {
+        let mut down = nic(r"\Device\NPF_{D}", Some(true), Some(false));
+        down.status = Some("Down".into());
+        let mut missing = nic(r"\Device\NPF_{M}", Some(true), Some(false));
+        missing.status = None;
+        assert!(nic(r"\Device\NPF_{U}", Some(true), Some(false)).is_connected_physical_nic());
+        assert!(!down.is_connected_physical_nic());
+        assert!(!missing.is_connected_physical_nic());
+        assert!(!nic(r"\Device\NPF_{V}", Some(true), Some(true)).is_connected_physical_nic());
+        assert!(!nic(r"\Device\NPF_Loopback", Some(true), Some(false)).is_connected_physical_nic());
     }
 
     #[test]
@@ -622,15 +637,14 @@ mod tests {
         assert!(physical_nics(&[nic(r"\Device\NPF_Loopback", Some(true), Some(false))]).is_empty());
     }
 
-    fn i226(name: &str, label: Option<&str>, description: &str) -> AdapterInfo {
+    fn addressed_nic(name: &str, description: &str, ip: &str) -> AdapterInfo {
         AdapterInfo {
-            name: name.into(),
             description: description.into(),
-            label: label.map(str::to_string),
-            hardware_interface: Some(true),
-            virtual_nic: Some(false),
-            mtu: Some(9000),
-            ..Default::default()
+            addresses: vec![AdapterAddress {
+                ip: ip.into(),
+                prefix: 24,
+            }],
+            ..nic(name, Some(true), Some(false))
         }
     }
 
@@ -648,109 +662,96 @@ mod tests {
     }
 
     #[test]
-    fn unique_i226_counts_only_confirmed_physical_matches() {
+    fn unique_connected_physical_accepts_any_vendor_and_ignores_ineligible_items() {
+        let mut disconnected = addressed_nic(r"\Device\NPF_{D}", "Intel I226-V", "192.0.2.2");
+        disconnected.status = Some("Disconnected".into());
+        let mut unknown = nic(r"\Device\NPF_{U}", Some(true), Some(false));
+        unknown.status = None;
         let items = vec![
-            i226(r"\Device\NPF_{A}", Some("Ethernet 2"), "Intel(R) I226-V"),
+            disconnected,
+            unknown,
             nic(r"\Device\NPF_{V}", Some(true), Some(true)),
-            AdapterInfo {
-                name: r"\Device\NPF_{U}".into(),
-                description: "Intel I226-V".into(),
-                ..Default::default()
-            },
-            i226(r"\Device\NPF_Loopback", None, "Intel I226-V"),
-            AdapterInfo {
-                name: r"\Device\NPF_{R}".into(),
-                description: "Realtek 2.5GbE".into(),
-                hardware_interface: Some(true),
-                virtual_nic: Some(false),
-                ..Default::default()
-            },
+            nic(r"\Device\NPF_{M}", None, None),
+            nic(r"\Device\NPF_Loopback", Some(true), Some(false)),
+            addressed_nic(r"\Device\NPF_{R}", "Realtek 2.5GbE", "192.0.2.3"),
         ];
-        let found = unique_i226(&items).unwrap().unwrap();
-        assert_eq!(found.name, r"\Device\NPF_{A}");
-        // 标签命中同样有效。
-        let by_label = vec![i226(
-            r"\Device\NPF_{B}",
-            Some("I226-LM Control"),
-            "Ethernet Controller",
-        )];
         assert_eq!(
-            unique_i226(&by_label).unwrap().unwrap().name,
-            r"\Device\NPF_{B}"
+            unique_connected_physical(&items).unwrap().unwrap().name,
+            r"\Device\NPF_{R}"
         );
-        // 没有 I226 时返回 None，而不是错误。
-        assert!(
-            unique_i226(&[nic(r"\Device\NPF_{R}", Some(true), Some(false))])
-                .unwrap()
-                .is_none()
-        );
+        assert!(unique_connected_physical(&items[..5]).unwrap().is_none());
+        assert!(unique_connected_physical(&[]).unwrap().is_none());
     }
 
     #[test]
-    fn unique_i226_refuses_to_pick_between_multiple_cards() {
+    fn unique_connected_physical_refuses_multiple_cards_regardless_of_vendor() {
         let items = vec![
-            i226(
-                r"\Device\NPF_{A}",
-                None,
-                "Intel(R) Ethernet Controller I226-V",
-            ),
-            i226(
-                r"\Device\NPF_{B}",
-                None,
-                "Intel(R) Ethernet Controller I226-LM",
-            ),
+            addressed_nic(r"\Device\NPF_{A}", "Intel I226-V", "192.0.2.2"),
+            addressed_nic(r"\Device\NPF_{B}", "Realtek 2.5GbE", "192.0.2.3"),
         ];
-        let error = unique_i226(&items).unwrap_err();
-        assert!(error.contains("2 张") && error.contains("显式指定") && error.contains("静默"));
+        let error = unique_connected_physical(&items).unwrap_err();
+        assert!(error.contains("2 张") && error.contains("手动选择") && error.contains("静默"));
     }
 
     #[test]
-    fn auto_adapter_prefers_unique_i226_without_route_dependency() {
+    fn route_match_follows_exact_address_not_vendor_or_order() {
         let items = vec![
-            i226(
-                r"\Device\NPF_{A}",
-                None,
-                "Intel(R) Ethernet Controller I226-V",
-            ),
-            nic(r"\Device\NPF_{B}", Some(true), Some(false)),
+            addressed_nic(r"\Device\NPF_{A}", "Intel I226-V", "192.0.2.2"),
+            addressed_nic(r"\Device\NPF_{B}", "Realtek 2.5GbE", "192.0.2.3"),
         ];
-        // TEST-NET-1 地址：唯一 I226 分支在创建路由探测前返回，不依赖真实网络。
-        let chosen = choose_auto_adapter(&items, "192.0.2.10").unwrap();
-        assert_eq!(chosen.name, r"\Device\NPF_{A}");
-        let error = choose_auto_adapter(&items[..1], "not-an-ip").unwrap_err();
+        let chosen = adapter_for_local_ip(&items, "192.0.2.3".parse().unwrap()).unwrap();
+        assert_eq!(chosen.name, r"\Device\NPF_{B}");
+        assert!(adapter_for_local_ip(&items, "192.0.2.30".parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn route_match_rejects_disconnected_virtual_unknown_and_ambiguous_cards() {
+        let address = "192.0.2.2".parse().unwrap();
+        let physical = addressed_nic(r"\Device\NPF_{P}", "Ethernet", "192.0.2.2");
+        let mut disconnected = physical.clone();
+        disconnected.name = r"\Device\NPF_{D}".into();
+        disconnected.status = Some("Disconnected".into());
+        let mut virtual_nic = physical.clone();
+        virtual_nic.virtual_nic = Some(true);
+        let mut unknown = physical.clone();
+        unknown.status = None;
+        let mut unknown_hardware = physical.clone();
+        unknown_hardware.hardware_interface = None;
+        let mut items = vec![disconnected, virtual_nic, unknown, unknown_hardware];
+        assert!(adapter_for_local_ip(&items, address).is_err());
+        items.push(physical.clone());
+        assert_eq!(
+            adapter_for_local_ip(&items, address).unwrap().name,
+            physical.name
+        );
+        let mut duplicate = physical;
+        duplicate.name = r"\Device\NPF_{OTHER}".into();
+        items.push(duplicate);
+        let error = adapter_for_local_ip(&items, address).unwrap_err();
+        assert!(error.contains("2 张") && error.contains("无法唯一选择"));
+    }
+
+    #[test]
+    fn auto_adapter_validates_controller_even_with_connected_cards() {
+        let items = vec![addressed_nic(
+            r"\Device\NPF_{A}",
+            "Intel I226-V",
+            "192.0.2.2",
+        )];
+        let error = choose_auto_adapter(&items, "not-an-ip").unwrap_err();
         assert!(error.contains("无效的主机 IPv4"));
     }
 
     #[test]
     fn auto_adapter_keeps_loopback_diagnostics_on_loopback_device() {
         let items = vec![
-            i226(
-                r"\Device\NPF_{A}",
-                None,
-                "Intel(R) Ethernet Controller I226-V",
-            ),
+            addressed_nic(r"\Device\NPF_{A}", "Intel I226-V", "192.0.2.2"),
             nic(r"\Device\NPF_Loopback", None, None),
         ];
         let chosen = choose_auto_adapter(&items, "127.0.0.1").unwrap();
         assert_eq!(chosen.name, r"\Device\NPF_Loopback");
-    }
-
-    #[test]
-    fn auto_adapter_reports_multiple_i226_before_route_probe() {
-        let items = vec![
-            i226(
-                r"\Device\NPF_{A}",
-                None,
-                "Intel(R) Ethernet Controller I226-V",
-            ),
-            i226(
-                r"\Device\NPF_{B}",
-                None,
-                "Intel(R) Ethernet Controller I226-LM",
-            ),
-        ];
-        let error = choose_auto_adapter(&items, "192.0.2.10").unwrap_err();
-        assert!(error.contains("2 张"));
+        // 没有显式提供回环设备时，不能回退到任意物理卡。
+        assert!(choose_auto_adapter(&items[..1], "127.0.0.1").is_err());
     }
 
     #[test]

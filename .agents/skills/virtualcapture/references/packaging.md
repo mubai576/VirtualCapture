@@ -13,9 +13,9 @@ GUI 截图必须非空白；黑屏就是失败，不删断言、不以窗口存�
 
 ## 载荷与运行前提
 
-- 图形入口 `VirtualCapture.exe`；Rust `vc-host/vc-capture/vc-updater/vc-stream/vc-transport/vc-vcam-verify.exe`。
+- 图形入口 `VirtualCapture.exe`；Rust `vc-host/vc-capture/vc-updater.exe` 与运行时隔离verifier `vc-vcam-verify.exe`。独立 `vc-stream.exe`/`vc-transport.exe` 只由构建树诊断使用，不随包分发。
 - `vc_stream.dll` C ABI v1、Rust `vc_vcam.dll`、`libpyrowave-shared-1.dll`、MSVC runtime。
-- 启动脚本、使用说明、生成的 `version.json`、许可证、`package-manifest.json`。
+- 启动脚本、使用说明、生成的 `version.json`、`package-manifest.json`。许可证仍在构建期收集和审计，不随便携包分发。
 - codecs 精确为 raw/pyrowave；sources 为 pattern/dda/wgc。旧 C++ 产品、`turbojpeg.dll` 与开发证据禁止进入包。
 - 目标机无需 Rust/Python/VS；实际收发需自行安装 Npcap。桌面转换需要硬件 D3D11；PyroWave 需真实 GPU 的 Vulkan1.3 驱动。驱动不随包复制。
 

@@ -2,7 +2,7 @@
 
 Runs the real `vc-capture.exe` on a random loopback port with an isolated ROOT.
 `--list-adapters` must stay a full diagnostic list, while `/adapters` must expose
-only confirmed physical NICs by default. Loopback requires the explicit
+only connected, confirmed physical NICs by default. Loopback requires the explicit
 `--allow-loopback-diagnostics` flag; if this build does not accept it yet, the
 loopback half is reported as unsupported instead of being silently skipped.
 """
@@ -130,7 +130,14 @@ def main():
     (RUN / "visible-adapters.json").write_text(
         json.dumps(visible, ensure_ascii=False, indent=2), encoding="utf-8")
     assert all(item.get("hardware_interface") is True and item.get("virtual") is False
+               and (item.get("status") or "").strip().lower() == "up"
                for item in visible), visible
+    assert visible, "No connected physical NIC is available for this adapter visibility smoke"
+    expected = {item["name"] for item in full
+                if item.get("hardware_interface") is True and item.get("virtual") is False
+                and (item.get("status") or "").strip().lower() == "up"
+                and item["name"].lower() != LOOPBACK.lower()}
+    assert {item["name"] for item in visible} == expected, (visible, full)
     assert all(item["name"].lower() != LOOPBACK.lower() for item in visible), visible
     assert code == 0, code
 
@@ -148,6 +155,7 @@ def main():
             json.dumps(with_diag, ensure_ascii=False, indent=2), encoding="utf-8")
         names = {item["name"] for item in with_diag}
         assert all(item.get("hardware_interface") is True and item.get("virtual") is False
+                   and (item.get("status") or "").strip().lower() == "up"
                    for item in with_diag if item["name"].lower() != LOOPBACK.lower()), with_diag
         loopback_check = "listed" if LOOPBACK in names else "device not present"
         assert code == 0, code
@@ -159,7 +167,7 @@ def main():
         "loopback_with_flag": loopback_check,
         "loopback_prepare_status": status,
         "checks": ["diagnostic --list-adapters remains full",
-                   "REST /adapters exposes only physical NICs",
+                   "REST /adapters matches all connected physical NICs without vendor filtering",
                    "REST /adapters hides Npcap Loopback by default",
                    "Loopback auto-route refused without diagnostics flag",
                    "refused probe started no capture session"],

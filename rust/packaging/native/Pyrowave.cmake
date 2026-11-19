@@ -80,12 +80,12 @@ function(vc_build_pyrowave)
   if(NOT CMAKE_CONFIGURATION_TYPES)
     install(FILES "${binary}/libpyrowave-shared-1.dll" DESTINATION . COMPONENT Runtime)
   endif()
-  install(FILES "${source}/LICENSE" DESTINATION licenses RENAME pyrowave-LICENSE.txt COMPONENT Runtime)
-  install(FILES "${source}/Granite/LICENSE" DESTINATION licenses RENAME granite-LICENSE.txt COMPONENT Runtime)
+  install(FILES "${source}/LICENSE" DESTINATION licenses RENAME pyrowave-LICENSE.txt COMPONENT LicenseAudit)
+  install(FILES "${source}/Granite/LICENSE" DESTINATION licenses RENAME granite-LICENSE.txt COMPONENT LicenseAudit)
   install(FILES "${source}/Granite/third_party/volk/LICENSE.md"
-    DESTINATION licenses RENAME volk-LICENSE.md COMPONENT Runtime)
+    DESTINATION licenses RENAME volk-LICENSE.md COMPONENT LicenseAudit)
   install(FILES "${source}/Granite/third_party/khronos/vulkan-headers/LICENSE.md"
-    DESTINATION licenses RENAME Vulkan-Headers-LICENSE.md COMPONENT Runtime)
+    DESTINATION licenses RENAME Vulkan-Headers-LICENSE.md COMPONENT LicenseAudit)
   install(DIRECTORY "${source}/Granite/third_party/khronos/vulkan-headers/LICENSES/"
-    DESTINATION licenses/Vulkan-Headers-LICENSES COMPONENT Runtime)
+    DESTINATION licenses/Vulkan-Headers-LICENSES COMPONENT LicenseAudit)
 endfunction()

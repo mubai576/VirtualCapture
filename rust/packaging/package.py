@@ -97,9 +97,13 @@ def build_native(log):
     run(["cmake", "--build", NATIVE_BUILD, "--config", "Release"], log)
 
 
-def install_native(stage, log):
+def install_native(stage, audit_root, log):
     run(["cmake", "--install", NATIVE_BUILD, "--config", "Release",
          "--component", "Runtime", "--prefix", stage], log)
+    native_audit = audit_root / "native"
+    native_audit.mkdir(parents=True, exist_ok=False)
+    run(["cmake", "--install", NATIVE_BUILD, "--config", "Release",
+         "--component", "LicenseAudit", "--prefix", native_audit], log)
 
 
 def copy_rust_payload(stage):
@@ -155,7 +159,7 @@ def import_audit(stage):
     return report
 
 
-def support_files(stage):
+def support_files(stage, native_license_dir):
     support = ROOT / "rust/packaging"
     scripts = stage / "scripts"
     scripts.mkdir()
@@ -181,8 +185,8 @@ def support_files(stage):
                ')\nexit /b %ERRORLEVEL%\n')
     (stage / "Start-Capture.cmd").write_text(capture, encoding="ascii", newline="\r\n")
     shutil.copy2(support / "README-zh.md", stage / "README.md")
-    (stage / "licenses").mkdir(exist_ok=True)
-    (stage / "licenses/MSVC-runtime.txt").write_text(
+    native_license_dir.mkdir(parents=True, exist_ok=True)
+    (native_license_dir / "MSVC-runtime.txt").write_text(
         "Microsoft Visual C++ 2015-2022 x64 runtime DLLs are copied from the installed "
         "Visual Studio Build Tools VC/Redist/MSVC Microsoft.VC143.CRT redistributable directory "
         "by CMake InstallRequiredSystemLibraries. These files are Microsoft software, "
@@ -199,14 +203,8 @@ def validate_inventory(stage):
     missing = [name for name in inventory.REQUIRED_FILES if not (stage / name).is_file()]
     if missing:
         raise RuntimeError(f"Missing payload files: {missing}")
-    missing_licenses = [name for name in inventory.REQUIRED_LICENSES
-                        if not (stage / "licenses" / name).is_file()]
-    if missing_licenses:
-        raise RuntimeError(f"Missing native/legal files: {missing_licenses}")
-    missing_rust_licenses = [name for name in inventory.RUST_LICENSE_OUTPUTS
-                             if not (stage / "licenses" / name).is_file()]
-    if missing_rust_licenses:
-        raise RuntimeError(f"Missing Rust license outputs: {missing_rust_licenses}")
+    if (stage / "licenses").exists():
+        raise RuntimeError("License audit materials must not be included in the portable payload")
     present = {p.name.lower() for p in stage.rglob("*") if p.is_file()}
     forbidden = sorted(present & inventory.FORBIDDEN_NAMES)
     if forbidden:
@@ -219,15 +217,35 @@ def validate_inventory(stage):
         raise RuntimeError(f"Development/runtime data in payload: {forbidden_paths}")
 
 
-def collect_rust_licenses(stage):
+def collect_rust_licenses(audit_root):
     collector = load_sibling("collect_licenses")
-    summary = collector.collect_licenses(ROOT, stage / "licenses/rust")
+    summary = collector.collect_licenses(ROOT, audit_root)
     if summary.get("exceptions"):
         raise RuntimeError(f'Unresolved dependency license texts: {summary["exceptions"]}')
     return summary
 
 
-def manifest(stage, source, version, licenses, imports, tag, checks):
+def validate_license_material(native_license_dir, rust_audit_root, summary):
+    missing_native = [name for name in inventory.NATIVE_LICENSE_AUDIT_FILES
+                      if not (native_license_dir / name).is_file()]
+    if missing_native:
+        raise RuntimeError(f"Missing native license audit inputs: {missing_native}")
+    missing_rust = [name for name in inventory.RUST_LICENSE_AUDIT_OUTPUTS
+                    if not (rust_audit_root / name).is_file()]
+    if missing_rust or not (rust_audit_root / "crates").is_dir():
+        raise RuntimeError(f"Incomplete Rust license audit outputs: {missing_rust}")
+    if summary.get("exceptions"):
+        raise RuntimeError(f'Unresolved dependency license texts: {summary["exceptions"]}')
+    return {
+        "target": summary["target"],
+        "third_party_packages": summary["counts"]["third_party_packages"],
+        "license_file_records": summary["counts"]["license_file_records"],
+        "exceptions": len(summary["exceptions"]),
+        "warnings": len(summary["warnings"]),
+    }
+
+
+def manifest(stage, source, version, imports, tag, checks):
     files = [{"path": p.relative_to(stage).as_posix(), "bytes": p.stat().st_size, "sha256": sha256(p)}
              for p in sorted(stage.rglob("*")) if p.is_file() and p.name != MARKER]
     result = {
@@ -243,14 +261,13 @@ def manifest(stage, source, version, licenses, imports, tag, checks):
         "source": source,
         "runtime_modules": {
             "in_process_dlls": list(inventory.RUST_DLLS),
-            "diagnostic_exes": ["vc-stream.exe", "vc-transport.exe", "vc-vcam-verify.exe"],
+            "diagnostic_exes": ["vc-vcam-verify.exe"],
             "codec_dlls": dict(inventory.CODEC_DLLS),
             "codecs": list(inventory.CODECS),
             "sources": list(inventory.SOURCES),
             "stream_abi": inventory.STREAM_ABI,
             "legacy_cpp_product": [],
         },
-        "rust_dependencies": licenses,
         "pe_imports": imports,
         "checks": dict(checks),
         "limits": [
@@ -311,10 +328,15 @@ def main():
              "--release", "--locked"], log)
 
         build_native(log)
-        install_native(stage, log)
+        license_audit_root = work / "license-audit"
+        native_license_dir = license_audit_root / "native/licenses"
+        install_native(stage, license_audit_root, log)
         copy_rust_payload(stage)
-        support_files(stage)
-        license_summary = collect_rust_licenses(stage)
+        support_files(stage, native_license_dir)
+        rust_audit_root = license_audit_root / "rust"
+        license_summary = collect_rust_licenses(rust_audit_root)
+        license_audit = validate_license_material(native_license_dir, rust_audit_root, license_summary)
+        log.write(f"License audit passed (not distributed): {license_audit}\n")
         validate_inventory(stage)
         imports = import_audit(stage)
         (stage / "version.json").write_text(json.dumps({
@@ -345,7 +367,7 @@ def main():
             "raw_loopback_120_frames": "not run (requires --extended-smokes)",
             "host_controller_ota": "not run (requires --extended-smokes)",
         }
-        manifest(stage, source, version, license_summary, imports, tag, checks)
+        manifest(stage, source, version, imports, tag, checks)
 
         # ZIP and extract the payload before runtime checks, including Unicode/spaces.
         candidate = work / "candidate.zip"
@@ -386,7 +408,7 @@ def main():
 
         if source_snapshot() != source:
             raise RuntimeError("Source files changed while building; no archive published")
-        result = manifest(stage, source, version, license_summary, imports, tag, checks)
+        result = manifest(stage, source, version, imports, tag, checks)
         dist = ROOT / "dist"
         dist.mkdir(exist_ok=True)
         output = dist / name
@@ -414,7 +436,8 @@ def main():
         report = {"ok": True, "directory": str(output), "zip": str(archive_path),
                   "sha256": digest, "bytes": archive_path.stat().st_size,
                   "files": len(result["files"]) + 1, "log": str(log_path),
-                  "validation_directory": str(work), "checks": result["checks"]}
+                  "validation_directory": str(work), "checks": result["checks"],
+                  "license_audit": license_audit}
         (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n",
                                           encoding="utf-8")
         print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)

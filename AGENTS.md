@@ -6,7 +6,7 @@
 
 被采集机 DDA/WGC → 硬件 D3D11 GPU 转 NV12 → Npcap L2 `0x88B5` → 主机重组/解码 → SHM v3 → Rust DirectShow。默认 Raw，另有显式开发后端 `pyrowave:vulkan`。桌面采集禁止 CPU 转换、WARP 和静默降级；CPU MJPEG 已移除。PyroWave 仍有 CPU 上传/回读，不是零拷贝。
 
-网卡优先唯一 Intel I226，多个候选须明确选择；MTU 可配置，新配置默认读取双端网卡报告值，不修改系统网卡参数。640×640@240 Raw 为 614400 B/帧、约 1.18 Gbps 像素载荷；可变尺寸不等于任意组合已验收。
+网卡正常枚举 Windows 状态为 Up 的物理非虚拟网卡，不按厂商或型号偏置；控制连接路由可唯一确定时自动选择，多候选需明确选择。MTU 可配置，新配置默认读取双端网卡报告值，不修改系统网卡参数。640×640@240 Raw 为 614400 B/帧、约 1.18 Gbps 像素载荷；可变尺寸不等于任意组合已验收。
 
 产品宿主进程内加载 `vc_stream.dll` C ABI v1；DLL 与诊断 EXE 共享 Rust 实现，不拉起旧 sender/receiver。范围仅采集与传输，不含推理或独占全屏 Hook。
 

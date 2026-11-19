@@ -16,7 +16,7 @@
 
 该入口只构建第三方 `pyrowave-shared`，不构建旧C++产品；不关闭TLS校验，缺源码/摘要不符直接失败。构建使用随源码固定的Vulkan-Headers，不需系统Vulkan SDK；运行必须由显卡驱动提供Vulkan1.3。
 
-将本次构建的 `libpyrowave-shared-1.dll` 放在Rust模块同目录；完整包自动安装它、app-local MSVC与上游原始许可证。PyroWave/Granite为MIT；volk/Vulkan-Headers许可一并保留。依赖源码/二进制缓存不进Git，不改 `thirdparty/`。
+将本次构建的 `libpyrowave-shared-1.dll` 放在Rust模块同目录；完整包自动安装它与app-local MSVC。许可文本仅由打包流程在独立 `LicenseAudit` 组件/构建验证目录中收集核对，不进入便携包。依赖源码/二进制缓存不进Git，不改 `thirdparty/`。
 
 ## 本机验证（不注册、不部署）
 

@@ -64,12 +64,7 @@ class VcStreamApiV1(c.Structure):
 def validate_payload(package):
     missing = [name for name in inventory.REQUIRED_FILES if not (package / name).is_file()]
     assert not missing, f"Missing payload files: {missing}"
-    missing_licenses = [name for name in inventory.REQUIRED_LICENSES
-                        if not (package / "licenses" / name).is_file()]
-    assert not missing_licenses, f"Missing native/legal files: {missing_licenses}"
-    missing_rust = [name for name in inventory.RUST_LICENSE_OUTPUTS
-                    if not (package / "licenses" / name).is_file()]
-    assert not missing_rust, f"Missing Rust license outputs: {missing_rust}"
+    assert not (package / "licenses").exists(), "License audit materials must not be distributed"
     present = {p.name.lower() for p in package.rglob("*") if p.is_file()}
     forbidden = sorted(present & inventory.FORBIDDEN_NAMES)
     assert not forbidden, f"Legacy C++ production binaries in payload: {forbidden}"

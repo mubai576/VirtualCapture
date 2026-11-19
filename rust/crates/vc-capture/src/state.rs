@@ -42,7 +42,7 @@ impl Agent {
     pub fn running(&mut self) -> bool {
         self.slot.running() || self.slot.cleanup_pending()
     }
-    /// 对外列表只含可确认的物理网卡；诊断模式额外列出回环。
+    /// 对外列表只含已连接的物理网卡；诊断模式额外列出回环。
     pub fn adapters(&mut self, refresh: bool) -> Result<Vec<AdapterInfo>, String> {
         if !refresh
             && let Some((time, items)) = &self.adapters_cache
@@ -72,23 +72,24 @@ impl Agent {
         config.capture = request.capture.clone();
         config.receive.mtu = request.capture.mtu;
         process::validate_start_config(&config)?;
-        // 先做网卡门禁再探测能力：虚拟/未知/未授权的回环不能进入启动路径。
+        // 回环自动路由必须先获显式诊断许可，不依赖当前物理网卡数量。
+        if request.auto_adapter
+            && !self.loopback_diagnostics
+            && is_loopback_controller(controller_ip)
+        {
+            return Err(
+                "本机回环采集只用于显式诊断，后台需以 --allow-loopback-diagnostics 启动。".into(),
+            );
+        }
+        // 先做网卡门禁再探测能力：虚拟、未连接与未知设备不能进入启动路径。
         let items = self.adapters(true)?;
         if items.is_empty() {
-            return Err("被采集机未发现可确认的物理网卡；请检查 Npcap 与网卡连接。".into());
+            return Err("被采集机未发现已连接的物理网卡；请检查 Npcap 与网卡连接。".into());
         }
         let adapter = if request.auto_adapter {
-            match vc_core::adapters::choose_auto_adapter(&items, controller_ip) {
-                Ok(item) => item.clone(),
-                Err(error)
-                    if !self.loopback_diagnostics && is_loopback_controller(controller_ip) =>
-                {
-                    return Err(format!(
-                        "{error} 本机回环采集只用于显式诊断，后台需以 --allow-loopback-diagnostics 启动。"
-                    ));
-                }
-                Err(error) => return Err(format!("{error} 采集端只接受已确认的物理网卡。")),
-            }
+            vc_core::adapters::choose_auto_adapter(&items, controller_ip)
+                .map_err(|error| format!("{error} 采集端只接受已连接的物理网卡。"))?
+                .clone()
         } else {
             vc_core::adapters::resolve(&items, &request.adapter)?
                 .ok_or("请指定 adapter 或 auto_adapter。")?
@@ -186,8 +187,8 @@ fn is_loopback_controller(controller_ip: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// 采集端可见网卡：系统确认的物理设备；只有显式诊断开关才额外列出 Npcap 回环。
-/// 虚拟网卡、元数据未知设备与回环默认都不进入列表。
+/// 采集端可见网卡：系统确认且已连接的物理设备；只有显式诊断开关才额外列出 Npcap 回环。
+/// 虚拟网卡、未连接、元数据未知设备与回环默认都不进入列表。
 fn selectable_adapters(items: &[AdapterInfo], loopback_diagnostics: bool) -> Vec<AdapterInfo> {
     let mut selected = vc_core::adapters::physical_nics(items);
     if loopback_diagnostics {
@@ -219,6 +220,7 @@ mod tests {
         AdapterInfo {
             name: name.into(),
             description: "test nic".into(),
+            status: Some("Up".into()),
             hardware_interface: hardware,
             virtual_nic,
             ..Default::default()
@@ -226,20 +228,28 @@ mod tests {
     }
 
     #[test]
-    fn capture_list_excludes_virtual_unknown_and_loopback_by_default() {
+    fn capture_list_excludes_virtual_unknown_disconnected_and_loopback_by_default() {
+        let mut down = nic(r"\Device\NPF_{D}", Some(true), Some(false));
+        down.status = Some("Disconnected".into());
         let raw = vec![
             nic(r"\Device\NPF_{P}", Some(true), Some(false)),
             nic(r"\Device\NPF_{V}", Some(true), Some(true)),
             nic(r"\Device\NPF_{U}", None, None),
+            down,
             nic(r"\Device\NPF_Loopback", None, None),
         ];
         let visible = selectable_adapters(&raw, false);
         let names: Vec<&str> = visible.iter().map(|item| item.name.as_str()).collect();
         assert_eq!(names, vec![r"\Device\NPF_{P}"]);
-        // 隐藏的虚拟/未知网卡不能被手动选择器重新启用。
-        assert!(vc_core::adapters::resolve(&visible, r"\Device\NPF_{V}").is_err());
-        assert!(vc_core::adapters::resolve(&visible, r"\Device\NPF_{U}").is_err());
-        assert!(vc_core::adapters::resolve(&visible, r"\Device\NPF_Loopback").is_err());
+        // 隐藏设备不能经手动选择重新启用。
+        for name in [
+            r"\Device\NPF_{V}",
+            r"\Device\NPF_{U}",
+            r"\Device\NPF_{D}",
+            r"\Device\NPF_Loopback",
+        ] {
+            assert!(vc_core::adapters::resolve(&visible, name).is_err());
+        }
     }
 
     #[test]
