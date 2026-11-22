@@ -33,6 +33,22 @@ GPUI 角色切换曾出现标题/HTTP 已变化但画面保留旧视图的问题
 
 提交前复核修正便携 smoke 的 Host ROOT 创建顺序及实际 GPUI 窗口标题。OTA 清单新增显式 `role_launch_args` / `desktop_capture` 能力：D34 旧 unified 入口回滚不传新角色参数，图形采集目标缺能力时在停旧进程前拒绝。旧 staged metadata 缺少快照时从完整校验的 manifest 在内存补齐；已有快照不符、载荷哈希不符仍拒绝，不改写旧元数据。旧 job 保持可读，helper 复核目标后恢复能力快照。新增回归覆盖旧/新清单、旧元数据安装与复验、快照冲突及载荷篡改；capture OTA smoke 以 D34 格式元数据验证真实激活。首轮完整包 smoke 的 GUI 截图碰到 Windows 前台焦点限制，增加线程输入附加辅助后独立重跑全 GUI smoke 通过；仍要求前台 HWND 精确匹配并保留非空白截图硬门。
 
+## 提交与便携包交付
+
+| 项目 | 结果 |
+|---|---|
+| 源码提交 | `a661fea`（D35角色选择、持久化与OTA能力兼容）；`df2f0ad`（GUI前台证据激活辅助及此交付记录） |
+| 最终来源 | `df2f0adaa4d0678a8fe6aba12b39f445abbd56bb`，manifest 记录 `dirty=false` |
+| 版本 / build ID | `0.2.1` Windows x64 / `20261122-133707-9f6564` |
+| 便携目录 / ZIP | `dist/VirtualCapture-Rust-0.2.1-windows-x64-20261122-133707-9f6564/` 与同名 `.zip` |
+| ZIP 大小 / SHA-256 | `14,474,955` 字节 / `31038befdbdb2186ac44522e77e04c71461135d2ea8aa664281fd552bd92a389` |
+| 载荷 | 共 16 个归档成员（含 manifest），仅 `VirtualCapture.exe` 与 `vc-updater.exe` 两个 EXE；独立核对 ZIP CRC、SHA-256 sidecar 和清单均一致 |
+| 构建记录 | `build/rust-package/20261122-133707-9f6564/{report.json,package.log}` |
+
+从干净源码提交运行 `RUST_TEST_THREADS=1 python scripts/package.py --extended-smokes`，完整和扩展十项检查全部通过。workspace Rust 测试 332 passed、0 failed、0 ignored；fmt、Clippy `-D warnings`、Release、原生依赖/PE/许可审计通过。许可审计覆盖 524 个 crate、1329 条文件记录、0 个未解决例外、24 个警告；许可材料不进入便携包。
+
+解压运行的 portable、同进程 DLL Raw、网卡可见性、真实 GPUI GUI、采集 OTA、HostController OTA 与 Loopback 控制 smoke 全通过。GUI 真实截图覆盖首次选端、保存后重启、采集/接收两侧重选、Host 工作台；截图窗口必须在前台且内容非空。采集 OTA 将 D34 格式的旧 staged metadata（无能力快照）用于新包真实激活，原元数据保持未改写；清单和哈希校验、回滚及错误路径测试通过。Loopback 控制为 `motion`、416×416@60、120帧、batch 1，收发哈希一致；这不是物理链路性能证据。
+
 ## 边界
 
-D35 专项实现验收仅覆盖本机构建及隔离/回环测试；专项验证当时未重新打包、提交或部署，后续交付结果在下文追加。没有使用 PC2、没有物理网卡发包、没有注册 DirectShow，也没有读取或操作现存更新令牌、`staging/` 或 `prev/`。不构成物理链路、双机、240fps、长稳、画质或完整 Rust-R3 产品验收。
+本轮未使用 PC2、未在物理网卡发包、未注册真实 DirectShow，也未读取或操作现存更新令牌、`staging/` 或 `prev/`。便携包、GUI 和 Loopback 门禁不构成物理链路、双机、240fps、长稳、画质或完整 Rust-R3 产品验收；不部署、不 push、不切稳定版。
