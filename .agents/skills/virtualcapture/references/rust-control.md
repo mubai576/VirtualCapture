@@ -4,13 +4,14 @@
 
 ## 拓扑、入口与目录
 
-- 被采集机 `vc-capture` 为REST v2 CLI，直接运行默认 `0.0.0.0:5143`；便携 `Start-Capture.cmd` 无参数默认15143。主机省略端口仍5143，必须填写实际 `IPv4:端口`。
-- 主机 `vc-host` 为GPUI原生客户端，直接调用UI无关的 `vc-core::host::HostController`，没有本机REST或浏览器UI。
-- 宿主通过 `vc_module_get_api` 加载 `vc_stream.dll` C ABI v1，list_adapters/start/status/stop/destroy/capabilities；start异步排队。DLL与独立诊断 `vc-stream.exe` 共用vc-source/vc-media/vc-transport实现，不拉起旧sender/receiver。
-- DShow为Rust `vc_vcam.dll`；隔离工具 `vc-vcam-verify.exe` 也由Cargo构建，既支持只读能力探测，也支持实际COM graph验证，不注册、不回退注册枚举。vc-core自身的通用C ABI SDK外观尚未实现。
+- `VirtualCapture.exe` 默认启动 GPUI 桌面端：首次显示采集端/接收端角色选择，确认后原子保存 `{schema:1,role:capture|receive}` 到独立 `vc-startup.json`；之后启动进入已保存角色。扁平布局在 ROOT 保存；Managed 在 `data/` 保存，两个布局间回滚时仍优先保留已存在的 `data/` 偏好。接收工作台和空闲采集控制页均可“重新选择角色”；重新选择不会停用正在运行或待清理的会话，采集控制页关闭窗口同样先等待后台退出确认。
+- `VirtualCapture.exe --select-role` 忽略保存的角色并显示选择页；打开选择页不改偏好，点击确认后才保存。Managed 固定 ROOT 转发该选项与 `--capture-bind/--capture-port`，配置损坏时可用该入口重新选择；普通启动对损坏/未知 schema 明确报错，不猜测角色。
+- `VirtualCapture.exe capture` 仍运行 CLI REST v2 采集后台，默认 `0.0.0.0:5143`；桌面采集端也使用该监听地址/端口。可从桌面入口使用 `--capture-bind`、`--capture-port` 设置。命令行 capture 保留控制台及 Ctrl+C 停止行为。OTA 恢复实际运行角色及图形/后台模式，保留采集端 bind/port；Host 更新首启显式指定 receive，不会被用户保存的 capture 角色覆盖，也不重写用户偏好。更新 job 写入和读取均拒绝不兼容的角色参数组合。
+- 角色进程通过 `vc_module_get_api` 加载 `vc_stream.dll` C ABI v1，list_adapters/start/status/stop/destroy/capabilities；start异步排队。DLL与独立诊断 `vc-stream.exe` 共用vc-source/vc-media/vc-transport实现，不拉起旧sender/receiver。
+- Rust DShow `vc_vcam.dll` 的能力探测由当前 `VirtualCapture.exe` 隔离子进程完成。构建树 `vc-vcam-verify.exe` 保留实际 COM graph 验证，不注册、不回退注册枚举，不随包分发。vc-core自身的通用C ABI SDK外观尚未实现。
 - 产品唯一workspace/锁为 `rust/Cargo.toml` / `rust/Cargo.lock`，构建/门禁/唯一完整包见 `docs/runbooks/build.md`。CMake仅构建固定PyroWave第三方库，旧根CMake已移除。
-- 两入口接受 `--root` / `--native-dir` 与 `VC_ROOT` / `VC_NATIVE_DIR`，CLI优先。显式native目录缺文件即失败；通常按显式目录→Managed当前release→build→ROOT→exe目录查找Rust模块，不补旧产品。源码运行应显式指向Rust产物目录。
-- 日常GUI入口 `VirtualCapture.exe`（Cargo产物vc-launcher）为Windows GUI子系统+图标，直接解析current并启动GPUI，不用CMD/PowerShell。回执/日志写data/run/host-*，无令牌；错误用原生消息框。采集控制台保留供Ctrl+C退出。
+- 主程序两种角色接受 `--root` / `--native-dir` 与 `VC_ROOT` / `VC_NATIVE_DIR`，CLI 优先。默认 DLL 目录为实际角色 EXE 所在目录；显式目录缺文件即失败，源码运行可指向 Rust 产物目录。
+- 主程序以 Windows GUI 子系统和原生图标构建，无需启动包装。实际 GUI 的 PID/ROOT/EXE 回执写 `run/host-*`（Managed 为 `data/run/host-*`），无令牌。采集模式附着已有父控制台，保留重定向；`vc-updater launch --root <ROOT> --role capture` 提供同步等待。
 - ROOT固定。有 `app/current.json` 时：`app/releases/<build_id>/`程序、`data/vc-rust-config.json`配置、`data/run/`证据、`updates/{staged,worker,incoming}/`与history.jsonl。无current保留扁平配置/run，首次激活只复制配置/凭据，不搬动旧证据；回滚指针恢复旧布局。
 - 不读取/迁移旧Python `vc-config.json`。Rust配置缺失才用默认；语法/版本错误明确失败，保存临时文件刷盘后原子替换。入口不自动部署/接管旧服务/注册真实虚拟卡。
 
@@ -51,7 +52,7 @@ PreparedSession为 `{capture,batch_packets,session_id,source_mac,adapter:Adapter
 - 新Capture默认 `mtu_auto=true`；旧配置缺字段反序列化为false，保留旧显式mtu。自动值为 `min(本机接收NIC NlMtu, 被采集机发送NIC NlMtu, 9000)`，双端需先确定；缺报告、低于1500或Loopback均拒绝自动解析。无法预选被采集机网卡时须明确选择或使用显式MTU。
 - 手动MTU范围1500..9000，不得超过实际网卡报告；物理卡未知报告同样拒绝，不能靠手动模式猜值。GUI显示双端报告值、生效值及自动/显式状态。
 - 主机产生有效配置副本，冻结mtu并令 `mtu_auto=false`，镜像receive.mtu；保存草稿不变。预算/prepare/start/DLL批大小共用此值；响应MTU、mtu_auto、全部capture和网卡须精确确认；采集端按实际卡再次复核。
-- `vc-capture --list-adapters`仍给完整诊断枚举；仅显式 `--allow-loopback-diagnostics` 且控制器为本机回环才允许Npcap Loopback。诊断用显式MTU、Raw batch1，不冒充物理网卡容量或产品性能。
+- `VirtualCapture.exe capture --list-adapters` 仍给完整诊断枚举；仅显式 `--allow-loopback-diagnostics` 且控制器为本机回环才允许Npcap Loopback。诊断用显式MTU、Raw batch1，不冒充物理网卡容量或产品性能。
 
 ## 几何、变换与预算
 
@@ -81,9 +82,8 @@ Raw预算：`P=mtu−42; B=w*h*3/2; N=ceil(B/P); last=B−(N−1)*P; wire_frame_
 
 ZIP须单一顶层目录、`package-manifest.json` product/schema/version/build_id/files完整；拒绝路径穿越、
 绝对路径、盘符、重复、符号链接、加密、数量/总大小越界和逐文件大小/哈希不符，不把SHA-256当发布者签名。
-运行中可暂存，采集或待清理时不能激活。helper从`updates/worker/`运行，等待原PID结束，复核载荷、原子切current、
-启动新程序；capture确认Rust身份/ROOT/build与就绪，host通过`--update-ready <唯一path>`首帧后回执pid/ROOT/build。
-失败恢复旧指针并重启，旧程序/配置/历史证据保留；暂存或HTTP202不等于激活成功。
+运行中可暂存，采集或待清理时不能激活。helper 与随包 CRT 复制到 `updates/worker/` 下的独立目录，等原 PID 结束、复核载荷、原子切 current 后按清单分派角色。`entrypoint: "unified-v1"` 使用统一主程序，未标记的旧包解析原拆分角色；旧包同名图形启动器不是角色进程。manifest 的 `capabilities.role_launch_args` 与 `capabilities.desktop_capture` 显式声明启动参数/图形采集能力；旧 manifest 默认不支持，Host 回滚不传新角色参数，图形采集 OTA 目标缺少能力时拒绝激活。旧 staged metadata 缺少能力快照时，从完整复核后的 manifest 在内存补齐，不改写旧元数据；已有快照不符仍拒绝。旧 job 缺少目标能力时同样以复核结果为准。坏指针或入口不回退。
+采集确认 Rust 身份、实际子 PID、ROOT/build 与就绪；主机通过 `--update-ready <唯一path>` 在首帧后写精确 PID/ROOT/build。统一版本就绪后补齐缺失的固定 ROOT 主程序，或原子替换清单和哈希可确认的旧图形启动器。旧角色 EXE、旧脚本及旧 ROOT 更新器不改；启动请用新主程序。失败恢复原指针并重启，失败回滚与回滚失败分开记录；暂存或 HTTP 202 不等于激活成功。
 
 主机更新入口在折叠面板，选择同一ZIP可分别暂存本机/上传采集机；应用本机更新正常退出后由helper重开。
 令牌可重新配对，更新错误必须可见；回滚只选择校验通过且保留的历史build。
@@ -98,7 +98,7 @@ ZIP须单一顶层目录、`package-manifest.json` product/schema/version/build_
 - Raw物理网卡batch=ceil(B/(MTU−42))，一整帧一个sendqueue；编码按实际AU整帧单次提交/边界flush，不配置固定batch。零/短发失败，无batch降级。只有显式Loopback诊断为每包提交/batch1。
 - PyroWave正式ready前以同几何/后端/帧预算合成NV12预热，接收端临时编码合法AU给正式解码器；不进入正式帧号/hashlog/SHM/FPS。每步5秒粘性看门狗不退出宿主、不展开/join挂起调用。
 - stop/destroy仅0确认释放，1表示pending可重试；destroy其他码为状态未知，不盲重试/卸载。pending保留worker/句柄/DLL，并锁配置、OTA与虚拟卡操作；不安全对象有意留至进程退出。
-- 真实注册前必须由 `native_exe("vc-vcam-verify.exe") --dll <实际DLL> --capabilities` 隔离能力探测；只用Cargo工具/正常Rust载荷路径，没有旧C++兄弟目录回退。SHM/动态格式/D12细节见docs/spec/shm-v3.md与runbooks/vcam.md。
+- 真实注册前由当前主程序另起 `__vcam-probe --dll <实际 DLL>`，有界地读取 `VCStreamCapabilities`；不加载 COM graph，不回退旧路径或注册表枚举。构建树的隔离 graph 验证与注册前探测是两项检查。SHM/动态格式/D12 细节见 `docs/spec/shm-v3.md` 与 `docs/runbooks/vcam.md`。
 
 开始：验证 Rust 对端 → fresh 网卡/prepare/预算 → 注册本目录虚拟卡 → 进程内 receiver → 进程内 sender → 参数回显。
 虚拟卡归属由匹配 DLL 路径、HKCU CLSID 的 `VirtualCaptureOwner` 全局记录与本根的一份有效

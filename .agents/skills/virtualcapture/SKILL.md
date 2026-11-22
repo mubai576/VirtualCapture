@@ -22,7 +22,7 @@ description: VirtualCapture Rust 采集、GPU NV12 转换、Npcap L2 传输、SH
 
 ## 不变量
 
-- 范围仅采集与传输。主机 `vc-host` GPUI 接收，被采集机 `vc-capture` REST v2 发送；角色以实际运行状态为准，不从历史 PC 编号推断。
+- 范围仅采集与传输。`VirtualCapture.exe` 默认打开 GPUI 角色入口：首次选择采集端/接收端，原子保存独立启动偏好后记住选择；接收工作台、空闲采集页及 `--select-role` 可重新选择。显式 `capture` 子命令仍运行 REST v2 采集后台；角色不从历史 PC 编号推断。
 - 两端同网卡承载 L2 数据与 IPv4 控制，保留控制 IP；不改系统 MAC。普通产品仅接受 Windows 明确标记为 Up 的物理/非虚拟网卡，不偏置厂商或型号；路由自动选择，多候选需明确选择。
 - `proto/vc_wire.h` 冻结 28B、EtherType `0x88B5`；改动必须先获 owner 批准。
 - `vc_stream.dll` 在宿主进程内运行，与诊断 EXE 共享实现；不回退已移除的产品进程。

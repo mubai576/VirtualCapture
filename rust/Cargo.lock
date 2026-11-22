@@ -7112,6 +7112,7 @@ dependencies = [
  "clap",
  "gpui-kit",
  "serde_json",
+ "vc-capture",
  "vc-core",
  "windows-sys 0.61.2",
 ]

@@ -2,7 +2,7 @@
 //!
 //! 复用与 C++ 兼容的 CLSID/注册表语义，不重写 DShow filter 接口。注册写
 //! HKCU\\Software\\Classes\\CLSID\\{...}，产品固定 `FrameMap=<shm>`、`Motion=0`。
-//! 能力探测走现有隔离诊断程序 `vc-vcam-verify.exe`，不注册 COM、不接管现用设备。
+//! 能力探测走主程序的隔离子进程，不注册 COM、不接管现用设备。
 
 use std::path::PathBuf;
 
@@ -740,15 +740,16 @@ pub fn check_available(status: &VcamStatus) -> Result<(), String> {
     }
 }
 
+pub const PROBE_MODE: &str = "__vcam-probe";
+
 /// 隔离子进程只读探测实际 DLL，不注册 COM 或接管现用设备。
 pub fn require_capabilities() -> Result<(), String> {
-    // 隔离验证器与 Rust DLL 同一次 Cargo 构建，不搜索已移除的 C++ 工具目录。
-    let probe = crate::paths::native_exe("vc-vcam-verify.exe");
+    let exe = std::env::current_exe().map_err(|e| format!("无法定位主程序：{e}"))?;
     let output = crate::process::run_bounded(
-        std::process::Command::new(&probe)
+        std::process::Command::new(exe)
+            .arg(PROBE_MODE)
             .arg("--dll")
-            .arg(dll_path())
-            .arg("--capabilities"),
+            .arg(dll_path()),
         std::time::Duration::from_secs(5),
     )?;
     if !output.status.success() {

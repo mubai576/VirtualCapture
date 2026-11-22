@@ -7,7 +7,7 @@
 //! letting `vc-updater` install and start the new GPUI host.
 //!
 //! No NIC capture, DShow registration or PC2 connection is performed. The peer
-//! is a private `vc-capture.exe` root on a random loopback port.
+//! runs `VirtualCapture.exe capture` with a private ROOT and random loopback port.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -122,7 +122,7 @@ fn run() -> Result<(), String> {
 
     harness.send(Command::Connect(args.peer_url.clone()));
     let snapshot = harness.wait_for(
-        "连接私有 vc-capture",
+        "连接私有采集后台",
         Duration::from_secs(40),
         |s| s.connected && s.peer_online && !s.busy,
     )?;

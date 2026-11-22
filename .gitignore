@@ -15,6 +15,11 @@ prev/
 *.log
 /vc-config.json
 /vc-rust-config.json
+/data/vc-rust-config.json
+/data/update-token.json
+/data/update-peer-token.json
+/vc-startup.json
+/data/vc-startup.json
 /update-token.json
 /update-peer-token.json
 /.claude/
@@ -22,3 +27,4 @@ prev/
 thirdparty/ninja-win.zip
 .tmp-ota-test/
 rust/target/
+.vscode/

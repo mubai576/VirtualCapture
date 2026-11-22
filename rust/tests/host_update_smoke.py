@@ -4,17 +4,18 @@ This test does not call REST endpoints directly to simulate the host: a small
 standalone Rust driver (rust/tests/host_update_fixture, built in an independent
 Cargo target under run/) links vc-core, sends the real `host::Command`s to
 `HostController`, and exits normally after `restart_requested`. The spawned
-`vc-updater` helper then switches the host root and starts a new `vc-host.exe`;
-the parent Python process waits for the GPUI ready marker, verifies the window,
-posts WM_CLOSE, and checks the process exits.
+`vc-updater` helper then switches the host root and starts `VirtualCapture.exe`;
+the parent Python process waits for its first-frame ready marker, verifies the
+native window, posts WM_CLOSE, and checks for a zero exit code.
 
-On the peer side a private `vc-capture.exe` root is started on a random loopback
-port; the driver pairs its update token, stages and activates a synthetic
-package through HostController, and the real capture helper restarts it.
+On the peer side `VirtualCapture.exe capture` runs on a random loopback port in
+a private ROOT. The driver pairs its token and stages and activates a synthetic
+package through HostController; the real capture helper restarts it.
 
-Everything uses private temporary roots and synthetic packages. Nothing is
-registered with DShow, no NIC capture or PC2 connection is performed, and the
-rust workspace manifest/lockfile is not touched.
+Both roots are private. With --package, the local update uses the original
+manifest and verified payload of the supplied candidate. Nothing is registered
+with DShow, no NIC capture or PC2 connection is performed, and the rust
+workspace manifest/lockfile is not touched.
 
 Run after a build:
     python -I rust/tests/host_update_smoke.py
@@ -25,7 +26,6 @@ import argparse
 import ctypes
 from ctypes import wintypes
 import hashlib
-import io
 import json
 from pathlib import Path
 import shutil
@@ -38,6 +38,7 @@ import urllib.request
 import uuid
 import winreg
 import zipfile
+from PIL import ImageGrab
 
 ROOT = Path(__file__).resolve().parents[2]
 TESTS = Path(__file__).resolve().parent
@@ -45,10 +46,14 @@ FIXTURE = TESTS / "host_update_fixture"
 CORE = ROOT / "rust/crates/vc-core"
 RUN = ROOT / "run" / ("rust-host-update-smoke-" + uuid.uuid4().hex[:10])
 PRODUCT = "VirtualCapture-Rust-portable"
+ENTRYPOINT = "unified-v1"
+APP_EXE = "VirtualCapture.exe"
+UPDATER_EXE = "vc-updater.exe"
 CREATE_NO_WINDOW = 0x08000000
 WM_CLOSE = 0x0010
-STILL_ACTIVE = 259
+WAIT_OBJECT_0 = 0
 PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+SYNCHRONIZE = 0x00100000
 CLSID = "{B84C7E21-4A5F-4E2B-9C11-5A3D7F01229A}"
 DSHOW_KEY = rf"Software\Classes\CLSID\{CLSID}\InprocServer32"
 
@@ -61,12 +66,15 @@ class SmokeError(RuntimeError):
 
 kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
 user32 = ctypes.WinDLL("user32", use_last_error=True)
+user32.SetProcessDPIAware()
 EnumWindowsProc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
 kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
 kernel32.OpenProcess.restype = wintypes.HANDLE
 kernel32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
 kernel32.GetExitCodeProcess.restype = wintypes.BOOL
+kernel32.WaitForSingleObject.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+kernel32.WaitForSingleObject.restype = wintypes.DWORD
 kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
 user32.EnumWindows.argtypes = [EnumWindowsProc, wintypes.LPARAM]
 user32.EnumWindows.restype = wintypes.BOOL
@@ -76,19 +84,77 @@ user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
 user32.GetWindowTextLengthW.restype = ctypes.c_int
 user32.GetWindowTextW.argtypes = [wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
 user32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.UINT]
+user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+user32.GetForegroundWindow.restype = wintypes.HWND
+user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
+user32.GetDpiForWindow.argtypes = [wintypes.HWND]
 
 
-def pid_alive(pid):
-    if not pid:
-        return False
-    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
-    if not handle:
-        return False
+def window_screenshot(hwnd, name):
+    assert user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, 0x0013)
     try:
-        code = wintypes.DWORD()
-        return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == STILL_ACTIVE
+        user32.SetForegroundWindow(hwnd)
+        time.sleep(.4)
+        assert user32.GetForegroundWindow() == hwnd, "target window is not foreground"
+        rect = wintypes.RECT()
+        origin = wintypes.POINT(0, 0)
+        assert user32.GetClientRect(hwnd, ctypes.byref(rect))
+        assert user32.ClientToScreen(hwnd, ctypes.byref(origin))
+        image = ImageGrab.grab(bbox=(origin.x, origin.y, origin.x + rect.right,
+                                    origin.y + rect.bottom), all_screens=True)
+        image.save(RUN / name)
+        colors = image.getcolors(256)
+        assert colors is None or len(colors) > 8, ("blank GPUI window", name)
+        return image
     finally:
-        kernel32.CloseHandle(handle)
+        user32.SetWindowPos(hwnd, wintypes.HWND(-2), 0, 0, 0, 0, 0x0013)
+
+
+def choose_managed_capture(hwnd):
+    """Click the real chooser in the forwarded GPUI window, not a config fixture."""
+    image = window_screenshot(hwnd, "managed-role-chooser.png")
+    try:
+        scale = user32.GetDpiForWindow(hwnd) / 96
+        # Match both outlined action borders in the visible chooser before clicking.
+        def edge(pixel):
+            return (all(abs(channel - expected) <= 4 for channel, expected in zip(pixel[:3], (225, 230, 237)))
+                    or (pixel[0] < 120 and 50 < pixel[1] < 150 and pixel[2] > 200))
+        def runs(y, left, right):
+            result, start = [], None
+            for x in range(left, right):
+                if edge(image.getpixel((x, y))):
+                    if start is None:
+                        start = x
+                elif start is not None:
+                    if x - start >= 55 * scale:
+                        result.append((start, x - 1))
+                    start = None
+            return result
+        buttons = []
+        for top in range(image.height - round(42 * scale)):
+            for left, right in runs(top, 0, image.width):
+                if right - left > 230 * scale:
+                    continue
+                for bottom in range(top + round(25 * scale), top + round(40 * scale)):
+                    if any(abs(a - left) <= 3 * scale and abs(b - right) <= 3 * scale
+                           for a, b in runs(bottom, max(0, left - 5), min(image.width, right + 6))):
+                        center = ((left + right) / 2, (top + bottom) / 2)
+                        if not any(abs(center[0] - x) < 12 * scale and abs(center[1] - y) < 20 * scale
+                                   for x, y in buttons):
+                            buttons.append(center)
+                        break
+        buttons.sort()
+        assert len(buttons) == 2, ("chooser must show exactly two outlined buttons", buttons)
+        x, y = buttons[0]
+        point = wintypes.POINT(round(x), round(y))
+        # Posted client coordinates are physical pixels on this DPI-aware process.
+        position = (point.y << 16) | point.x
+        assert user32.PostMessageW(hwnd, 0x0201, 1, position)
+        assert user32.PostMessageW(hwnd, 0x0202, 0, position)
+    finally:
+        user32.SetWindowPos(hwnd, wintypes.HWND(-2), 0, 0, 0, 0, 0x0013)
 
 
 def windows_for_pid(pid):
@@ -109,9 +175,21 @@ def windows_for_pid(pid):
     return found
 
 
-def close_windows(handles):
-    for hwnd, _title in handles:
-        user32.PostMessageW(hwnd, WM_CLOSE, 0, 0)
+def close_host(pid, windows, label):
+    # Hold the real host's handle across WM_CLOSE so disappearance alone can't
+    # pass the check after a crash or forced shutdown.
+    process = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, False, pid)
+    if not process:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        for hwnd, _title in windows:
+            assert user32.PostMessageW(hwnd, WM_CLOSE, 0, 0), (label, hwnd)
+        waited = kernel32.WaitForSingleObject(process, 20_000)
+        assert waited == WAIT_OBJECT_0, (label, "WM_CLOSE did not end the host", waited)
+        code = wintypes.DWORD()
+        assert kernel32.GetExitCodeProcess(process, ctypes.byref(code)) and code.value == 0, (label, code.value)
+    finally:
+        kernel32.CloseHandle(process)
 
 
 def dshow_registration():
@@ -181,6 +259,45 @@ def read_json(path):
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
+def pending_json(path):
+    # These files are created before the writer has completed the JSON record.
+    try:
+        return read_json(path)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def wait_launch_receipt(root, exe, before=()):
+    run_dir = root / "data/run"
+
+    def find_new():
+        receipts = set(run_dir.glob("host-*.launch.json")).difference(before)
+        assert len(receipts) <= 1, receipts
+        return pending_json(next(iter(receipts))) if receipts else None
+
+    receipt = wait_for(find_new, 30, "fresh GPUI launch receipt")
+    assert Path(receipt["root"]).samefile(root), receipt
+    assert Path(receipt["exe"]).samefile(exe), receipt
+    for stream in ("stdout", "stderr"):
+        logfile = Path(receipt[stream])
+        assert logfile.is_file() and logfile.parent.samefile(run_dir), receipt
+    assert isinstance(receipt["pid"], int) and receipt["pid"] > 0, receipt
+    return receipt
+
+
+def expect_release(root, build, native_files):
+    pointer = read_json(root / "app/current.json")
+    assert pointer["schema"] == 1 and pointer["build_id"] == build, pointer
+    release = root / "app/releases" / build
+    manifest = read_json(release / "package-manifest.json")
+    assert (manifest["schema"], manifest["entrypoint"], manifest["build_id"]) == (1, ENTRYPOINT, build), manifest
+    assert manifest["capabilities"] == {"role_launch_args": True, "desktop_capture": True}, manifest
+    assert {path.relative_to(release).as_posix() for path in release.rglob("*.exe")} == {APP_EXE, UPDATER_EXE}
+    for name in native_files:
+        assert (release / name).is_file(), f"installed release missing {name}: {release}"
+    return release
+
+
 def history(root):
     path = Path(root) / "updates/history.jsonl"
     try:
@@ -194,8 +311,8 @@ def history(root):
 def resolve_binaries(args):
     package = args.package.resolve() if args.package else None
     bin_dir = (args.bin or package or ROOT / "rust/target/debug").resolve()
-    native = args.native or package or bin_dir
-    required = ["vc-host.exe", "vc-capture.exe", "vc-updater.exe"]
+    native = (args.native or package or bin_dir).resolve()
+    required = [APP_EXE, UPDATER_EXE]
     missing = [name for name in required if not (bin_dir / name).is_file()]
     if missing:
         raise SmokeError(
@@ -244,6 +361,8 @@ def make_package(path, build_id, version, files, manifest_bytes=None):
         manifest = {
             "product": PRODUCT,
             "schema": 1,
+            "entrypoint": ENTRYPOINT,
+            "capabilities": {"role_launch_args": True, "desktop_capture": True},
             "version": version,
             "build_id": build_id,
             "files": [
@@ -269,19 +388,36 @@ def rezip_extracted_package(package, target):
     if not manifest_path.is_file():
         raise SmokeError(f"{package} has no package-manifest.json; pass the extracted package root")
     manifest = read_json(manifest_path)
+    if (manifest.get("product"), manifest.get("schema"), manifest.get("entrypoint")) != (PRODUCT, 1, ENTRYPOINT):
+        raise SmokeError(f"{manifest_path} is not a unified-v1 schema 1 portable manifest")
+    if manifest.get("capabilities") != {"role_launch_args": True, "desktop_capture": True}:
+        raise SmokeError(f"{manifest_path} does not declare current launch capabilities")
     forbidden = {
         "update-token.json", "update-peer-token.json", "vc-rust-config.json",
         "vc-config.json", "package-manifest.json",
     }
+    declared = manifest["files"]
+    names = [entry["path"] for entry in declared]
+    if {name for name in names if name.lower().endswith(".exe")} != {APP_EXE, UPDATER_EXE}:
+        raise SmokeError("package manifest must declare exactly the two top-level unified EXEs")
+    if len({name.lower() for name in names}) != len(names):
+        raise SmokeError("package manifest has duplicate paths")
     files = {}
-    for entry in manifest.get("files", []):
+    for entry in declared:
         name = entry["path"]
-        if Path(name).name in forbidden:
-            raise SmokeError(f"package manifest lists runtime data: {name}")
+        # Portable package paths are flat; do not follow links or read a credential
+        # misdeclared as payload (including case/NTFS trailing-dot aliases).
+        if (not name or name in (".", "..") or name.rstrip(" .") != name
+                or any(char in name for char in "/\\:") or name.lower() in forbidden
+                or name.lower().endswith((".cmd", ".ps1", ".bat", ".py"))):
+            raise SmokeError(f"unexpected package manifest path: {name}")
         source = package / name
-        if not source.is_file():
-            raise SmokeError(f"package manifest lists missing file: {source}")
-        files[name] = source.read_bytes()
+        if source.is_symlink() or not source.is_file():
+            raise SmokeError(f"package manifest does not name a regular file: {source}")
+        data = source.read_bytes()
+        if entry["bytes"] != len(data) or entry["sha256"] != sha256(data):
+            raise SmokeError(f"package manifest size or hash mismatch: {source}")
+        files[name] = data
     make_package(target, manifest["build_id"], manifest["version"], files,
                  manifest_bytes=manifest_path.read_bytes())
     return manifest["build_id"], manifest["version"], files
@@ -306,8 +442,10 @@ def version_json(version):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--package", type=Path, help="extracted Rust portable Release directory")
-    parser.add_argument("--bin", type=Path, help="directory containing vc-host/vc-capture/vc-updater")
+    parser.add_argument("--bin", type=Path, help="directory containing VirtualCapture.exe and vc-updater.exe")
     parser.add_argument("--native", type=Path, help="directory containing vc_stream.dll and vc_vcam.dll")
+    parser.add_argument("--capture-desktop", action="store_true",
+                        help="also verify the peer OTA restores its native capture window")
     args = parser.parse_args()
 
     RUN.mkdir(parents=True)
@@ -315,6 +453,9 @@ def main():
     peer_root = RUN / "peer"
     host_root.mkdir()
     peer_root.mkdir()
+    # The saved desktop choice must not override the Host OTA's receive role.
+    (host_root / "vc-startup.json").write_text(
+        json.dumps({"schema": 1, "role": "capture"}), encoding="utf-8")
     bin_dir, native_dir = resolve_binaries(args)
     dshow_before = dshow_registration()
     checks = []
@@ -333,8 +474,8 @@ def main():
             local_build = "local-" + uuid.uuid4().hex[:8]
             local_version = "0.1.2"
             local_files = {
-                "vc-host.exe": (bin_dir / "vc-host.exe").read_bytes(),
-                "vc-updater.exe": (bin_dir / "vc-updater.exe").read_bytes(),
+                APP_EXE: (bin_dir / APP_EXE).read_bytes(),
+                UPDATER_EXE: (bin_dir / UPDATER_EXE).read_bytes(),
                 "version.json": version_json(local_version),
             }
             local_files.update(native_runtime_files(native_dir))
@@ -348,8 +489,8 @@ def main():
         peer_build = "peer-" + uuid.uuid4().hex[:8]
         peer_version = local_version if args.package else "0.1.1"
         peer_files = {
-            "vc-capture.exe": (bin_dir / "vc-capture.exe").read_bytes(),
-            "vc-updater.exe": (bin_dir / "vc-updater.exe").read_bytes(),
+            APP_EXE: (bin_dir / APP_EXE).read_bytes(),
+            UPDATER_EXE: (bin_dir / UPDATER_EXE).read_bytes(),
             "vc_stream.dll": (native_dir / "vc_stream.dll").read_bytes(),
             "version.json": version_json(peer_version),
         }
@@ -357,21 +498,32 @@ def main():
         make_package(peer_zip, peer_build, peer_version, peer_files)
 
         port = free_port()
-        capture = subprocess.Popen(
-            [str(bin_dir / "vc-capture.exe"), "--root", str(peer_root), "--native-dir", str(native_dir),
-             "--bind", "127.0.0.1", "--port", str(port)],
-            cwd=peer_root, stdout=log, stderr=log, creationflags=CREATE_NO_WINDOW)
+        capture_args = [str(bin_dir / APP_EXE), "--root", str(peer_root), "--native-dir", str(native_dir)]
+        if args.capture_desktop:
+            (peer_root / "vc-startup.json").write_text(
+                json.dumps({"schema": 1, "role": "capture"}), encoding="utf-8")
+            capture_args.extend(["--capture-bind", "127.0.0.1", "--capture-port", str(port)])
+        else:
+            capture_args.extend(["capture", "--bind", "127.0.0.1", "--port", str(port)])
+        capture = subprocess.Popen(capture_args, cwd=peer_root, stdout=log, stderr=log,
+                                   creationflags=CREATE_NO_WINDOW)
         pids.add(capture.pid)
         health = wait_for(lambda: capture_health(port), 20, "private capture health")
-        assert health["layout"] == "legacy", health
-        first_pid = health["pid"]
-        pids.add(first_pid)
+        assert health["api_revision"] == 2 and health["layout"] == "legacy" and health["build"] is None, health
+        assert health["pid"] == capture.pid and Path(health["root"]).samefile(peer_root), health
+        first_pid = capture.pid
+        if args.capture_desktop:
+            peer_windows = wait_for(
+                lambda: [(hwnd, title) for hwnd, title in windows_for_pid(first_pid)
+                         if title == "VirtualCapture · 采集端"] or None,
+                30, "original desktop capture window")
+            window_screenshot(peer_windows[0][0], "desktop-capture-before-ota.png")
         token_path = wait_for(
             lambda: (peer_root / "update-token.json") if (peer_root / "update-token.json").is_file() else None,
             15, "capture update token")
         peer_token = read_json(token_path)["token"]
         assert len(peer_token) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in peer_token)
-        checks.append("private vc-capture started; random port; token read from its root")
+        checks.append("private unified capture started on a random port with its own token")
 
         print(f"building standalone fixture (independent target, no workspace build): {RUN / 'fixture'}")
         fixture_exe = build_fixture()
@@ -406,47 +558,58 @@ def main():
         peer_after = wait_for(
             lambda: (lambda value: value if value and value.get("build") == peer_build and value.get("pid") != first_pid else None)(capture_health(port)),
             90, "peer capture restarted with new build")
+        assert peer_after["api_revision"] == 2 and peer_after["layout"] == "managed", peer_after
+        assert Path(peer_after["root"]).samefile(peer_root), peer_after
         pids.add(peer_after["pid"])
-        assert capture.poll() is not None, "old capture process still running"
-        peer_pointer = read_json(peer_root / "app/current.json")
-        assert peer_pointer["build_id"] == peer_build, peer_pointer
-        peer_release = peer_root / "app/releases" / peer_build
-        assert (peer_release / "vc-capture.exe").is_file()
-        assert (peer_release / "vc_stream.dll").is_file(), (
-            "peer capture release must carry the real vc_stream.dll")
+        assert capture.wait(timeout=5) == 0, "original capture did not shut down gracefully"
+        pids.discard(first_pid)
+        expect_release(peer_root, peer_build, ("vc_stream.dll",))
         assert any(entry.get("build_id") == peer_build and entry.get("state") == "active"
                    for entry in history(peer_root)), history(peer_root)
-        checks.append("peer helper switched capture to the staged build and restarted it with vc_stream.dll")
+        checks.append("peer capture exited cleanly; helper started the unified managed release with vc_stream.dll")
+        if args.capture_desktop:
+            peer_jobs = list((peer_root / "updates/worker").glob("job-*.json"))
+            assert len(peer_jobs) == 1, peer_jobs
+            peer_job = read_json(peer_jobs[0])
+            assert peer_job["role"] == "capture" and peer_job["capture_desktop"] is True, peer_job
+            assert peer_job["start_role"] is None and peer_job["bind"] == "127.0.0.1" and peer_job["port"] == port, peer_job
+            peer_windows = wait_for(
+                lambda: [(hwnd, title) for hwnd, title in windows_for_pid(peer_after["pid"])
+                         if title == "VirtualCapture · 采集端"] or None,
+                30, "OTA restored desktop capture window")
+            window_screenshot(peer_windows[0][0], "desktop-capture-after-ota.png")
+            assert read_json(peer_root / "vc-startup.json") == {"schema": 1, "role": "capture"}
+            close_host(peer_after["pid"], peer_windows, "desktop capture after OTA")
+            pids.discard(peer_after["pid"])
+            assert capture_health(port) is None, "OTA desktop capture listener survived close"
+            checks.append("desktop capture OTA restored its window and original loopback bind/port; closed with exit 0")
 
-        jobs = sorted((host_root / "updates/worker").glob("job-*.json"))
-        assert jobs, "host helper job not created"
-        job = read_json(jobs[-1])
-        assert job["role"] == "host" and job["target"] == local_build, job
-        assert job["parent_pid"] == fixture.pid, job
+        jobs = list((host_root / "updates/worker").glob("job-*.json"))
+        assert len(jobs) == 1, jobs
+        job = read_json(jobs[0])
+        assert job["schema"] == 1 and job["role"] == "host" and job["target"] == local_build, job
+        assert job["start_role"] == "receive" and job["capture_desktop"] is False, job
+        assert job["parent_pid"] == fixture.pid and Path(job["root"]).samefile(host_root), job
+        pids.discard(fixture.pid)
         ready_path = Path(job["ready_path"])
-        ready = wait_for(lambda: read_json(ready_path) if ready_path.is_file() else None,
-                         120, "new GPUI host ready marker")
+        ready = wait_for(lambda: pending_json(ready_path), 120, "new GPUI host ready marker")
         assert ready["schema"] == 1 and ready["build"] == local_build, ready
-        host_pid = ready["pid"]
-        pids.add(host_pid)
         assert Path(ready["root"]).samefile(host_root), ready
-        pointer = read_json(host_root / "app/current.json")
-        assert pointer["build_id"] == local_build, pointer
-        host_release = host_root / "app/releases" / local_build
-        assert (host_release / "vc-host.exe").is_file()
-        assert (host_release / "vc_stream.dll").is_file(), "host release must carry vc_stream.dll"
-        assert (host_release / "vc_vcam.dll").is_file(), "host release must carry vc_vcam.dll"
-        checks.append("vc-updater helper installed local build with vc_stream.dll/vc_vcam.dll and new vc-host wrote first-frame ready marker")
+        host_release = expect_release(host_root, local_build, ("vc_stream.dll", "vc_vcam.dll"))
+        receipt = wait_launch_receipt(host_root, host_release / APP_EXE)
+        assert receipt["pid"] == ready["pid"], (receipt, ready)
+        host_pid = receipt["pid"]
+        pids.add(host_pid)
+        checks.append("unified GPUI first-frame marker matches the installed build and exact launch receipt")
 
         windows = wait_for(lambda: windows_for_pid(host_pid) or None, 30, "new GPUI window")
         titles = [title for _hwnd, title in windows]
-        assert any("VirtualCapture" in title for title in titles), windows
+        assert any("VirtualCapture" in title and "接收端" in title for title in titles), windows
         wait_for(lambda: any(entry.get("build_id") == local_build and entry.get("state") == "active"
                              for entry in history(host_root)), 30, "helper confirmed first frame")
-        close_windows(windows)
-        exited = wait_for(lambda: not pid_alive(host_pid), 20, "new GPUI host exit after WM_CLOSE")
-        assert exited, "WM_CLOSE did not end the host"
-        checks.append(f"new GPUI window(s) {titles!r} closed with WM_CLOSE; process exited")
+        close_host(host_pid, windows, "activated GPUI host")
+        pids.discard(host_pid)
+        checks.append(f"new GPUI window(s) {titles!r} closed with WM_CLOSE; process exited 0")
 
         helper_logs = list((host_root / "updates/worker").glob("updater-*.log"))
         wait_for(lambda: any(f"active {local_build}" in path.read_text(encoding="utf-8", errors="replace")
@@ -455,28 +618,77 @@ def main():
                    for entry in history(host_root)), history(host_root)
         checks.append("host helper log/history confirm active local build")
 
-        if "VirtualCapture.exe" in local_files:
-            entry = host_root / "VirtualCapture.exe"
-            assert entry.read_bytes() == local_files["VirtualCapture.exe"], "new host did not install ROOT entry"
-            launcher = subprocess.run([str(entry)], cwd=RUN, stdout=log, stderr=log, timeout=20)
-            assert launcher.returncode == 0, "graphical entry could not reopen the updated host"
-            receipts = list((host_root / "data/run").glob("host-*.launch.json"))
-            assert receipts, "no graphical launch receipt after OTA"
-            receipt = read_json(max(receipts, key=lambda path: path.stat().st_mtime_ns))
-            assert Path(receipt["root"]).samefile(host_root), receipt
-            assert Path(receipt["exe"]).samefile(host_root / "app/releases" / local_build / "vc-host.exe"), receipt
-            reopened_pid = int(receipt["pid"])
-            pids.add(reopened_pid)
-            reopened = wait_for(lambda: windows_for_pid(reopened_pid) or None, 30, "updated host reopened from ROOT EXE")
-            close_windows(reopened)
-            wait_for(lambda: not pid_alive(reopened_pid), 20, "reopened host closed")
-            checks.append("OTA installed ROOT VirtualCapture.exe; direct EXE reopened current release and closed normally")
+        entry = host_root / APP_EXE
+        assert entry.read_bytes() == local_files[APP_EXE], "new host did not install ROOT entry"
+        receipts_before = set((host_root / "data/run").glob("host-*.launch.json"))
+        capture_port = free_port()
+        launcher = subprocess.Popen(
+            [str(entry), "--capture-bind", "127.0.0.1", "--capture-port", str(capture_port)],
+            cwd=RUN, stdout=log, stderr=log)
+        pids.add(launcher.pid)
+        assert launcher.wait(timeout=20) == 0, "ROOT entry could not forward to the updated host"
+        pids.discard(launcher.pid)
+        reopened_receipt = wait_launch_receipt(host_root, host_release / APP_EXE, receipts_before)
+        reopened_pid = reopened_receipt["pid"]
+        assert reopened_pid != launcher.pid, reopened_receipt
+        pids.add(reopened_pid)
+        reopened = wait_for(lambda: windows_for_pid(reopened_pid) or None, 30, "updated host reopened from ROOT EXE")
+        assert any("VirtualCapture" in title and "采集端" in title for _hwnd, title in reopened), reopened
+        capture_reopened = wait_for(
+            lambda: capture_health(capture_port), 20, "saved capture role on forwarded port")
+        assert capture_reopened["pid"] == reopened_pid, capture_reopened
+        close_host(reopened_pid, reopened, "GPUI capture reopened from ROOT entry")
+        pids.discard(reopened_pid)
+        assert capture_health(capture_port) is None, "capture listener survived window close"
+        checks.append("ROOT entry reopened saved capture role on custom loopback port; exited 0 after WM_CLOSE")
+
+        # Seed only the previous choice; the new capture preference must come from a real click.
+        preference_path = host_root / "data/vc-startup.json"
+        receive_preference = {"schema": 1, "role": "receive"}
+        preference_path.write_text(json.dumps(receive_preference), encoding="utf-8")
+        config_before_reselect = (host_root / "data/vc-rust-config.json").read_bytes()
+        receipts_before = set((host_root / "data/run").glob("host-*.launch.json"))
+        select_port = free_port()
+        launcher = subprocess.Popen(
+            [str(entry), "--select-role", "--capture-bind", "127.0.0.1",
+             "--capture-port", str(select_port)], cwd=RUN, stdout=log, stderr=log)
+        pids.add(launcher.pid)
+        assert launcher.wait(timeout=20) == 0, "ROOT entry could not forward role selection"
+        pids.discard(launcher.pid)
+        select_receipt = wait_launch_receipt(host_root, host_release / APP_EXE, receipts_before)
+        select_pid = select_receipt["pid"]
+        pids.add(select_pid)
+        chooser = wait_for(
+            lambda: [(hwnd, title) for hwnd, title in windows_for_pid(select_pid)
+                     if title == "VirtualCapture · 选择本机角色"] or None,
+            30, "Managed ROOT role chooser")
+        assert read_json(preference_path) == receive_preference
+        assert capture_health(select_port) is None, "capture started before a role was selected"
+        choose_managed_capture(chooser[0][0])
+        selected_capture = wait_for(
+            lambda: [(hwnd, title) for hwnd, title in windows_for_pid(select_pid)
+                     if title == "VirtualCapture · 采集端"] or None,
+            20, "capture role after Managed chooser click")
+        wait_for(lambda: pending_json(preference_path) == {"schema": 1, "role": "capture"},
+                 10, "Managed preference persisted by the chooser")
+        selected_health = wait_for(lambda: capture_health(select_port), 20,
+                                   "capture listening on the forwarded chooser port")
+        assert selected_health["pid"] == select_pid, selected_health
+        assert selected_health["build"] == local_build and selected_health["layout"] == "managed", selected_health
+        assert Path(selected_health["root"]).samefile(host_root), selected_health
+        assert (host_root / "data/vc-rust-config.json").read_bytes() == config_before_reselect
+        window_screenshot(selected_capture[0][0], "managed-selected-capture.png")
+        close_host(select_pid, selected_capture, "capture selected through Managed ROOT")
+        pids.discard(select_pid)
+        assert capture_health(select_port) is None, "selected capture listener survived window close"
+        checks.append("ROOT --select-role forwarded chooser and custom loopback port; real click saved data/vc-startup.json")
 
         peer_token_file = host_root / "data/update-peer-token.json"
         assert read_json(peer_token_file)["token"] == peer_token, peer_token_file
+        assert read_json(peer_root / "data/update-token.json")["token"] == peer_token
         host_config = read_json(host_root / "data/vc-rust-config.json")
         assert host_config["peer_url"] == f"http://127.0.0.1:{port}", host_config
-        checks.append("pairing token and config survived legacy -> managed migration")
+        checks.append("pairing token, peer token and config survived flat -> managed migration")
 
         dshow_after = dshow_registration()
         assert dshow_before == dshow_after, (dshow_before, dshow_after)
@@ -487,12 +699,17 @@ def main():
             "scope": "HostController -> real vc-updater -> new GPUI first frame; peer capture restarted via real helper",
             "run": str(RUN),
             "builds": {"peer": peer_build, "local": local_build},
+            "peer_capture_desktop": args.capture_desktop,
+            "screenshots": ["managed-role-chooser.png", "managed-selected-capture.png"] + (
+                ["desktop-capture-before-ota.png", "desktop-capture-after-ota.png"]
+                if args.capture_desktop else []),
             "checks": checks,
             "limits": [
                 "private temporary roots; random loopback control port",
                 "no DShow registration, no NIC capture, no PC2 connection",
-                "peer package is synthetic; local activation reuses the extracted candidate tree under --package; "
-                "SHA-256 manifest only, not a signature",
+                "peer package is synthetic; under --package the local update uses the verified candidate payload and unchanged manifest",
+                "flat data layout migration does not exercise an old split-binary release",
+                "SHA-256 manifest verification is not a signature check",
                 "GPUI window is closed with WM_CLOSE from this process",
             ],
         }

@@ -63,6 +63,8 @@ pub struct Snapshot {
     pub update_message: Option<String>,
     pub update_token_paired: bool,
     pub restart_requested: bool,
+    /// 工作线程已确认空闲并结束；UI 此时才允许离开接收角色。
+    pub role_selection_ready: bool,
     pub events: Vec<String>,
 }
 impl Snapshot {
@@ -92,6 +94,8 @@ pub enum Command {
     StageLocalUpdate(std::path::PathBuf),
     ActivateLocalUpdate(String),
     RollbackLocalUpdate(String),
+    /// 只在工作线程确认无会话、无待清理资源且未准备 OTA 后离开角色。
+    SelectRole,
     Shutdown,
 }
 
@@ -194,6 +198,11 @@ impl Worker {
                     self.stop();
                     break;
                 }
+                Ok(Command::SelectRole) => {
+                    if self.prepare_role_selection() {
+                        break;
+                    }
+                }
                 Ok(command) => self.handle(command),
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
@@ -203,6 +212,17 @@ impl Worker {
             }
         }
     }
+    fn prepare_role_selection(&mut self) -> bool {
+        if self.blocked() || self.state.busy || self.state.restart_requested {
+            self.fail("会话运行中、仍待清理或正在更新，请处理完成后重新选择角色。".into());
+            return false;
+        }
+        // 在命令队列中封口，确认后不再处理后续 Start/OTA；不隐式停止远端会话。
+        self.state.role_selection_ready = true;
+        self.publish();
+        true
+    }
+
     fn publish(&mut self) {
         self.state.remote_pending =
             self.sender_pending || self.remote_stop_pending || self.discovered_sender.is_some();
@@ -277,7 +297,7 @@ impl Worker {
             return;
         }
         match command {
-            Command::Shutdown => {}
+            Command::Shutdown | Command::SelectRole => {}
             Command::CleanupLocal => self.stop_inner(false),
             Command::Connect(url) => self.connect(url),
             Command::Refresh => {
@@ -446,6 +466,8 @@ impl Worker {
             wait_ms: 120_000,
             ready_ms: 30_000,
             require_ready: true,
+            capture_desktop: false,
+            start_role: Some(crate::startup::DesktopRole::Receive),
         };
         match crate::update::prepare_activation(request) {
             Ok(_) => {
@@ -1168,6 +1190,29 @@ mod tests {
             virtual_nic: Some(false),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn role_selection_requires_confirmed_idle_worker() {
+        let (mut worker, _tx) = test_worker("http://127.0.0.1:1");
+        worker.state.running = true;
+        assert!(!worker.prepare_role_selection());
+        worker.state.running = false;
+        worker.sender_pending = true;
+        assert!(!worker.prepare_role_selection());
+        worker.sender_pending = false;
+        worker.remote_stop_pending = true;
+        assert!(!worker.prepare_role_selection());
+        worker.remote_stop_pending = false;
+        worker.vcam_owned = true;
+        assert!(!worker.prepare_role_selection());
+        worker.vcam_owned = false;
+        worker.state.restart_requested = true;
+        assert!(!worker.prepare_role_selection());
+        assert!(!worker.state.role_selection_ready);
+        worker.state.restart_requested = false;
+        assert!(worker.prepare_role_selection());
+        assert!(worker.state.role_selection_ready);
     }
 
     #[test]

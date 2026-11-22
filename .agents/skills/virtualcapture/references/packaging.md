@@ -6,16 +6,16 @@
 
 Windows x64：Rust MSVC/Windows SDK、Python（pefile/Pillow）、Git、CMake/MSVC。所有产品及隔离验证器由 Cargo 构建；`rust/packaging/native/` 只构建固定 PyroWave 第三方库并收集 app-local MSVC。
 
-流程：源码来源快照 → fmt/tests/Clippy/Release → 原生依赖 build/install → 载荷/许可与 PE 导入审计 → 完整候选清单/ZIP解压 → portable/DLL/adapter/真实GUI/capture OTA smoke → 来源不变复核 → 唯一 dist 目录/ZIP/SHA-256。
+流程：源码来源快照 → fmt/tests/Clippy/Release → 原生依赖 build/install → 载荷/许可与 PE 导入审计 → 完整候选清单/ZIP解压 → portable/DLL/adapter visibility/真实GUI/capture OTA smoke → 来源不变复核 → 唯一 dist 目录/ZIP/SHA-256。adapter visibility 要求至少一张 Windows Up 的物理非虚拟网卡，但不发送帧、不代表物理链路通过。
 `--extended-smokes` 追加 control 与 host_update。本地隔离 OTA 不等于真实双机部署。
 
 GUI 截图必须非空白；黑屏就是失败，不删断言、不以窗口存在代替。失败只保留候选和日志，不发布“已验收”最终包。日志位于 `build/rust-package/<build_id>/package.log`，未执行门禁保持 pending。
 
 ## 载荷与运行前提
 
-- 图形入口 `VirtualCapture.exe`；Rust `vc-host/vc-capture/vc-updater.exe` 与运行时隔离verifier `vc-vcam-verify.exe`。独立 `vc-stream.exe`/`vc-transport.exe` 只由构建树诊断使用，不随包分发。
-- `vc_stream.dll` C ABI v1、Rust `vc_vcam.dll`、`libpyrowave-shared-1.dll`、MSVC runtime。
-- 启动脚本、使用说明、生成的 `version.json`、`package-manifest.json`。许可证仍在构建期收集和审计，不随便携包分发。
+- 载荷、文件清单和 ZIP 全树都只有两个 EXE，且都在顶层：`VirtualCapture.exe`（首次选择并保存桌面角色，`capture` 启动采集后台，内部子命令隔离探测虚拟卡能力）和 `vc-updater.exe`（独立更新）。`vc-stream.exe`、`vc-transport.exe`、`vc-vcam-verify.exe` 只在构建树诊断，不随包分发。
+- `vc_stream.dll` C ABI v1、Rust `vc_vcam.dll`、`libpyrowave-shared-1.dll`、应用本地 MSVC 运行库。
+- 使用说明、`version.json`、schema 1 的 `package-manifest.json`（`entrypoint: "unified-v1"`）。不分发 CMD/PowerShell 启动包装或脚本目录；许可证仍在构建期收集和审计，不进便携包。
 - codecs 精确为 raw/pyrowave；sources 为 pattern/dda/wgc。旧 C++ 产品、`turbojpeg.dll` 与开发证据禁止进入包。
 - 目标机无需 Rust/Python/VS；实际收发需自行安装 Npcap。桌面转换需要硬件 D3D11；PyroWave 需真实 GPU 的 Vulkan1.3 驱动。驱动不随包复制。
 

@@ -22,6 +22,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 pub const PRODUCT: &str = "VirtualCapture-Rust-portable";
 pub const MANIFEST_NAME: &str = "package-manifest.json";
 pub const UPDATE_SCHEMA: u32 = 1;
+pub const APP_EXE: &str = "VirtualCapture.exe";
+const UPDATER_EXE: &str = "vc-updater.exe";
+const ENTRY_CRT_FILES: [&str; 2] = ["vcruntime140.dll", "vcruntime140_1.dll"];
 /// 上传 ZIP 上限。便携包约 17 MiB，留足余量同时避免异常请求耗尽磁盘。
 pub const MAX_UPLOAD_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_FILES: usize = 20_000;
@@ -38,11 +41,47 @@ pub enum Role {
 }
 
 impl Role {
-    fn exe(self) -> &'static str {
+    fn split_exe(self) -> &'static str {
         match self {
             Role::Capture => "vc-capture.exe",
             Role::Host => "vc-host.exe",
         }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub enum Entrypoint {
+    #[serde(rename = "unified-v1")]
+    UnifiedV1,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct PackageCapabilities {
+    #[serde(default)]
+    pub role_launch_args: bool,
+    #[serde(default)]
+    pub desktop_capture: bool,
+}
+
+pub struct RoleLaunch {
+    pub exe: PathBuf,
+    role: Role,
+    pub unified: bool,
+    pub capabilities: PackageCapabilities,
+}
+
+impl RoleLaunch {
+    pub fn command(&self, root: &Path, native_dir: Option<&Path>) -> std::process::Command {
+        let mut command = std::process::Command::new(&self.exe);
+        if self.unified && self.role == Role::Capture {
+            command.arg("capture");
+        }
+        command
+            .arg("--root")
+            .arg(root)
+            .arg("--native-dir")
+            .arg(native_dir.unwrap_or_else(|| self.exe.parent().unwrap_or(root)));
+        command
     }
 }
 
@@ -72,6 +111,11 @@ pub struct PackageManifest {
     pub version: String,
     pub build_id: String,
     pub files: Vec<UpdateFile>,
+    /// 旧拆分版清单无此字段；同名的旧 VirtualCapture.exe 不是角色进程。
+    /// 仅新版本可声明；缺失时按不支持新启动参数和图形采集处理。
+    pub entrypoint: Option<Entrypoint>,
+    #[serde(default)]
+    pub capabilities: PackageCapabilities,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -83,6 +127,8 @@ pub struct StagedMeta {
     pub zip_sha256: String,
     pub bytes: u64,
     pub files: Vec<UpdateFile>,
+    #[serde(default)]
+    pub capabilities: Option<PackageCapabilities>,
     pub staged_utc: String,
 }
 
@@ -142,6 +188,10 @@ pub struct ActivationRequest {
     pub wait_ms: u64,
     pub ready_ms: u64,
     pub require_ready: bool,
+    #[serde(default)]
+    pub capture_desktop: bool,
+    #[serde(default)]
+    pub start_role: Option<crate::startup::DesktopRole>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -158,6 +208,8 @@ pub struct ActivationJob {
     pub root: String,
     pub role: Role,
     pub target: String,
+    #[serde(default)]
+    pub target_capabilities: Option<PackageCapabilities>,
     pub previous: Option<String>,
     pub previous_exe: Option<String>,
     pub previous_native_dir: Option<String>,
@@ -167,7 +219,40 @@ pub struct ActivationJob {
     pub wait_ms: u64,
     pub ready_ms: u64,
     pub ready_path: Option<String>,
+    #[serde(default)]
+    pub capture_desktop: bool,
+    #[serde(default)]
+    pub start_role: Option<crate::startup::DesktopRole>,
     pub created_utc: String,
+}
+
+fn validate_role_launch(
+    role: Role,
+    capture_desktop: bool,
+    start_role: Option<crate::startup::DesktopRole>,
+) -> Result<(), String> {
+    match role {
+        Role::Capture if start_role.is_some() => error("采集更新任务不能指定桌面启动角色。"),
+        Role::Capture => Ok(()),
+        Role::Host if capture_desktop => error("接收端更新任务不能启用图形采集模式。"),
+        Role::Host if start_role == Some(crate::startup::DesktopRole::Capture) => {
+            error("接收端更新任务只能恢复接收角色。")
+        }
+        Role::Host => Ok(()),
+    }
+}
+
+fn validate_launch_capabilities(
+    role: Role,
+    capture_desktop: bool,
+    capabilities: PackageCapabilities,
+) -> Result<(), String> {
+    if capture_desktop && role == Role::Capture && !capabilities.desktop_capture {
+        return error(
+            "目标版本未声明图形采集启动能力，拒绝静默改为后台采集。请先更新到支持图形采集的版本。",
+        );
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug)]
@@ -634,6 +719,33 @@ fn validate_manifest(manifest: &PackageManifest) -> Result<(), String> {
             return error("清单总大小超过上限。");
         }
     }
+    if manifest.capabilities.role_launch_args && manifest.entrypoint != Some(Entrypoint::UnifiedV1)
+    {
+        return error("role_launch_args 仅适用于声明 unified-v1 的版本。");
+    }
+    if manifest.capabilities.desktop_capture && !manifest.capabilities.role_launch_args {
+        return error("desktop_capture 需要 role_launch_args 能力。");
+    }
+    if manifest.entrypoint == Some(Entrypoint::UnifiedV1) {
+        let mut exes: Vec<_> = seen.iter().filter(|path| path.ends_with(".exe")).collect();
+        exes.sort_unstable();
+        if exes
+            .into_iter()
+            .map(String::as_str)
+            .ne(["vc-updater.exe", "virtualcapture.exe"])
+        {
+            return error(
+                "unified-v1 包必须在根目录且仅包含 VirtualCapture.exe 和 vc-updater.exe 两个 EXE。",
+            );
+        }
+        if seen.iter().any(|path| {
+            path.starts_with("scripts/") || path.ends_with(".cmd") || path.ends_with(".ps1")
+        }) {
+            return error("unified-v1 包不得包含旧启动脚本。");
+        }
+    } else if seen.contains("virtualcapture.exe") && !seen.contains("vc-host.exe") {
+        return error("VirtualCapture.exe 缺少 unified-v1 入口声明或旧版 vc-host.exe。");
+    }
     Ok(())
 }
 
@@ -739,6 +851,7 @@ pub fn stage_file(root: &Path, zip_path: &Path) -> Result<StagedMeta, String> {
         zip_sha256: scan.zip_sha256.clone(),
         bytes: scan.manifest.files.iter().map(|f| f.bytes).sum(),
         files: scan.manifest.files.clone(),
+        capabilities: Some(scan.manifest.capabilities),
         staged_utc: now_utc(),
     };
     let text = serde_json::to_vec_pretty(&meta).map_err(|e| e.to_string())?;
@@ -905,22 +1018,61 @@ fn verify_no_extras(
     Ok(())
 }
 
+fn read_manifest_at(dir: &Path) -> Result<PackageManifest, String> {
+    let path = dir.join(MANIFEST_NAME);
+    let metadata =
+        fs::symlink_metadata(&path).map_err(|e| format!("无法读取 {}：{e}", path.display()))?;
+    if is_reparse(&metadata) || !metadata.is_file() || metadata.len() > MAX_MANIFEST_BYTES {
+        return error(format!("发布清单不是有效常规文件：{}", path.display()));
+    }
+    let file = File::open(&path).map_err(|e| e.to_string())?;
+    let manifest = serde_json::from_reader(file.take(MAX_MANIFEST_BYTES))
+        .map_err(|e| format!("发布清单无效：{e}"))?;
+    validate_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn verify_manifest_at(dir: &Path, meta: &StagedMeta) -> Result<PackageCapabilities, String> {
+    let manifest = read_manifest_at(dir)?;
+    if manifest.build_id != meta.build_id
+        || manifest.version != meta.version
+        || manifest.files != meta.files
+        || meta
+            .capabilities
+            .is_some_and(|capabilities| manifest.capabilities != capabilities)
+    {
+        return error("发布清单与暂存元数据不一致。");
+    }
+    Ok(manifest.capabilities)
+}
+
 /// 重算暂存文件哈希，确认与清单一致；激活前必须通过。
 pub fn verify_staged_at(root: &Path, build_id: &str) -> Result<StagedMeta, String> {
     if !valid_build_id(build_id) {
         return error("build_id 无效。");
     }
-    let meta =
+    let mut meta =
         staged_meta_at(root, build_id).ok_or_else(|| format!("版本 {build_id} 尚未暂存。"))?;
     let allowed = checked_meta_files(&meta)?;
     let dir = root.join(paths::UPDATES_DIR).join("staged").join(build_id);
+    if meta.schema != UPDATE_SCHEMA || meta.build_id != build_id {
+        return error("暂存元数据与目标版本不一致。");
+    }
+    let capabilities = verify_manifest_at(&dir, &meta)?;
     verify_files(&dir, &meta.files, "暂存文件")?;
     verify_no_extras(&dir, &allowed, "暂存目录")?;
+    // 旧更新器未保存能力快照；全部复核通过后仅在内存中补齐，不改旧证据。
+    meta.capabilities = Some(capabilities);
     Ok(meta)
 }
 
 pub fn verify_staged(build_id: &str) -> Result<StagedMeta, String> {
     verify_staged_at(&paths::root(), build_id)
+}
+
+pub fn staged_capabilities_at(root: &Path, build_id: &str) -> Result<PackageCapabilities, String> {
+    let meta = verify_staged_at(root, build_id)?;
+    Ok(meta.capabilities.unwrap_or_default())
 }
 
 // ---------------------------------------------------------------- 状态与历史
@@ -1017,6 +1169,7 @@ pub fn verify_release_at(root: &Path, build_id: &str) -> Result<Value, String> {
     let meta =
         staged_meta_at(root, build_id).ok_or_else(|| format!("找不到版本 {build_id} 的清单。"))?;
     let allowed = checked_meta_files(&meta)?;
+    verify_manifest_at(&dir, &meta)?;
     verify_files(&dir, &meta.files, "已安装文件")?;
     verify_no_extras(&dir, &allowed, "版本目录")?;
     Ok(json!({"build_id":build_id,"version":meta.version,"files":meta.files.len()}))
@@ -1090,6 +1243,70 @@ pub fn install_staged_at(root: &Path, build_id: &str) -> Result<PathBuf, String>
     Ok(target)
 }
 
+/// 从已验证且就绪的新版本建立固定入口。不覆盖已有统一版或无法证明来源的程序。
+fn install_root_entry(root: &Path, release: &Path, meta: &StagedMeta) -> Result<(), String> {
+    let entry = root.join(APP_EXE);
+    match fs::symlink_metadata(&entry) {
+        Ok(info) if info.is_file() && !is_reparse(&info) => {
+            let old_launcher = read_manifest_at(root).ok().is_some_and(|manifest| {
+                manifest.entrypoint.is_none()
+                    && manifest.files.iter().any(|file| {
+                        file.path.eq_ignore_ascii_case(APP_EXE)
+                            && file.bytes == info.len()
+                            && sha256_file(&entry)
+                                .is_ok_and(|hash| hash.eq_ignore_ascii_case(&file.sha256))
+                    })
+            });
+            if !old_launcher {
+                return Ok(());
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return error("固定 ROOT 的 VirtualCapture.exe 不是普通文件。"),
+    }
+
+    let publish = |file: &UpdateFile| -> Result<(), String> {
+        let temp = root.join(format!(".entry-{}.tmp", random_hex(8)));
+        let result = (|| {
+            let mut input = File::open(release.join(&file.path)).map_err(|e| e.to_string())?;
+            {
+                let mut output = OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&temp)
+                    .map_err(|e| e.to_string())?;
+                let bytes = std::io::copy(&mut input, &mut output).map_err(|e| e.to_string())?;
+                output.sync_all().map_err(|e| e.to_string())?;
+                if bytes != file.bytes || !sha256_file(&temp)?.eq_ignore_ascii_case(&file.sha256) {
+                    return error(format!("固定入口文件校验失败：{}", file.path));
+                }
+            }
+            fs::rename(&temp, root.join(&file.path)).map_err(|e| e.to_string())
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&temp);
+        }
+        result
+    };
+    // 新建的固定 ROOT 不一定有系统 MSVC；应用本地 CRT 缺失时从清单补齐。
+    for name in ENTRY_CRT_FILES {
+        if !root.join(name).try_exists().map_err(|e| e.to_string())?
+            && let Some(file) = meta
+                .files
+                .iter()
+                .find(|file| file.path.eq_ignore_ascii_case(name))
+        {
+            publish(file)?;
+        }
+    }
+    let file = meta
+        .files
+        .iter()
+        .find(|file| file.path.eq_ignore_ascii_case(APP_EXE))
+        .ok_or("清单缺少 VirtualCapture.exe。")?;
+    publish(file)
+}
+
 fn write_pointer_at(root: &Path, pointer: &CurrentPointer) -> Result<(), String> {
     let dir = root.join(paths::APP_DIR);
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -1125,23 +1342,30 @@ fn restore_pointer_at(root: &Path, previous: Option<&[u8]>) -> Result<(), String
     }
 }
 
-fn helper_source(root: &Path, target: &str) -> Option<PathBuf> {
-    let mut candidates = vec![
-        root.join(paths::UPDATES_DIR)
-            .join("staged")
-            .join(target)
-            .join("vc-updater.exe"),
-    ];
-    if let Some(dir) = paths::active_release_dir_at(root) {
-        candidates.push(dir.join("vc-updater.exe"));
-    }
-    if let Some(dir) = std::env::current_exe()
-        .ok()
-        .and_then(|path| path.parent().map(Path::to_path_buf))
+fn helper_source(root: &Path, target: &str) -> Result<PathBuf, String> {
+    let staged = root.join(paths::UPDATES_DIR).join("staged").join(target);
+    let manifest = read_manifest_at(&staged)?;
+    let running = std::env::current_exe().map_err(|e| e.to_string())?;
+    let sibling = running.with_file_name(UPDATER_EXE);
+    let plain_file = |path: &PathBuf| {
+        fs::symlink_metadata(path).is_ok_and(|meta| meta.is_file() && !is_reparse(&meta))
+    };
+    if running
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(APP_EXE))
+        && manifest.entrypoint.is_none()
     {
-        candidates.push(dir.join("vc-updater.exe"));
+        // 旧目标里的助手不认识统一版，不能让它负责失败后的重启。
+        return Some(sibling)
+            .filter(plain_file)
+            .ok_or_else(|| "当前统一版缺少有效的 vc-updater.exe，无法安全激活旧版。".into());
     }
-    candidates.into_iter().find(|path| path.is_file())
+    let active = paths::active_release_dir_at(root).map(|dir| dir.join(UPDATER_EXE));
+    std::iter::once(staged.join(UPDATER_EXE))
+        .chain(active)
+        .chain([sibling])
+        .find(plain_file)
+        .ok_or_else(|| "发布包与当前版本都缺少有效的 vc-updater.exe，无法激活。".into())
 }
 
 fn spawn_detached(helper: &Path, job: &Path, log: &Path) -> Result<u32, String> {
@@ -1231,50 +1455,108 @@ fn write_legacy_baseline(
     Ok(path)
 }
 
-/// `vc-updater launch` 使用的当前可执行文件：有指针取 release，否则取扁平根。
-pub fn launch_exe_at(root: &Path, role: Role) -> Result<PathBuf, String> {
-    let exe = match paths::layout_at(root) {
-        // 指针存在即 Managed；指针损坏/版本目录缺失必须明确失败，不能悄悄退回扁平布局。
-        paths::Layout::Managed => {
-            let build = paths::current_build_id_at(root).ok_or(
-                "app/current.json 存在但缺少有效 build_id（指针损坏）；拒绝启动，请修复指针。",
-            )?;
-            let exe = root
-                .join(paths::APP_DIR)
-                .join("releases")
-                .join(&build)
-                .join(role.exe());
-            if !exe.is_file() {
-                return error(format!(
-                    "当前版本 {build} 缺少可执行文件：{}；拒绝退回扁平布局。",
-                    exe.display()
-                ));
-            }
-            exe
-        }
-        paths::Layout::Legacy => root.join(role.exe()),
-    };
-    if !exe.is_file() {
-        return error(format!("缺少可执行文件：{}", exe.display()));
+fn checked_launch(
+    exe: PathBuf,
+    role: Role,
+    unified: bool,
+    capabilities: PackageCapabilities,
+) -> Result<RoleLaunch, String> {
+    if !fs::symlink_metadata(&exe).is_ok_and(|meta| meta.is_file() && !is_reparse(&meta)) {
+        return error(format!("缺少常规可执行文件：{}；拒绝启动。", exe.display()));
     }
-    Ok(exe)
+    Ok(RoleLaunch {
+        exe,
+        role,
+        unified,
+        capabilities,
+    })
+}
+
+fn launch_from_dir(dir: &Path, build: Option<&str>, role: Role) -> Result<RoleLaunch, String> {
+    // 旧扁平开发目录可能没有便携清单；版本目录必须有，且只能使用清单声明的入口。
+    let manifest = if build.is_some()
+        || dir
+            .join(MANIFEST_NAME)
+            .try_exists()
+            .map_err(|e| e.to_string())?
+    {
+        Some(read_manifest_at(dir)?)
+    } else {
+        None
+    };
+    if let Some(build) = build
+        && manifest
+            .as_ref()
+            .is_none_or(|manifest| manifest.build_id != build)
+    {
+        return error("版本目录的清单与目标 build_id 不一致。");
+    }
+    let unified =
+        manifest.as_ref().and_then(|manifest| manifest.entrypoint) == Some(Entrypoint::UnifiedV1);
+    let capabilities = manifest
+        .as_ref()
+        .map(|manifest| manifest.capabilities)
+        .unwrap_or_default();
+    let name = if unified { APP_EXE } else { role.split_exe() };
+    if let Some(manifest) = manifest
+        && !manifest
+            .files
+            .iter()
+            .any(|file| file.path.eq_ignore_ascii_case(name))
+    {
+        return error(format!("发布清单未声明 {name}；拒绝启动。"));
+    }
+    checked_launch(dir.join(name), role, unified, capabilities)
+}
+
+/// 有指针时只从当前 release 解析；指针或入口损坏不回退旧文件。
+pub fn launch_role_at(root: &Path, role: Role) -> Result<RoleLaunch, String> {
+    paths::validate_current_at(root)?;
+    match paths::layout_at(root) {
+        paths::Layout::Managed => {
+            let build = paths::current_build_id_at(root).ok_or("当前版本指针无效。")?;
+            let dir = root.join(paths::APP_DIR).join("releases").join(&build);
+            launch_from_dir(&dir, Some(&build), role)
+        }
+        paths::Layout::Legacy => launch_from_dir(root, None, role),
+    }
 }
 
 pub fn prepare_activation_at(
     root: &Path,
     request: ActivationRequest,
 ) -> Result<Activation, String> {
+    validate_role_launch(request.role, request.capture_desktop, request.start_role)?;
     if !valid_build_id(&request.target) {
         return error("目标 build_id 无效。");
     }
     let meta = verify_staged_at(root, &request.target)?;
-    let helper = helper_source(root, &request.target)
-        .ok_or("发布包与当前版本都缺少 vc-updater.exe，无法激活。")?;
+    validate_launch_capabilities(
+        request.role,
+        request.capture_desktop,
+        meta.capabilities.unwrap_or_default(),
+    )?;
+    let helper = helper_source(root, &request.target)?;
     let worker = root.join(paths::UPDATES_DIR).join("worker");
     fs::create_dir_all(&worker).map_err(|e| e.to_string())?;
     let nonce = random_hex(8);
-    let helper_copy = worker.join(format!("vc-updater-{nonce}.exe"));
+    // 每次更新单独放置 helper 与同版本的 app-local CRT，避免依赖目标机安装运行库。
+    let helper_dir = worker.join(format!("helper-{nonce}"));
+    fs::create_dir(&helper_dir).map_err(|e| e.to_string())?;
+    let helper_copy = helper_dir.join(UPDATER_EXE);
     fs::copy(&helper, &helper_copy).map_err(|e| format!("无法复制更新 helper：{e}"))?;
+    for name in ENTRY_CRT_FILES {
+        let source = helper.with_file_name(name);
+        match fs::symlink_metadata(&source) {
+            Ok(meta) if meta.is_file() && !is_reparse(&meta) => {
+                fs::copy(&source, helper_dir.join(name))
+                    .map_err(|e| format!("无法复制更新运行库 {name}：{e}"))?;
+            }
+            // 源码/测试构建可独立使用系统运行库；完整便携包的 CRT 由打包闸验证。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            _ => return error(format!("更新运行库不是普通文件：{}。", source.display())),
+        }
+    }
     let ready_path = request
         .require_ready
         .then(|| worker.join(format!("ready-{nonce}.json")));
@@ -1308,6 +1590,7 @@ pub fn prepare_activation_at(
             .to_string(),
         role: request.role,
         target: request.target,
+        target_capabilities: meta.capabilities,
         previous,
         previous_exe,
         previous_native_dir,
@@ -1317,6 +1600,8 @@ pub fn prepare_activation_at(
         wait_ms: request.wait_ms.max(5_000),
         ready_ms: request.ready_ms.max(5_000),
         ready_path: ready_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        capture_desktop: request.capture_desktop,
+        start_role: request.start_role,
         created_utc: now_utc(),
     };
     let job_path = worker.join(format!("job-{nonce}.json"));
@@ -1359,6 +1644,19 @@ pub fn read_job(path: &Path) -> Result<ActivationJob, String> {
     }
     if job.root.is_empty() || !valid_build_id(&job.target) {
         return error("job 缺少有效 root/target。");
+    }
+    validate_role_launch(job.role, job.capture_desktop, job.start_role)?;
+    validate_launch_capabilities(
+        job.role,
+        job.capture_desktop,
+        job.target_capabilities.unwrap_or_default(),
+    )?;
+    if job
+        .previous
+        .as_deref()
+        .is_some_and(|build| !valid_build_id(build))
+    {
+        return error("job 的回滚 build_id 无效。");
     }
     Ok(job)
 }
@@ -1487,18 +1785,14 @@ fn wait_ready(
 ) -> Result<(), String> {
     let deadline = SystemTime::now() + Duration::from_millis(job.ready_ms);
     loop {
-        if let Some(status) = child.try_wait().map_err(|e| e.to_string())?
-            && !status.success()
-        {
+        if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
             return Err(format!("新版本进程提前退出（{status}）。"));
         }
         let ready = match job.role {
             Role::Capture => capture_ready(job, root, Some(&job.target), Some(child.id())),
-            Role::Host => {
-                child.try_wait().ok().flatten().is_none() && host_ready(job, child.id(), root)
-            }
+            Role::Host => host_ready(job, child.id(), root),
         };
-        if ready {
+        if ready && child.try_wait().map_err(|e| e.to_string())?.is_none() {
             return Ok(());
         }
         if SystemTime::now() >= deadline {
@@ -1508,44 +1802,60 @@ fn wait_ready(
     }
 }
 
-fn role_args(job: &ActivationJob, native_dir: &Path, ready: Option<&Path>) -> Vec<String> {
-    let mut args = vec![
-        "--root".into(),
-        job.root.clone(),
-        "--native-dir".into(),
-        native_dir.to_string_lossy().to_string(),
-    ];
+fn role_command(
+    job: &ActivationJob,
+    launch: &RoleLaunch,
+    native_dir: Option<&Path>,
+    ready: Option<&Path>,
+) -> std::process::Command {
+    let mut command = launch.command(Path::new(&job.root), native_dir);
     match job.role {
         Role::Capture => {
-            args.push("--bind".into());
-            args.push(job.bind.clone());
-            args.push("--port".into());
-            args.push(job.port.to_string());
+            if job.capture_desktop && launch.capabilities.desktop_capture {
+                command.arg("--desktop");
+            }
+            if let Some(role) = job
+                .start_role
+                .filter(|_| launch.capabilities.role_launch_args)
+            {
+                command.arg("--start-role").arg(match role {
+                    crate::startup::DesktopRole::Capture => "capture",
+                    crate::startup::DesktopRole::Receive => "receive",
+                });
+            }
+            command
+                .arg("--bind")
+                .arg(&job.bind)
+                .arg("--port")
+                .arg(job.port.to_string());
         }
         Role::Host => {
+            if launch.unified && launch.capabilities.role_launch_args {
+                if let Some(role) = job.start_role {
+                    command.arg("--start-role").arg(match role {
+                        crate::startup::DesktopRole::Capture => "capture",
+                        crate::startup::DesktopRole::Receive => "receive",
+                    });
+                } else {
+                    command.arg("--resume-role");
+                }
+            }
             if let Some(path) = ready {
-                args.push("--update-ready".into());
-                args.push(path.to_string_lossy().to_string());
+                command.arg("--update-ready").arg(path);
             }
         }
     }
-    args
+    command
 }
 
 fn spawn_role(
     job: &ActivationJob,
-    exe: &Path,
+    launch: &RoleLaunch,
     native_dir: Option<&Path>,
     ready: Option<&Path>,
 ) -> Result<std::process::Child, String> {
-    if !exe.is_file() {
-        return error(format!("缺少可执行文件：{}", exe.display()));
-    }
-    let fallback = exe.parent().unwrap_or(Path::new("."));
-    let native_dir = native_dir.unwrap_or(fallback);
-    let mut command = std::process::Command::new(exe);
+    let mut command = role_command(job, launch, native_dir, ready);
     command
-        .args(role_args(job, native_dir, ready))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
@@ -1556,31 +1866,31 @@ fn spawn_role(
     }
     command
         .spawn()
-        .map_err(|e| format!("无法启动 {}：{e}", exe.display()))
+        .map_err(|e| format!("无法启动 {}：{e}", launch.exe.display()))
 }
 
-fn release_exe(root: &Path, build_id: &str, role: Role) -> PathBuf {
-    root.join(paths::APP_DIR)
-        .join("releases")
-        .join(build_id)
-        .join(role.exe())
+fn previous_launch(job: &ActivationJob, root: &Path) -> Result<RoleLaunch, String> {
+    if let Some(build) = &job.previous {
+        let dir = root.join(paths::APP_DIR).join("releases").join(build);
+        return launch_from_dir(&dir, Some(build), job.role);
+    }
+    let exe = job
+        .previous_exe
+        .as_ref()
+        .map(PathBuf::from)
+        .ok_or("没有可回滚的旧版本。")?;
+    // schema 1 旧 job 记录真实角色进程，不会把同名的旧图形启动器记录在这里。
+    let unified = exe
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case(APP_EXE));
+    checked_launch(exe, job.role, unified, PackageCapabilities::default())
 }
 
 fn restart_previous(job: &ActivationJob, root: &Path) -> Result<(), String> {
-    let (exe, ready) = match &job.previous {
-        Some(build) => (release_exe(root, build, job.role), None),
-        None => {
-            let exe = job
-                .previous_exe
-                .as_ref()
-                .map(PathBuf::from)
-                .ok_or("没有可回滚的旧版本。")?;
-            (exe, None)
-        }
-    };
-    // 回滚不传 --update-ready：旧版 host 不认识该参数，会直接退出。
+    let launch = previous_launch(job, root)?;
+    // 回滚不传 --update-ready，保持旧版 host 的退出/恢复契约。
     let native_dir = job.previous_native_dir.as_deref().map(Path::new);
-    let mut child = spawn_role(job, &exe, native_dir, ready)?;
+    let mut child = spawn_role(job, &launch, native_dir, None)?;
     let deadline = SystemTime::now() + Duration::from_secs(8);
     loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())?
@@ -1675,7 +1985,20 @@ pub fn execute_activation(job: &ActivationJob) -> Result<(), ActivationError> {
     // 旧进程已退出：之后任何失败都必须恢复指针并重启旧版本，否则后台会一直停着。
     let pointer_path = root.join(paths::APP_DIR).join(paths::CURRENT_FILE_NAME);
     let previous_bytes = fs::read(&pointer_path).ok();
-    let meta = match verify_staged_at(&root, &job.target) {
+    let meta = match verify_staged_at(&root, &job.target).and_then(|meta| {
+        if job
+            .target_capabilities
+            .is_some_and(|capabilities| Some(capabilities) != meta.capabilities)
+        {
+            return error("job 与已校验目标清单的启动能力不一致。");
+        }
+        validate_launch_capabilities(
+            job.role,
+            job.capture_desktop,
+            meta.capabilities.unwrap_or_default(),
+        )?;
+        Ok(meta)
+    }) {
         Ok(meta) => meta,
         Err(e) => {
             return Err(rollback_after_failure(
@@ -1746,10 +2069,13 @@ pub fn execute_activation(job: &ActivationJob) -> Result<(), ActivationError> {
             format!("迁移本地配置/令牌失败：{e}"),
         ));
     }
-    let exe = release.join(job.role.exe());
     let ready = job.ready_path.as_ref().map(PathBuf::from);
-    let mut child = match spawn_role(job, &exe, None, ready.as_deref()) {
-        Ok(child) => child,
+    let launch = launch_from_dir(&release, Some(&job.target), job.role).and_then(|launch| {
+        let child = spawn_role(job, &launch, None, ready.as_deref())?;
+        Ok((launch, child))
+    });
+    let (launch, mut child) = match launch {
+        Ok(started) => started,
         Err(e) => {
             return Err(rollback_after_failure(
                 job,
@@ -1761,7 +2087,14 @@ pub fn execute_activation(job: &ActivationJob) -> Result<(), ActivationError> {
             ));
         }
     };
-    if let Err(e) = wait_ready(job, &root, &mut child) {
+    let ready = wait_ready(job, &root, &mut child).and_then(|()| {
+        if launch.unified {
+            install_root_entry(&root, &release, &meta)
+                .map_err(|e| format!("无法安装固定 ROOT 入口：{e}"))?;
+        }
+        Ok(())
+    });
+    if let Err(e) = ready {
         let _ = child.kill();
         let _ = child.wait();
         return Err(rollback_after_failure(
@@ -1789,6 +2122,142 @@ pub fn execute_activation(job: &ActivationJob) -> Result<(), ActivationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn role_launch_rejects_incompatible_update_modes() {
+        use crate::startup::DesktopRole;
+
+        assert!(validate_role_launch(Role::Capture, false, None).is_ok());
+        assert!(validate_role_launch(Role::Capture, true, None).is_ok());
+        assert!(validate_role_launch(Role::Capture, false, Some(DesktopRole::Capture)).is_err());
+        assert!(validate_role_launch(Role::Host, false, None).is_ok());
+        assert!(validate_role_launch(Role::Host, false, Some(DesktopRole::Receive)).is_ok());
+        assert!(validate_role_launch(Role::Host, true, None).is_err());
+        assert!(validate_role_launch(Role::Host, false, Some(DesktopRole::Capture)).is_err());
+
+        let old_unified = PackageCapabilities::default();
+        let current = PackageCapabilities {
+            role_launch_args: true,
+            desktop_capture: true,
+        };
+        assert!(validate_launch_capabilities(Role::Host, false, old_unified).is_ok());
+        assert!(validate_launch_capabilities(Role::Host, false, current).is_ok());
+        assert!(validate_launch_capabilities(Role::Capture, true, old_unified).is_err());
+        assert!(validate_launch_capabilities(Role::Capture, true, current).is_ok());
+
+        let role_args = |command: &std::process::Command| {
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+        let mut rollback_job = ActivationJob {
+            schema: 1,
+            root: "root".into(),
+            role: Role::Host,
+            target: "new".into(),
+            target_capabilities: Some(current),
+            previous: Some("old".into()),
+            previous_exe: None,
+            previous_native_dir: None,
+            parent_pid: 1,
+            port: 5143,
+            bind: "127.0.0.1".into(),
+            wait_ms: 5_000,
+            ready_ms: 5_000,
+            ready_path: None,
+            capture_desktop: false,
+            start_role: None,
+            created_utc: String::new(),
+        };
+        let old_host = RoleLaunch {
+            exe: PathBuf::from(APP_EXE),
+            role: Role::Host,
+            unified: true,
+            capabilities: old_unified,
+        };
+        let new_host = RoleLaunch {
+            exe: PathBuf::from(APP_EXE),
+            role: Role::Host,
+            unified: true,
+            capabilities: current,
+        };
+        let old_args = role_args(&role_command(&rollback_job, &old_host, None, None));
+        assert!(
+            !old_args
+                .iter()
+                .any(|arg| arg == "--start-role" || arg == "--resume-role")
+        );
+        let new_args = role_args(&role_command(&rollback_job, &new_host, None, None));
+        assert!(new_args.iter().any(|arg| arg == "--resume-role"));
+        let desktop_capture = role_args(&role_command(
+            &ActivationJob {
+                role: Role::Capture,
+                capture_desktop: true,
+                target_capabilities: Some(current),
+                ..rollback_job.clone()
+            },
+            &RoleLaunch {
+                exe: PathBuf::from(APP_EXE),
+                role: Role::Capture,
+                unified: true,
+                capabilities: current,
+            },
+            None,
+            None,
+        ));
+        assert!(desktop_capture.iter().any(|arg| arg == "--desktop"));
+        let old_capture = role_args(&role_command(
+            &ActivationJob {
+                role: Role::Capture,
+                capture_desktop: true,
+                target_capabilities: None,
+                ..rollback_job.clone()
+            },
+            &RoleLaunch {
+                exe: PathBuf::from(APP_EXE),
+                role: Role::Capture,
+                unified: true,
+                capabilities: old_unified,
+            },
+            None,
+            None,
+        ));
+        assert!(!old_capture.iter().any(|arg| arg == "--desktop"));
+        rollback_job.start_role = Some(DesktopRole::Receive);
+        let new_role_args = role_args(&role_command(&rollback_job, &new_host, None, None));
+        assert!(
+            new_role_args
+                .windows(2)
+                .any(|pair| pair == ["--start-role", "receive"])
+        );
+
+        let mut legacy_job = serde_json::json!({
+            "schema": 1,
+            "root": "root",
+            "role": "host",
+            "target": "target",
+            "previous": "previous",
+            "previous_exe": null,
+            "previous_native_dir": null,
+            "parent_pid": 1,
+            "port": 5143,
+            "bind": "127.0.0.1",
+            "wait_ms": 5000,
+            "ready_ms": 5000,
+            "ready_path": null,
+            "created_utc": "now"
+        });
+        let path = temp_dir("legacy-job").join("job.json");
+        fs::write(&path, serde_json::to_vec(&legacy_job).unwrap()).unwrap();
+        let parsed = read_job(&path).unwrap();
+        assert_eq!(parsed.target_capabilities, None);
+        legacy_job["capture_desktop"] = serde_json::Value::Bool(true);
+        legacy_job["role"] = serde_json::Value::String("capture".into());
+        fs::write(&path, serde_json::to_vec(&legacy_job).unwrap()).unwrap();
+        assert!(read_job(&path).is_err());
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
 
     #[test]
     fn build_ids_are_bounded_and_safe() {
@@ -1825,6 +2294,8 @@ mod tests {
             schema: UPDATE_SCHEMA,
             version: "0.1.0".into(),
             build_id: "b1".into(),
+            entrypoint: None,
+            capabilities: PackageCapabilities::default(),
             files: vec![UpdateFile {
                 path: "a.txt".into(),
                 bytes: 1,
@@ -1944,9 +2415,205 @@ mod tests {
                 bytes: 1,
                 sha256: "0".repeat(64),
             }],
+            capabilities: None,
             staged_utc: String::new(),
         };
         assert!(checked_meta_files(&meta).is_err());
+    }
+
+    fn entry_manifest(
+        build: &str,
+        entrypoint: Option<Entrypoint>,
+        names: &[&str],
+    ) -> PackageManifest {
+        PackageManifest {
+            product: PRODUCT.into(),
+            schema: UPDATE_SCHEMA,
+            version: "0.2.1".into(),
+            build_id: build.into(),
+            entrypoint,
+            capabilities: PackageCapabilities::default(),
+            files: names
+                .iter()
+                .map(|name| UpdateFile {
+                    path: (*name).into(),
+                    bytes: 2,
+                    sha256: format!("{:x}", Sha256::digest(b"MZ")),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn legacy_staged_meta_uses_verified_manifest_capabilities() {
+        let root = temp_dir("legacy-capabilities");
+        let staged = root.join(paths::UPDATES_DIR).join("staged");
+        for (build, capabilities) in [
+            ("old", PackageCapabilities::default()),
+            (
+                "new",
+                PackageCapabilities {
+                    role_launch_args: true,
+                    desktop_capture: true,
+                },
+            ),
+        ] {
+            let dir = staged.join(build);
+            fs::create_dir_all(&dir).unwrap();
+            for name in [APP_EXE, UPDATER_EXE] {
+                fs::write(dir.join(name), b"MZ").unwrap();
+            }
+            let mut manifest =
+                entry_manifest(build, Some(Entrypoint::UnifiedV1), &[APP_EXE, UPDATER_EXE]);
+            manifest.capabilities = capabilities;
+            fs::write(
+                dir.join(MANIFEST_NAME),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            let mut meta = serde_json::json!({
+                "schema": UPDATE_SCHEMA,
+                "build_id": build,
+                "version": manifest.version,
+                "zip_sha256": "0".repeat(64),
+                "bytes": 4,
+                "files": manifest.files,
+                "staged_utc": "now"
+            });
+            let meta_path = staged.join(format!("{build}.json"));
+            fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            let verified = verify_staged_at(&root, build).unwrap();
+            assert_eq!(verified.capabilities, Some(capabilities));
+            assert_eq!(staged_capabilities_at(&root, build).unwrap(), capabilities);
+            assert!(install_staged_at(&root, build).is_ok());
+            assert!(verify_release_at(&root, build).is_ok());
+            assert_eq!(staged_meta_at(&root, build).unwrap().capabilities, None);
+
+            meta["capabilities"] = serde_json::to_value(PackageCapabilities {
+                role_launch_args: !capabilities.role_launch_args,
+                desktop_capture: false,
+            })
+            .unwrap();
+            fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            assert!(verify_staged_at(&root, build).is_err());
+            assert!(verify_release_at(&root, build).is_err());
+            meta.as_object_mut().unwrap().remove("capabilities");
+            fs::write(&meta_path, serde_json::to_vec(&meta).unwrap()).unwrap();
+            fs::write(dir.join(APP_EXE), b"XX").unwrap();
+            assert!(verify_staged_at(&root, build).is_err());
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn unified_manifest_limits_the_entire_exe_inventory() {
+        let valid = entry_manifest("new", Some(Entrypoint::UnifiedV1), &[APP_EXE, UPDATER_EXE]);
+        assert!(validate_manifest(&valid).is_ok());
+        for extra in [
+            "vc-capture.exe",
+            "tools/test.EXE",
+            "vcruntime-test.exe",
+            "Start-Capture.cmd",
+            "scripts/options.txt",
+        ] {
+            let mut bad = valid.clone();
+            let mut extra_file = bad.files[0].clone();
+            extra_file.path = extra.into();
+            bad.files.push(extra_file);
+            assert!(validate_manifest(&bad).is_err(), "extra file {extra}");
+        }
+        let mut missing_marker = valid.clone();
+        missing_marker.entrypoint = None;
+        assert!(validate_manifest(&missing_marker).is_err());
+
+        let mut unsupported_caps = valid.clone();
+        unsupported_caps.entrypoint = None;
+        unsupported_caps.capabilities.role_launch_args = true;
+        assert!(validate_manifest(&unsupported_caps).is_err());
+
+        let mut desktop_without_role_args = valid;
+        desktop_without_role_args.capabilities.desktop_capture = true;
+        assert!(validate_manifest(&desktop_without_role_args).is_err());
+    }
+
+    #[test]
+    fn role_launch_uses_the_selected_release_manifest() {
+        let dir = temp_dir("entrypoint");
+        for (build, entrypoint, names) in [
+            (
+                "old",
+                None,
+                &[APP_EXE, "vc-host.exe", "vc-capture.exe", UPDATER_EXE][..],
+            ),
+            (
+                "new",
+                Some(Entrypoint::UnifiedV1),
+                &[APP_EXE, UPDATER_EXE][..],
+            ),
+        ] {
+            let release = dir.join(paths::APP_DIR).join("releases").join(build);
+            fs::create_dir_all(&release).unwrap();
+            for name in names {
+                fs::write(release.join(name), b"MZ").unwrap();
+            }
+            let mut manifest = entry_manifest(build, entrypoint, names);
+            if build == "new" {
+                manifest.capabilities = PackageCapabilities {
+                    role_launch_args: true,
+                    desktop_capture: true,
+                };
+            }
+            fs::write(
+                release.join(MANIFEST_NAME),
+                serde_json::to_vec(&manifest).unwrap(),
+            )
+            .unwrap();
+            write_pointer_at(
+                &dir,
+                &CurrentPointer {
+                    schema: UPDATE_SCHEMA,
+                    build_id: build.into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let host = launch_role_at(&dir, Role::Host).unwrap();
+            let capture = launch_role_at(&dir, Role::Capture).unwrap();
+            assert_eq!(
+                host.exe,
+                release.join(if entrypoint.is_some() {
+                    APP_EXE
+                } else {
+                    "vc-host.exe"
+                })
+            );
+            assert_eq!(
+                capture.exe,
+                release.join(if entrypoint.is_some() {
+                    APP_EXE
+                } else {
+                    "vc-capture.exe"
+                })
+            );
+            assert_eq!(
+                capture.command(&dir, None).get_args().next().unwrap(),
+                if entrypoint.is_some() {
+                    "capture"
+                } else {
+                    "--root"
+                }
+            );
+            assert_eq!(
+                host.command(&dir, None).get_args().next().unwrap(),
+                "--root"
+            );
+            assert_eq!(host.unified, entrypoint.is_some());
+            assert_eq!(host.capabilities.role_launch_args, build == "new");
+            assert_eq!(capture.capabilities.desktop_capture, build == "new");
+            fs::remove_file(release.join(MANIFEST_NAME)).unwrap();
+            assert!(launch_role_at(&dir, Role::Capture).is_err());
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1958,11 +2625,11 @@ mod tests {
             "not json",
         )
         .unwrap();
-        assert!(launch_exe_at(&dir, Role::Capture).is_err());
+        assert!(launch_role_at(&dir, Role::Capture).is_err());
         fs::write(dir.join("vc-capture.exe"), b"MZ").unwrap();
-        assert!(launch_exe_at(&dir, Role::Capture).is_err());
+        assert!(launch_role_at(&dir, Role::Capture).is_err());
         fs::remove_file(dir.join(paths::APP_DIR).join(paths::CURRENT_FILE_NAME)).unwrap();
-        assert!(launch_exe_at(&dir, Role::Capture).is_ok());
+        assert!(launch_role_at(&dir, Role::Capture).is_ok());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -2,7 +2,7 @@
 
 入口/仓库地图/硬规则见 AGENTS.md；长证据只放docs/bringup或proposals。历史PLAN与旧实现查Git；docs/history为只读档案。
 
-## 0. 当前状态（2026-11-20）
+## 0. 当前状态（2026-11-22）
 
 - 开发全面转Rust，产品宿主进程内加载vc_stream.dll；旧C++/Python产品树和旧运维脚本从工作树移除，只保留Git历史。独立Python测试参考与打包协调不是产品后台，继续保留。
 - 当前编码Raw/显式PyroWave；DDA/WGC仅硬件GPU转换，CPU MJPEG移除。必要CPU上传/回读/Npcap/hash/SHM仍存在，不宣称零CPU或零拷贝。
@@ -15,15 +15,16 @@
 
 | 范围 | 契约与真相源 |
 |---|---|
+| 桌面角色 | 双击首次选择采集/接收；确认后独立 `vc-startup.json` 原子持久化，下次进入该角色；空闲角色页或 `--select-role` 可重新选择，Managed ROOT 保留重选及自定义监听参数；回滚保留已有 data 偏好，OTA 按 manifest 能力恢复实际图形/后台模式并兼容旧入口；见 references/rust-control.md |
 | Wire | proto/vc_wire.h冻结28B、0x88B5；payload=mtu−42，Raw帧B=w×h×3/2、N=ceil(B/payload)，不占保留位；skill references/wire-protocol.md |
-| 产品拓扑 | vc-host GPUI主机（无REST）；vc-capture REST v2采集后台；vc-core进程内加载C ABI v1，EXE/DLL共享实现，不回退旧进程；references/rust-control.md |
+| 产品拓扑 | `VirtualCapture.exe` 首次选端并保存偏好，启动已选 GPUI 角色；接收端无本机 REST，采集端内嵌 REST v2（默认 5143），`capture` 子命令仍运行控制台 REST 后台；`vc-updater.exe` 独立更新/回滚。角色进程内加载 C ABI v1，EXE/DLL 共用数据面，不拉起旧 sender/receiver；references/rust-control.md |
 | 网卡/MTU | 仅列 Windows 状态为Up的物理非虚拟网卡，不按型号偏置；本机按控制连接路由精确匹配，对端多候选须明确选择。显式选择保持、失效后重选。新配置自动MTU，旧缺字段保留显式值；双端只读NlMtu取最小、上限9000，不改系统参数 |
 | GPU/编码 | DDA/WGC强制硬件GPU；pattern独立诊断。Raw不压缩；PyroWave显式开发/精确backend、GOP1、真实GPU Vulkan1.3；MJPEG明确拒绝，旧codec ID不复用；references/encoded-stream.md |
 | 批提交 | Raw物理卡整帧一个sendqueue，编码按实际AU整帧一次提交，零/短发送失败。显式Loopback固定batch1例外，不冒充产品性能 |
 | 生命周期 | stop/destroy仅0证明释放；pending保留worker/句柄/DLL，未知destroy不盲重试。PyroWave每操作5s粘性看门狗不退出宿主；待清理锁配置/OTA/虚拟卡 |
 | SHM/DShow | docs/spec/shm-v3.md；动态NV12、12槽、只读seqlock、事件对；D12从无好帧不输出、停流只重复最后好帧。隔离verifier由Cargo构建，无注册表枚举回退 |
 | 归属/OTA | 全局owner+本根schema2精确证明/互斥/刷盘pending；未知拒绝接管。固定app/data/updates，配对令牌独立，stage不等于activate成功；references/rust-control.md |
-| 构建/包 | Cargo workspace/locked为唯一产品入口；CMake仅PyroWave第三方库。scripts/verify.py为Rust总闸，package.py为薄入口；便携载荷不含许可材料或独立数据面诊断EXE，保留运行时verifier；许可仅build审计。唯一dist不覆盖旧成品，GUI黑屏硬失败；references/packaging.md |
+| 构建/包 | Cargo workspace/locked 为唯一产品入口；CMake 仅处理 PyroWave 第三方库与运行库。便携包顶层仅 `VirtualCapture.exe` 和 `vc-updater.exe`，无启动脚本、独立诊断 EXE 或许可材料；构建树保留完整 COM graph 验证。`unified-v1` 清单标记区分旧拆分版；唯一 dist 不覆盖旧成品，GUI 黑屏硬失败；references/packaging.md |
 | 判据 | test-matrix.md冻结T0–T5/D1；Raw整帧FNV，性能motion且注明batch/adapter，跨机不减QPC；有损transport/decoded出口分开核对 |
 
 浮点只允许已批准UNORM格式解码例外且逐字节匹配整数参考，不扩展为图案生成许可。实际配置/能力/精确回显优先，预算不当实测。
@@ -67,6 +68,8 @@ D1–D28为历史决策原记录，涉及已移除实现的路径/命令只在Gi
 | D31 | 精简 Rust 便携包 | owner（2026-11-19）要求移除无用包文件，并明确许可材料无需随包分发。许可收集/例外检查仍在 build 审计目录执行；便携包不含许可文件、许可元数据、`vc-stream.exe` 或 `vc-transport.exe`，保留运行时依赖 `vc-vcam-verify.exe`。精简包和验收证据见[记录](docs/bringup/bringup-20261119-rust-r3a-trimmed-package.md)。 | Rust-R3a 精简包 |
 | D32 | 产品网卡枚举不偏置 I226 | owner（2026-11-20）澄清：“只是当时测试用的网卡是 i226”，要求正常枚举已连接物理网卡。产品候选限定 Windows `Status=Up`、明确硬件且非虚拟；不按厂商/型号偏置。本机自动选择按控制连接路由精确匹配，对端唯一候选才可预览，多候选明确选择；MTU只读契约不变。 | Rust-R3a 网卡策略修正 |
 | D33 | 精简网卡修正版提交与打包 | owner（2026-11-20）要求“提交 打包”：提交D31/D32已审阅改动，从精确干净提交`d6eb33d`生成0.2.1新包，完整及扩展门禁通过；不升版本、不push、不部署，不授权PC2、物理网卡变更或真实DShow注册。23文件、来源/哈希与证据见[交付记录](docs/bringup/bringup-20261120-rust-r3a-connected-adapters-package.md)。 | Rust-R3a 修正版包 |
+| D34 | 两 EXE 便携入口 | owner（2026-11-21）要求把包内五个 EXE 减到两个。合并主机、采集和隔离能力探测，独立保留更新器；新采集默认 5143，OTA 沿用运行实例原 bind/port。不改数据面/验收门限，不自动部署、注册或切稳定版。 | Rust-R3a 两 EXE 入口 |
+| D35 | 启动选端、重选与持久化 | owner 要求启动选择采集/接收角色并独立持久化；首次选择、下次直启、本机角色空闲时重选，显式 capture 后台不受偏好影响，OTA 恢复实际运行模式。已完成实现和本机 GUI/OTA 专项验收；本次另行授权提交与重新打包，不部署。 | Rust-R3a 桌面角色 |
 
 ## 3. 当前任务卡
 
@@ -85,6 +88,10 @@ D1–D28为历史决策原记录，涉及已移除实现的路径/命令只在Gi
 ### Rust-R3a 精简网卡修正版提交与打包（D33） — DONE
 
 源码提交`d6eb33d`；干净来源0.2.1包`20261120-005019-063265`为23个文件，314项测试、10项完整/扩展包检查、真实GUI截图与来源/ZIP/逐文件哈希独立复核通过，见[交付记录](docs/bringup/bringup-20261120-rust-r3a-connected-adapters-package.md)。交付后仅补本记录与PLAN证据，不改包内来源；无push或部署。
+
+### Rust-R3a 两 EXE 便携入口（D34） — DONE
+
+`0.2.1` 包 `20261121-163453-82bb3e` 共 16 个文件、仅两个 EXE；原 D34 验收证据见[记录](docs/bringup/bringup-20261121-rust-r3a-two-exe-package.md)。本机后续源码增补及 D35 验收见[桌面角色记录](docs/bringup/bringup-20261122-desktop-role-selection.md)：完整 Rust 门禁331项测试、Clippy、Release、独立参考与 DLL 自检通过；Release GUI 首选/重选/重启真实点击通过；Managed ROOT 显式重选写入 data 偏好；图形采集 OTA 恢复窗口及原 bind/port，隔离 Host OTA 通过。用户要求提交代码并重新打包；交付结果待补。本机与 Loopback 证据不代表物理网卡、双机、长稳或画质通过。
 
 ### Rust-R3b 双机矩阵替代与产品验收 — TODO
 

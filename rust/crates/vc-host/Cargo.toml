@@ -1,13 +1,19 @@
 [package]
 name = "vc-host"
-default-run = "vc-host"
-description = "主机 GPUI 客户端：内嵌接收与虚拟卡管理，经 HTTP 控制被采集机后台"
+default-run = "VirtualCapture"
+autobins = false
+description = "VirtualCapture 统一入口：GPUI 接收、采集后台与隔离能力探测"
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
 
+[[bin]]
+name = "VirtualCapture"
+path = "src/main.rs"
+
 [dependencies]
 vc-core.workspace = true
+vc-capture = { path = "../vc-capture" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

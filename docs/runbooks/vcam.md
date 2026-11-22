@@ -16,7 +16,7 @@ python -I rust/tests/vcam_dll_smoke.py
 .\rust\target\release\vc-vcam-verify.exe --dll .\rust\target\release\vc_vcam.dll --shm Local\VirtualCapture-Isolated --width 416 --height 416 --fps 60 --seconds 3 --hashlog .\run\isolated-outlet.jsonl
 ```
 
-`--dll`必填，没有真实注册枚举回退。`--capabilities`只加载DLL并读取导出；实际graph验证才覆盖COM收流。`--allow-empty`允许无信号，`--block-receive`检查BeginFlush解阻塞，`--hold-samples`与`--disconnect-running`检查生命周期；Stop/Disconnect须小于2秒。结束要求 `DllCanUnloadNow=S_OK` 后才卸载。
+`--dll` 必填，没有真实注册枚举回退。便携主程序内部另起 `VirtualCapture.exe __vcam-probe --dll <绝对路径>`，只读实际 DLL 能力导出，不运行 COM graph。构建树工具的 `--capabilities` 也只读能力，不能替代 COM 收流验证。`--allow-empty`允许无信号，`--block-receive`检查BeginFlush解阻塞，`--hold-samples`与`--disconnect-running`检查生命周期；Stop/Disconnect须小于2秒。结束要求 `DllCanUnloadNow=S_OK` 后才卸载。
 
 ## SHM与格式
 

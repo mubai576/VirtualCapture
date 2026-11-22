@@ -12,7 +12,7 @@ Windows x64、Rust MSVC工具链、Visual Studio C++/Windows SDK、Python；完�
 cargo build --manifest-path rust/Cargo.toml --workspace --release --locked
 ```
 
-输出 `rust/target/release/`：Rust EXE、`vc_stream.dll`、`vc_vcam.dll`；`vc-launcher.exe` 在包内命名 `VirtualCapture.exe`。
+输出 `rust/target/release/`：主程序 `VirtualCapture.exe`、独立更新器 `vc-updater.exe`、`vc_stream.dll`、`vc_vcam.dll` 及仅供开发验证的工具。主程序直接由 Cargo 输出，不做入口改名。首次启动选择本机角色并独立持久化；可用 `VirtualCapture.exe --select-role` 再次选择，显式 `capture` 子命令仍运行控制台后台。
 
 ```powershell
 python scripts/verify.py
@@ -54,7 +54,7 @@ python scripts/package.py
 python scripts/package.py --allow-dirty
 ```
 
-唯一实现 `rust/packaging/package.py`，精确载荷 `inventory.py`。自动fmt/tests/Clippy/Release/native install、构建期许可/PE审计、解压运行、DLL/网卡/GUI/OTA隔离门；审计文本留在构建验证目录，不进入便携包。独立 `vc-stream.exe`/`vc-transport.exe` 仅供构建树诊断，包内保留运行时所需 `vc-vcam-verify.exe`。`--extended-smokes`追加control/host_update。GUI黑屏不可绕过，任一失败不发布最终包。
+唯一实现 `rust/packaging/package.py`，精确载荷 `inventory.py`。自动 fmt/tests/Clippy/Release/native install、构建期许可/PE 审计、解压运行、DLL/网卡可见性/GUI/OTA 隔离门。网卡可见性 smoke 需要至少一张 Windows Up 的物理非虚拟网卡，但不发送数据帧、不代表物理链路验收。包全树恰好两个 EXE（顶层 `VirtualCapture.exe` 和 `vc-updater.exe`），无启动脚本；审计文本不随包分发。`vc-stream.exe`、`vc-transport.exe`、`vc-vcam-verify.exe` 仅供构建树诊断。`--extended-smokes` 追加 control/host_update。GUI 黑屏不可绕过，任一失败不发布最终包。
 
 输出唯一 `dist/VirtualCapture-Rust-<版本>-windows-x64-<时间>-<id>/`、ZIP和SHA256，不覆盖已用 `dist/VirtualCapture`；日志/候选在 `build/rust-package/<build_id>/`。构建过程中源码改变即失败；来源/载荷不得收录现有凭据、配置、证据或未审阅并发改动。
 

@@ -8,7 +8,7 @@
 
 网卡正常枚举 Windows 状态为 Up 的物理非虚拟网卡，不按厂商或型号偏置；控制连接路由可唯一确定时自动选择，多候选需明确选择。MTU 可配置，新配置默认读取双端网卡报告值，不修改系统网卡参数。640×640@240 Raw 为 614400 B/帧、约 1.18 Gbps 像素载荷；可变尺寸不等于任意组合已验收。
 
-产品宿主进程内加载 `vc_stream.dll` C ABI v1；DLL 与诊断 EXE 共享 Rust 实现，不拉起旧 sender/receiver。范围仅采集与传输，不含推理或独占全屏 Hook。
+便携包只有 `VirtualCapture.exe` 和 `vc-updater.exe` 两个 EXE。主程序首次显示采集/接收角色选择，持久化后启动上次选择的 GPUI 角色；`capture` 子命令仍运行采集后台，内部子进程隔离探测虚拟卡；更新器独立执行。角色进程内加载 `vc_stream.dll` C ABI v1；DLL 与构建树诊断 EXE 共享 Rust 实现，不拉起旧 sender/receiver。范围仅采集与传输，不含推理或独占全屏 Hook。
 
 **Rust-R3 仍在验收中**：历史本机 Loopback/WGC/隔离虚拟卡证据不代表物理网卡、双机、长稳或画质通过；历史 GUI 黑屏导致完整便携验收失败，硬门禁不得绕过。本次重构不自动部署、不切稳定版。
 
@@ -31,7 +31,7 @@
 |---|---|
 | `rust/Cargo.toml`、`Cargo.lock` | 唯一产品 workspace 与锁定依赖 |
 | `rust/crates/vc-core` | UI 无关配置、预算、网卡、会话、DLL 生命周期、虚拟卡归属、OTA |
-| `rust/crates/vc-capture` / `vc-host` / `vc-updater` | REST v2 采集后台 / GPUI 主机与图形入口 / 更新助手 |
+| `rust/crates/vc-capture` / `vc-host` / `vc-updater` | REST v2 采集库 / `VirtualCapture.exe` 统一入口与 GPUI / `vc-updater.exe` 更新助手 |
 | `rust/crates/vc-stream` | `vc_stream.dll` 与独立 `vc-stream.exe`；Npcap、调度、SHM 写端 |
 | `rust/crates/vc-source` | 整数 pattern、DDA/WGC、GPU 转换与四种几何变换 |
 | `rust/crates/vc-media` | Raw/PyroWave、VCAU、受保护的原生库加载与看门狗 |

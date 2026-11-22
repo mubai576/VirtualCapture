@@ -29,6 +29,7 @@ type Reply = (StatusCode, Json<Value>);
 pub struct ServerInfo {
     pub bind: String,
     pub port: u16,
+    pub desktop: bool,
 }
 
 #[derive(Clone)]
@@ -375,6 +376,8 @@ async fn begin_activation(state: &AppState, target: String) -> Reply {
         wait_ms: 120_000,
         ready_ms: 30_000,
         require_ready: false,
+        capture_desktop: state.server.desktop,
+        start_role: None,
     };
     let prepared =
         tokio::task::spawn_blocking(move || update::prepare_activation_at(&root, request)).await;

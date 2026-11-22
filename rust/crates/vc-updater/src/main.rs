@@ -1,13 +1,13 @@
-//! OTA helper：由运行中的 `vc-capture`/`vc-host` 复制到 `updates/worker/` 后脱离父进程运行。
+//! OTA helper：由运行中的 VirtualCapture 复制到 `updates/worker/` 后脱离父进程运行。
 //!
 //! 只信任 job 文件；流程与安全校验在 `vc_core::update::execute_activation` 中实现，
 //! 本入口保持极薄，避免升级逻辑分散。
 //!
-//! `vc-updater launch` 供 CMD/PowerShell 引导使用：解析当前 release（或扁平根）后
+//! `vc-updater launch` 可在终端前台使用：解析当前 release（或扁平根）后
 //! 前台启动并等待子进程退出；Ctrl-C/Ctrl-Break 只交给子进程处理，避免启动器先退出
 //! 导致脚本在旧后台尚未停机时立刻重启而抢占端口。
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitCode};
+use std::process::ExitCode;
 use std::time::{Duration, SystemTime};
 
 use vc_core::update::{self, Role};
@@ -52,19 +52,17 @@ unsafe extern "system" fn ignore_ctrl(_event: u32) -> i32 {
 
 fn launch(spec: Launch) -> ExitCode {
     vc_core::paths::set_root_override(spec.root.clone());
-    let exe = match update::launch_exe_at(&spec.root, spec.role) {
-        Ok(exe) => exe,
+    let target = match update::launch_role_at(&spec.root, spec.role) {
+        Ok(target) => target,
         Err(error) => {
             eprintln!("vc-updater: {error}");
             return ExitCode::from(2);
         }
     };
-    let release = exe.parent().unwrap_or(&spec.root);
-    let mut command = Command::new(&exe);
-    command.arg("--root").arg(&spec.root);
-    command
-        .arg("--native-dir")
-        .arg(spec.native_dir.as_deref().unwrap_or(release));
+    let mut command = target.command(&spec.root, spec.native_dir.as_deref());
+    if spec.role == Role::Host && target.capabilities.role_launch_args {
+        command.arg("--start-role").arg("receive");
+    }
     if spec.role == Role::Capture {
         if let Some(bind) = &spec.bind {
             command.arg("--bind").arg(bind);
@@ -92,7 +90,7 @@ fn launch(spec: Launch) -> ExitCode {
             }
         },
         Err(error) => {
-            eprintln!("vc-updater: 无法启动 {}：{error}", exe.display());
+            eprintln!("vc-updater: 无法启动 {}：{error}", target.exe.display());
             ExitCode::from(5)
         }
     }
@@ -165,7 +163,7 @@ fn run() -> ExitCode {
     let Some(job_path) = job_path else {
         return usage();
     };
-    let job = match update::read_job(&job_path) {
+    let mut job = match update::read_job(&job_path) {
         Ok(job) => job,
         Err(error) => {
             eprintln!("vc-updater: {error}");
@@ -176,6 +174,10 @@ fn run() -> ExitCode {
         }
     };
     vc_core::paths::set_root_override(PathBuf::from(&job.root));
+    if job.target_capabilities.is_none() {
+        job.target_capabilities =
+            vc_core::update::staged_capabilities_at(Path::new(&job.root), &job.target).ok();
+    }
     let log_path = log_path.unwrap_or_else(|| job_path.with_extension("log"));
     log(
         &log_path,

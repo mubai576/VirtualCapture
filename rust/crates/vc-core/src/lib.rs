@@ -12,6 +12,7 @@ pub mod host;
 pub mod paths;
 pub mod process;
 pub mod session;
+pub mod startup;
 pub mod update;
 pub mod vcam;
 pub mod version;

@@ -175,31 +175,9 @@ impl Config {
 
     /// 原子保存：写入同目录临时文件、刷盘，再替换目标文件。
     pub fn save(&self, path: &Path) -> std::io::Result<()> {
-        if let Some(parent) = path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
         let text = serde_json::to_string_pretty(self)
             .map_err(|error| invalid_data(format!("配置无法序列化：{error}")))?;
-        let tmp = temp_path(path);
-        let write_result = (|| {
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&tmp)?;
-            file.write_all(text.as_bytes())?;
-            file.sync_all()
-        })();
-        if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error);
-        }
-        if let Err(error) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(error);
-        }
-        Ok(())
+        write_text_atomic(path, &text)
     }
 
     pub fn save_root(&self) -> std::io::Result<()> {
@@ -405,16 +383,48 @@ fn invalid_data(message: String) -> std::io::Error {
     std::io::Error::new(std::io::ErrorKind::InvalidData, message)
 }
 
+/// 原子写入文本：同目录唯一临时文件 → 刷盘 → 替换目标。
+///
+/// 供 [`Config::save`] 与启动偏好等独立状态文件复用。失败时清理临时文件，
+/// 目标文件保持原内容（加载路径不会调用本函数）。
+pub(crate) fn write_text_atomic(path: &Path, text: &str) -> std::io::Result<()> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = temp_path(path);
+    let write_result = (|| {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    if let Err(error) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn temp_path(path: &Path) -> PathBuf {
+    static TEMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_nanos())
         .unwrap_or(0);
+    let seq = TEMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let name = path
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "vc-rust-config.json".into());
-    let tmp_name = format!(".{name}.{}.{nanos}.tmp", std::process::id());
+        .unwrap_or_else(|| "vc-state.json".into());
+    let tmp_name = format!(".{name}.{}.{nanos}.{seq}.tmp", std::process::id());
     path.with_file_name(tmp_name)
 }
 

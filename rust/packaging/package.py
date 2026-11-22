@@ -19,7 +19,6 @@ import uuid
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-MARKER = "package-manifest.json"
 NATIVE_SOURCE = ROOT / "rust/packaging/native"
 NATIVE_BUILD = ROOT / "build/rust-package-native"
 DEFAULT_DLL_SMOKE = ROOT / "rust/tests/dll_stream_smoke.py"
@@ -40,6 +39,7 @@ def load_sibling(name):
 
 
 inventory = load_sibling("inventory")
+MARKER = inventory.MANIFEST_NAME
 
 
 def source_snapshot():
@@ -49,6 +49,8 @@ def source_snapshot():
     files = {}
     for name in sorted({os.fsdecode(n) for n in names.split(b"\0") if n}):
         path = ROOT / name
+        if path.name.lower() in {"update-token.json", "update-peer-token.json"}:
+            raise RuntimeError("Update credentials may not be included in a source snapshot")
         if path.is_file():
             files[name] = sha256(path)
     status = git("status", "--porcelain=v1", "--untracked-files=all").decode("utf-8")
@@ -108,6 +110,7 @@ def install_native(stage, audit_root, log):
 
 def copy_rust_payload(stage):
     release = ROOT / "rust/target/release"
+    # Build-tree diagnostic binaries are deliberately not copied into the portable package.
     for name in inventory.RUST_EXES + inventory.RUST_DLLS:
         source = release / name
         if not source.is_file():
@@ -116,20 +119,15 @@ def copy_rust_payload(stage):
                 hint = " (crates/vc-vcam must be a member of the rust workspace)"
             raise RuntimeError(f"Missing Rust payload file: {source}{hint}")
         shutil.copy2(source, stage / name)
-    launcher = release / "vc-launcher.exe"
-    if not launcher.is_file():
-        raise RuntimeError(f"Missing Rust launcher: {launcher}")
-    shutil.copy2(launcher, stage / "VirtualCapture.exe")
 
 
 def import_audit(stage):
     import pefile
     local = {p.name.lower(): p for p in stage.iterdir()
              if p.is_file() and p.suffix.lower() in (".exe", ".dll")}
-    expected = set(inventory.EXPECTED_PE_NAMES)
-    runtime_families = ("msvcp", "vcruntime", "concrt", "vcomp", "ucrtbase")
     unexpected = sorted(name for name in local
-                        if name not in expected and not name.startswith(runtime_families))
+                        if name not in inventory.EXPECTED_PE_NAMES
+                        and not inventory.is_msvc_runtime_dll(name))
     if unexpected:
         raise RuntimeError(f"Unexpected PE payload: {unexpected}")
     nested = [p.relative_to(stage).as_posix() for p in stage.rglob("*")
@@ -160,31 +158,7 @@ def import_audit(stage):
 
 
 def support_files(stage, native_license_dir):
-    support = ROOT / "rust/packaging"
-    scripts = stage / "scripts"
-    scripts.mkdir()
-    for name in ("start-host.ps1", "resolve-capture.ps1"):
-        (scripts / name).write_text((support / name).read_text(encoding="utf-8"),
-                                    encoding="utf-8-sig", newline="\r\n")
-    host = ('@echo off\nsetlocal\n'
-            '"%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\\start-host.ps1" %*\n'
-            'exit /b %ERRORLEVEL%\n')
-    (stage / "Start-Host.cmd").write_text(host, encoding="ascii", newline="\r\n")
-    # Execute the CLI directly: PowerShell interprets Ctrl+Break as a debugger
-    # request. A plain CMD parent preserves the native console shutdown handler.
-    capture = ('@echo off\nsetlocal\n'
-               'set "VC_RELEASE_ID="\n'
-               'for /f "usebackq delims=" %%D in (`""%SystemRoot%\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "%~dp0scripts\\resolve-capture.ps1" -Root "%~dp0.""`) do set "VC_RELEASE_ID=%%D"\n'
-               'if not defined VC_RELEASE_ID exit /b 1\n'
-               'set "VC_RELEASE_DIR=%~dp0app\\releases\\%VC_RELEASE_ID%"\n'
-               'if "%VC_RELEASE_ID%"=="." set "VC_RELEASE_DIR=%~dp0."\n'
-               'if "%~1"=="" (\n'
-               '  "%VC_RELEASE_DIR%\\vc-capture.exe" --root "%~dp0." --native-dir "%VC_RELEASE_DIR%" --port 15143\n'
-               ') else (\n'
-               '  "%VC_RELEASE_DIR%\\vc-capture.exe" --root "%~dp0." --native-dir "%VC_RELEASE_DIR%" %*\n'
-               ')\nexit /b %ERRORLEVEL%\n')
-    (stage / "Start-Capture.cmd").write_text(capture, encoding="ascii", newline="\r\n")
-    shutil.copy2(support / "README-zh.md", stage / "README.md")
+    shutil.copy2(ROOT / "rust/packaging/README-zh.md", stage / "README.md")
     native_license_dir.mkdir(parents=True, exist_ok=True)
     (native_license_dir / "MSVC-runtime.txt").write_text(
         "Microsoft Visual C++ 2015-2022 x64 runtime DLLs are copied from the installed "
@@ -197,24 +171,6 @@ def support_files(stage, native_license_dir):
         "PyroWave additionally requires a Vulkan 1.3-capable graphics driver at runtime; "
         "vulkan-1.dll is not bundled. No CPU codec fallback is included.\n",
         encoding="utf-8")
-
-
-def validate_inventory(stage):
-    missing = [name for name in inventory.REQUIRED_FILES if not (stage / name).is_file()]
-    if missing:
-        raise RuntimeError(f"Missing payload files: {missing}")
-    if (stage / "licenses").exists():
-        raise RuntimeError("License audit materials must not be included in the portable payload")
-    present = {p.name.lower() for p in stage.rglob("*") if p.is_file()}
-    forbidden = sorted(present & inventory.FORBIDDEN_NAMES)
-    if forbidden:
-        raise RuntimeError(f"Legacy C++ production binaries in payload: {forbidden}")
-    forbidden_paths = [p.relative_to(stage).as_posix() for p in stage.rglob("*")
-                       if p.name in ("vc-rust-config.json", "vc-config.json", "update-token.json",
-                                     "update-peer-token.json", "run", "target", "__pycache__")
-                       or p.suffix.lower() in (".pdb", ".log", ".pyc")]
-    if forbidden_paths:
-        raise RuntimeError(f"Development/runtime data in payload: {forbidden_paths}")
 
 
 def collect_rust_licenses(audit_root):
@@ -246,11 +202,13 @@ def validate_license_material(native_license_dir, rust_audit_root, summary):
 
 
 def manifest(stage, source, version, imports, tag, checks):
-    files = [{"path": p.relative_to(stage).as_posix(), "bytes": p.stat().st_size, "sha256": sha256(p)}
-             for p in sorted(stage.rglob("*")) if p.is_file() and p.name != MARKER]
+    paths = inventory.validate_payload_directory(stage, with_manifest=(stage / MARKER).exists()) - {MARKER}
+    files = [{"path": name, "bytes": (stage / name).stat().st_size, "sha256": sha256(stage / name)}
+             for name in sorted(paths)]
     result = {
         "product": "VirtualCapture-Rust-portable",
         "schema": 1,
+        "entrypoint": inventory.ENTRYPOINT,
         "version": version,
         "build_id": tag,
         "platform": "windows-11-x64",
@@ -261,7 +219,7 @@ def manifest(stage, source, version, imports, tag, checks):
         "source": source,
         "runtime_modules": {
             "in_process_dlls": list(inventory.RUST_DLLS),
-            "diagnostic_exes": ["vc-vcam-verify.exe"],
+            "diagnostic_commands": [list(inventory.VCAM_PROBE_COMMAND)],
             "codec_dlls": dict(inventory.CODEC_DLLS),
             "codecs": list(inventory.CODECS),
             "sources": list(inventory.SOURCES),
@@ -281,9 +239,44 @@ def manifest(stage, source, version, imports, tag, checks):
             "Rust OTA only; not a legacy Python update payload",
         ],
         "files": files,
+        "capabilities": {
+            "role_launch_args": True,
+            "desktop_capture": True,
+        },
     }
     (stage / MARKER).write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return result
+
+
+def validate_archive(archive, name, expected_manifest):
+    prefix = name + "/"
+    paths = archive.namelist()
+    if any(not path.startswith(prefix) for path in paths):
+        raise RuntimeError("Unexpected archive root")
+    actual = inventory.validate_payload_paths((path[len(prefix):] for path in paths), with_manifest=True)
+    declared = inventory.validate_payload_paths(file["path"] for file in expected_manifest["files"])
+    if actual != declared | {MARKER}:
+        raise RuntimeError("Archive file inventory does not match manifest")
+    if archive.testzip() is not None:
+        raise RuntimeError("Archive CRC check failed")
+    if json.loads(archive.read(prefix + MARKER)) != expected_manifest:
+        raise RuntimeError("Archive manifest mismatch")
+    for file in expected_manifest["files"]:
+        info = archive.getinfo(prefix + file["path"])
+        if info.file_size != file["bytes"]:
+            raise RuntimeError(f'Archive length mismatch: {file["path"]}')
+        with archive.open(info) as stream:
+            if hashlib.file_digest(stream, "sha256").hexdigest() != file["sha256"]:
+                raise RuntimeError(f'Archive hash mismatch: {file["path"]}')
+
+
+def write_verified_archive(path, stage, expected_manifest):
+    paths = inventory.validate_payload_directory(stage, with_manifest=True)
+    with zipfile.ZipFile(path, "x", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
+        for name in sorted(paths):
+            archive.write(stage / name, f"{stage.name}/{name}")
+    with zipfile.ZipFile(path) as archive:
+        validate_archive(archive, stage.name, expected_manifest)
 
 
 def main():
@@ -337,8 +330,6 @@ def main():
         license_summary = collect_rust_licenses(rust_audit_root)
         license_audit = validate_license_material(native_license_dir, rust_audit_root, license_summary)
         log.write(f"License audit passed (not distributed): {license_audit}\n")
-        validate_inventory(stage)
-        imports = import_audit(stage)
         (stage / "version.json").write_text(json.dumps({
             "product": "VirtualCapture-Rust",
             "version": version,
@@ -352,6 +343,8 @@ def main():
             },
             "gpu_only": True,
         }, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        inventory.validate_payload_directory(stage)
+        imports = import_audit(stage)
 
         # Stage a complete OTA-valid manifest before testing the extracted
         # candidate. Pending checks are promoted only after their command passes.
@@ -361,25 +354,20 @@ def main():
             "clippy": "passed",
             "portable_smoke": "pending",
             "dll_stream_smoke": "pending",
-            "physical_adapters": "pending",
+            "adapter_visibility": "pending",
             "gui_smoke": "pending",
             "capture_ota": "pending",
             "raw_loopback_120_frames": "not run (requires --extended-smokes)",
             "host_controller_ota": "not run (requires --extended-smokes)",
         }
-        manifest(stage, source, version, imports, tag, checks)
+        result = manifest(stage, source, version, imports, tag, checks)
 
         # ZIP and extract the payload before runtime checks, including Unicode/spaces.
         candidate = work / "candidate.zip"
-        with zipfile.ZipFile(candidate, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            for file in sorted(stage.rglob("*")):
-                if file.is_file():
-                    archive.write(file, Path(name) / file.relative_to(stage))
+        write_verified_archive(candidate, stage, result)
         extract_root = work / "解压运行 smoke"
         extract_root.mkdir()
         with zipfile.ZipFile(candidate) as archive:
-            if archive.testzip() is not None:
-                raise RuntimeError("Candidate archive CRC check failed")
             archive.extractall(extract_root)
         extracted = extract_root / name
 
@@ -391,7 +379,7 @@ def main():
         checks["dll_stream_smoke"] = "passed"
         run([sys.executable, "-I", "-X", "utf8", "rust/tests/adapter_smoke.py",
              "--package", extracted], log)
-        checks["physical_adapters"] = "passed"
+        checks["adapter_visibility"] = "passed"
         run([sys.executable, "-I", "-X", "utf8", "rust/tests/gui_smoke.py",
              "--package", extracted], log)
         checks["gui_smoke"] = "passed"
@@ -409,30 +397,21 @@ def main():
         if source_snapshot() != source:
             raise RuntimeError("Source files changed while building; no archive published")
         result = manifest(stage, source, version, imports, tag, checks)
+        verified_zip = work / "release.zip"
+        write_verified_archive(verified_zip, stage, result)
+        digest = sha256(verified_zip)
         dist = ROOT / "dist"
         dist.mkdir(exist_ok=True)
         output = dist / name
         archive_path = dist / (name + ".zip")
+        checksum = archive_path.with_suffix(".zip.sha256")
         # Unique paths: never replace a prior package, user config, evidence or legacy dist.
-        if output.exists() or archive_path.exists():
+        if any(path.exists() for path in (output, archive_path, checksum)):
             raise RuntimeError("Output already exists")
         stage.rename(output)
-        with zipfile.ZipFile(archive_path, "x", zipfile.ZIP_DEFLATED, compresslevel=6) as archive:
-            for file in sorted(output.rglob("*")):
-                if file.is_file():
-                    archive.write(file, Path(name) / file.relative_to(output))
-        with zipfile.ZipFile(archive_path) as archive:
-            if archive.testzip() is not None:
-                raise RuntimeError("Final archive CRC check failed")
-            if json.loads(archive.read(f"{name}/{MARKER}")) != result:
-                raise RuntimeError("Final archive manifest mismatch")
-            for file in result["files"]:
-                with archive.open(f'{name}/{file["path"]}') as stream:
-                    if hashlib.file_digest(stream, "sha256").hexdigest() != file["sha256"]:
-                        raise RuntimeError(f'Final archive hash mismatch: {file["path"]}')
-        digest = sha256(archive_path)
-        checksum = archive_path.with_suffix(".zip.sha256")
-        checksum.write_text(f"{digest}  {archive_path.name}\n", encoding="ascii")
+        verified_zip.rename(archive_path)
+        with checksum.open("x", encoding="ascii") as file:
+            file.write(f"{digest}  {archive_path.name}\n")
         report = {"ok": True, "directory": str(output), "zip": str(archive_path),
                   "sha256": digest, "bytes": archive_path.stat().st_size,
                   "files": len(result["files"]) + 1, "log": str(log_path),

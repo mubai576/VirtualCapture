@@ -1,6 +1,6 @@
 """Check capture-side adapter visibility without starting any capture.
 
-Runs the real `vc-capture.exe` on a random loopback port with an isolated ROOT.
+Runs `VirtualCapture.exe capture` on a random loopback port with an isolated ROOT.
 `--list-adapters` must stay a full diagnostic list, while `/adapters` must expose
 only connected, confirmed physical NICs by default. Loopback requires the explicit
 `--allow-loopback-diagnostics` flag; if this build does not accept it yet, the
@@ -19,8 +19,8 @@ import urllib.request
 import uuid
 
 ROOT = Path(__file__).resolve().parents[2]
-EXE = ROOT / "rust/target/debug/vc-capture.exe"
 NATIVE = ROOT / "rust/target/debug"
+EXE = NATIVE / "VirtualCapture.exe"
 RUN = ROOT / "run" / ("rust-adapter-smoke-" + uuid.uuid4().hex[:10])
 RUN.mkdir(parents=True)
 LOOPBACK = r"\Device\NPF_Loopback"
@@ -50,13 +50,13 @@ def post(port, path, body, timeout=40):
 
 
 def start_service(port, root, extra=()):
-    log = (root / "capture.log").open("wb")
-    proc = subprocess.Popen(
-        [str(EXE), "--bind", "127.0.0.1", "--port", str(port), "--root", str(root),
-         "--native-dir", str(NATIVE), *extra],
-        stdout=log, stderr=log,
-        creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
-    )
+    with (root / "capture.log").open("wb") as log:
+        proc = subprocess.Popen(
+            [str(EXE), "capture", "--root", str(root), "--native-dir", str(NATIVE),
+             "--bind", "127.0.0.1", "--port", str(port), *extra],
+            stdout=log, stderr=log,
+            creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+        )
     deadline = time.monotonic() + 20
     while time.monotonic() < deadline:
         if proc.poll() is not None:
@@ -82,8 +82,8 @@ def stop_service(proc):
 
 
 def supported_flag():
-    out = subprocess.run([str(EXE), "--help"], capture_output=True, text=True,
-                         encoding="utf-8", errors="replace", timeout=20)
+    out = subprocess.run([str(EXE), "capture", "--help"], capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=20, check=True)
     return "--allow-loopback-diagnostics" in (out.stdout + out.stderr)
 
 
@@ -94,11 +94,16 @@ def main():
     args = parser.parse_args()
     if args.package:
         NATIVE = args.package.resolve()
-        EXE = NATIVE / "vc-capture.exe"
+        EXE = NATIVE / "VirtualCapture.exe"
     assert EXE.is_file() and (NATIVE / "vc_stream.dll").is_file(), (
         f"Missing {EXE} or {NATIVE / 'vc_stream.dll'}; build rust workspace first")
+    kernel = c.windll.kernel32
+    if not kernel.GetConsoleCP():
+        assert kernel.AllocConsole(), "Could not allocate a console for the Ctrl-Break check"
+        kernel.GetConsoleWindow.restype = c.c_void_p
+        c.windll.user32.ShowWindow(c.c_void_p(kernel.GetConsoleWindow()), 0)
     listed = subprocess.run(
-        [str(EXE), "--root", str(RUN), "--native-dir", str(NATIVE), "--list-adapters"],
+        [str(EXE), "capture", "--root", str(RUN), "--native-dir", str(NATIVE), "--list-adapters"],
         capture_output=True, encoding="utf-8", timeout=45, check=True,
     )
     full = json.loads(listed.stdout)
@@ -127,6 +132,8 @@ def main():
     assert "回环" in refused.get("error", ""), refused
     assert still_idle, "Loopback probe must not start a capture session"
     assert health["implementation"] == "virtualcapture-rust", health
+    assert health["role"] == "capture" and health["pid"] == proc.pid, health
+    assert Path(health["root"]).samefile(root), health
     (RUN / "visible-adapters.json").write_text(
         json.dumps(visible, ensure_ascii=False, indent=2), encoding="utf-8")
     assert all(item.get("hardware_interface") is True and item.get("virtual") is False

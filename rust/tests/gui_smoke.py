@@ -1,5 +1,6 @@
-"""Exercise the real GPUI window against an isolated failing HTTP fixture.
-No capture/receiver/registry operations. Needs an interactive Windows desktop.
+"""Exercise real GPUI role selection, persistence and host controls in private roots.
+Only loopback control HTTP; no stream, packet transmission or registry operations.
+Needs an interactive Windows desktop.
 """
 import argparse
 import ctypes as c
@@ -7,9 +8,12 @@ from ctypes import wintypes as w
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
+import socket
 import subprocess
 import threading
 import time
+import urllib.error
+import urllib.request
 import uuid
 from PIL import ImageGrab
 
@@ -18,7 +22,7 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument("--package", type=Path, help="Exercise an extracted portable package instead of debug outputs")
 args = parser.parse_args()
 NATIVE = args.package.resolve() if args.package else ROOT / "rust/target/debug"
-HOST = NATIVE / "vc-host.exe" if args.package else ROOT / "rust/target/debug/vc-host.exe"
+EXE = NATIVE / "VirtualCapture.exe"
 RUN = ROOT / "run" / ("rust-gui-smoke-" + uuid.uuid4().hex[:10])
 RUN.mkdir(parents=True)
 user = c.windll.user32
@@ -39,7 +43,7 @@ user.GetClassLongPtrW.restype = c.c_ssize_t
 CALLBACK = c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
 
 
-def find_window(pid):
+def find_window(pid, title_prefix="VirtualCapture"):
     found = []
     @CALLBACK
     def visit(hwnd, _):
@@ -47,7 +51,7 @@ def find_window(pid):
         user.GetWindowThreadProcessId(hwnd, c.byref(owner))
         title = c.create_unicode_buffer(512)
         user.GetWindowTextW(hwnd, title, 512)
-        if owner.value == pid and title.value == "VirtualCapture" and user.IsWindowVisible(hwnd):
+        if owner.value == pid and title.value.startswith(title_prefix) and user.IsWindowVisible(hwnd):
             found.append(hwnd)
         return True
     user.EnumWindows(visit, 0)
@@ -59,7 +63,10 @@ def screenshot(hwnd, name):
     # above others briefly, then crop its opaque client area and restore z-order.
     assert user.SetWindowPos(hwnd, w.HWND(-1), 0, 0, 0, 0, 0x0013)
     try:
+        user.SetForegroundWindow(hwnd)
         time.sleep(.3)
+        assert user.GetForegroundWindow() == hwnd, (
+            "目标窗口未获得前台，拒绝把其他应用截图作为 GPUI 证据", hwnd, user.GetForegroundWindow())
         bounds = w.RECT()
         assert user.GetClientRect(hwnd, c.byref(bounds))
         origin = w.POINT(0, 0)
@@ -194,6 +201,197 @@ def window_icon(hwnd):
     return 0
 
 
+def wait_for_window(proc, role):
+    expected = f"VirtualCapture · {role}"
+    deadline = time.monotonic() + 15
+    while time.monotonic() < deadline:
+        assert proc.poll() is None, f"Desktop exited before {expected}: rc={proc.returncode}"
+        hwnd = find_window(proc.pid, expected)
+        if hwnd:
+            user.SetForegroundWindow(hwnd)
+            time.sleep(.5)
+            return hwnd
+        time.sleep(.1)
+    raise AssertionError(f"Window did not enter {expected}; evidence: {RUN}")
+
+
+def wait_for_role(role):
+    path = RUN / "vc-startup.json"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        try:
+            preference = json.loads(path.read_text(encoding="utf-8"))
+            if preference == {"schema": 1, "role": role}:
+                return preference
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+        time.sleep(.1)
+    raise AssertionError(f"UI did not persist role {role}; evidence: {RUN}")
+
+
+def close_desktop(proc, hwnd):
+    assert user.PostMessageW(hwnd, 0x0010, 0, 0)  # WM_CLOSE
+    assert proc.wait(timeout=15) == 0, (proc.returncode, str(RUN))
+
+
+def outlined_buttons(image, scale):
+    """Locate actual button borders; never assume a fixed chooser position."""
+    def edge(pixel):
+        return border_pixel(pixel) or (pixel[0] < 120 and 50 < pixel[1] < 150 and pixel[2] > 200)
+
+    buttons = []
+    min_len, max_len = int(55 * scale), int(230 * scale)
+    for top in range(image.height - int(42 * scale)):
+        for left, right in runs(image, top, 0, image.width, edge, min_len):
+            if right - left > max_len:
+                continue
+            for bottom in range(top + int(25 * scale), top + int(40 * scale)):
+                if any(abs(a - left) <= 3 * scale and abs(b - right) <= 3 * scale
+                       for a, b in runs(image, bottom, max(0, left - 5), min(image.width, right + 6), edge, min_len)):
+                    center = ((left + right) / 2, (top + bottom) / 2)
+                    if not any(abs(center[0] - x) < 12 * scale and abs(center[1] - y) < 20 * scale
+                               for x, y in buttons):
+                        buttons.append(center)
+                    break
+    return sorted(buttons)
+
+
+def choose_role(hwnd, role, image):
+    scale = user.GetDpiForWindow(hwnd) / 96
+    buttons = outlined_buttons(image, scale)
+    assert len(buttons) == 2, ("Role chooser must show two buttons", buttons, str(RUN))
+    x, y = buttons[0 if role == "capture" else 1]
+    click(hwnd, x / scale, y / scale)
+    return wait_for_role(role)
+
+
+def wait_for_health(port):
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    deadline = time.monotonic() + 12
+    while time.monotonic() < deadline:
+        try:
+            with opener.open(f"http://127.0.0.1:{port}/health", timeout=.5) as response:
+                return json.load(response)
+        except (OSError, urllib.error.URLError):
+            time.sleep(.1)
+    raise AssertionError(f"Capture health did not become ready on 127.0.0.1:{port}")
+
+
+def require_listener_closed(port):
+    with socket.socket() as sock:
+        sock.settimeout(.5)
+        assert sock.connect_ex(("127.0.0.1", port)) != 0, "采集后台退出后仍在监听"
+
+
+def require_config_unchanged(path, before):
+    after = json.loads(path.read_text(encoding="utf-8"))
+    stable = lambda config: {key: value for key, value in config.items() if key != "adapter"}
+    assert stable(after) == stable(before), ("角色选择改写了启动角色以外的配置", before, after)
+
+
+def exercise_roles():
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+    config_path = RUN / "vc-rust-config.json"
+    original_config = json.loads(config_path.read_text(encoding="utf-8"))
+    preference_path = RUN / "vc-startup.json"
+    assert not preference_path.exists()
+    processes = []
+
+    def launch(name, *extra):
+        with (RUN / f"{name}.log").open("wb") as log:
+            proc = subprocess.Popen(
+                [str(EXE), "--root", str(RUN), "--native-dir", str(NATIVE),
+                 "--capture-bind", "127.0.0.1", "--capture-port", str(port), *extra],
+                cwd=NATIVE, stdout=log, stderr=log,
+            )
+        processes.append(proc)
+        return proc
+
+    try:
+        proc = launch("roles-first-start")
+        hwnd = wait_for_window(proc, "选择本机角色")
+        assert window_icon(hwnd), "Window/exe icon resource is missing"
+        assert not preference_path.exists(), "角色未确认时不应写启动偏好"
+        require_config_unchanged(config_path, original_config)
+        require_listener_closed(port)
+        chooser = screenshot(hwnd, "role-chooser.png")
+        choose_role(hwnd, "capture", chooser)
+        hwnd = wait_for_window(proc, "采集端")
+        health = wait_for_health(port)
+        assert health["ok"] and health["role"] == "capture" and health["pid"] == proc.pid, health
+        assert Path(health["root"]).samefile(RUN), health
+        screenshot(hwnd, "capture-role.png")
+        require_config_unchanged(config_path, original_config)
+        close_desktop(proc, hwnd)
+        require_listener_closed(port)
+
+        proc = launch("roles-saved-capture")
+        hwnd = wait_for_window(proc, "采集端")
+        assert wait_for_health(port)["pid"] == proc.pid
+        scale = user.GetDpiForWindow(hwnd) / 96
+        deadline = time.monotonic() + 8
+        while True:
+            image = screenshot(hwnd, "saved-capture.png")
+            buttons = outlined_buttons(image, scale)
+            if len(buttons) == 1:
+                break
+            assert time.monotonic() < deadline, ("采集页未渲染重新选择角色按钮", buttons, str(RUN))
+            time.sleep(.3)
+        click(hwnd, buttons[0][0] / scale, buttons[0][1] / scale)
+        hwnd = wait_for_window(proc, "选择本机角色")
+        require_listener_closed(port)
+        assert wait_for_role("capture"), "打开重选页不应改写原角色"
+        require_config_unchanged(config_path, original_config)
+        chooser = screenshot(hwnd, "role-reselect.png")
+        choose_role(hwnd, "receive", chooser)
+        hwnd = wait_for_window(proc, "接收端")
+        require_config_unchanged(config_path, original_config)
+        require_listener_closed(port)
+        image = screenshot(hwnd, "receive-role.png")
+        clusters = header_clusters(image, scale)
+        assert len(clusters) >= 4, ("接收端缺少重新选择角色入口", clusters)
+        click(hwnd, sum(clusters[-4]) / 2 / scale, 36)
+        hwnd = wait_for_window(proc, "选择本机角色")
+        chooser = screenshot(hwnd, "receive-reselect.png")
+        assert wait_for_role("receive")
+        choose_role(hwnd, "receive", chooser)
+        hwnd = wait_for_window(proc, "接收端")
+        close_desktop(proc, hwnd)
+
+        proc = launch("roles-saved-receive")
+        hwnd = wait_for_window(proc, "接收端")
+        screenshot(hwnd, "saved-receiver.png")
+        require_listener_closed(port)
+        close_desktop(proc, hwnd)
+
+        proc = launch("roles-explicit-reselect", "--select-role")
+        hwnd = wait_for_window(proc, "选择本机角色")
+        screenshot(hwnd, "explicit-role-chooser.png")
+        close_desktop(proc, hwnd)
+        require_config_unchanged(config_path, original_config)
+        preference = wait_for_role("receive")
+        return {
+            "startup_preference": preference, "control_config_unchanged_by_roles": True,
+            "capture_http": {key: health[key] for key in ("ok", "role", "pid", "root")},
+            "role_screenshots": ["role-chooser.png", "capture-role.png", "saved-capture.png",
+                                 "role-reselect.png", "receive-role.png", "receive-reselect.png",
+                                 "saved-receiver.png", "explicit-role-chooser.png"],
+        }
+    finally:
+        for proc in processes:
+            if proc.poll() is None:
+                hwnd = find_window(proc.pid)
+                if hwnd:
+                    user.PostMessageW(hwnd, 0x0010, 0, 0)
+                try:
+                    proc.wait(timeout=8)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait()
+
+
 def main():
     requested = threading.Event()
     requests = []
@@ -211,13 +409,14 @@ def main():
             pass
 
     with ThreadingHTTPServer(("127.0.0.1", 0), FailingCapture) as server:
-        threading.Thread(target=server.serve_forever, daemon=True).start()
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
         address = f"127.0.0.1:{server.server_port}"
+        assert EXE.is_file(), f"Missing {EXE}; build the workspace or pass --package"
         # Preserve capture-side diagnostics while independently recording what the
         # host UI must retain. No packets or registry operations are performed.
         listed = subprocess.run([
-            str(NATIVE / "vc-capture.exe" if args.package else ROOT / "rust/target/debug/vc-capture.exe"), "--root", str(RUN),
-            "--native-dir", str(NATIVE), "--list-adapters",
+            str(EXE), "capture", "--root", str(RUN), "--native-dir", str(NATIVE), "--list-adapters",
         ], capture_output=True, encoding="utf-8", timeout=40, check=True)
         adapters = json.loads(listed.stdout)
         physical = [item for item in adapters if item.get("hardware_interface") is True
@@ -229,20 +428,26 @@ def main():
         (RUN / "vc-rust-config.json").write_text(json.dumps({
             "version": 1, "peer_url": "", "adapter": r"\Device\NPF_Loopback",
         }), encoding="utf-8")
+        roles = exercise_roles()
         with (RUN / "host.log").open("wb") as log:
             ready_path = RUN / "update-ready.json"
-            proc = subprocess.Popen([str(HOST), "--root", str(RUN), "--native-dir", str(NATIVE), "--update-ready", str(ready_path)], cwd=NATIVE, stdout=log, stderr=log)
+            proc = subprocess.Popen(
+                [str(EXE), "--root", str(RUN), "--native-dir", str(NATIVE),
+                 "--update-ready", str(ready_path)],
+                cwd=NATIVE, stdout=log, stderr=log,
+            )
         hwnd = None
         try:
-            deadline = time.monotonic() + 15
-            while not hwnd:
-                assert proc.poll() is None, (RUN / "host.log").read_text(errors="replace")
-                hwnd = find_window(proc.pid)
-                assert time.monotonic() < deadline, "GPUI window did not appear"
-                time.sleep(.1)
-            user.SetForegroundWindow(hwnd)
-            time.sleep(1)
+            hwnd = wait_for_window(proc, "接收端")
             assert window_icon(hwnd), "Window/exe icon resource is missing"
+            receipts = list((RUN / "run").glob(f"host-*-{proc.pid}.launch.json"))
+            assert len(receipts) == 1, receipts
+            receipt = json.loads(receipts[0].read_text(encoding="utf-8"))
+            assert receipt["pid"] == proc.pid and Path(receipt["root"]).samefile(RUN), receipt
+            assert Path(receipt["exe"]).samefile(EXE), receipt
+            for stream in ("stdout", "stderr"):
+                logfile = Path(receipt[stream])
+                assert logfile.is_file() and logfile.parent.samefile(RUN / "run"), receipt
             deadline = time.monotonic() + 10
             while not ready_path.exists():
                 assert time.monotonic() < deadline, "First-frame update-ready marker was not written"
@@ -251,8 +456,6 @@ def main():
             assert ready["pid"] == proc.pid and ready["root"] and "build" in ready, ready
             initial = screenshot(hwnd, "initial.png")
             scale = user.GetDpiForWindow(hwnd) / 96
-            # The former "采集工作台" heading and cleanup banner would push the card
-            # down; assert the settings card starts directly under the header.
             top = card_top(initial)
             assert abs(top - 100 * scale) <= 8 * scale, ("主区大标题或横幅仍然存在", top / scale)
             px = initial.load()
@@ -376,7 +579,7 @@ def main():
             user.PostMessageW(hwnd, 0x0010, 0, 0)
             proc.wait(timeout=15)
             assert proc.returncode == 0, (proc.returncode, (RUN / "host.log").read_text(errors="replace"))
-            report = {"ok": True, "window": "VirtualCapture", "process_exit": proc.returncode, "address": address, "requests": requests, "response": 503, "screenshots": ["initial.png", "updates.png", "updates-typed.png", "paired.png", "updates-repair.png", "updates-repair-typed.png", "repair-paired.png", "updates-closed.png", "presets-720p.png", "details.png", "compact.png", "physical-adapters.png", "connection-error.png"], "physical_adapters": [item.get("label") or item["description"] for item in physical], "excluded_adapters": len(adapters) - len(physical), "token_file": token_file.name, "checks": ["application icon resource", "first-frame update-ready marker", "main heading and cleanup banner removed", "update panel opens and closes without shifting layout", "peer update token paired and persisted", "paired state reopens token input and replaces token", "720p and 120fps saved", "640 square and 240fps restored", "diagnostic table expansion", "compact window layout", "real host adapter refresh", "saved virtual selection cleared", "connection HTTP error", "normal window close"], "scope": "real native GPUI controls, update panel pairing/re-pairing and draft persistence; no capture or DShow registration"}
+            report = {"ok": True, "window": "VirtualCapture", "process_exit": proc.returncode, "address": address, "requests": requests, "response": 503, "screenshots": [*roles["role_screenshots"], "initial.png", "updates.png", "updates-typed.png", "paired.png", "updates-repair.png", "updates-repair-typed.png", "repair-paired.png", "updates-closed.png", "presets-720p.png", "details.png", "compact.png", "physical-adapters.png", "connection-error.png"], "physical_adapters": [item.get("label") or item["description"] for item in physical], "excluded_adapters": len(adapters) - len(physical), "token_file": token_file.name, "checks": ["application icon resource", "first-frame update-ready marker", "role selection, persistence, restart and both in-app reselect controls", "capture HTTP binds to requested loopback port and closes before switching", "control config unaffected by role selection", "main heading and cleanup banner removed", "update panel opens and closes without shifting layout", "peer update token paired and persisted", "paired state reopens token input and replaces token", "720p and 120fps saved", "640 square and 240fps restored", "diagnostic table expansion", "compact window layout", "real host adapter refresh", "saved virtual selection cleared", "connection HTTP error", "normal window close"], "roles": roles, "scope": "real native GPUI controls, role persistence and host workbench; no data stream, physical NIC transmission or DShow registration"}
             (RUN / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             print(json.dumps({"run": str(RUN), **report}, ensure_ascii=False))
         finally:
@@ -389,6 +592,7 @@ def main():
                     proc.kill()
                     proc.wait()
             server.shutdown()
+            worker.join(timeout=5)
 
 
 if __name__ == "__main__":

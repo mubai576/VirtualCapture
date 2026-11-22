@@ -22,7 +22,7 @@ args = parser.parse_args()
 RUN = ROOT / "run" / ("rust-smoke-" + uuid.uuid4().hex[:10])
 RUN.mkdir(parents=True)
 NATIVE = args.package.resolve() if args.package else ROOT / "rust" / "target" / "debug"
-CAPTURE = NATIVE / "vc-capture.exe"
+CAPTURE = NATIVE / "VirtualCapture.exe"
 STREAM_DLL = NATIVE / "vc_stream.dll"
 SID = "s-" + uuid.uuid4().hex
 MAC = "02:14:11:26:00:01"
@@ -261,15 +261,21 @@ class DllReceiver:
 def main():
     assert CAPTURE.is_file() and STREAM_DLL.is_file(), (
         f"missing {CAPTURE} or {STREAM_DLL}; build the rust workspace or pass --package")
-    # Ensure native child console control handlers can flush final stats.
-    if not ctypes.windll.kernel32.GetConsoleWindow():
-        ctypes.windll.kernel32.AllocConsole()
-        ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
+    # The GUI-subsystem capture entry attaches to our console to handle Ctrl-Break.
+    kernel = ctypes.windll.kernel32
+    if not kernel.GetConsoleCP():
+        assert kernel.AllocConsole(), "Could not allocate a console for the Ctrl-Break check"
+        kernel.GetConsoleWindow.restype = ctypes.c_void_p
+        ctypes.windll.user32.ShowWindow(ctypes.c_void_p(kernel.GetConsoleWindow()), 0)
     flags = subprocess.CREATE_NEW_PROCESS_GROUP
     service = receiver = None
     try:
         with (RUN / "capture.log").open("wb") as log:
-            service = subprocess.Popen([str(CAPTURE), "--allow-loopback-diagnostics", "--bind", "127.0.0.1", "--port", str(PORT), "--root", str(RUN), "--native-dir", str(NATIVE)], stdout=log, stderr=log, creationflags=flags)
+            service = subprocess.Popen(
+                [str(CAPTURE), "capture", "--root", str(RUN), "--native-dir", str(NATIVE),
+                 "--bind", "127.0.0.1", "--port", str(PORT), "--allow-loopback-diagnostics"],
+                stdout=log, stderr=log, creationflags=flags,
+            )
         deadline = time.monotonic() + 10
         while True:
             assert service.poll() is None, (RUN / "capture.log").read_text()
@@ -281,10 +287,16 @@ def main():
                     raise
                 time.sleep(.1)
         assert health["implementation"] == "virtualcapture-rust" and health["api_revision"] == 2
+        assert health["role"] == "capture" and health["pid"] == service.pid, health
+        assert Path(health["root"]).samefile(RUN), health
         config = request("/config")
         bad = request("/config", {"capture": {"width": 417}}, 400)
         assert bad["error"] and request("/config")["capture"]["width"] == config["capture"]["width"]
-        config = request("/config", {"capture": {"mode": "pattern", "width": WIDTH, "height": HEIGHT, "fps": FPS, "frames": FRAMES, "gpu_convert": False}})["config"]
+        config = request("/config", {"capture": {
+            "mode": "pattern", "pattern": "motion", "width": WIDTH, "height": HEIGHT,
+            "fps": FPS, "frames": FRAMES, "gpu_convert": False,
+            "codec": "raw", "mtu": MTU, "mtu_auto": False,
+        }})["config"]
         capture = config["capture"]
         body = {"capture": capture, "session_id": SID, "source_mac": MAC, "auto_adapter": True, "adapter": ""}
         prepared = request("/sender/prepare", body)
@@ -338,6 +350,7 @@ def main():
         rstats = json.loads((RUN / "rx.json").read_text())
         assert rstats["hash_mismatch"] == 0 and rstats["dropped"] == 0, rstats
         report = {"ok": True, "scope": "local Loopback functional evidence only", "pattern": "motion", "batch_packets": prepared["batch_packets"], "frame_packets": 29, "batch_policy": "Loopback diagnostic per-packet exception; physical NIC uses one frame per sendqueue submit", "adapter": LOOPBACK, "width": WIDTH, "height": HEIGHT, "fps_limit": FPS, "sent_frames": len(tx), "received_frames": len(rx), "hash_equal": True, "shm": SHM, "receiver": {"module": done["module"], "abi_version": done["abi_version"], "pid": done["pid"], "ready_before_send": True, "exit_code": done["exit_code"], "stop_joined": True, "destroyed": True}, "checks": ["Rust health identity", "invalid config leaves draft intact", "prepare has no process side effects", "exact capture/session/source echo", "reject wrong-session stop", "reject running config change", "reject replacing running sender", "reject reused session without overwriting hashlog", "in-process vc_stream.dll receiver ready before sender", "DLL receiver 120-frame FNV reconciliation", "DLL stop joins a completed receiver and destroy releases it", "Ctrl-Break graceful service shutdown"]}
+        assert service.poll() is None, "capture exited before the Ctrl-Break check"
         stop(service)
         assert service.returncode == 0, service.returncode
         (RUN / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
