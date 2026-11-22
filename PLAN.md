@@ -91,7 +91,7 @@ D1–D28为历史决策原记录，涉及已移除实现的路径/命令只在Gi
 
 ### Rust-R3a 两 EXE 便携入口（D34） — DONE
 
-`0.2.1` 包 `20261121-163453-82bb3e` 共 16 个文件、仅两个 EXE；原 D34 验收证据见[记录](docs/bringup/bringup-20261121-rust-r3a-two-exe-package.md)。本机后续源码增补及 D35 验收见[桌面角色记录](docs/bringup/bringup-20261122-desktop-role-selection.md)：完整 Rust 门禁331项测试、Clippy、Release、独立参考与 DLL 自检通过；Release GUI 首选/重选/重启真实点击通过；Managed ROOT 显式重选写入 data 偏好；图形采集 OTA 恢复窗口及原 bind/port，隔离 Host OTA 通过。用户要求提交代码并重新打包；交付结果待补。本机与 Loopback 证据不代表物理网卡、双机、长稳或画质通过。
+`0.2.1` 包 `20261121-163453-82bb3e` 共 16 个文件、仅两个 EXE；原 D34 验收证据见[记录](docs/bringup/bringup-20261121-rust-r3a-two-exe-package.md)。本机后续源码增补及 D35 验收见[桌面角色记录](docs/bringup/bringup-20261122-desktop-role-selection.md)：完整 Rust 门禁、Clippy、Release、独立参考与 DLL 自检通过；Release GUI 首选/重选/重启真实点击通过；Managed ROOT 显式重选写入 data 偏好；图形采集 OTA 恢复窗口及原 bind/port，隔离 Host OTA 通过。源码已提交 `a661fea`，最终扩展便携包交付证据待补。本机与 Loopback 证据不代表物理网卡、双机、长稳或画质通过。
 
 ### Rust-R3b 双机矩阵替代与产品验收 — TODO
 

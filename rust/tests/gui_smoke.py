@@ -26,6 +26,7 @@ EXE = NATIVE / "VirtualCapture.exe"
 RUN = ROOT / "run" / ("rust-gui-smoke-" + uuid.uuid4().hex[:10])
 RUN.mkdir(parents=True)
 user = c.windll.user32
+kernel = c.windll.kernel32
 user.SetProcessDPIAware()
 user.GetWindowThreadProcessId.argtypes = [w.HWND, c.POINTER(w.DWORD)]
 user.SetForegroundWindow.argtypes = [w.HWND]
@@ -40,6 +41,9 @@ user.SendMessageW.argtypes = [w.HWND, w.UINT, w.WPARAM, w.LPARAM]
 user.SendMessageW.restype = c.c_ssize_t
 user.GetClassLongPtrW.argtypes = [w.HWND, c.c_int]
 user.GetClassLongPtrW.restype = c.c_ssize_t
+kernel.GetCurrentThreadId.restype = w.DWORD
+user.AttachThreadInput.argtypes = [w.DWORD, w.DWORD, w.BOOL]
+user.AttachThreadInput.restype = w.BOOL
 CALLBACK = c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
 
 
@@ -58,12 +62,40 @@ def find_window(pid, title_prefix="VirtualCapture"):
     return found[0] if found else None
 
 
+def focus_window(hwnd, timeout=2):
+    """Activate the test window despite Windows foreground-lock restrictions."""
+    current_thread = kernel.GetCurrentThreadId()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        foreground = user.GetForegroundWindow()
+        foreground_thread = user.GetWindowThreadProcessId(foreground, None) if foreground else 0
+        target_thread = user.GetWindowThreadProcessId(hwnd, None)
+        attached = []
+        for thread_id in dict.fromkeys((foreground_thread, target_thread)):
+            if thread_id and thread_id != current_thread:
+                if user.AttachThreadInput(current_thread, thread_id, True):
+                    attached.append(thread_id)
+        try:
+            user.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user.BringWindowToTop(hwnd)
+            user.SetForegroundWindow(hwnd)
+            user.SetActiveWindow(hwnd)
+            user.SetFocus(hwnd)
+        finally:
+            for thread_id in reversed(attached):
+                user.AttachThreadInput(current_thread, thread_id, False)
+        if user.GetForegroundWindow() == hwnd:
+            return True
+        time.sleep(.05)
+    return user.GetForegroundWindow() == hwnd
+
+
 def screenshot(hwnd, name):
     # GPUI's GPU surface cannot be captured with PrintWindow. Put only our window
     # above others briefly, then crop its opaque client area and restore z-order.
     assert user.SetWindowPos(hwnd, w.HWND(-1), 0, 0, 0, 0, 0x0013)
     try:
-        user.SetForegroundWindow(hwnd)
+        focus_window(hwnd)
         time.sleep(.3)
         assert user.GetForegroundWindow() == hwnd, (
             "目标窗口未获得前台，拒绝把其他应用截图作为 GPUI 证据", hwnd, user.GetForegroundWindow())
@@ -208,7 +240,7 @@ def wait_for_window(proc, role):
         assert proc.poll() is None, f"Desktop exited before {expected}: rc={proc.returncode}"
         hwnd = find_window(proc.pid, expected)
         if hwnd:
-            user.SetForegroundWindow(hwnd)
+            focus_window(hwnd)
             time.sleep(.5)
             return hwnd
         time.sleep(.1)

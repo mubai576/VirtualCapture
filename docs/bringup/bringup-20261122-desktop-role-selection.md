@@ -31,7 +31,7 @@ GPUI 角色切换曾出现标题/HTTP 已变化但画面保留旧视图的问题
 
 ## 提交前兼容修正
 
-提交前复核修正便携 smoke 的 Host ROOT 创建顺序及实际 GPUI 窗口标题。OTA 清单新增显式 `role_launch_args` / `desktop_capture` 能力：D34 旧 unified 入口回滚不传新角色参数，图形采集目标缺能力时在停旧进程前拒绝。旧 staged metadata 缺少快照时从完整校验的 manifest 在内存补齐；已有快照不符、载荷哈希不符仍拒绝，不改写旧元数据。旧 job 保持可读，helper 复核目标后恢复能力快照。新增回归覆盖旧/新清单、旧元数据安装与复验、快照冲突及载荷篡改；capture OTA smoke 以 D34 格式元数据验证真实激活。
+提交前复核修正便携 smoke 的 Host ROOT 创建顺序及实际 GPUI 窗口标题。OTA 清单新增显式 `role_launch_args` / `desktop_capture` 能力：D34 旧 unified 入口回滚不传新角色参数，图形采集目标缺能力时在停旧进程前拒绝。旧 staged metadata 缺少快照时从完整校验的 manifest 在内存补齐；已有快照不符、载荷哈希不符仍拒绝，不改写旧元数据。旧 job 保持可读，helper 复核目标后恢复能力快照。新增回归覆盖旧/新清单、旧元数据安装与复验、快照冲突及载荷篡改；capture OTA smoke 以 D34 格式元数据验证真实激活。首轮完整包 smoke 的 GUI 截图碰到 Windows 前台焦点限制，增加线程输入附加辅助后独立重跑全 GUI smoke 通过；仍要求前台 HWND 精确匹配并保留非空白截图硬门。
 
 ## 边界
 
