@@ -15,7 +15,7 @@ GUI 截图必须非空白；黑屏就是失败，不删断言、不以窗口存�
 
 - 载荷、文件清单和 ZIP 全树都只有两个 EXE，且都在顶层：`VirtualCapture.exe`（首次选择并保存桌面角色，`capture` 启动采集后台，内部子命令隔离探测虚拟卡能力）和 `vc-updater.exe`（独立更新）。`vc-stream.exe`、`vc-transport.exe`、`vc-vcam-verify.exe` 只在构建树诊断，不随包分发。
 - `vc_stream.dll` C ABI v1、Rust `vc_vcam.dll`、`libpyrowave-shared-1.dll`、应用本地 MSVC 运行库。
-- 使用说明、`version.json`、schema 1 的 `package-manifest.json`（`entrypoint: "unified-v1"`）。不分发 CMD/PowerShell 启动包装或脚本目录；许可证仍在构建期收集和审计，不进便携包。
+- 使用说明、`version.json`、schema 1 的 `package-manifest.json`（`entrypoint: "unified-v1"`；`capabilities.role_launch_args` / `capabilities.desktop_capture` 声明角色参数与图形采集能力，旧清单默认不支持，图形采集 OTA 缺能力时拒绝激活）。不分发 CMD/PowerShell 启动包装或脚本目录；许可证仍在构建期收集和审计，不进便携包。
 - codecs 精确为 raw/pyrowave；sources 为 pattern/dda/wgc。旧 C++ 产品、`turbojpeg.dll` 与开发证据禁止进入包。
 - 目标机无需 Rust/Python/VS；实际收发需自行安装 Npcap。桌面转换需要硬件 D3D11；PyroWave 需真实 GPU 的 Vulkan1.3 驱动。驱动不随包复制。
 

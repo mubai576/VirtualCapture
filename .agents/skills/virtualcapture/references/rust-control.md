@@ -24,12 +24,12 @@
 
 | 方法 | 路径 | 请求 / 返回 |
 |---|---|---|
-| GET | `/health` | `ok,implementation,api_revision,version,role,running,pid,root,session_id,build,layout`；pid 是后台 pid，build为active标识或null，不含更新令牌 |
+| GET | `/health` | `ok,implementation,api_revision,version,role,running,pid,root,session_id,build,layout`；pid 是提供该 HTTP 服务的进程 pid（桌面采集时即 GUI 宿主），session_id 当前恒为 null，build为active标识或null，不含更新令牌 |
 | GET | `/version` | Rust crate version + implementation/api_revision；不以旧 version.json 充当 Rust 版本 |
 | GET/POST | `/config` | GET 完整 Config；POST 部分对象合并校验，失败不写，运行中409；成功 `{saved,config}` |
 | GET | `/adapters?refresh=true` | `{items:[AdapterInfo...]}`，refresh 强制重新探测；普通查询缓存10s |
 | POST | `/sender/prepare` | SenderRequest → PreparedSession；校验实际模块能力、路由、网卡、几何/编码参数和预算，不启停/写配置；Raw 的 `batch_packets=ceil(NV12 frame bytes/(MTU−42))`；编码为 null，由数据面在编码帧完成后按实际AU包数整帧提交 |
-| POST | `/sender/start` | 同请求/响应；已有活动 sender 或同会话运行证据时409，拒绝覆盖；启动存活检查350ms不代表首帧验收 |
+| POST | `/sender/start` | 同请求/响应；已有活动 sender 或同会话运行证据时409，拒绝覆盖。DLL ABI 的 start 异步排队，REST 在返回前等待真实 ready（默认10s，PyroWave 30s）并校验启动回显；超时/回显不符即失败并保留待清理会话。ready 不代表首帧验收 |
 | POST | `/sender/stop` | `{session_id}`；匹配后停止，错误会话不得停当前活动进程；停止后可幂等重复 |
 | GET | `/sender/stats` | 数据面 stats 合并 session_id/running/adapter/pid/exit_code；异常含 error/log_tail |
 
