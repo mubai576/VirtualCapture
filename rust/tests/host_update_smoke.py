@@ -90,14 +90,58 @@ user32.GetForegroundWindow.restype = wintypes.HWND
 user32.GetClientRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
 user32.ClientToScreen.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.POINT)]
 user32.GetDpiForWindow.argtypes = [wintypes.HWND]
+user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+user32.AttachThreadInput.restype = wintypes.BOOL
+user32.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG), wintypes.HWND, wintypes.UINT, wintypes.UINT, wintypes.UINT]
+user32.PeekMessageW.restype = wintypes.BOOL
+user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+user32.BringWindowToTop.argtypes = [wintypes.HWND]
+user32.SetActiveWindow.argtypes = [wintypes.HWND]
+user32.SetFocus.argtypes = [wintypes.HWND]
+kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+
+def focus_window(hwnd, timeout=2):
+    """将测试窗口切到前台；调用线程先建立输入队列以配合 AttachThreadInput。"""
+    message = wintypes.MSG()
+    user32.PeekMessageW(ctypes.byref(message), None, 0, 0, 0)
+    current_thread = kernel32.GetCurrentThreadId()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        foreground = user32.GetForegroundWindow()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
+        attached = []
+        for thread_id in dict.fromkeys((foreground_thread, target_thread)):
+            if thread_id and thread_id != current_thread:
+                if user32.AttachThreadInput(current_thread, thread_id, True):
+                    attached.append(thread_id)
+        try:
+            user32.ShowWindow(hwnd, 9)
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetActiveWindow(hwnd)
+            user32.SetFocus(hwnd)
+        finally:
+            for thread_id in reversed(attached):
+                user32.AttachThreadInput(current_thread, thread_id, False)
+        if user32.GetForegroundWindow() == hwnd:
+            return True
+        time.sleep(.05)
+    return user32.GetForegroundWindow() == hwnd
 
 
 def window_screenshot(hwnd, name):
     assert user32.SetWindowPos(hwnd, wintypes.HWND(-1), 0, 0, 0, 0, 0x0013)
     try:
-        user32.SetForegroundWindow(hwnd)
-        time.sleep(.4)
-        assert user32.GetForegroundWindow() == hwnd, "target window is not foreground"
+        # 繁忙桌面上前台可能被其他应用短暂抢走；有界重试，但截图前仍必须是本窗口前台。
+        deadline = time.monotonic() + 8
+        while True:
+            focus_window(hwnd)
+            time.sleep(.3)
+            if user32.GetForegroundWindow() == hwnd:
+                break
+            assert time.monotonic() < deadline, "target window is not foreground"
         rect = wintypes.RECT()
         origin = wintypes.POINT(0, 0)
         assert user32.GetClientRect(hwnd, ctypes.byref(rect))
