@@ -78,18 +78,24 @@ def run(argv, log, cwd=ROOT):
 
 
 def native_cmake_args():
-    """复用原生依赖构建目录的生成器，不再依赖旧工程缓存。"""
+    """复用原生依赖构建目录已记录的生成器与平台。"""
     cache = NATIVE_BUILD / "CMakeCache.txt"
-    if cache.is_file():
-        for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
-            if line.startswith("CMAKE_GENERATOR:INTERNAL="):
-                generator = line.split("=", 1)[1].strip()
-                if generator.startswith("Visual Studio"):
-                    # The legacy cache leaves the platform implicit; pin x64
-                    # explicitly because Rust artifacts are x86_64.
-                    return ["-G", generator, "-A", "x64"]
-                return ["-G", generator]
-    return []
+    if not cache.is_file():
+        return []
+    generator = ""
+    platform = ""
+    for line in cache.read_text(encoding="utf-8", errors="replace").splitlines():
+        if line.startswith("CMAKE_GENERATOR:INTERNAL="):
+            generator = line.split("=", 1)[1].strip()
+        elif line.startswith("CMAKE_GENERATOR_PLATFORM:INTERNAL="):
+            platform = line.split("=", 1)[1].strip()
+    if not generator:
+        return []
+    args = ["-G", generator]
+    # Visual Studio 缓存可能把平台留空；此时不能改传 -A，否则 CMake 拒绝复用缓存。
+    if generator.startswith("Visual Studio") and platform:
+        args.extend(["-A", platform])
+    return args
 
 
 def build_native(log):
