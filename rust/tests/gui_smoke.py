@@ -44,6 +44,8 @@ user.GetClassLongPtrW.restype = c.c_ssize_t
 kernel.GetCurrentThreadId.restype = w.DWORD
 user.AttachThreadInput.argtypes = [w.DWORD, w.DWORD, w.BOOL]
 user.AttachThreadInput.restype = w.BOOL
+user.PeekMessageW.argtypes = [c.POINTER(w.MSG), w.HWND, w.UINT, w.UINT, w.UINT]
+user.PeekMessageW.restype = w.BOOL
 CALLBACK = c.WINFUNCTYPE(w.BOOL, w.HWND, w.LPARAM)
 
 
@@ -64,6 +66,9 @@ def find_window(pid, title_prefix="VirtualCapture"):
 
 def focus_window(hwnd, timeout=2):
     """Activate the test window despite Windows foreground-lock restrictions."""
+    # AttachThreadInput 要求调用线程已有输入队列；先窥视（不移除）消息以建立队列。
+    message = w.MSG()
+    user.PeekMessageW(c.byref(message), None, 0, 0, 0)
     current_thread = kernel.GetCurrentThreadId()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
@@ -95,10 +100,16 @@ def screenshot(hwnd, name):
     # above others briefly, then crop its opaque client area and restore z-order.
     assert user.SetWindowPos(hwnd, w.HWND(-1), 0, 0, 0, 0, 0x0013)
     try:
-        focus_window(hwnd)
-        time.sleep(.3)
-        assert user.GetForegroundWindow() == hwnd, (
-            "目标窗口未获得前台，拒绝把其他应用截图作为 GPUI 证据", hwnd, user.GetForegroundWindow())
+        # 繁忙桌面上前台可能被其他应用短暂抢走；有界重试，但截图前仍必须是本窗口前台。
+        deadline = time.monotonic() + 8
+        while True:
+            focus_window(hwnd)
+            time.sleep(.3)
+            if user.GetForegroundWindow() == hwnd:
+                break
+            assert time.monotonic() < deadline, (
+                "目标窗口未获得前台，拒绝把其他应用截图作为 GPUI 证据",
+                hwnd, user.GetForegroundWindow())
         bounds = w.RECT()
         assert user.GetClientRect(hwnd, c.byref(bounds))
         origin = w.POINT(0, 0)
