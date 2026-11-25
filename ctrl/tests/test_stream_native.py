@@ -183,8 +183,10 @@ def test_sender_absent_mode_defaults_to_pattern_without_window(agent, monkeypatc
 def test_pyrowave_runtime_slot_tracks_packaged_root_layout(agent, monkeypatch, tmp_path):
     monkeypatch.setattr(agent, "BUILD_DIR", str(tmp_path / "build"))
     (tmp_path / "libpyrowave-shared-1.dll").write_bytes(b"packaged")
+    (tmp_path / "vc-sender.exe").write_bytes(b"packaged-sender")
     assert agent._update_slots()["libpyrowave-shared-1.dll"] == str(tmp_path / "libpyrowave-shared-1.dll")
     (tmp_path / "build").mkdir()
+    (tmp_path / "build" / "vc-sender.exe").write_bytes(b"dev-sender")
     (tmp_path / "build" / "libpyrowave-shared-1.dll").write_bytes(b"dev")
     assert agent._update_slots()["libpyrowave-shared-1.dll"] == str(tmp_path / "build" / "libpyrowave-shared-1.dll")
 

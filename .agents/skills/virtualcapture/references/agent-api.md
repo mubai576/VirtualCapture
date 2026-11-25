@@ -30,6 +30,8 @@ Impl: `agent/vc-agent.py` single-file zero-dep，同一份程序以 `--role host
 | GET | `/` `/ui` | — | 仅主机提供内置控制台（HTML，no-store）；采集后台返回 404，不渲染 UI |
 | GET | `/config` | — | `{role, peer_url, adapter, capture{mode,pattern,gpu_convert,fps,batch,mtu,dst_mac,output,wgc_window,width,height,transform,codec,bitrate_mbps,max_bitrate_mbps},transport{headroom_pct}, receive{shm,mtu,vcam_autoregister}}`（ROOT/vc-config.json，缺省值见 agent；新流配置与实现边界见 stream-config.md） |
 | POST | `/config` | 部分字段（未知键丢弃，子对象逐键合并） | `{saved, config}`；校验失败 400 `{error, details[]}`。产品角色由启动方式固定；主机 peer_url 只接受 `http://IPv4:5143`，UI 只填 IP。adapter 接受安全描述子串或完整 `\Device\NPF_{GUID}` / `\Device\NPF_Loopback`；运行时拒绝更改连接配置（409） |
+| GET | `/capture/windows` | 仅 capture 后台 | `{windows:[{title,pid,selectable,reason}]}`；Win32枚举，不启动采集；其他角色403，非Windows501。可见/非最小化/非cloaked/有效尺寸顶层窗口；标题非法或子串匹配不唯一时selectable=false |
+| POST | `/capture/windows` | 主机 `{peer_url:"http://IPv4:5143"}`，允许尚未保存的合法IP | 固定路径代理对端窗口清单，先确认对端capture角色；不枚举主机、不保存、不启停；对端不可达/旧版502，capture角色403 |
 | GET | `/vcam/status` | — | `{dll, registered, match}`（HKCU InprocServer32 是否指向本机 ROOT 下 dll） |
 | POST | `/vcam/register` | — | regsvr32 /s 本机 dll；同步 FrameMap，Motion=0；200 需 exit=0 且 match。产品 UI 不提供手动注册入口 |
 | POST | `/product/local/start` `/product/local/stop` | 采集后台 start 必须带 `{capture:{...},auto_adapter:true,stream:<descriptor>}`；成功回显 stream | host 起/停 receiver（固定默认 SHM，timeout 0），接收前注册 vcam、接收结束回收；capture 起/停 sender，参数由主机下发。auto_adapter 按请求来源 IP 的本机出站地址精确匹配系统网卡，匹配不唯一时 409，不随意选首卡 |
@@ -88,12 +90,15 @@ compute=vulkan、zero_copy=false。GUI不再把PyroWave显示为CPU SIMD，hardw
 - `POST /activate {version}`（缺省用已 stage 版本）或 `{rollback:true}`（用 prev）：拷贝适用条目到 live 位 →
   应答 `{activated, version, rollback, restart}`（`restart=execv`）→ 原地 `os.execv` 接管（同 argv；冻结模式切 `version.json` exe 指针到版本化 exe 并 GC 旧版）。
 - 交接期 `health/version` 短暂不可达，轮询确认；`run/updates.log` 记录每次 stage/apply/rollback。
-- Zip allowlist：顶层 `vc-agent.exe|vc-agent.py|vc-sender.exe|vc-receiver.exe|vc-vcam.dll|vc-testwin.exe|libpyrowave-shared-1.dll|version.json` 加 `scripts/*.ps1`；`version.json` 必带；zip-slip（`..`/absolute）400。`libpyrowave-shared-1.dll` 与 exe 同目录（开发布局 `build/`，便携包 ROOT），stage 前快照、activate 覆盖、rollback 一并恢复，避免升级后动态库与 exe 失配；仅替换运行 DLL（无 agent 自更新条目）时按非自更新包停旧会话后立即应用。
-- stage 包不含自更新条目时（只换 sender/receiver exe）直接 live 应用并返回 `{updated, version, restart:none}`（先停 sender/receiver 会话）。
+- Zip allowlist：顶层 `vc-agent.exe|vc-agent.py|vc-sender.exe|vc-receiver.exe|vc-vcam.dll|vc-testwin.exe|libpyrowave-shared-1.dll|msvcp140.dll|vcruntime140.dll|vcruntime140_1.dll|version.json` 加 `scripts/*.ps1`；`version.json` 必带；zip-slip（`..`/absolute）400。
+- P6-OTA（2026-11-14）：native 槽位沿用实际查找优先级的既有文件位置（build、build/Release、适用的build/Debug、ROOT），缺省冻结便携包落ROOT、源码开发落build。不再把ROOT原生强制更新到更高优先级build，从而遗漏旧native备份。运行库按sender目录为主槽，同时将包内同一运行库复制到每个受管native目录（含独立vcam目录）；各位置的旧字节/原先不存在均纳入事务及rollback。内部`_runtime/`快照键不允许上传。
+- 更新native时，其目录中四项app-local运行库必须已存在或在本包提供，缺少则400 `{error,missing[]}`，在stage/prev变更之前拒绝。仅更新DLL不要求补齐其他DLL，仍按非自更新包处理。DLL副本不覆盖非受管路径。
+- 首次从旧agent升级必须先用agent-only包（含启动脚本）交接到新agent，再上传含全部native与四项DLL的完整OTA包；首次请求由旧代码执行，不会因zip含新agent而提前获得新布局/白名单逻辑。已有旧版不完整prev无法补造历史字节，应保留独立部署备份。
+- stage 包不含自更新条目时直接 live 应用并返回 `{updated, version, restart:none}`；运行会话存在时409拒绝。应用前保存事务快照，任意复制失败恢复旧字节/删除新增文件，恢复失败保留快照。冻结agent无自更新的包保留当前`version.json.exe`指针，避免重启旧镜像；启动器校验指针为同目录安全agent文件名，缺失/非法明确拒绝，不静默fallback。
 - 自更新条目（`vc-agent.exe|vc-agent.py`）若落不到 ROOT 下，整包 400 拒绝（不静默跳过）；冻结模式 ROOT 默认为 exe 所在目录，生产布局不受影响。
 - 回滚用 `prev/mirror` 走同一 activate 路径，恢复旧字节并移除旧快照不存在的新增受管文件。
   activate前另存唯一的`prev/activate-live-<id>`事务快照；复制/回滚删除失败则恢复激活前状态，
-  未改变的锁定exe不重写，恢复也失败则保留事务快照供恢复，不在下一轮覆盖。
+  未改变的锁定exe不重写，恢复也失败则保留事务快照供恢复，不在下一轮覆盖。新prev以内部`_runtime-layout.json`标记运行库副本/缺失语义；旧prev未记录MSVC DLL和副本，回滚不把这些遗漏当作不存在而删除它们，旧原生遗漏仍须独立备份处理。
   空备份 → 409；stage 版本不符 → 409；staged agent.py 编译失败 → 500；中途失败一律500 JSON，轮询 `/version` 为准。
 - 调用方：`scripts/update.ps1` 与 `ctrl/run_remote.py --update/--rollback` 做 stage→activate→poll `/version`；
   `health.updater` 非 ps-ok 拒绝（该处走 install-pc2.ps1）。同版本重复 stage 保留更旧的 prev 备份。

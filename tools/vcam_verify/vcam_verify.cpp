@@ -17,6 +17,7 @@
 #include <chrono>
 #include "../../common/fnv1a.h"
 #include "../../common/stream.h"
+#include "../../common/mjpeg_codec.h"
 #pragma comment(lib,"strmiids.lib")
 #pragma comment(lib,"ole32.lib")
 #pragma comment(lib,"oleaut32.lib")
@@ -147,11 +148,17 @@ class VerifySink : public IPin, public IMemInputPin {
   HANDLE flushed=CreateEvent(nullptr,TRUE,FALSE,nullptr);
   bool block_receive=false;
   bool hold_samples=false;
+  bool jpeg=false;
+  bool checkFlat=false;
+  vcjpeg::Codec decoder;
   std::mutex held_mu;
   std::vector<IMediaSample*> held;
 public:
   std::atomic<uint64_t> samples{0}, invalid{0};
-  VerifySink(const VCStream& s,const std::string& path,bool block,bool hold):stream(s),block_receive(block),hold_samples(hold){ if(!path.empty()) hashes.open(path,std::ios::binary); }
+  VerifySink(const VCStream& s,const std::string& path,bool block,bool hold,bool mjpg,bool flat):stream(s),block_receive(block),hold_samples(hold),jpeg(mjpg),checkFlat(flat){
+    if(!path.empty()) hashes.open(path,std::ios::binary);
+    if(jpeg)decoder.open(stream,false,80,8*1024*1024);
+  }
   ~VerifySink(){for(auto* sample:held)sample->Release();if(flushed)CloseHandle(flushed);}
   STDMETHODIMP QueryInterface(REFIID id,void** out){
     if(!out) return E_POINTER; *out=nullptr;
@@ -166,8 +173,8 @@ public:
     if(!mt || mt->cbFormat<sizeof(VIDEOINFOHEADER) || !mt->pbFormat) return VFW_E_TYPE_NOT_ACCEPTED;
     auto* v=(VIDEOINFOHEADER*)mt->pbFormat;
     return v->bmiHeader.biWidth==stream.width && v->bmiHeader.biHeight==stream.height &&
-      v->bmiHeader.biSizeImage==stream.frame_bytes() && v->AvgTimePerFrame==10000000LL/stream.fps &&
-      mt->subtype==MEDIASUBTYPE_NV12_EXPECTED ? S_OK:VFW_E_TYPE_NOT_ACCEPTED;
+      (jpeg || v->bmiHeader.biSizeImage==stream.frame_bytes()) && v->AvgTimePerFrame==10000000LL/stream.fps &&
+      mt->subtype==(jpeg ? MEDIASUBTYPE_MJPG : MEDIASUBTYPE_NV12_EXPECTED) ? S_OK:VFW_E_TYPE_NOT_ACCEPTED;
   }
   STDMETHODIMP Disconnect(){ return S_OK; }
   STDMETHODIMP ConnectedTo(IPin** p){if(p)*p=nullptr;return VFW_E_NOT_CONNECTED;}
@@ -190,8 +197,17 @@ public:
   STDMETHODIMP GetAllocatorRequirements(ALLOCATOR_PROPERTIES*){return E_NOTIMPL;}
   STDMETHODIMP Receive(IMediaSample* sample){
     BYTE* p=nullptr;
-    if(!sample || sample->GetActualDataLength()!=stream.frame_bytes() || FAILED(sample->GetPointer(&p)) || !p){invalid++;return E_FAIL;}
-    uint64_t hash=vc_fnv1a64(p,stream.frame_bytes());
+    if(!sample || (!jpeg && sample->GetActualDataLength()!=stream.frame_bytes()) || sample->GetActualDataLength()<=0 ||
+       sample->GetActualDataLength()>sample->GetSize() || FAILED(sample->GetPointer(&p)) || !p){invalid++;return E_FAIL;}
+    const uint8_t* pixels=p;
+    if(jpeg){try{pixels=decoder.decompress(p,(size_t)sample->GetActualDataLength()).data();}catch(...){invalid++;return E_FAIL;}}
+    if(checkFlat){
+      for(size_t i=0;i<stream.frame_bytes();i++){
+        const int expected=i<stream.y_bytes()?96:((i-stream.y_bytes())%2?208:32);
+        if(abs((int)pixels[i]-expected)>(jpeg?2:0)){invalid++;return E_FAIL;}
+      }
+    }
+    uint64_t hash=vc_fnv1a64(pixels,stream.frame_bytes());
     REFERENCE_TIME start=0,end=0; sample->GetTime(&start,&end);
     if(end-start!=10000000LL/stream.fps) invalid++;
     char hex[17];vc_fnv1a64_hex(hash,hex);
@@ -204,14 +220,16 @@ public:
 };
 
 int main(int argc,char** argv){
-  VCStream stream; std::string dll,map,hashlog; int seconds=2; bool capabilities=false,allow_empty=false,block=false,hold=false,disconnect_running=false;
+  VCStream stream; std::string dll,map,hashlog; int seconds=2; bool capabilities=false,allow_empty=false,block=false,hold=false,disconnect_running=false,jpeg=false,checkFlat=false;
   for(int i=1;i<argc;i++){
     std::string arg=argv[i];
     auto value=[&](){if(i+1>=argc){fprintf(stderr,"missing value\n");exit(2);}return std::string(argv[++i]);};
     if(arg=="--dll") dll=value(); else if(arg=="--shm") map=value(); else if(arg=="--hashlog") hashlog=value();
     else if(arg=="--width") stream.width=vc_cli_int(value().c_str()); else if(arg=="--height") stream.height=vc_cli_int(value().c_str());
     else if(arg=="--fps") stream.fps=vc_cli_int(value().c_str()); else if(arg=="--seconds") seconds=vc_cli_int(value().c_str());
+    else if(arg=="--format"){const auto format=value();if(format!="nv12" && format!="mjpeg"){fprintf(stderr,"format must be nv12|mjpeg\n");return 2;}jpeg=format=="mjpeg";}
     else if(arg=="--capabilities") capabilities=true; else if(arg=="--allow-empty") allow_empty=true;
+    else if(arg=="--check-flat") checkFlat=true;
     else if(arg=="--block-receive") block=true;
     else if(arg=="--hold-samples") hold=true;
     else if(arg=="--disconnect-running") disconnect_running=true;
@@ -235,8 +253,40 @@ int main(int argc,char** argv){
   if(SUCCEEDED(hr)) hr=CoCreateInstance(CLSID_FilterGraph,nullptr,CLSCTX_INPROC_SERVER,IID_IGraphBuilder,(void**)&graph);
   if(SUCCEEDED(hr)) hr=graph->AddFilter(filter,L"Isolated VirtualCapture");
   if(SUCCEEDED(hr)) hr=filter->FindPin(L"Capture",&pin);
-  VerifySink* sink=new VerifySink(stream,hashlog,block,hold);
+  VerifySink* sink=new VerifySink(stream,hashlog,block,hold,jpeg,checkFlat);
+  IAMStreamConfig* config=nullptr;AM_MEDIA_TYPE* selected=nullptr;
+  if(SUCCEEDED(hr)) hr=pin->QueryInterface(IID_IAMStreamConfig,(void**)&config);
+  if(SUCCEEDED(hr)){
+    int count=0,size=0;hr=config->GetNumberOfCapabilities(&count,&size);
+    if(SUCCEEDED(hr) && (count!=2 || size!=sizeof(VIDEO_STREAM_CONFIG_CAPS)))hr=E_FAIL;
+    VIDEO_STREAM_CONFIG_CAPS caps={};
+    if(SUCCEEDED(hr))hr=config->GetStreamCaps(jpeg?1:0,&selected,(BYTE*)&caps);
+    if(SUCCEEDED(hr))hr=config->SetFormat(selected);
+    AM_MEDIA_TYPE* actual=nullptr;
+    if(SUCCEEDED(hr))hr=config->GetFormat(&actual);
+    if(SUCCEEDED(hr) && (!actual || actual->subtype!=selected->subtype))hr=E_FAIL;
+    FreeMediaType(actual);
+    if(SUCCEEDED(hr) && pin->QueryAccept(selected)!=S_OK)hr=E_FAIL;
+    if(SUCCEEDED(hr)){
+      auto* video=(VIDEOINFOHEADER*)selected->pbFormat;
+      const LONG savedWidth=video->bmiHeader.biWidth;video->bmiHeader.biWidth+=2;
+      if(pin->QueryAccept(selected)!=S_FALSE || SUCCEEDED(config->SetFormat(selected)))hr=E_FAIL;
+      video->bmiHeader.biWidth=savedWidth;
+      const GUID savedSubtype=selected->subtype;selected->subtype=MEDIASUBTYPE_RGB24;
+      if(pin->QueryAccept(selected)!=S_FALSE)hr=E_FAIL;selected->subtype=savedSubtype;
+      IEnumMediaTypes* types=nullptr;
+      if(SUCCEEDED(hr))hr=pin->EnumMediaTypes(&types);
+      if(SUCCEEDED(hr)){
+        AM_MEDIA_TYPE* entries[2]={};ULONG got=0;
+        if(types->Next(2,entries,&got)!=S_OK || got!=2 || entries[0]->subtype!=MEDIASUBTYPE_NV12_EXPECTED || entries[1]->subtype!=MEDIASUBTYPE_MJPG)hr=E_FAIL;
+        FreeMediaType(entries[0]);FreeMediaType(entries[1]);
+        types->Reset();if(types->Skip(2)!=S_OK || types->Skip(1)!=S_FALSE)hr=E_FAIL;
+        types->Release();
+      }
+    }
+  }
   if(SUCCEEDED(hr)) hr=pin->Connect(sink,nullptr);
+  if(config)config->Release();FreeMediaType(selected);
   if(SUCCEEDED(hr)) hr=filter->Run(0);
   if(SUCCEEDED(hr)) Sleep((DWORD)seconds*1000);
   auto stop_start=std::chrono::steady_clock::now();
@@ -245,7 +295,7 @@ int main(int argc,char** argv){
   double stop_ms=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-stop_start).count();
   bool pass=SUCCEEDED(hr) && sink->invalid==0 && (allow_empty || sink->samples>0) && stop_ms<2000;
   printf("Stop/Disconnect %.3f ms block_receive=%d hold_samples=%d disconnect_running=%d\n",stop_ms,block,hold,disconnect_running);
-  printf("DLL stream %dx%d@%d samples=%llu invalid=%llu hr=0x%08x %s\n",stream.width,stream.height,stream.fps,
+  printf("DLL stream %dx%d@%d format=%s samples=%llu invalid=%llu hr=0x%08x %s\n",stream.width,stream.height,stream.fps,jpeg?"MJPG":"NV12",
     (unsigned long long)sink->samples.load(),(unsigned long long)sink->invalid.load(),(unsigned)hr,pass?"PASS":"FAIL");
   if(pin){pin->Disconnect();pin->Release();}
   if(filter) filter->Release();

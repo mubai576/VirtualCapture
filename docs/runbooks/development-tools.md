@@ -9,6 +9,7 @@
 |---|---|
 | 一键编译验证并打包完整目录 | `python scripts/package.py`；确认包含未提交改动时加 `--allow-dirty` |
 | 本地完整验证 | `python scripts/verify.py` |
+| 虚拟卡NV12/MJPG协商/样本/停止生命周期 | `python -m pytest ctrl/tests/test_vcam_formats.py -q`；直接加载DLL、私有SHM，含真实JPEG解码/色度向量检查，不注册；静态功能向量不是motion性能验收 |
 | GUI 前端状态逻辑 | `python -m pytest ctrl/tests/test_gui_client.py -q`；需要开发机有 Node.js，无 npm 依赖，agent 运行不需要 Node.js |
 | MJPEG缓冲生命周期与故障清理 | `python -m pytest ctrl/tests/test_mjpeg_buffers.py -q`；MSVC编译实际sender/receiver，注入内存Npcap替身，不操作网卡/注册表；需先有默认MJPEG原生构建 |
 | 主机/后台与虚拟卡生命周期 | `python -m pytest ctrl/tests/test_gui_host.py -q`；使用进程与注册替身，不操作真实注册表 |
@@ -69,7 +70,7 @@ python scripts/p6_codec_verify.py --codec mjpeg `
 | SHM NV12 预览、OSD | `tools/monitor/monitor.cpp` | `vc-monitor` |
 | D3D11 诊断 | `tools/monitor/diag.cpp` | `vc-monitor-diag` |
 | DDA 高帧率动画源 | `tools/testwin/testwin.cpp` | `vc-testwin` |
-| DShow 枚举 / NV12 格式验收 | `tools/vcam_verify/vcam_verify.cpp` | `vc-vcam-verify` |
+| DShow 枚举 / NV12及MJPG隔离取帧（`--dll ... --format nv12|mjpeg`，默认NV12；MJPG实际解码校验；`--check-flat`仅供固定Y96/U32/V208功能向量） | `tools/vcam_verify/vcam_verify.cpp` | `vc-vcam-verify` |
 | 虚拟卡对象/真实连接图生命周期（直接加载 DLL，不注册） | `tools/vcam_verify/vcam_lifecycle.cpp` | `vc-vcam-lifecycle` |
 
 这三个源码目录于 2026-10-29 从根目录迁入 `tools/`；历史报告中的旧源码路径保留原文。

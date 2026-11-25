@@ -9,13 +9,17 @@
 - 自定义：偶数宽高 2..8192，整数 fps 1..1000；单帧包数不得超过 uint16。范围是软件参数校验，不是显存/吞吐/硬件认证。
 - `capture`：`width,height,fps,transform,codec,bitrate_mbps,max_bitrate_mbps`，其余 GPU/batch/MTU 等隐藏值保留。
 - 采集后端：`capture.mode=dda|wgc|pattern`；`capture.output`（0..15，默认0）选择显示器；`capture.wgc_window`（<=128 字符标题子串，空=显示器）仅 WGC 使用。WGC 仍经 DWM 合成，窗口模式包含光标，独占全屏不可采集；切换后端必须显式配置，不自动回退。
-- `codec=raw|mjpeg|pyrowave`；H.264/H.265 已于 2026-11-13 移除。码率整数 1..10000 Mbps。Raw/非当前编码后端保留历史校验 max>=target；MJPEG/PyroWave 的目标码率不生效（GUI 中字段禁用），允许 max<target，原生分别独立限制每个值（100 kbps..2 Gbps）并保留描述符中的原值，最大码率仍限流。MJPEG/PyroWave 的质量或每帧预算、能力与精确会话追加见encoded-stream；Raw 不压缩、不静默切编码或降尺寸/帧率。
+- GUI 采集设置显式提供 DDA/WGC/测试图案（沿用已保存 pattern）、被采集机显示器编号与 WGC 显示器/窗口目标。窗口用下拉枚举并可刷新，通过主机 POST `/capture/windows` 获取被采集机 GET `/capture/windows`；不用本机窗口，不要求手输标题。只列可见、未最小化、未 cloaked、尺寸有效的有标题顶层窗口；超过128字符/控制字符/标题子串不唯一的项不可选。保存仍使用现有 `wgc_window`；启动时原生重新检查唯一匹配，0个或多个都拒绝，窗口关闭不重选。切换非窗口模式保存空标题；隐藏的 output/pattern/GPU/batch/MTU 原值保留。草稿不影响运行，运行中禁改源。
+- `codec=raw|mjpeg|pyrowave`；H.264/H.265 已于 2026-11-13 移除。码率整数 1..10000 Mbps。Raw/非当前编码后端保留历史校验 max>=target；MJPEG/PyroWave 的目标码率不生效（GUI 移除无效目标码率选项，保留后台原值），允许 max<target，原生分别独立限制每个值（100 kbps..2 Gbps）并保留描述符中的原值，最大码率仍限流。MJPEG/PyroWave 的质量或每帧预算、能力与精确会话追加见encoded-stream；Raw 不压缩、不静默切编码或降尺寸/帧率。
+- GUI 移除固定 GOP 与无可选值的编码/解码类别控件；现有 MJPEG/PyroWave 由实现确定 GOP=1、hardware=false（非固定功能引擎），说明文字保留 CPU/SIMD 与 Vulkan 区别。保留有效的最大码率、解码在途上限、MJPEG质量、开发功能授权；GUI按所选codec确定唯一固定后端并只读说明（MJPEG=turbojpeg:cpu、PyroWave=pyrowave:vulkan），不再提供无选择价值的两个输入框，API仍显式提交并严格协商，未启用开发授权仍拒绝。PyroWave显示与原生同公式的每帧字节上限及相对NV12预算比，不伪造quality参数；Raw 隐藏编码参数并保留原值。
 - `transport.headroom_pct`：0..50，默认20，仅预算建议，不修改历史验收门限。
 
 ## 变换与限速
 
+虚拟采集卡单 pin 提供两种客户端输出：NV12（默认、原字节不变）与 MJPG（真正 baseline JPEG，libjpeg-turbo CPU/SIMD、固定质量80、4:2:0、每帧独立）。EnumMediaTypes/GetStreamCaps 均列出两档，SetFormat/GetFormat 与 Connect/QueryAccept 按客户端协商；两档尺寸/fps 均固定为实例发现的 SHM 会话，连接后不动态改格式。MJPG 分配按 JPEG 最坏大小，样本实际长度为当帧JPEG字节数，不把NV12改标签。内部SHM仍为NV12，D12无信号/重复策略不变；MJPG新增主机编码开销，不承诺原始240fps性能，链路MJPEG解码后再次编码有额外有损。MJPG输出不能逐像素对账SHM；仅NV12保留该判据。隔离验证器追加 `--format nv12|mjpeg`（默认nv12），MJPG样本实际解码验证，不注册/切换部署。
+
 源为 `capture.output` 指定的显示器（DDA/WGC，默认0）或 WGC 指定窗口，传输/虚拟卡尺寸与源桌面分辨率分离。不修改显示设置；DDA 旋转输出拒绝。
-WGC以帧ContentSize为有效源范围；源变大/变小先释放旧帧并按ContentSize重建帧池，丢弃过渡帧，
+WGC启动前固定设置`MinUpdateInterval=10000`（100ns单位，即1ms；owner 2026-11-14指定），并读回确认；系统无`IGraphicsCaptureSession5`、设置失败或读回不符均明确拒绝，不保留默认约16ms、不回退DDA。此值是采集最小更新间隔，不是端到端延迟保证；现有`fps`发送上限不变，不补帧、不承诺1000fps或240fps实画面。WGC以帧ContentSize为有效源范围；源变大/变小先释放旧帧并按ContentSize重建帧池，丢弃过渡帧，
 不改变协商输出。crop变小到不足输出尺寸则明确失败；空/最小化暂不送帧。
 捕获项Closed、原始窗口句柄/进程身份失效和FrameArrived异常为终止错误，不再伪装成无新帧超时；
 窗口关闭不重新按标题寻找替代窗口。回调共享状态跨撤销/排队存活，

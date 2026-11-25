@@ -133,6 +133,10 @@ int main(int argc, char** argv) {
     std::printf("WGC-LIVE: %s init: %s\n", unavailable ? "SKIP" : "FAIL", cap.err());
     return finish(unavailable ? 2 : 1);
   }
+  // Successful init must have applied the requested 1ms interval before capture.
+  CHECK(cap.session.MinUpdateInterval().count() == WGCCap::min_update_interval_100ns);
+  std::printf("WGC-LIVE: MinUpdateInterval=%lld (100ns)\n",
+              (long long)cap.session.MinUpdateInterval().count());
   if (want_gpu) {
     std::string why;
     if (!cap.start_gpu(why)) {

@@ -105,9 +105,9 @@ python -m PyInstaller packaging/vc-agent.spec
 ## Release zip
 
 版本以 `version.json` 为准。包内包含 `vc-agent.exe`、`vc-sender.exe`、`vc-receiver.exe`、
-`vc-vcam.dll`、`libpyrowave-shared-1.dll`、`version.json` 与所需 `scripts/*.ps1`；原生文件取上述 Release 产物。
-PyroWave DLL是sender/receiver的必需运行时（即便选择Raw），与exe同批更新并纳入备份/回滚。
-旧agent若不接受该DLL，先单独更新agent，再stage完整运行时；不要直接向旧白名单上传新完整包。
+`vc-vcam.dll`、`vc-testwin.exe`、`libpyrowave-shared-1.dll`、`msvcp140.dll`、`vcruntime140.dll`、`vcruntime140_1.dll`、`version.json` 与所需 `scripts/*.ps1`；原生文件取上述 Release 产物，运行库取同批便携成品。
+PyroWave DLL是sender/receiver的必需运行时（即便选择Raw）；四项DLL与native同批更新，按各native实际目录部署、备份及回滚。native缺app-local依赖且包内未提供时拒绝，不依赖cwd或其他目录DLL搜索。已有portable ROOT native不生成build影子副本。
+旧agent须两步升级：先仅agent+version+启动脚本包，确认新agent接管后再stage完整native/四项DLL包。首次请求仍由旧agent执行，直接上传新完整包会被旧白名单拒绝，或继续使用旧槽位；不能靠包内新agent修复该次请求。保留独立旧目录备份，旧prev遗漏的原生不能事后恢复。
 使用 `Compress-Archive` 生成 `release/vc-<ver>.zip`；`pc2-cutover.md`仅为历史0.3.7/18080割接，P6双机并存与实际切换须按`p6-cutover.md`重新批准，不直接照搬。
 完整便携目录包含白名单之外的工具与文档，不能直接整体压缩上传 `/update`；OTA zip 仍按本节选取允许的文件。
 构建验证本身不打包、不注册 DLL、不触发 OTA。

@@ -131,6 +131,8 @@ struct WGCSharedState {
 #endif
 
 struct WGCCap {
+  // Owner-selected capture update interval, not an end-to-end latency promise.
+  static constexpr int64_t min_update_interval_100ns = 10000; // 1 ms
   // E_CLOSED/E_CALLBACK 必须与 E_TIMEOUT 不同：前者是采集终结，后者只是本帧没有新图像。
   // sender（vc_sender.cpp / encoded_sender.h）只把 E_TIMEOUT 当作非致命，因此新值会
   // 走现有的 fatal 分支并打印 err_msg；无需改调用方。
@@ -223,7 +225,7 @@ struct WGCCap {
     MultiByteToWideChar(CP_UTF8, 0, s.c_str(), (int)s.size(), &w[0], n);
     return w;
   }
-  struct FindWindow { std::wstring needle; HWND hwnd = nullptr; };
+  struct FindWindow { std::wstring needle; HWND hwnd = nullptr; unsigned matches = 0; };
   static BOOL CALLBACK enum_window(HWND h, LPARAM lp) {
     FindWindow* f = (FindWindow*)lp;
     if (!IsWindowVisible(h) || IsIconic(h)) return TRUE;
@@ -241,7 +243,7 @@ struct WGCCap {
     DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
     if (pid == GetCurrentProcessId()) return TRUE;
     RECT r{}; if (!GetWindowRect(h, &r) || r.right - r.left < 2 || r.bottom - r.top < 2) return TRUE;
-    f->hwnd = h; return FALSE;
+    f->hwnd = h; ++f->matches; return TRUE;
   }
   static bool output_monitor(ID3D11Device* d, int index, HMONITOR& hmon, int& w, int& h) {
     winrt::com_ptr<IDXGIDevice> dxgi;
@@ -361,6 +363,9 @@ inline bool WGCCap::init(std::string& detail) {
       if (!find.hwnd) {
         shutdown(); err_code = E_NOOUTPUT; err_msg = "WGC window not found: " + window_title; return false;
       }
+      if (find.matches != 1) {
+        shutdown(); err_code = E_NOOUTPUT; err_msg = "WGC window title is ambiguous; refresh window selection: " + window_title; return false;
+      }
       target_window = find.hwnd;
       GetWindowThreadProcessId(target_window, &target_process);
       hr = interop->CreateForWindow(find.hwnd,
@@ -408,6 +413,27 @@ inline bool WGCCap::init(std::string& detail) {
     frame_token = pool.FrameArrived([st](auto&& sender, auto&&) { st->on_frame(sender); });
     session = pool.CreateCaptureSession(item);
     if (!session) { shutdown(); err_code = E_INTERNAL; err_msg = "WGC capture session failed"; return false; }
+    // Do not inherit the OS default (16 ms on the diagnosed capture machine).
+    // Unsupported systems or rejected settings must fail explicitly, not silently
+    // retain a ~60 fps ceiling. The sender's separate fps limit is unchanged.
+    try {
+      auto timing = session.try_as<winrt::Windows::Graphics::Capture::IGraphicsCaptureSession5>();
+      if (!timing) {
+        shutdown(); err_code = E_NODDA; // unavailable capability; startup still fails
+        err_msg = "WGC 1ms MinUpdateInterval requires IGraphicsCaptureSession5; unsupported Windows version";
+        return false;
+      }
+      timing.MinUpdateInterval(winrt::Windows::Foundation::TimeSpan{min_update_interval_100ns});
+      if (timing.MinUpdateInterval().count() != min_update_interval_100ns) {
+        shutdown(); err_code = E_INTERNAL;
+        err_msg = "WGC MinUpdateInterval did not accept 1ms";
+        return false;
+      }
+    } catch (const winrt::hresult_error& e) {
+      shutdown(); err_code = E_INTERNAL;
+      err_msg = std::string("WGC 1ms MinUpdateInterval failed: ") + winrt::to_string(e.message());
+      return false;
+    }
     try { session.IsCursorCaptureEnabled(include_cursor); } catch (...) {}
     try { session.IsBorderRequired(false); } catch (...) {} // Win10 无此属性，保持系统边框
     session.StartCapture();

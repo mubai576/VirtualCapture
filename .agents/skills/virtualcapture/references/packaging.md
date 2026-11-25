@@ -35,6 +35,5 @@ PyroWave动态链接`libpyrowave-shared-1.dll`（与exe同目录，须随包分�
 - 打包不注册 DLL、不修改机器配置、不启动真实采集/传输、不执行 OTA。
 
 这是完整便携目录，**不是 OTA zip**；不得整体上传 `/update`。
-OTA允许的根文件额外包含`libpyrowave-shared-1.dll`，与sender/receiver同目录、同批激活，
-纳入prev快照/回滚及本轮激活失败恢复（含首次新增后失败时移除）；旧agent先独立升级白名单，
-再传含必需运行时的完整OTA。操作仍为stage/activate分离，不自动部署。
+OTA允许的根文件额外包含`libpyrowave-shared-1.dll`、`msvcp140.dll`、`vcruntime140.dll`、`vcruntime140_1.dll`，包内运行库部署到各受管native实际目录，不把ROOT便携原生强制搬到build。
+各DLL副本纳入prev快照/回滚及激活/非self立即应用失败恢复（含首次新增后失败时移除）；native缺app-local依赖且包内未提供即拒绝。旧agent先独立升级agent/启动器，接管后再传含必需运行时的完整OTA；旧代码执行的第一次请求不会自动获得新白名单/布局。版本化agent指针供启动器安全复用，缺失/非法拒绝。详情见`agent-api.md`。操作仍保留self包stage/activate与非self包立即应用区别，不自动部署。

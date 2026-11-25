@@ -51,6 +51,40 @@ def lifecycle(agent, monkeypatch):
     return events
 
 
+def test_window_choices_reject_duplicates_substrings_and_invalid_titles(agent):
+    windows = [{"title": title, "pid": n} for n, title in enumerate(
+        ["Game", "Game - settings", "Duplicate", "duplicate", "Unique 中文", "x" * 129, "bad\nname"])]
+    items = agent._window_choices(windows)
+    assert [item["selectable"] for item in items] == [False, True, False, False, True, False, False]
+
+
+def test_window_proxy_uses_capture_peer_and_fixed_read_only_paths(agent, monkeypatch):
+    calls = []
+    def peer(path, **kwargs):
+        calls.append((path, kwargs))
+        return (200, {"product_role": "capture"}) if path == "/health" else (200, {"windows": []})
+    monkeypatch.setattr(agent, "peer_call", peer)
+    before = agent.load_config()
+    assert agent.peer_windows_request({"peer_url": "http://192.168.2.60:5143"}) == (200, {"windows": []})
+    assert [path for path, _ in calls] == ["/health", "/capture/windows"]
+    assert all(kw["url"] == "http://192.168.2.60:5143" for _, kw in calls)
+    assert agent.load_config() == before
+    assert agent.peer_windows_request({"peer_url": "http://bad:5143"})[0] == 400
+    monkeypatch.setattr(agent, "peer_call", lambda *a, **k: (200, {"product_role": "receive"}))
+    assert agent.peer_windows_request({})[0] == 502
+    agent.state["role"] = "capture"
+    assert agent.peer_windows_request({})[0] == 403
+
+
+def test_windows_enumeration_smoke(agent):
+    import os
+    if os.name != "nt": pytest.skip("Windows enumeration only")
+    code, result = agent.capture_windows()
+    assert code == 200, result
+    assert isinstance(result["windows"], list)
+    assert all(isinstance(item["pid"], int) and isinstance(item["title"], str) for item in result["windows"])
+
+
 def test_host_config_is_fixed_and_validates_ip_and_adapter(agent):
     assert agent.DEFAULT_PORT == 5143
     code, result = agent.save_config({"role": "capture", "receive": {"shm": "Local\\Other", "vcam_autoregister": False}})

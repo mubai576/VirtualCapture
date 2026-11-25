@@ -22,6 +22,17 @@ if ($health) {
   return
 }
 $agentExe = Join-Path $Root 'vc-agent.exe'
+$versionFile = Join-Path $Root 'version.json'
+if (Test-Path -LiteralPath $versionFile) {
+  $version = Get-Content -LiteralPath $versionFile -Raw -Encoding UTF8 | ConvertFrom-Json
+  if ($version.exe) {
+    # OTA keeps the running image locked and switches a same-directory pointer.
+    $imageName = [string]$version.exe
+    if ($imageName -notmatch '^vc-agent[-A-Za-z0-9_]*\.exe$') { throw 'Invalid agent image in version.json.' }
+    $agentExe = Join-Path $Root $imageName
+    if (-not (Test-Path -LiteralPath $agentExe -PathType Leaf)) { throw 'Agent image from version.json is missing.' }
+  }
+}
 if (Test-Path -LiteralPath $agentExe) {
   $agentArgs = @('--role', $Role, '--root', ('"' + $Root + '"'))
 } else {

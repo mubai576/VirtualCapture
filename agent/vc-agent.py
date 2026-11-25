@@ -477,8 +477,9 @@ def run_exec(argv, timeout_s, client):
 UPDATE_LOCK = threading.RLock()
 UPDATE_MAX_ZIP = 100 * 1024 * 1024
 UPDATE_MAX_FILES = 1000
-UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll",
-                       "vc-testwin.exe", "libpyrowave-shared-1.dll", "version.json"}
+UPDATE_RUNTIME_DLLS = ("libpyrowave-shared-1.dll", "msvcp140.dll", "vcruntime140.dll", "vcruntime140_1.dll")
+UPDATE_NATIVE_FILES = ("vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll", "vc-testwin.exe")
+UPDATE_ALLOWED_ROOT = {"vc-agent.exe", "vc-agent.py", "version.json", *UPDATE_NATIVE_FILES, *UPDATE_RUNTIME_DLLS}
 
 
 FILES_MAX_BYTES = 262144
@@ -539,12 +540,18 @@ def _update_slots():
     else:
         try: m["vc-agent.py"] = _agent_script_path()
         except Exception: pass
-    m["vc-sender.exe"] = os.path.join(BUILD_DIR, "vc-sender.exe")
-    m["vc-receiver.exe"] = os.path.join(BUILD_DIR, "vc-receiver.exe")
-    m["vc-vcam.dll"] = os.path.join(BUILD_DIR, "vc-vcam.dll")
-    m["vc-testwin.exe"] = os.path.join(BUILD_DIR, "vc-testwin.exe")
-    # PyroWave 运行时与 exe 同目录；必须纳入备份/回滚，否则升级后 DLL 与 exe 失配。
-    m["libpyrowave-shared-1.dll"] = runtime_path("libpyrowave-shared-1.dll")
+    # Preserve the paths actually selected at runtime, including portable ROOT and
+    # multi-config builds. Never introduce a higher-priority shadow build/*.exe.
+    default_dir = ROOT if getattr(sys, "frozen", False) else BUILD_DIR
+    for name in UPDATE_NATIVE_FILES:
+        candidates = [os.path.join(BUILD_DIR, name), os.path.join(BUILD_DIR, "Release", name)]
+        if name != "vc-vcam.dll": candidates.append(os.path.join(BUILD_DIR, "Debug", name))
+        candidates.append(os.path.join(ROOT, name))
+        m[name] = next((p for p in candidates if os.path.isfile(p)), os.path.join(default_dir, name))
+    # Each native directory receives its own app-local dependencies. The sender
+    # directory is the canonical slot; other copies have private snapshot keys.
+    for name in UPDATE_RUNTIME_DLLS:
+        m[name] = os.path.join(os.path.dirname(m["vc-sender.exe"]), name)
     m["version.json"] = VERSION_FILE
     return m
 
@@ -577,10 +584,32 @@ def _safe_zip_entries(zf):
         items.append((n, rel))
     return items, ""
 
+def _runtime_slots(slots):
+    """All managed runtime copies, including absence for transactional rollback.
+
+    _runtime/ keys are generated internally, never accepted as zip entries.
+    Include existing standard layouts to preserve a ROOT DLL even when the
+    selected sender is in build/ and its app-local runtime is still missing.
+    """
+    directories = {ROOT, BUILD_DIR, os.path.join(BUILD_DIR, "Release"), os.path.join(BUILD_DIR, "Debug")}
+    directories.update(os.path.dirname(slots[name]) for name in UPDATE_NATIVE_FILES)
+    result = {}
+    for name in UPDATE_RUNTIME_DLLS:
+        primary = os.path.abspath(slots[name])
+        for directory in sorted(directories):
+            path = os.path.abspath(os.path.join(directory, name))
+            if os.path.normcase(path) == os.path.normcase(primary):
+                result[name] = path
+            elif _under_root(path):
+                result["_runtime/" + os.path.relpath(path, ROOT).replace(os.sep, "/")] = path
+    return result
+
+
 def _live_for_rel(rel, slots):
-    # 判运行文件绝对路径
-    if rel in ("vc-agent.exe", "vc-agent.py", "vc-sender.exe", "vc-receiver.exe", "vc-vcam.dll",
-               "vc-testwin.exe", "libpyrowave-shared-1.dll", "version.json"):
+    # Only internally generated runtime snapshot keys can address extra copies.
+    if rel.startswith("_runtime/"):
+        return _runtime_slots(slots).get(rel)
+    if rel in slots:
         return slots.get(rel)
     if rel.startswith("scripts/"):
         return os.path.join(ROOT, rel.replace("/", os.sep))
@@ -606,7 +635,8 @@ def _all_managed_files():
     # 列管控文件（OTA范围）
     _out = []
     try:
-        for _rel, _live in _update_slots().items():
+        slots = _update_slots()
+        for _rel, _live in {**slots, **_runtime_slots(slots)}.items():
             if not _live:
                 continue
             try:
@@ -681,6 +711,10 @@ def _full_prev_snapshot():
             if _dd:
                 os.makedirs(_dd, exist_ok=True)
             _sh.copy2(_live, _dest)
+    # Older snapshots did not manage MSVC DLLs or per-directory copies. Mark new
+    # snapshots so rollback never interprets old omissions as proven absence.
+    with open(os.path.join(_prev, "_runtime-layout.json"), "w", encoding="utf-8") as f:
+        json.dump({"revision": 1}, f)
     return _prev
 
 def _versioned_exe_name(ver):
@@ -828,6 +862,11 @@ def _do_activate(ver_or_none, is_rollback):
                 _prev_rels = {_managed_rel(os.path.relpath(os.path.join(dp, name), _target))
                               for dp, _, names in os.walk(_target) for name in names}
                 for _rel, _live in _all_managed_files():
+                    # Legacy prev never recorded MSVC DLLs/additional copies;
+                    # omission there is unknown, not proof that a DLL was absent.
+                    if "_runtime-layout.json" not in _prev_rels and (
+                            _rel in UPDATE_RUNTIME_DLLS[1:] or _rel.startswith("_runtime/")):
+                        continue
                     if _managed_rel(_rel) not in _prev_rels and os.path.isfile(_live):
                         os.remove(_live)
         except Exception as _e:
@@ -897,14 +936,41 @@ def handle_update_binary(body):
         if not newver or not isinstance(newver, str):
             return 400, {"error": "bad version.json"}
         slots = _update_slots()
+        incoming = {rel for _, rel in items}
+        # Partial native updates may reuse existing app-local DLLs, never a DLL
+        # found only in another directory (Windows does not search it reliably).
+        native_dirs = {os.path.dirname(slots[name]) for name in UPDATE_NATIVE_FILES if name in incoming}
+        missing = [os.path.relpath(os.path.join(directory, dll), ROOT)
+                   for directory in sorted(native_dirs) for dll in UPDATE_RUNTIME_DLLS
+                   if dll not in incoming and not os.path.isfile(os.path.join(directory, dll))]
+        if missing:
+            return 400, {"error": "native update missing app-local runtimes", "missing": missing}
         pairs = []
         for n, rel in items:
             live = _live_for_rel(rel, slots)
             if not live or not _under_root(live):
                 continue
             pairs.append((rel, live, n))
+            if rel in UPDATE_RUNTIME_DLLS:
+                # Fan out the same packaged bytes beside every managed native
+                # image. Extra staging paths also encode exact rollback locations.
+                native_dirs = {os.path.normcase(os.path.abspath(os.path.dirname(slots[name])))
+                               for name in UPDATE_NATIVE_FILES}
+                for key, path in _runtime_slots(slots).items():
+                    if (key.startswith("_runtime/") and os.path.basename(path) == rel
+                            and os.path.normcase(os.path.dirname(path)) in native_dirs):
+                        pairs.append((key, path, n))
         if not pairs:
             return 400, {'error': 'no applicable files for this layout'}
+        # Runtime-only updates must not discard the frozen agent's active image
+        # pointer and restart an older vc-agent.exe on the next desktop login.
+        retained_exe = None
+        if getattr(sys, "frozen", False) and "vc-agent.exe" not in incoming:
+            try:
+                with open(VERSION_FILE, encoding="utf-8") as current:
+                    retained_exe = json.load(current).get("exe")
+            except (OSError, ValueError):
+                pass
         for _n, _rel in items:
             if _rel in ('vc-agent.exe', 'vc-agent.py') and _rel not in [r for r, _lv, _nn in pairs]:
                 return 400, {'error': 'self update not applicable: ' + _rel + ' outside ROOT'}
@@ -927,6 +993,13 @@ def handle_update_binary(body):
             os.makedirs(os.path.dirname(dest) or stag, exist_ok=True)
             with zf.open(n) as src, open(dest, "wb") as f:
                 _sh.copyfileobj(src, f)
+        if retained_exe:
+            staged_version = os.path.join(stag, "version.json")
+            with open(staged_version, encoding="utf-8") as f:
+                metadata = json.load(f)
+            metadata["exe"] = retained_exe
+            with open(staged_version, "w", encoding="utf-8") as f:
+                json.dump(metadata, f)
     try:
         os.remove(tmp)
     except Exception:
@@ -938,8 +1011,22 @@ def handle_update_binary(body):
             _dd = os.path.dirname(_lv)
             if _dd:
                 os.makedirs(_dd, exist_ok=True)
-        for relp, live, n in pairs:
-            _sh.copy2(os.path.join(stag, relp), live)
+        snapshot = os.path.join(ROOT, "prev", "activate-live-" + uuid.uuid4().hex)
+        try:
+            before = _snapshot_live_managed(snapshot)
+        except Exception as failure:
+            return 500, {"error": "cannot snapshot live files before update: %s" % failure}
+        try:
+            for relp, live, n in pairs:
+                _sh.copy2(os.path.join(stag, relp), live)
+        except Exception as failure:
+            try:
+                _restore_live_managed(snapshot, before)
+            except Exception as restore_failure:
+                return 500, {"error": "update failed: %s; live restore also failed: %s; snapshot retained" % (failure, restore_failure)}
+            _sh.rmtree(snapshot, ignore_errors=True)
+            return 500, {"error": "update failed: %s; live files restored" % failure}
+        _sh.rmtree(snapshot, ignore_errors=True)
         try:
             os.remove(tmp)
         except Exception:
@@ -1869,6 +1956,83 @@ def product_status():
             out["peer"] = p
     return out
 
+def _window_choices(windows):
+    """Keep the existing case-insensitive substring selector unambiguous."""
+    result = []
+    for item in windows:
+        title = item["title"]
+        selectable = (0 < len(title) <= 128 and bool(title.strip())
+                      and not any(ord(ch) < 32 for ch in title))
+        unique = sum(title.lower() in other["title"].lower() for other in windows) == 1
+        result.append(dict(item, selectable=selectable and unique,
+                           reason="" if selectable and unique else
+                           "标题匹配不唯一" if selectable else "标题超长或包含无效字符"))
+    return result
+
+
+def capture_windows():
+    if os.name != "nt": return 501, {"error": "窗口枚举仅支持 Windows。"}
+    try:
+        import ctypes as ct
+        from ctypes import wintypes as wt
+        user = ct.WinDLL("user32", use_last_error=True)
+        dwm = ct.WinDLL("dwmapi")
+        callback_type = ct.WINFUNCTYPE(wt.BOOL, wt.HWND, wt.LPARAM)
+        user.EnumWindows.argtypes = [callback_type, wt.LPARAM]; user.EnumWindows.restype = wt.BOOL
+        for name in ("IsWindowVisible", "IsIconic", "GetWindowTextLengthW"):
+            getattr(user, name).argtypes = [wt.HWND]
+            getattr(user, name).restype = ct.c_int
+        user.GetWindowTextW.argtypes = [wt.HWND, wt.LPWSTR, ct.c_int]
+        user.GetWindowTextW.restype = ct.c_int
+        user.GetWindowThreadProcessId.argtypes = [wt.HWND, ct.POINTER(wt.DWORD)]
+        user.GetWindowRect.argtypes = [wt.HWND, ct.POINTER(wt.RECT)]
+        dwm.DwmGetWindowAttribute.argtypes = [wt.HWND, wt.DWORD, ct.c_void_p, wt.DWORD]
+        dwm.DwmGetWindowAttribute.restype = ct.c_long
+        windows, errors = [], []
+        def visit(hwnd, _):
+            try:
+                if not user.IsWindowVisible(hwnd) or user.IsIconic(hwnd): return True
+                length = user.GetWindowTextLengthW(hwnd)
+                if length <= 0: return True
+                title = ct.create_unicode_buffer(length + 1)
+                if user.GetWindowTextW(hwnd, title, len(title)) <= 0: return True
+                cloaked = wt.DWORD()
+                if dwm.DwmGetWindowAttribute(hwnd, 14, ct.byref(cloaked), ct.sizeof(cloaked)) == 0 and cloaked.value: return True
+                pid, rect = wt.DWORD(), wt.RECT()
+                user.GetWindowThreadProcessId(hwnd, ct.byref(pid))
+                if pid.value == os.getpid(): return True
+                if not user.GetWindowRect(hwnd, ct.byref(rect)) or rect.right - rect.left < 2 or rect.bottom - rect.top < 2: return True
+                windows.append({"title": title.value, "pid": pid.value})
+            except Exception as ex:
+                errors.append(str(ex))
+            return True
+        callback = callback_type(visit)
+        if not user.EnumWindows(callback, 0) or errors:
+            return 500, {"error": "窗口枚举失败，请刷新重试。"}
+        return 200, {"windows": _window_choices(windows)}
+    except Exception as ex:
+        return 500, {"error": "窗口枚举失败：%s" % ex}
+
+
+def peer_windows_request(args):
+    if deployment_role() == "capture": return 403, {"error": "请从主机获取被采集机窗口。"}
+    config = _merge(load_config(), {"peer_url": args.get("peer_url", load_config()["peer_url"])})
+    errors = validate_config(config)
+    match = _re.fullmatch(r"http://([0-9.]+):5143", str(config["peer_url"]))
+    try:
+        if not match: raise ValueError()
+        ipaddress.IPv4Address(match[1])
+    except ValueError:
+        errors.append("被采集机地址必须为 http://IPv4:5143")
+    if errors: return 400, {"error": "invalid config", "details": errors}
+    code, health = peer_call("/health", url=config["peer_url"])
+    if code != 200 or health.get("product_role") != "capture":
+        return 502, {"error": "被采集机不可用或未以 capture 角色启动。"}
+    code, result = peer_call("/capture/windows", url=config["peer_url"])
+    if code != 200: return 502, {"error": "无法枚举被采集机窗口，请确认后台已更新。", "details": [result.get("error", str(code))]}
+    return 200, result
+
+
 def _p5_get(h):
     p = h.path.split("?")[0]
     if p in ("/", "/ui", "/ui/"):
@@ -1879,6 +2043,9 @@ def _p5_get(h):
         h.send_response(200); h.send_header("Content-Type", "text/html; charset=utf-8")
         h.send_header("Cache-Control", "no-store"); h.send_header("Content-Length", str(len(b)))
         h.end_headers(); h.wfile.write(b); return True
+    if p == "/capture/windows":
+        code, result = capture_windows() if deployment_role() == "capture" else (403, {"error": "只允许在被采集机枚举窗口。"})
+        h._j(result, code); return True
     if p == "/config": h._j(load_config()); return True
     if p == "/stream/capabilities": h._j(stream_capabilities(h.client_address[0])); return True
     if p == "/vcam/status": h._j(vcam_status()); return True
@@ -1887,6 +2054,7 @@ def _p5_get(h):
 
 def _p5_post(h, args):
     routes = {"/config": lambda: save_config(args),
+              "/capture/windows": lambda: peer_windows_request(args),
               "/stream/plan": lambda: stream_plan_request(args),
               "/stream/codec-check": lambda: codec_check_request(args),
               "/vcam/register": vcam_register,
@@ -1951,7 +2119,7 @@ UI_HTML = r'''<!doctype html>
 <div class="kpis">
 <article class="kpi"><div class="kpi-label"><svg aria-hidden="true"><use href="#i-monitor"/></svg>接收帧率</div><div class="kpi-value"><strong id="rxFps">—</strong><small>fps</small></div><div id="rxFpsNote" class="kpi-note">等待接收完整帧</div></article>
 <article class="kpi"><div class="kpi-label"><svg aria-hidden="true"><use href="#i-capture"/></svg>采集帧率</div><div class="kpi-value"><strong id="txFps">—</strong><small>fps</small></div><div id="txFpsNote" class="kpi-note">等待采集会话</div></article>
-<article class="kpi"><div class="kpi-label"><svg aria-hidden="true"><use href="#i-arrow"/></svg>链路带宽</div><div class="kpi-value"><strong id="bandwidth">—</strong><small>Gbps</small></div><div class="kpi-note">未压缩 NV12 · raw L2</div></article>
+<article class="kpi"><div class="kpi-label"><svg aria-hidden="true"><use href="#i-arrow"/></svg>链路带宽</div><div class="kpi-value"><strong id="bandwidth">—</strong><small id="bandwidthUnit">Mbps</small></div><div id="bandwidthNote" class="kpi-note">等待传输统计 · 会话平均</div></article>
 <article class="kpi"><div class="kpi-label"><svg aria-hidden="true"><use href="#i-check"/></svg>已接收帧</div><div class="kpi-value"><strong id="complete">—</strong><small>帧</small></div><div id="frameNote" class="kpi-note">当前接收会话累计</div></article>
 </div>
 <div class="section-heading"><h2>设备与链路</h2><span>采集 → 接收 → 虚拟采集卡</span></div>
@@ -1975,24 +2143,25 @@ UI_HTML = r'''<!doctype html>
 </div></div>
 <div class="form-section"><div class="form-heading"><span class="step">02</span><h2>采集设置</h2></div>
 <div class="field-grid">
+<div class="field full"><label for="c_capture_mode">采集方式</label><select id="c_capture_mode"><option value="dda">DXGI DDA · 桌面采集</option><option value="wgc">WGC · 显示器 / 窗口采集</option><option value="pattern">测试图案 · 沿用已保存图案</option></select><p>选择被采集机的画面来源；失败明确报错，不自动切换采集方式。</p></div>
+<div id="wgcTargetField" class="field" hidden><label for="c_wgc_target">WGC 采集目标</label><select id="c_wgc_target"><option value="display">显示器</option><option value="window">窗口</option></select><p>WGC 仍有系统合成开销，不保证比 DDA 更快；独占全屏不支持。</p></div>
+<div id="captureOutputField" class="field"><label for="c_output">被采集机显示器编号</label><input id="c_output" type="number" min="0" max="15" step="1" required><p>原生采集枚举编号，从 0 开始，并非 Windows 设置中的显示器编号；不存在的编号启动时报错。</p></div>
+<div id="wgcWindowField" class="field full" hidden><label for="c_wgc_window">被采集机窗口</label><div class="input-action"><select id="c_wgc_window"><option value="">请选择窗口</option></select><button type="button" id="bWindows" class="btn">刷新窗口</button></div><p id="windowResult" class="inline-feedback" aria-live="polite">选择窗口目标后自动获取被采集机当前可选窗口，不读取主机窗口。</p><p>窗口模式包含光标；最小化、隐藏或标题匹配不唯一的窗口不可选。窗口关闭后不会自动改选其他窗口。</p></div>
 <div class="field full"><label for="c_resolution">输出分辨率预设</label><select id="c_resolution"><option value="416x416">416 × 416 · 方形</option><option value="640x640">640 × 640 · 默认</option><option value="1280x720">720p · 1280 × 720</option><option value="1920x1080">1080p · 1920 × 1080</option><option value="2560x1440">1440p · 2560 × 1440</option><option value="custom">自定义宽高</option></select><p>这是传输及虚拟卡的目标 NV12 尺寸，不会修改桌面显示分辨率。Raw 已支持这些尺寸；编码组合须通过所选后端协商。</p></div>
 <div class="field"><label for="c_width">输出宽度</label><input id="c_width" type="number" min="2" max="8192" step="2" required><p>2–8192 的偶数；直接输入可切换为自定义。</p></div>
 <div class="field"><label for="c_height">输出高度</label><input id="c_height" type="number" min="2" max="8192" step="2" required><p>NV12 色度采样要求宽高均为偶数。</p></div>
-<div class="field"><label for="c_fps">发送帧率上限</label><input id="c_fps" type="number" min="1" max="1000" step="1" required><p>严格限制发送间隔，不追赶补发；DDA 只发新桌面画面，实际帧率可能更低。</p></div>
+<div class="field"><label for="c_fps">发送帧率上限</label><input id="c_fps" type="number" min="1" max="1000" step="1" required><p>这是发送上限，不是采集帧率承诺；DDA/WGC 受源画面更新、显示器和 DWM 节奏限制，无新帧不补发。</p></div>
 <div class="field"><label for="c_transform">裁切 / 缩放方式</label><select id="c_transform"><option value="crop">居中裁切 · 1:1 像素</option><option value="fit">完整画面 · 等比缩放 + 黑边</option><option value="fill">铺满输出 · 等比缩放 + 裁切</option><option value="stretch">拉伸填满 · 不保持比例</option></select><p>居中裁切不缩放；其他方式使用确定性的整数最近邻采样。裁切输出大于源桌面时拒绝启动。</p></div>
 </div></div>
 <div class="form-section"><div class="form-heading"><span class="step">03</span><h2>传输模式与预算</h2></div>
 <div class="field-grid">
-<div class="field full"><label for="c_codec">链路像素 / 编码模式</label><select id="c_codec"><option value="raw">Raw NV12 · 无压缩</option><option value="mjpeg">MJPEG · 每帧独立 / CPU SIMD / 开发版</option><option value="pyrowave">PyroWave · 每帧独立 / Vulkan 计算 / 开发版</option></select><p>H.264/H.265 已于 2026-11-13 移除。编码只用于两机链路，主机解码后仍提供 NV12；不使用有损前后像素相等来判定传输正确。</p></div>
+<div class="field full"><label for="c_codec">链路像素 / 编码模式</label><select id="c_codec"><option value="raw">Raw NV12 · 无压缩</option><option value="mjpeg">MJPEG · 每帧独立 / CPU SIMD / 开发版</option><option value="pyrowave">PyroWave · 每帧独立 / Vulkan 计算 / 开发版</option></select><p>这里只选择两机之间的传输格式，不是客户端与虚拟采集卡协商的输出格式。虚拟采集卡由客户端协商 NV12 或 MJPEG（MJPG）；主机内部帧仍为 NV12，MJPG 输出另经 CPU JPEG 编码。链路完整性与有损画质分别验证。</p></div>
 <div id="bitrateFields" class="field full" hidden><div class="field-grid">
 <div class="field full"><label for="c_experimental">编码功能授权</label><select id="c_experimental"><option value="0">仅保存草案，不启动编码</option><option value="1">明确启用开发版编码（未完成双机 / 长稳 / 画质验收）</option></select></div>
-<div class="field"><label for="c_encoder">采集机编码后端</label><input id="c_encoder" list="encoderBackends" maxlength="256" placeholder="turbojpeg:cpu" required><datalist id="encoderBackends"></datalist></div>
-<div class="field"><label for="c_encoder_hw">编码器类别</label><select id="c_encoder_hw"><option value="0">由所选后端决定</option></select></div>
-<div class="field"><label for="c_decoder">主机解码后端</label><input id="c_decoder" list="decoderBackends" maxlength="256" placeholder="turbojpeg:cpu" required><datalist id="decoderBackends"></datalist></div>
-<div class="field"><label for="c_decoder_hw">解码器类别</label><select id="c_decoder_hw"><option value="0">由所选后端决定</option></select></div>
-<div class="field"><label for="c_bitrate">目标码率 · Mbps</label><input id="c_bitrate" type="number" min="1" max="2000" step="1" required></div>
-<div class="field"><label for="c_max_bitrate">最大码率 · Mbps</label><input id="c_max_bitrate" type="number" min="1" max="2000" step="1" required></div>
-<div class="field"><label for="c_gop">GOP · 固定 1（每帧独立）</label><input id="c_gop" type="number" min="1" max="1" step="1" required></div>
+<input id="c_encoder" type="hidden"><input id="c_decoder" type="hidden">
+<div class="field full"><p id="backendIdentity"></p><p>当前每种编码只有一组固定后端，由所选编码确定；不是 GPU 型号选择。实际设备见运行中的设备卡片，启动前仍严格核对两端能力。</p></div>
+<div class="field"><label for="c_max_bitrate" id="maxBitrateLabel">最大码率 · Mbps</label><input id="c_max_bitrate" type="number" min="1" max="2000" step="1" required></div>
+<p id="pyrowaveBudget" class="field full" hidden></p>
 <div class="field"><label for="c_in_flight">解码在途帧上限</label><input id="c_in_flight" type="number" min="1" max="8" step="1" required></div>
 <p id="codecPath" class="field full"></p>
 <div id="mjpegFields" class="field full" hidden><div class="field-grid">
@@ -2016,6 +2185,7 @@ const history = [];
 let lastStatus = null, previous = null, savedConfig = null, dirty = false, busy = false;
 let polling = false, pollTimer = null, eventCount = 0, scanBusy = false, configGeneration = 0, busyAction = '';
 let planTimer = null, planGeneration = 0, planInFlight = false, planPending = false, planRefresh = false;
+let windowScan = 0, windowScanBusy = false;
 const finite = value => typeof value === 'number' && Number.isFinite(value);
 const fmt = (value, digits = 2) => finite(value) ? value.toFixed(digits) : '—';
 const count = value => finite(value) ? value.toLocaleString('zh-CN') : '—';
@@ -2026,6 +2196,20 @@ function frameRate(current, old, key, seconds) {
   if (current.session_id !== old.session_id || current.uptime_s < old.uptime_s) return null;
   if (!finite(current[key]) || !finite(old[key]) || current[key] < old[key]) return null;
   return (current[key] - old[key]) / seconds;
+}
+function bandwidthMetric(tx, rx) {
+  const stats = finite(tx.bps) && tx.bps >= 0 ? tx : rx;
+  if (!finite(stats.bps) || stats.bps < 0) return {value:null,unit:'Mbps',note:'等待传输统计 · 会话平均'};
+  const bps = stats.bps, unit = bps >= 1e9 ? 'Gbps' : bps >= 1e6 ? 'Mbps' : bps >= 1e3 ? 'Kbps' : 'bps';
+  const divisor = {Gbps:1e9,Mbps:1e6,Kbps:1e3,bps:1}[unit];
+  const codec = stats.codec || 'raw';
+  return {value:bps/divisor,unit,note:(codec === 'raw' ? 'Raw NV12' : codec === 'mjpeg' ? 'MJPEG' : codec === 'pyrowave' ? 'PyroWave' : codec)+' · '+(stats === tx ? '发送' : '接收')+'会话平均，非实时带宽'};
+}
+function frameRateNote(stats, rate, receiving=false) {
+  if (!stats.running) return receiving ? '等待接收完整帧' : '等待采集会话';
+  if (rate === null) return '正在建立采样基线';
+  if (rate === 0) return receiving ? '本次采样无新增完整帧' : '本次采样无新增采集帧';
+  return receiving ? '完整帧增量 · 实时采样' : '发送帧增量 · 实时采样';
 }
 function getSides(status) {
   const local = status && status.local, peer = status && status.peer;
@@ -2109,7 +2293,10 @@ async function api(path, body, timeout = 10000) {
   try {
     const response = await fetch(path, {signal:controller.signal, cache:'no-store',
       ...(body === undefined ? {} : {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})});
-    const data = await response.json();
+    const raw = await response.text();
+    let data;
+    try { data = JSON.parse(raw); }
+    catch (_) { throw new Error('控制接口 '+path+' 返回非 JSON（HTTP '+response.status+'）。请确认打开的是正式主机控制台 :5143，而不是只读预览或代理错误页。'); }
     return [response.status,data];
   } catch (error) {
     throw new Error(error.name === 'AbortError' ? '请求超时，请检查连接后重试。' : friendlyError(error.message));
@@ -2150,6 +2337,7 @@ function syncControls() {
   $('bReset').disabled = busy || !dirty;
   $('dirtyDot').hidden = !dirty;
   text('saveState',!savedConfig ? '配置尚未读取' : dirty ? '有未保存的修改' : '配置已同步');
+  syncCaptureFields();
 }
 function captureSource(stats, config) {
   const source = stats.mode ? stats : config.capture || {};
@@ -2205,10 +2393,11 @@ function render(status) {
   renderMachine('capCard',sides.capture,'sender',status.local);
   renderMachine('rxCard',sides.receive,'receiver',status.local);
   text('txFps',fmt(txFps,0)); text('rxFps',fmt(rxFps,0));
-  text('bandwidth',fmt(finite(tx.bps) ? tx.bps/1e9 : finite(rx.bps) ? rx.bps/1e9 : null,2));
+  const bandwidth = bandwidthMetric(tx,rx);
+  text('bandwidth',fmt(bandwidth.value,2)); text('bandwidthUnit',bandwidth.unit); text('bandwidthNote',bandwidth.note);
   text('complete',count(rx.complete));
-  text('txFpsNote',tx.running ? txFps === null ? '正在建立采样基线' : '当前采集会话 · 每秒更新' : '等待采集会话');
-  text('rxFpsNote',rx.running ? rxFps === null ? '正在建立采样基线' : rxFps > 0 ? '正在接收完整帧' : '暂未收到新的完整帧' : '等待接收完整帧');
+  text('txFpsNote',frameRateNote(tx,txFps));
+  text('rxFpsNote',frameRateNote(rx,rxFps,true));
   text('frameNote',rx.session_id || '当前接收会话累计');
   const encoded = rx.codec && rx.codec !== 'raw', integrityKey = encoded ? 'transport_errors' : 'hash_mismatch';
   text('hashErrorLabel',encoded ? '压缩字节校验错误' : 'Raw 像素哈希错误');
@@ -2284,20 +2473,22 @@ function readConfig() {
   const config = clone(savedConfig);
   config.peer_url = peerUrl($('c_peer_ip').value) || '';
   config.adapter = $('c_adapter').value;
+  config.capture.mode = $('c_capture_mode').value;
+  const windowCapture = config.capture.mode === 'wgc' && $('c_wgc_target').value === 'window';
+  if (config.capture.mode !== 'pattern' && !windowCapture) config.capture.output = Number($('c_output').value);
+  config.capture.wgc_window = windowCapture ? $('c_wgc_window').value : '';
   config.capture.fps = Number($('c_fps').value);
   config.capture.width = Number($('c_width').value);
   config.capture.height = Number($('c_height').value);
   config.capture.transform = $('c_transform').value;
   config.capture.codec = $('c_codec').value;
   if (config.capture.codec !== 'raw') {
-    config.capture.bitrate_mbps = Number($('c_bitrate').value);
     config.capture.max_bitrate_mbps = Number($('c_max_bitrate').value);
     config.capture.codec_experimental = $('c_experimental').value === '1';
-    config.capture.encoder_backend = $('c_encoder').value.trim();
-    config.capture.decoder_backend = $('c_decoder').value.trim();
-    config.capture.encoder_hardware = $('c_encoder_hw').value === '1';
-    config.capture.decoder_hardware = $('c_decoder_hw').value === '1';
-    config.capture.gop_frames = Number($('c_gop').value);
+    config.capture.encoder_backend = config.capture.decoder_backend = config.capture.codec === 'pyrowave' ? 'pyrowave:vulkan' : 'turbojpeg:cpu';
+    config.capture.encoder_hardware = false;
+    config.capture.decoder_hardware = false;
+    config.capture.gop_frames = 1;
     config.capture.decode_in_flight = Number($('c_in_flight').value);
     if (config.capture.codec === 'mjpeg') config.capture.jpeg_quality = Number($('c_jpeg_quality').value);
   }
@@ -2308,15 +2499,18 @@ function fillConfig(config) {
   savedConfig = clone(config); dirty = false;
   const match = /^http:\/\/([0-9.]+):\d+$/.exec(config.peer_url || '');
   const cp = config.capture;
-  const values = {c_peer_ip:match ? match[1] : '',c_fps:cp.fps,c_width:cp.width,c_height:cp.height,
-    c_transform:cp.transform,c_codec:cp.codec,c_bitrate:cp.bitrate_mbps,c_max_bitrate:cp.max_bitrate_mbps,
+  const values = {c_capture_mode:cp.mode,c_output:cp.output ?? 0,c_wgc_window:cp.wgc_window || '',
+    c_wgc_target:cp.mode === 'wgc' && cp.wgc_window ? 'window' : 'display',
+    c_peer_ip:match ? match[1] : '',c_fps:cp.fps,c_width:cp.width,c_height:cp.height,
+    c_transform:cp.transform,c_codec:cp.codec,c_max_bitrate:cp.max_bitrate_mbps,
     c_headroom:config.transport.headroom_pct,c_experimental:cp.codec_experimental ? '1' : '0',
-    c_encoder:cp.encoder_backend || '',c_decoder:cp.decoder_backend || '',c_encoder_hw:cp.encoder_hardware === false ? '0' : '1',
-    c_decoder_hw:cp.decoder_hardware ? '1' : '0',c_gop:cp.gop_frames || 1,c_in_flight:cp.decode_in_flight || 2,
+    c_encoder:cp.encoder_backend || '',c_decoder:cp.decoder_backend || '',c_in_flight:cp.decode_in_flight || 2,
     c_jpeg_quality:cp.jpeg_quality ?? 80};
+  setWindowOptions([],cp.wgc_window || '');
   Object.entries(values).forEach(([id,value]) => { $(id).value = value; });
   const preset = cp.width+'x'+cp.height;
   $('c_resolution').value = [...$('c_resolution').options].some(option => option.value === preset) ? preset : 'custom';
+  syncCaptureFields();
   syncCodecFields();
   if (![...$('c_adapter').options].some(option => option.value === config.adapter)) {
     const option = document.createElement('option'); option.value = config.adapter;
@@ -2325,45 +2519,72 @@ function fillConfig(config) {
   $('c_adapter').value = config.adapter;
   $('configError').hidden = true;
   schedulePlan();
+  if (cp.mode === 'wgc' && cp.wgc_window && !windowScanBusy) detectWindows();
 }
 function markDirty(event) {
   const id = event && event.target && event.target.id;
   if (id === 'c_codec' && $('c_codec').value === 'mjpeg') {
     $('c_encoder').value = $('c_decoder').value = 'turbojpeg:cpu';
-    $('c_encoder_hw').value = $('c_decoder_hw').value = '0';
-    $('c_gop').value = '1'; $('c_in_flight').value = '1';
+    $('c_in_flight').value = '1';
   } else if (id === 'c_codec' && $('c_codec').value === 'pyrowave') {
     $('c_encoder').value = $('c_decoder').value = 'pyrowave:vulkan';
-    $('c_encoder_hw').value = $('c_decoder_hw').value = '0';
-    $('c_gop').value = '1'; $('c_in_flight').value = '1';
+    $('c_in_flight').value = '1';
   }
+  if (id === 'c_peer_ip') {
+    windowScan++; windowScanBusy = false;
+    setWindowOptions([],'');
+  }
+  if (['c_capture_mode','c_wgc_target','c_peer_ip'].includes(id) &&
+      $('c_capture_mode').value === 'wgc' && $('c_wgc_target').value === 'window') detectWindows();
   if (id === 'c_resolution' && $('c_resolution').value !== 'custom') {
     const [width,height] = $('c_resolution').value.split('x');
     $('c_width').value = width; $('c_height').value = height;
   } else if (id === 'c_width' || id === 'c_height') $('c_resolution').value = 'custom';
+  syncCaptureFields();
   syncCodecFields();
   dirty = !!savedConfig && (JSON.stringify(readConfig()) !== JSON.stringify(savedConfig) || !peerUrl($('c_peer_ip').value));
   $('configError').hidden = true; syncControls();
   schedulePlan();
 }
+function syncCaptureFields() {
+  const mode = $('c_capture_mode').value;
+  const wgc = mode === 'wgc', windowCapture = wgc && $('c_wgc_target').value === 'window';
+  const locked = busy || !savedConfig || hasRunning(lastStatus);
+  $('wgcTargetField').hidden = !wgc;
+  $('captureOutputField').hidden = mode === 'pattern' || windowCapture;
+  $('wgcWindowField').hidden = !windowCapture;
+  $('c_capture_mode').disabled = locked;
+  $('c_wgc_target').disabled = locked || !wgc;
+  $('c_output').disabled = locked || mode === 'pattern' || windowCapture;
+  $('c_wgc_window').disabled = locked || !windowCapture;
+  $('c_wgc_window').required = windowCapture;
+  $('bWindows').disabled = locked || !windowCapture || windowScanBusy;
+  // 显式选择窗口时，空白标题不能悄悄变为显示器采集。
+  $('c_wgc_window').setCustomValidity(windowCapture &&
+    (!$('c_wgc_window').value.trim() || /[\x00-\x1f]/.test($('c_wgc_window').value) ||
+     [...$('c_wgc_window').options].some(option => option.value === $('c_wgc_window').value && option.disabled))
+    ? '请刷新并选择被采集机窗口。' : '');
+}
 function syncCodecFields() {
   const raw = $('c_codec').value === 'raw';
   const mjpeg = $('c_codec').value === 'mjpeg';
   $('bitrateFields').hidden = raw;
-  ['c_bitrate','c_max_bitrate','c_experimental','c_encoder','c_decoder','c_encoder_hw','c_decoder_hw','c_gop','c_in_flight']
+  ['c_max_bitrate','c_experimental','c_encoder','c_decoder','c_in_flight']
     .forEach(id => { $(id).disabled = raw; });
-  ['c_encoder','c_decoder'].forEach(id => { $(id).required = !raw && $('c_experimental').value === '1'; });
+  ['c_encoder','c_decoder'].forEach(id => { $(id).required = false; });
   const codec = $('c_codec').value;
-  ['c_encoder_hw','c_decoder_hw'].forEach(id => {
-    const option = $(id).options[0]; if (option) option.textContent = codecCategory(codec);
-    $(id).disabled = true;
-  });
-  text('codecPath',codec === 'pyrowave' ? 'Vulkan 编解码核心；CPU NV12 上传、解码回读并交错 UV，非全 GPU / 非零拷贝。类别标志 false 仅表示非厂商固定功能视频引擎；实际设备以活动会话上报为准。' : mjpeg ? 'libjpeg-turbo CPU/SIMD 编解码；不使用 Vulkan。' : 'Raw 无编解码。');
+  text('backendIdentity',raw ? 'Raw 无编解码后端' : codec === 'pyrowave' ? '固定后端：PyroWave Vulkan（两端 pyrowave:vulkan）' : '固定后端：libjpeg-turbo CPU/SIMD（两端 turbojpeg:cpu）');
+  text('maxBitrateLabel',codec === 'pyrowave' ? '压缩预算 / 最大发送码率 · Mbps' : '最大码率 · Mbps');
+  $('pyrowaveBudget').hidden = codec !== 'pyrowave';
+  if (codec === 'pyrowave') {
+    const width = Number($('c_width').value), height = Number($('c_height').value), fps = Number($('c_fps').value), max = Number($('c_max_bitrate').value);
+    const bytes = fps > 0 && max > 0 ? Math.min(Math.floor(max*1e6/8/fps),(savedConfig?.capture?.max_au_bytes || 8388608)-48,width*height*3/2) : 0;
+    text('pyrowaveBudget',bytes > 0 ? '每帧压缩上限：'+bytes.toLocaleString('zh-CN')+' B；相对 NV12 预算约 '+(width*height*3/2/bytes).toFixed(1)+':1。由 最大码率 ÷ 8 ÷ 目标 fps 计算（不超过原帧大小），不是实测压缩比。降低预算通常损失画质；提高目标 fps 而不增加码率会降低每帧预算。当前库没有 JPEG quality 式参数。' : '填写有效尺寸、目标 fps 和最大码率后显示每帧压缩预算。');
+  }
+  text('codecPath',codec === 'pyrowave' ? 'Vulkan 计算编解码，每帧独立；CPU NV12 上传、解码回读并交错 UV，非全 GPU / 非零拷贝。实际设备以活动会话上报为准。' : mjpeg ? 'libjpeg-turbo CPU/SIMD 编解码；不使用 Vulkan。' : 'Raw 无编解码。');
   $('mjpegFields').hidden = !mjpeg;
   $('c_jpeg_quality').disabled = !mjpeg;
-  // 现有编码后端（MJPEG/PyroWave）都不应用目标码率，且强制每帧独立；仅最大码率可调。
-  $('c_bitrate').disabled = true;
-  $('c_gop').disabled = true;
+  // 目标码率不生效，沿用后台值；GOP=1 与后端类别由现有编码实现确定，不提供伪选项。
 }
 function schedulePlan(refresh = false) {
   planGeneration++; planRefresh = planRefresh || refresh;
@@ -2385,16 +2606,7 @@ function renderStreamPlan(plan) {
     (network.max_raw_fps !== null ? ' · 此尺寸理论上限 '+network.max_raw_fps+' fps' : ''));
   text('planDetails',(implementation.reasons.length ? implementation.reasons.join('\n') : '原生路径与配置检查通过；不等于该参数组合的双机 / 长稳 / 画质验收。'));
   text('planWarnings',plan.warnings.join('\n'));
-  if (plan.backends) {
-    for (const side of ['encoder','decoder']) {
-      const list = $(side+'Backends'); list.replaceChildren();
-      for (const item of plan.backends[side] || []) {
-        if (item.codec !== $('c_codec').value) continue;
-        const option = document.createElement('option'); option.value = item.identity;
-        option.label = item.name+' · '+(item.hardware ? '硬件' : '系统/软件')+' · 候选未验收'; list.append(option);
-      }
-    }
-  }
+  // Backend identities are fixed by codec; native negotiation remains authoritative.
 }
 async function updateStreamPlan() {
   if (planInFlight) { planPending = true; return; }
@@ -2464,6 +2676,42 @@ async function action(path, name) {
     await poll(); busy = false; syncControls();
   }
 }
+function setWindowOptions(windows, selected) {
+  const select = $('c_wgc_window');
+  select.replaceChildren();
+  const placeholder = document.createElement('option'); placeholder.value = ''; placeholder.textContent = '请选择窗口'; select.append(placeholder);
+  for (const item of windows) {
+    const option = document.createElement('option'); option.value = item.title;
+    option.textContent = item.title+' · PID '+item.pid+(item.selectable ? '' : ' · '+item.reason);
+    option.disabled = !item.selectable; select.append(option);
+  }
+  if (selected && !windows.some(item => item.title === selected && item.selectable)) {
+    const option = document.createElement('option'); option.value = selected;
+    option.textContent = '已保存（未确认可用）· '+selected; option.disabled = true; select.append(option);
+  }
+  select.value = selected || '';
+}
+async function detectWindows() {
+  const url = peerUrl($('c_peer_ip').value);
+  if (!url) { text('windowResult','请先填写被采集机 IPv4 地址。'); return; }
+  const generation = ++windowScan; windowScanBusy = true;
+  syncCaptureFields(); text('windowResult','正在获取被采集机窗口…');
+  try {
+    const [code,result] = await api('/capture/windows',{peer_url:url},10000);
+    if (generation !== windowScan) return;
+    if (code !== 200) throw new Error(result.error || '窗口枚举失败');
+    const windows = result.windows || [];
+    setWindowOptions(windows,$('c_wgc_window').value);
+    text('windowResult','被采集机可选窗口 '+windows.filter(item => item.selectable).length+' 个；标题重复或匹配不唯一的窗口不可选。');
+  } catch (error) {
+    if (generation === windowScan) {
+      setWindowOptions([],$('c_wgc_window').value);
+      text('windowResult','获取失败：'+error.message);
+    }
+  } finally {
+    if (generation === windowScan) { windowScanBusy = false; syncCaptureFields(); }
+  }
+}
 async function detectAdapters() {
   if (scanBusy) return;
   scanBusy = true; $('bAdapters').disabled = true; text('adapterResult','正在检测本机网卡…');
@@ -2512,7 +2760,7 @@ function init() {
   $('bReset').onclick = () => { fillConfig(savedConfig); syncControls(); };
   $('bCapture').onclick = () => { const stopping = readiness(lastStatus,dirty).canStop;
     action(stopping ? '/product/stop' : '/product/start',stopping ? '停止采集' : '开始采集'); };
-  $('bAdapters').onclick = detectAdapters; $('bRefresh').onclick = poll;
+  $('bAdapters').onclick = detectAdapters; $('bWindows').onclick = detectWindows; $('bRefresh').onclick = poll;
   $('bPlan').onclick = () => schedulePlan(true);
   $('bClear').onclick = () => { $('events').replaceChildren(); eventCount = 0; text('eventCount',''); };
   if (typeof ResizeObserver !== 'undefined') new ResizeObserver(draw).observe($('cv'));

@@ -18,6 +18,7 @@ static int g_failures = 0;
 } while (0)
 
 static void test_error_mapping() {
+  static_assert(WGCCap::min_update_interval_100ns == 10000, "WGC update interval must be 1ms");
   // The sender treats only E_TIMEOUT as non-fatal (vc_sender.cpp and
   // encoded_sender.h use `!= DDACap::E_TIMEOUT`). Closed/callback errors must
   // therefore be distinct values that fall into the fatal branch.

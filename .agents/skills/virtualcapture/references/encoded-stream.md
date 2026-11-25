@@ -211,7 +211,7 @@ PyroWave 的创建、编码/取包、解码、重置和销毁各由独立看门�
   两者均不是额外队列或纯 GPU 时长；旧日志缺字段不补造证据。
 - receiver `<hashlog>.transport.jsonl`：每个完整有效图像单元的 frame_id/transport_hash/encoded_bytes/keyframe；不记 EOS。
 - receiver hashlog：每个真实解码输出的 frame_id/decoded_hash/transport_hash/qpc_ns/decode_pipeline_ms（接收首包至解码完成，同机）。
-- 正确性：对比 sender 与 transport 日志的压缩字节 hash；另核对 decoded_hash 与 SHM/DShow 输出。
+- 正确性：对比 sender 与 transport 日志的压缩字节 hash；另核对 decoded_hash 与 SHM/DShow NV12 输出。客户端选择虚拟卡 MJPG 时，SHM NV12 另经 CPU JPEG 编码（固定质量80），不能再逐像素对账其解码像素；需验证真实JPEG/尺寸/时序，画质另验收。此输出格式与两机链路codec独立，详见stream-config。
   **不能**把 source_hash==decoded_hash 或旧 raw reconcile 作为有损 PASS 门；画质另验收。
 - receiver complete=真实解码数；compressed_complete 不含 EOS。追加 transport_errors、decode_errors/resets/discarded/queue_drops/pending、
   decode_in_flight_limit、waiting_idr、failed；保留 packet/drop/SHM 与 vseg 计数。不伪造 raw hash_mismatch=0。

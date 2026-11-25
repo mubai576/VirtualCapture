@@ -64,6 +64,26 @@ def test_ui_served(pair):
     (_, a), _ = pair
     c, html = _req(a, "/ui")
     assert c == 200 and "VirtualCapture 控制台" in html and "/product/status" in html
+    for field in ("c_capture_mode", "c_output", "c_wgc_target", "c_wgc_window", "bWindows"):
+        assert 'id="' + field + '"' in html
+    assert '<select id="c_wgc_window"' in html
+    for removed in ("c_bitrate", "c_gop", "c_encoder_hw", "c_decoder_hw"):
+        assert removed not in html
+
+
+def test_wgc_source_config_persists_without_starting(pair):
+    (_, a), _ = pair
+    capture = {"mode": "wgc", "output": 2, "wgc_window": "Example Game"}
+    code, result = _req(a, "/config", {"capture": capture})
+    assert code == 200
+    saved = _req(a, "/config")[1]["capture"]
+    assert all(saved[key] == value for key, value in capture.items())
+    assert not _req(a, "/sender/stats")[1]["running"]
+    for invalid in ({"output": 16}, {"output": -1}, {"output": 1.5},
+                    {"wgc_window": "x" * 129}, {"wgc_window": "bad\nname"}):
+        assert _req(a, "/config", {"capture": invalid})[0] == 400
+    assert _req(a, "/config", {"capture": {"mode": "dda", "wgc_window": ""}})[0] == 200
+    assert _req(a, "/config")[1]["capture"]["output"] == 2
 
 
 def test_product_start_requires_roles(pair):

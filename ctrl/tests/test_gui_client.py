@@ -52,6 +52,29 @@ assert(frameRate(old,old,'sent_frames',0) === null, 'zero interval');
 """)
 
 
+def test_bandwidth_adaptive_units_and_stalled_frame_notes(client):
+    check(client, """
+assert(bandwidthMetric({bps:1943590.2,codec:'pyrowave'},{}).unit === 'Mbps');
+assert(bandwidthMetric({bps:1943590.2,codec:'pyrowave'},{}).value > 1.9);
+assert(bandwidthMetric({bps:1943590.2,codec:'pyrowave'},{}).note.includes('会话平均'));
+assert(bandwidthMetric({bps:1943590.2,codec:'pyrowave'},{}).note.includes('PyroWave'));
+assert(bandwidthMetric({bps:1180000000},{}).unit === 'Gbps');
+assert(bandwidthMetric({bps:80000},{}).unit === 'Kbps');
+assert(bandwidthMetric({bps:80},{}).unit === 'bps');
+assert(bandwidthMetric({bps:0},{}).value === 0);
+assert(bandwidthMetric({},{}).value === null);
+assert(bandwidthMetric({bps:-1},{bps:2000000}).value === 2);
+assert(bandwidthMetric({},{bps:2000000}).note.includes('接收'));
+const stats = {running:true,session_id:'stalled',uptime_s:100,sent_frames:518,complete:518};
+assert(frameRate({...stats,uptime_s:101},stats,'sent_frames',1) === 0);
+assert(frameRate({...stats,uptime_s:101},stats,'complete',1) === 0);
+assert(frameRateNote(stats,0).includes('无新增采集帧'));
+assert(frameRateNote(stats,0,true).includes('无新增完整帧'));
+assert(frameRateNote(stats,null).includes('基线'));
+assert(frameRateNote(stats,240).includes('实时采样'));
+""")
+
+
 def test_offline_and_stub_metrics_stay_unknown(client):
     check(client, """
 const sender = {running:true,note:'stub-no-binary',sent_frames:0};
@@ -194,17 +217,20 @@ FORM = """
 const elements = new Map();
 const element = id => {
   if (!elements.has(id)) elements.set(id,{id,value:'',options:[],textContent:'',hidden:false,disabled:false,
-    append(option) {this.options.push(option);}});
+    append(option) {this.options.push(option);},
+    replaceChildren() {this.options=[];},
+    setCustomValidity(message) {this.validationMessage=message;}});
   return elements.get(id);
 };
 globalThis.document = {getElementById:element,createElement:() => ({value:'',textContent:''})};
 globalThis.clearTimeout = () => {};
 globalThis.setTimeout = () => 99;
 syncControls = () => {};
+detectWindows = () => {};
 element('c_resolution').options = ['416x416','640x640','1280x720','1920x1080','2560x1440','custom'].map(value => ({value}));
 const fullConfig = {role:'receive',adapter:'DirectNIC',peer_url:'http://192.168.2.59:5143',
   capture:{width:640,height:640,fps:240,codec:'raw',transform:'crop',bitrate_mbps:50,max_bitrate_mbps:80,
-    mode:'dda',pattern:'motion',gpu_convert:true,mtu:9000,batch:69,dst_mac:'00:11:22:33:44:55'},
+    mode:'dda',output:0,wgc_window:'',pattern:'motion',gpu_convert:true,mtu:9000,batch:69,dst_mac:'00:11:22:33:44:55'},
   transport:{headroom_pct:20},receive:{shm:'Local\\\\VirtualCaptureVcamFrame',mtu:9000,vcam_autoregister:true}};
 fillConfig(fullConfig);
 """
@@ -233,14 +259,83 @@ assert(!dirty && readConfig().capture.width === 1024);
 """)
 
 
+def test_capture_source_roundtrip_visibility_and_reset(client):
+    check(client, FORM + """
+assert.equal(element('c_capture_mode').value,'dda');
+assert(!element('captureOutputField').hidden && element('wgcTargetField').hidden);
+element('c_capture_mode').value='wgc'; markDirty({target:element('c_capture_mode')});
+assert(!element('wgcTargetField').hidden && element('wgcWindowField').hidden);
+element('c_output').value='2';
+assert.equal(readConfig().capture.output,2);
+element('c_wgc_target').value='window'; markDirty({target:element('c_wgc_target')});
+assert(element('captureOutputField').hidden && element('c_output').disabled);
+assert(!element('wgcWindowField').hidden && element('c_wgc_window').required);
+assert(element('c_wgc_window').validationMessage, 'empty window cannot become monitor capture');
+element('c_wgc_window').value='  '; syncCaptureFields();
+assert(element('c_wgc_window').validationMessage);
+setWindowOptions([{title:'Example Game',pid:123,selectable:true}],'Example Game');
+element('c_wgc_window').value='Example Game'; markDirty({target:element('c_wgc_window')});
+assert.equal(element('c_wgc_window').validationMessage,'');
+const windowConfig=readConfig();
+assert.equal(windowConfig.capture.mode,'wgc');
+assert.equal(windowConfig.capture.wgc_window,'Example Game');
+assert.equal(windowConfig.capture.output,0, 'inactive display index keeps saved value');
+fillConfig(windowConfig);
+assert(!dirty && element('c_wgc_target').value==='window');
+assert.equal(element('c_wgc_window').value,'Example Game');
+element('c_wgc_target').value='display'; markDirty({target:element('c_wgc_target')});
+assert.equal(readConfig().capture.wgc_window,'');
+element('c_capture_mode').value='dda'; markDirty({target:element('c_capture_mode')});
+assert.equal(readConfig().capture.wgc_window,'');
+assert(element('c_wgc_window').disabled && !element('c_wgc_window').required);
+element('c_capture_mode').value='pattern'; markDirty({target:element('c_capture_mode')});
+assert(element('captureOutputField').hidden && element('c_output').disabled);
+assert.equal(readConfig().capture.pattern,'motion');
+assert.equal(readConfig().capture.gpu_convert,true);
+fillConfig(fullConfig);
+assert(!dirty && element('c_capture_mode').value==='dda');
+assert.equal(JSON.stringify(readConfig()),JSON.stringify(fullConfig));
+""")
+
+
+def test_window_dropdown_preserves_selection_and_blocks_unavailable_entries(client):
+    check(client, FORM + """
+element('c_capture_mode').value='wgc'; element('c_wgc_target').value='window';
+setWindowOptions([{title:'Editor 中文',pid:12,selectable:true},{title:'Duplicate',pid:13,selectable:false,reason:'ambiguous'}],'Editor 中文');
+syncCaptureFields();
+assert.equal(element('c_wgc_window').value,'Editor 中文');
+assert.equal(element('c_wgc_window').validationMessage,'');
+assert(element('c_wgc_window').options.find(x=>x.value==='Duplicate').disabled);
+setWindowOptions([],'Editor 中文');syncCaptureFields();
+assert(element('c_wgc_window').validationMessage,'saved unavailable window must be refreshed');
+setWindowOptions([{title:'Editor 中文',pid:12,selectable:true}],'Editor 中文');syncCaptureFields();
+assert.equal(element('c_wgc_window').validationMessage,'');
+element('c_peer_ip').value='192.168.2.60';markDirty({target:element('c_peer_ip')});
+assert.equal(element('c_wgc_window').value,'','different machine invalidates old selection');
+""")
+
+
+def test_capture_source_locks_when_running_or_busy(client):
+    check(client, FORM + """
+element('c_capture_mode').value='wgc'; element('c_wgc_target').value='window';
+lastStatus={local:{sender:{running:false}},peer:{sender:{running:true}}};
+syncCaptureFields();
+for (const id of ['c_capture_mode','c_output','c_wgc_target','c_wgc_window']) assert(element(id).disabled,id);
+lastStatus=null; busy=true; syncCaptureFields();
+assert(element('c_capture_mode').disabled && element('c_wgc_window').disabled);
+busy=false; syncCaptureFields();
+assert(!element('c_capture_mode').disabled && !element('c_wgc_window').disabled);
+""")
+
+
 def test_codec_controls_preserve_inactive_bitrates(client):
     check(client, FORM + """
-assert(element('bitrateFields').hidden && element('c_bitrate').disabled);
-element('c_bitrate').value = ''; element('c_max_bitrate').value = 'bad';
+assert(element('bitrateFields').hidden);
+element('c_max_bitrate').value = 'bad';
 assert.equal(readConfig().capture.bitrate_mbps,50, 'hidden raw fields must not corrupt saved settings');
-element('c_codec').value = 'mjpeg'; element('c_bitrate').value = '90'; element('c_max_bitrate').value = '120';
+element('c_codec').value = 'mjpeg'; element('c_max_bitrate').value = '120';
 markDirty({target:element('c_codec')});
-assert(!element('bitrateFields').hidden && element('c_bitrate').disabled);
+assert(!element('bitrateFields').hidden);
 assert.equal(readConfig().capture.codec,'mjpeg');
 assert.equal(readConfig().capture.max_bitrate_mbps,120);
 element('c_headroom').value = '25';
@@ -253,10 +348,10 @@ assert(!dirty && element('c_width').value === 640 && element('c_codec').value ==
 def test_disabled_target_does_not_block_lower_max_for_encoded(client):
     check(client, FORM + """
 element('c_codec').value = 'mjpeg';
-element('c_bitrate').value = '90';
+savedConfig.capture.bitrate_mbps = 90;
 element('c_max_bitrate').value = '60';
 markDirty({target:element('c_codec')});
-assert(element('c_bitrate').disabled, 'target bitrate stays disabled for constant-quality MJPEG');
+assert(!elements.has('c_bitrate'), 'unused target bitrate must not be a control');
 const cp = readConfig().capture;
 assert.equal(cp.bitrate_mbps,90);
 assert.equal(cp.max_bitrate_mbps,60,'visible max must survive even when the unused target is higher');
@@ -268,10 +363,8 @@ def test_mjpeg_selection_exposes_quality_and_explicit_cpu_backend(client):
 element('c_codec').value='mjpeg'; markDirty({target:element('c_codec')});
 assert.equal(element('c_encoder').value,'turbojpeg:cpu');
 assert.equal(element('c_decoder').value,'turbojpeg:cpu');
-assert.equal(element('c_gop').value,'1');
-assert.equal(element('c_encoder_hw').value,'0');
+assert(!elements.has('c_gop') && !elements.has('c_encoder_hw'));
 assert(!element('mjpegFields').hidden && !element('c_jpeg_quality').disabled);
-assert(element('c_bitrate').disabled && element('c_gop').disabled);
 element('c_jpeg_quality').value='86';
 const cp=readConfig().capture;
 assert.equal(cp.jpeg_quality,86); assert.equal(cp.gop_frames,1);
@@ -282,16 +375,44 @@ assert(element('mjpegFields').hidden && element('c_jpeg_quality').disabled);
 """)
 
 
+def test_pyrowave_compression_budget_matches_native_formula(client):
+    check(client, FORM + """
+element('c_codec').value='pyrowave'; markDirty({target:element('c_codec')});
+assert(element('backendIdentity').textContent.includes('pyrowave:vulkan'));
+assert(!element('pyrowaveBudget').hidden);
+assert(element('pyrowaveBudget').textContent.includes('41,666'));
+assert(element('pyrowaveBudget').textContent.includes('14.7:1'));
+element('c_max_bitrate').value='160';markDirty({target:element('c_max_bitrate')});
+assert(element('pyrowaveBudget').textContent.includes('83,333'));
+element('c_fps').value='120';markDirty({target:element('c_fps')});
+assert(element('pyrowaveBudget').textContent.includes('166,666'));
+element('c_codec').value='raw';markDirty({target:element('c_codec')});
+assert(element('pyrowaveBudget').hidden);
+""")
+
+
+def test_api_html_error_has_actionable_message(client):
+    check(client, """
+globalThis.AbortController = class {signal={};abort(){}};
+globalThis.setTimeout=()=>1; globalThis.clearTimeout=()=>{};
+globalThis.fetch=async()=>({status:403,text:async()=>'< !DOCTYPE html>Preview forbidden'});
+api('/product/stop',{}).then(()=>{throw Error('must reject HTML');},error=>{
+ assert(error.message.includes('HTTP 403'));
+ assert(error.message.includes(':5143'));
+ assert(!error.message.includes('Unexpected token'));
+});
+""")
+
+
 def test_codec_opt_in_backends_and_quality_are_explicit(client):
     check(client, FORM + """
 assert(pendingPipeline({codec:'mjpeg'}).includes('明确启用'));
 element('c_codec').value='mjpeg'; element('c_experimental').value='1';
-syncCodecFields(); assert(element('c_encoder').required && element('c_decoder').required);
+syncCodecFields(); assert(!element('c_encoder').required && !element('c_decoder').required, 'fixed backend identities are hidden, not editable choices');
 element('c_experimental').value='0'; syncCodecFields();
 assert(!element('c_encoder').required && !element('c_decoder').required, 'drafts do not require backends');
 element('c_experimental').value='1';
 element('c_encoder').value='turbojpeg:cpu'; element('c_decoder').value='turbojpeg:cpu';
-element('c_encoder_hw').value='0'; element('c_decoder_hw').value='0';
 element('c_jpeg_quality').value='86';
 const cp=readConfig().capture;
 assert(cp.codec_experimental && !cp.encoder_hardware && !cp.decoder_hardware);
@@ -338,17 +459,12 @@ updateStreamPlan().then(() => {
 
 def test_pyrowave_category_tracks_codec_without_changing_legacy_flag(client):
     check(client, FORM + """
-element('c_encoder_hw').options = [{value:'0'}];
-element('c_decoder_hw').options = [{value:'0'}];
 element('c_codec').value='pyrowave'; markDirty({target:element('c_codec')});
-assert(element('c_encoder_hw').options[0].textContent.includes('Vulkan'));
-assert(!element('c_encoder_hw').options[0].textContent.includes('turbojpeg'));
-assert(element('c_encoder_hw').disabled && element('c_decoder_hw').disabled);
+assert(!elements.has('c_encoder_hw') && !elements.has('c_decoder_hw'));
 assert(element('codecPath').textContent.includes('非全 GPU'));
 assert.equal(readConfig().capture.encoder_backend,'pyrowave:vulkan');
 assert.equal(readConfig().capture.encoder_hardware,false);
 element('c_codec').value='mjpeg'; markDirty({target:element('c_codec')});
-assert(element('c_encoder_hw').options[0].textContent.includes('CPU / SIMD'));
 assert(element('codecPath').textContent.includes('不使用 Vulkan'));
 """)
 

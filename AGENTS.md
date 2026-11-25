@@ -44,7 +44,7 @@ MJPEG 开发链路已接通 L2/解码/SHM/DShow 与显式 GUI 后端选择，须
 | `common/` | 共用 CRC32 / FNV-1a64、`stream.h` 会话/整数变换/限速、`mjpeg_codec.h`、`pyrowave_codec.h`、`access_unit.h`/`codec_session.h` 编码载荷与会话（`vc-common` CMake target） | 算法只保留一份；MJPEG依赖/许可证见`docs/runbooks/mjpeg.md`，PyroWave见`docs/runbooks/pyrowave.md` |
 | `proto/vc_wire.h` | 28B 包头，**冻结** | 仅 owner 可改 |
 | `sender/` | `vc-sender.exe`（pattern/file/dda/wgc，`--batch`，`pattern.h` 整数测试源，`dda.h`/`wgc.h` 桌面采集） | C++17 |
-| `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，会话 NV12 尺寸/fps，SHM v3，motion 仅显式 bring-up） | C++17 |
+| `vcam/` | `vc-vcam.dll`（P4-3 DShow source filter，用户态，会话尺寸/fps、客户端协商 NV12/MJPG，SHM v3，motion 仅显式 bring-up） | C++17 |
 | `receiver/` | `vc-receiver.exe`（重组、hash、stats、hashlog 带 qpc_ns） | C++17 |
 | `tools/` | `monitor/` 预览与诊断、`testwin/` DDA 动画源、`vcam_verify/` DShow 枚举/隔离取帧 | C++17；随根 CMake 一起构建，现有产物路径保留 |
 | `agent/vc-agent.py` | 主机 UI / 被采集机后台（REST :5143，/exec 白名单，/files 分页，stage/activate OTA） | 单文件零依赖 |

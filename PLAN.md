@@ -47,6 +47,7 @@ PC1=192.168.2.100 接收；历史报告中的 PC1 sender / PC2 receiver 不代�
 ### 1.2 构建
 - 根 `CMakeLists.txt` 编排 `common/`、`sender/`、`receiver/`、`vcam/` 与 `tools/`，MSVC 优先；统一规则在 `cmake/`。默认 `-B build` 下发收端入口仍为 `build/vc-sender.exe`、`build/vc-receiver.exe`；各目标路径见 `docs/runbooks/build.md`。
 - 一键便携包：`python scripts/package.py [--allow-dirty] [--output <目录>]`；默认 `dist/VirtualCapture/`，包含 7 个原生目标、冻结 agent（含 GUI）、MSVC 运行库、脚本和文档。生成文件 SHA-256 与源码来源清单；成功才替换，旧成品整目录归档。契约见 skill `references/packaging.md`。
+- P6-OTA（2026-11-14）：OTA沿用实际native位置，运行库白名单含PyroWave及三项MSVC DLL，包内运行库复制到各native目录并按副本备份/回滚；native缺app-local依赖时拒绝。非自更新包也做失败恢复，启动器使用安全版本化exe指针。旧agent先agent-only升级，再完整运行库包；不声称旧请求自动修复。契约见`references/agent-api.md`，操作见`docs/runbooks/build.md`。
 
 ### 1.3 CLI（动词级冻结；dda/batch 为已落地的追加，本次正式纳入）
 ```text
@@ -62,7 +63,7 @@ vc-receiver.exe --adapter <子串> --ethertype 0x88B5 --mtu 9000
 
 P6-3 MJPEG共同CLI追加：`--codec mjpeg --codec-backend turbojpeg:cpu --codec-hardware 0 --gop 1 --bitrate <bps> --max-bitrate <bps> --decode-in-flight N --max-au-bytes N --jpeg-quality 1..100`；另有`--codec-backends/--codec-check/--au-selftest/--mjpeg-selftest`。压缩载荷/API/日志契约见skill `references/encoded-stream.md`，28B包头不变；Raw CLI和判据不变。`--codec h264|hevc` 在打开网卡前以退出码2拒绝。
 
-WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture 采集 `--output` 指定显示器（默认0），`--wgc-window <标题子串>` 改为按窗口采集；窗口模式默认包含光标，`--wgc-no-cursor` 关闭。WGC 仍经 DWM 合成，不消除合成延迟；独占全屏不可采集；失败显式报错，不回退 DDA。DDA 同样支持 `--output`。不改变 28B 包头、raw 逐像素判据与 `--gpu-convert` 语义。
+WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture 采集 `--output` 指定显示器（默认0），`--wgc-window <标题子串>` 改为按窗口采集；窗口模式默认包含光标，`--wgc-no-cursor` 关闭。WGC 仍经 DWM 合成，不消除合成延迟；独占全屏不可采集；失败显式报错，不回退 DDA。DDA 同样支持 `--output`。2026-11-14 owner指定WGC最小更新间隔1ms：StartCapture前设置MinUpdateInterval=10000（100ns）并读回，系统不支持或失败明确拒绝；不静默保留默认16ms，不改变fps发送上限、不承诺端到端1ms或240实帧。不改变 28B 包头、raw 逐像素判据与 `--gpu-convert` 语义。
 
 ### 1.4 文件型 IPC
 - stats ~500ms 原子覆写（tmp→rename）；hashlog 每帧 append 一行。
@@ -80,6 +81,8 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 - P5 GUI（D16）：agent 新增 `/ui`、`/config`（ROOT/vc-config.json）、`/vcam/status|register`、`/product/{start,stop,status}`、`/product/local/{start,stop}`；`/sender/start` 可选 `gpu_convert`。详见 agent-api.md。
 - P5-U2（D17）：仅主机（默认 `--role host`）提供 UI，收端角色固定；被采集机 `--role capture` 仅后台。产品控制端口 5143，UI 只填 IPv4，网卡自动枚举后下拉选择；主机下发采集参数，对端按控制路由匹配网卡。默认 SHM 固定隐藏，接收前注册 vcam，停止/失败/子进程退出时回收；开始/停止采集合为一个按钮。API 追加能力标记、网卡详情与生命周期语义，详见 agent-api.md；数据面与判据不变。
 - P5-U2 后续精简：连接配置仅显示 IP、网卡和目标帧率，移除画面来源、像素转换、发送批大小及 MTU；隐藏参数沿用后台配置，保存时保留原值，底层 API 与默认值不变。
+- P6 客户端格式适配（2026-11-13，owner要求）：虚拟卡单 pin 按客户端协商 NV12（默认）或真实 MJPG，几何/fps仍固定会话；MJPG复用libjpeg-turbo CPU/SIMD、质量80、420，按最坏JPEG容量分配/实际长度交付。内部SHM与链路codec不变；D12不变；MJPG不套Raw逐像素门，不承诺240fps，双机/真实客户端兼容和画质待验收。隔离验证器 `--format nv12|mjpeg`；契约见skill `references/stream-config.md`、`encoded-stream.md`。
+- P6 WGC 配置入口（2026-11-13）：GUI 恢复采集方式（DDA/WGC/测试图案）、显示器编号与 WGC 目标。窗口下拉由主机 POST `/capture/windows` 代理被采集机 GET 同路径枚举，支持草稿IP/刷新，不枚举主机；同名/子串歧义项禁选，原生启动再次拒绝多匹配。运行中禁改源，非窗口模式清空标题，其余隐藏参数保留。传输配置移除无效目标码率、固定GOP及类别伪选项，保留后台目标值与实际限流/质量/授权。详见 skill `references/stream-config.md`、`agent-api.md`。
 - P5-U3 后端整合：产品启动约 1 秒存活检查，提前退出失败并回滚；stats 追加进程诊断和实际采集方式，界面等待首帧。`/health.root` 支持启动器校验同目录/同角色复用；主机与采集后台各有便携启动入口。契约见 agent-api.md、packaging.md。
 - P6-1（D19）：配置新增输出宽高、crop/fit/fill/stretch、raw/mjpeg、目标/最大码率与链路预留余量；旧配置仍为 640×640 / crop / raw。新增只读 `GET /stream/capabilities` 与草稿 `POST /stream/plan`，`/adapters` 追加数值型收/发链路速率，`/health.stream_revision=1`（历史，现已由P6-2的2替代）。该阶段的非640/缩放拒绝由P6-2解锁；编码模式仍在注册/启动前409拒绝；禁止低层接口静默忽略新流参数。预算使用 mtu-42 和完整 L2 线速开销，不是实测吞吐或帧率保证；速率未知不冒充可行。完整契约见 skill `references/stream-config.md`。
 - P6-2（D19）：`stream_revision=2`、显式 descriptor 双端回显、实际原生能力探测与源 MAC 会话过滤；旧后台/二进制拒绝。可变尺寸 Raw、整数 crop/fit/fill/stretch、发送帧率上限已接通。SHM v3（VCA3，header offset32/36/40=width/height/fps，动态12槽步长）；新读端兼容固定v2，旧读端拒绝v3，writer拒绝已有同名映射。DShow 创建时固定一档真实会话格式，改尺寸先关下游再重新开始/打开；D12不变。详情与低层API见 skill `references/stream-config.md`。
@@ -134,6 +137,8 @@ WGC开发追加（2026-11-13）：`--mode wgc` 使用 Windows Graphics Capture �
 | D22 | PC1 Raw 数小时后卡顿排查 | ✅owner（2026-11-08）：批准独立采样、生命周期修复候选、分项阻塞计时和隔离回归；不自动换已用DLL/部署、不改网卡或下游业务逻辑。六小时现场关联与整机根因仍待实用复现 | P5-LR |
 | D23 | 移除 H.264/H.265 | ✅owner（2026-11-13）：这种编解码方式不适合当前项目。移除 Media Foundation H.264/HEVC、原生 NVENC、`vc-codec-probe`/`vc-codec-roundtrip` 及全部相关测试结果/报告/开发包；保留 Raw 与 D21 的 MJPEG。不自动替换稳定部署；契约与 PLAN/AGENTS/skill 同批更新 | P6-3/P6-4 |
 | D24 | 接入 PyroWave | ✅owner（2026-11-13）：“开始 PyroWave 接入”。新增显式开发编码 `pyrowave:vulkan`（MIT，Vulkan 1.3 计算小波，intra-only），保留 Raw/MJPEG；阶段一只做 CPU 上传/回读，不做 D3D11 互操作；每帧预算=min(max_bitrate÷8÷fps, max_au−48, NV12 帧字节)，无质量旋钮；不自动回退/替换部署；双机/长稳/画质未验收。构建与限制见 `docs/runbooks/pyrowave.md` | P6-3 |
+| D27 | WGC最小更新间隔 | ✅owner（2026-11-14）将3.3ms请求改为“延迟1”，按当前WGC诊断上下文设为固定1ms（MinUpdateInterval=10000×100ns）；发送fps上限不变，不代表端到端延迟1ms。不支持该属性或设置失败明确拒绝，不自动部署 | P6-WGC |
+| D26 | 配置页与客户端输出格式 | ✅owner（2026-11-13）要求补 WGC 配置、枚举被采集机窗口替代标题输入、移除传输页无效选项，并让虚拟卡按客户端协商 NV12/MJPEG。开发实现保留 NV12 默认、实际 MJPG 质量80/CPU编码；不自动打包/切换部署，不等于双机/真实客户端/画质验收 | P6 配置与虚拟卡 |
 | D25 | P6 review修正版提交/打包/部署 | ✅owner（2026-11-13）：“提交 打包 部署”。批准本轮修复提交、生成0.5.0便携包并切换双端；保留旧目录、配置与运行证据，编码仍须显式启用。0.5.0已提交/打包并在本机host启动；PC2预检为0.4.1 host/receive错误角色，按切换门禁未执行远端部署；最终发现本轮之外已将PC2更新为0.5.0 capture，并将双端改为活动PyroWave，停止进一步部署操作，不覆盖并发状态；远端包manifest未核验。证据见[发布记录](docs/bringup/bringup-20261113-release-0.5.0.md)；双机/长稳/画质仍未验收 | P6-R1发布 |
 
 ## 3. 任务卡
@@ -217,9 +222,29 @@ capabilities/codec-check/descriptor、48B VCAU（codec=4）、有界解码与 GU
 
 8项修复提交62e37cd；总闸301 passed / 4 skipped、WGC CPU/GPU私有窗口resize/close通过、PyroWave阻塞注入与640²@240回环480/480通过。0.5.0已打包并启动本机host，PC2错误角色阻塞远端部署。证据：[修复回归](docs/bringup/bringup-20261113-review-fixes.md)、[发布/部署状态](docs/bringup/bringup-20261113-release-0.5.0.md)。
 
+### P6-R3 配置入口与客户端格式 — DONE（本机回归；双端部署预检通过，2026-11-14）
+
+WGC远端窗口下拉/采集源、传输项精简与NV12/MJPG客户端协商落地；总闸328 passed / 6 skipped，0.5.1成品110项哈希通过。PC2恢复后补齐build运行库，双端0.5.1/原生能力/网卡/远端窗口及当前WGC/PyroWave启动前协商通过；未开始实际流，真实客户端/吞吐/长稳/画质仍未验收，OTA布局修复尚未入产品源码；未提交。证据：[0.5.1发布记录](docs/bringup/bringup-20261114-release-0.5.1.md)。
+
+### P6-OTA 原生布局与运行库 — DONE（源码/隔离回归，2026-11-14）
+
+修复OTA实际native槽位、四项app-local运行库多目录部署/备份/回滚、缺依赖拒绝与非self更新事务，启动器沿用安全版本化agent指针；定向49 passed，最终总闸348 passed / 6 skipped、构建/双selftest/pattern_ref全绿。未改版本/打包/部署/提交，旧agent须两步升级。证据：[OTA布局回归](docs/bringup/bringup-20261114-ota-layout.md)。
+
 ### P6-R2 编码指标与设备身份 — DONE（本机回归，2026-11-13）
 
 补编码pc1_seg/rseg、PyroWave只读Vulkan类别与实际设备身份；总闸303 passed / 6 skipped，本机motion/Loopback/batch1的MJPEG、PyroWave及显式丢片恢复通过，实测编解码设备RTX 4070。未提交/打包/部署。证据：[修复记录](docs/bringup/bringup-20261113-pyrowave-metrics.md)。
+
+### P6-UI 控制入口与编码参数说明 — DONE（源码回归，2026-11-14）
+
+关闭误用只读预览并通过正式接口停止/回收，完整保留双端会话；非JSON错误友好报告、固定后端只读、PyroWave每帧预算可见。总闸350 passed / 6 skipped、build/双selftest/pattern_ref全绿；未打包部署提交。WGC约59fps仅定位到约17ms帧供给节奏，根因未证实、未改采集实现。证据：[控制入口与WGC诊断](docs/bringup/bringup-20261114-wgc-controls.md)。
+
+### P6-WGC 约60fps定位与1ms间隔 — DONE（源码/私有验证，2026-11-14）
+
+同源motion双机WGC Raw/PyroWave均约60，DDA约230/235、pattern PyroWave约239.7，五组收发/hash一致；A/B定位默认16ms。按D27启动前固定1ms并读回，不支持明确拒绝；PC2真实初始化显示器/窗口均读回10000，完整证据保全，双端空闲配置未变。最终总闸350 passed / 6 skipped，PC1无接口的WGC live跳过；未验收修改后双机吞吐/240独立画面，未打包部署提交。证据：[WGC节奏诊断](docs/bringup/bringup-20261114-wgc-cadence.md)。
+
+### P6-R3 0.5.2打包与部署 — DONE（2026-11-14）
+
+owner要求“打包部署”；包含WGC1ms/GUI/OTA修复，350 passed / 6 skipped、成品116项SHA256通过；独立备份后PC2两步OTA、主机受管载荷更新，双端0.5.2/空闲/配置不变，PC2部署sender WGC自检PASS、当前PyroWave预检can_start=true。未开业务流/未240长稳画质验收，未提交。证据：[0.5.2发布部署](docs/bringup/bringup-20261114-release-0.5.2.md)。
 
 ### P6-4 组合验收与交付 — TODO
 
