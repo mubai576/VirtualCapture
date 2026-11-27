@@ -22,8 +22,8 @@ GUI 截图必须非空白；黑屏就是失败，不删断言、不以窗口存�
 ## 来源保护与输出
 
 默认 dirty 工作区拒绝；`--allow-dirty` 只在确认收录范围后使用，不代表允许夹带并发未审阅改动。
-来源记录 Git revision/dirty、受跟踪与未忽略源码 SHA-256；构建中源码改变则失败。凭据、配置、run/build/dist 等不得作为来源或载荷收录；尤其不得读取现有更新令牌。
+来源记录 Git revision/dirty、受跟踪与未忽略源码 SHA-256；构建中源码改变则失败。配置、run/build/dist 等不得作为来源或载荷收录；旧更新令牌文件仍不读取并继续排除。
 
 每次新建 `dist/VirtualCapture-Rust-<version>-windows-x64-<time>-<id>/` 及同名 ZIP/.sha256；不覆盖旧 `dist/VirtualCapture` 或运行配置。没有旧 `--output` 覆盖目录语义。
 
-同一个完整 Rust ZIP 可用于 Rust OTA stage，必须先完整校验、再在停止且非 pending 状态激活；不兼容旧 Python `/update`。SHA-256 只证完整性，不是发布者签名。详细运行布局、令牌配对、就绪与回滚见 `rust-control.md`。
+同一个完整 Rust ZIP 可用于 Rust OTA stage，必须先完整校验、再在停止且非 pending 状态激活；不兼容旧 Python `/update`。SHA-256 只证完整性，不是发布者签名。OTA 不要求配对令牌，控制端口须限制在可信网段；详细运行布局、就绪与回滚见 `rust-control.md`。

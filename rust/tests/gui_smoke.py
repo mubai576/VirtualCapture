@@ -224,13 +224,6 @@ def find_input(image, y0, y1, x0, x1, scale):
     return None
 
 
-def label_right_of(image, box):
-    """Dark label cluster (button text) right of the input box, same row."""
-    clusters = text_clusters(image, box["top"] + 3, box["bottom"] - 2,
-                             box["right"] + 12, image.width - 8, merge=8)
-    return next((cluster for cluster in clusters if cluster[1] - cluster[0] >= 8), None)
-
-
 def window_icon(hwnd):
     # WM_GETICON first, then the window class icon registered from the exe resource.
     for kind in (0, 1, 2):
@@ -508,63 +501,16 @@ def main():
             clusters = header_clusters(initial, scale)
             assert len(clusters) >= 3, ("找不到『更新』页签", clusters)
             updates_x = (clusters[-3][0] + clusters[-3][1]) / 2 / scale
-            # Open the compact update panel and pair a token through the real input.
+            # Open the compact update panel; pairing is removed, so no token input
+            # or token file may appear.
             click(hwnd, updates_x, 36)
             time.sleep(.5)
             opened = screenshot(hwnd, "updates.png")
             assert stage_top(opened) - stage > 120 * scale, ("更新面板没有展开", stage, stage_top(opened))
             box = find_input(opened, top + int(8 * scale), top + int(380 * scale),
                              int(opened.width * .6), opened.width - 12, scale)
-            assert box, "更新面板里找不到配对令牌输入框"
-            token = "0123456789abcdef" * 4
-            click(hwnd, (box["left"] + box["right"]) / 2 / scale, (box["top"] + box["bottom"]) / 2 / scale)
-            for character in token:
-                assert user.PostMessageW(hwnd, 0x0102, ord(character), 0)
-            # The pair button is disabled until the value renders as a valid token;
-            # the 350 ms ticker re-render enables it, so wait before clicking.
-            time.sleep(1.0)
-            typed = screenshot(hwnd, "updates-typed.png")
-            pair = label_right_of(typed, box)
-            assert pair, "更新面板里找不到配对按钮"
-            print(json.dumps({"pair_box": box, "pair_label": pair, "scale": scale}), flush=True)
-            click(hwnd, (pair[0] + pair[1]) / 2 / scale, (box["top"] + box["bottom"]) / 2 / scale)
-            time.sleep(.5)
-            screenshot(hwnd, "pair-clicked.png")
-            token_file = RUN / "update-peer-token.json"
-            deadline = time.monotonic() + 10
-            while not token_file.exists():
-                assert time.monotonic() < deadline, "配对令牌没有保存"
-                time.sleep(.1)
-            saved = json.loads(token_file.read_text(encoding="utf-8"))
-            assert saved.get("token") == token, saved
-            paired_im = screenshot(hwnd, "paired.png")
-            # Paired hides the input; the compact "更换令牌" entry must reopen it.
-            row = text_clusters(paired_im, box["top"] + 3, box["bottom"] - 2,
-                                int(paired_im.width * .6), paired_im.width - 12)
-            assert len(row) >= 2, ("已配对时找不到『更换令牌』入口", row)
-            click(hwnd, (row[1][0] + row[1][1]) / 2 / scale, (box["top"] + box["bottom"]) / 2 / scale)
-            time.sleep(.5)
-            reopened = screenshot(hwnd, "updates-repair.png")
-            box2 = find_input(reopened, top + int(8 * scale), top + int(380 * scale),
-                              int(reopened.width * .6), reopened.width - 12, scale)
-            assert box2, "『更换令牌』没有重新展开输入框"
-            token2 = "fedcba9876543210" * 4
-            click(hwnd, (box2["left"] + box2["right"]) / 2 / scale, (box2["top"] + box2["bottom"]) / 2 / scale)
-            for character in token2:
-                assert user.PostMessageW(hwnd, 0x0102, ord(character), 0)
-            time.sleep(1.0)
-            typed2 = screenshot(hwnd, "updates-repair-typed.png")
-            pair2 = label_right_of(typed2, box2)
-            assert pair2, "更换令牌后找不到配对按钮"
-            click(hwnd, (pair2[0] + pair2[1]) / 2 / scale, (box2["top"] + box2["bottom"]) / 2 / scale)
-            deadline = time.monotonic() + 10
-            while True:
-                current = json.loads(token_file.read_text(encoding="utf-8"))
-                if current.get("token") == token2:
-                    break
-                assert time.monotonic() < deadline, ("重新配对没有保存新令牌", current.get("token"))
-                time.sleep(.1)
-            screenshot(hwnd, "repair-paired.png")
+            assert box is None, ("更新面板仍显示令牌输入框", box)
+            assert not (RUN / "update-peer-token.json").exists(), "更新面板生成了配对令牌文件"
             # Collapsing the panel must restore the exact layout the fixed click
             # coordinates below were measured against.
             click(hwnd, updates_x, 36)
@@ -622,7 +568,7 @@ def main():
             user.PostMessageW(hwnd, 0x0010, 0, 0)
             proc.wait(timeout=15)
             assert proc.returncode == 0, (proc.returncode, (RUN / "host.log").read_text(errors="replace"))
-            report = {"ok": True, "window": "VirtualCapture", "process_exit": proc.returncode, "address": address, "requests": requests, "response": 503, "screenshots": [*roles["role_screenshots"], "initial.png", "updates.png", "updates-typed.png", "paired.png", "updates-repair.png", "updates-repair-typed.png", "repair-paired.png", "updates-closed.png", "presets-720p.png", "details.png", "compact.png", "physical-adapters.png", "connection-error.png"], "physical_adapters": [item.get("label") or item["description"] for item in physical], "excluded_adapters": len(adapters) - len(physical), "token_file": token_file.name, "checks": ["application icon resource", "first-frame update-ready marker", "role selection, persistence, restart and both in-app reselect controls", "capture HTTP binds to requested loopback port and closes before switching", "control config unaffected by role selection", "main heading and cleanup banner removed", "update panel opens and closes without shifting layout", "peer update token paired and persisted", "paired state reopens token input and replaces token", "720p and 120fps saved", "640 square and 240fps restored", "diagnostic table expansion", "compact window layout", "real host adapter refresh", "saved virtual selection cleared", "connection HTTP error", "normal window close"], "roles": roles, "scope": "real native GPUI controls, role persistence and host workbench; no data stream, physical NIC transmission or DShow registration"}
+            report = {"ok": True, "window": "VirtualCapture", "process_exit": proc.returncode, "address": address, "requests": requests, "response": 503, "screenshots": [*roles["role_screenshots"], "initial.png", "updates.png", "updates-closed.png", "presets-720p.png", "details.png", "compact.png", "physical-adapters.png", "connection-error.png"], "physical_adapters": [item.get("label") or item["description"] for item in physical], "excluded_adapters": len(adapters) - len(physical), "checks": ["application icon resource", "first-frame update-ready marker", "role selection, persistence, restart and both in-app reselect controls", "capture HTTP binds to requested loopback port and closes before switching", "control config unaffected by role selection", "main heading and cleanup banner removed", "update panel opens and closes without shifting layout", "update panel has no pairing token input or token file", "720p and 120fps saved", "640 square and 240fps restored", "diagnostic table expansion", "compact window layout", "real host adapter refresh", "saved virtual selection cleared", "connection HTTP error", "normal window close"], "roles": roles, "scope": "real native GPUI controls, role persistence and host workbench; no data stream, physical NIC transmission or DShow registration"}
             (RUN / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
             print(json.dumps({"run": str(RUN), **report}, ensure_ascii=False))
         finally:

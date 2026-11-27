@@ -19,13 +19,13 @@
 | Wire | proto/vc_wire.h冻结28B、0x88B5；payload=mtu−42，Raw帧B=w×h×3/2、N=ceil(B/payload)，不占保留位；skill references/wire-protocol.md |
 | 产品拓扑 | `VirtualCapture.exe` 首次选端并保存偏好，启动已选 GPUI 角色；接收端无本机 REST，采集端内嵌 REST v2（默认 5143），`capture` 子命令仍运行控制台 REST 后台；`vc-updater.exe` 独立更新/回滚。角色进程内加载 C ABI v1，EXE/DLL 共用数据面，不拉起旧 sender/receiver；references/rust-control.md |
 | 网卡/MTU | 仅列 Windows 状态为Up的物理非虚拟网卡，不按型号偏置；本机按控制连接路由精确匹配，对端多候选须明确选择。显式选择保持、失效后重选。新配置自动MTU，旧缺字段保留显式值；双端只读NlMtu取最小、上限9000，不改系统参数 |
-| GPU/编码 | DDA/WGC强制硬件GPU；pattern独立诊断。Raw不压缩；PyroWave显式开发/精确backend、GOP1、真实GPU Vulkan1.3；MJPEG明确拒绝，旧codec ID不复用；references/encoded-stream.md |
+| GPU/编码 | DDA/WGC强制硬件GPU；NV12 回读 DO_NOT_WAIT、两平面共用1s期限并响应同会话取消，超时失败无降级；WGC FreeThreaded 同设备启用 D3D11 多线程保护；DDA回显Acquire/超时/取得/转换计数，不以ready冒充有帧。pattern独立诊断。Raw不压缩；PyroWave显式开发/精确backend、GOP1、真实GPU Vulkan1.3；MJPEG明确拒绝，旧codec ID不复用；references/encoded-stream.md |
 | 批提交 | Raw物理卡整帧一个sendqueue，编码按实际AU整帧一次提交，零/短发送失败。显式Loopback固定batch1例外，不冒充产品性能 |
-| 生命周期 | stop/destroy仅0证明释放；pending保留worker/句柄/DLL，未知destroy不盲重试。PyroWave每操作5s粘性看门狗不退出宿主；待清理锁配置/OTA/虚拟卡 |
-| SHM/DShow | docs/spec/shm-v3.md；动态NV12、12槽、只读seqlock、事件对；D12从无好帧不输出、停流只重复最后好帧。隔离verifier由Cargo构建，无注册表枚举回退 |
-| 归属/OTA | 全局owner+本根schema2精确证明/互斥/刷盘pending；未知拒绝接管。固定app/data/updates，配对令牌独立，stage不等于activate成功；references/rust-control.md |
+| 生命周期 | stop/destroy仅0证明释放；pending保留worker/句柄/DLL，未知destroy不盲重试。PyroWave每操作5s粘性看门狗不退出宿主；待清理锁配置/OTA/虚拟卡；UI 不将停止未确认显示为普通待开始，实际帧率只读 fps_actual（运行中按最近1秒滑动窗口，空闲归零、终态保留全场统计），源/网络空闲仍更新；终结失败在回收前保留可见，不以目标 fps 回填 |
+| SHM/DShow | docs/spec/shm-v3.md；动态NV12、12槽、只读seqlock、事件对；只读归属预检（拒绝存活宿主或状态未知；确认无存活宿主的旧/他根/无记录注册在注册阶段自动移除）后先启动 receiver 确认真实SHM几何，再发布虚拟卡注册、启动 sender，既有固定格式graph改尺寸须重开。D12从无好帧不输出、停流只重复最后好帧。隔离verifier由Cargo构建，无注册表枚举回退 |
+| 归属/OTA | 全局owner+本根schema2精确证明/互斥/刷盘pending；停止只注销自有归属，启动在确认无存活宿主时自动移除旧/他根/无记录注册，存活宿主或状态未知拒绝接管。固定app/data/updates；不设更新令牌，连接后可直接查询/上传/激活，控制面须限制在可信网段，stage不等于activate成功；references/rust-control.md |
 | 构建/包 | Cargo workspace/locked 为唯一产品入口；CMake 仅处理 PyroWave 第三方库与运行库。便携包顶层仅 `VirtualCapture.exe` 和 `vc-updater.exe`，无启动脚本、独立诊断 EXE 或许可材料；构建树保留完整 COM graph 验证。`unified-v1` 清单标记区分旧拆分版；唯一 dist 不覆盖旧成品，GUI 黑屏硬失败；references/packaging.md |
-| 判据 | test-matrix.md冻结T0–T5/D1；Raw整帧FNV，性能motion且注明batch/adapter，跨机不减QPC；有损transport/decoded出口分开核对 |
+| 判据 | test-matrix.md冻结T0–T5/D1；Raw整帧FNV，性能motion且注明batch/adapter，跨机不减QPC；有损transport/decoded出口分开核对。source smoke无限会话实际发/收至少10帧后stop+destroy共用2秒绝对期限，迟到返回0仍FAIL；DDA零帧超时不改判BLOCKED |
 
 浮点只允许已批准UNORM格式解码例外且逐字节匹配整数参考，不扩展为图案生成许可。实际配置/能力/精确回显优先，预算不当实测。
 
@@ -70,8 +70,21 @@ D1–D28为历史决策原记录，涉及已移除实现的路径/命令只在Gi
 | D33 | 精简网卡修正版提交与打包 | owner（2026-11-20）要求“提交 打包”：提交D31/D32已审阅改动，从精确干净提交`d6eb33d`生成0.2.1新包，完整及扩展门禁通过；不升版本、不push、不部署，不授权PC2、物理网卡变更或真实DShow注册。23文件、来源/哈希与证据见[交付记录](docs/bringup/bringup-20261120-rust-r3a-connected-adapters-package.md)。 | Rust-R3a 修正版包 |
 | D34 | 两 EXE 便携入口 | owner（2026-11-21）要求把包内五个 EXE 减到两个。合并主机、采集和隔离能力探测，独立保留更新器；新采集默认 5143，OTA 沿用运行实例原 bind/port。不改数据面/验收门限，不自动部署、注册或切稳定版。 | Rust-R3a 两 EXE 入口 |
 | D35 | 启动选端、重选与持久化 | owner 要求启动选择采集/接收角色并独立持久化；首次选择、下次直启、本机角色空闲时重选，显式 capture 后台不受偏好影响，OTA 恢复实际运行模式。已完成实现和本机 GUI/OTA 专项验收；本次另行授权提交与重新打包，不部署。 | Rust-R3a 桌面角色 |
+| D36 | 移除 OTA 配对令牌 | owner（2026-11-25）要求“移除配对码的设定 连接上就可以直接更新”。删除采集端令牌创建、`--print-update-token`、Bearer 校验、主机配对 UI/状态与 `update-peer-token.json` 写入；`/update/*` 与普通控制接口一样不做应用层鉴权，部署时须把 5143 限制在可信网段。旧令牌文件不读取、不删除，仅继续排除出升级基线和包；新旧版本混用时旧采集端仍会拒绝无令牌请求。不改 wire、SHM、数据面与验收门限。 | Rust-R3a 直接更新 |
+| D37 | 虚拟卡状态自动刷新 | 新增每秒重读注册状态、冲突消失后清除旧提示及预检错误附带注册路径；包 `20261126-002714-cbcb20` 的 16 文件/10 项门禁通过，打包时未部署。2026-11-26 现场确认真实原因是 HKCU 64 位仍有指向已删除 2026-11-14 DLL 的旧注册，非仅窗口缓存；经用户再次明确授权，备份后仅删除该 CLSID 与设备枚举项。12 项注册表复核均不存在，同一 PID `6504` 的红色冲突自动消失、虚拟卡显示“待启动”；见[定位与清理证据](docs/bringup/bringup-20261126-vcam-stale-hkcu.md)。未启动采集或注册新卡，不改 wire、SHM、数据面与验收门限。 | Rust-R3a 虚拟卡（DONE） |
+| D38 | 停止/黑屏诊断与运行指标修正 | 2026-11-26 用户反馈无法停止、黑屏与无视频流量。只读本机保全确认收/发布 361 帧与远端 stop Pending 409；修正 UI 目标/实际 FPS 混用及待清理提示，补连续 pending 资源保留回归。416@240 私有 DLL 交付/格式打开顺序检查通过；未定位远端原生卡点或现场黑屏根因，未获 PC2/强制释放/部署授权，不以本机测试关闭故障。见[现场记录](docs/bringup/bringup-20261126-stop-pending-black-output.md)。 | Rust-R3a 指标修正 / R3b 故障未闭环 |
+| D39 | 实际出图与停止修复迭代 | owner（2026-11-26）要求“修复好他，就像我预期的一样”。加入有界GPU回读/同会话取消、WGC设备线程保护、先receiver SHM后注册、空闲实际FPS与终结错误保留及活跃停止回归。Rust344项/静态总门、Raw/REST与GUI回归通过；最终DLL私有WGC416@240目标链路271帧到DShow704样本哈希匹配。DDA本机及独立原生Acquire均0帧超时，保留FAIL；不放宽门限、不换源、无PC2/部署/真实注册或强制释放。见[本轮修复与失败证据](docs/bringup/bringup-20261126-stop-pending-black-output.md#实际修复迭代d39)。 | Rust-R3b 保持 IN PROGRESS |
+| D40 | 启动时自动移除旧虚拟卡注册 | ✅owner（2026-11-27）：“我希望在启动的遇到问题的时候 可以自动移除旧的注册”。启动预检/注册在全局 CLSID 锁内确认无存活宿主（排除 Busy/Unknown）后，自动移除旧版、他根、损坏或无全局 owner 的残留注册并重新注册当前目录 DLL；停止仍只回收自有归属，不删其他目录注册。 | Rust-R3a 虚拟卡恢复 |
 
 ## 3. 当前任务卡
+
+### Rust-R3a 运行指标与待停止提示修正（D38） — DONE
+
+现场 `s-26bc9b1be54e2f58` 已接收/发布 361 帧，远端三次 stop 返回 Pending 409；本机 receiver 已正常回收。修正 UI 以目标 `fps` 冒充实际帧率及待清理显示为普通待开始的问题，补连续 Pending 资源保留回归；198 项单测、fmt 与三 crate 全 target Clippy 通过，已用包的私有 416×416@240 DLL 交付/格式时序检查通过。证据见[停止与黑屏诊断](docs/bringup/bringup-20261126-stop-pending-black-output.md)。只完成本地诊断/展示修正，未提交、打包或部署，不代表现场挂起和黑屏解决。
+
+### Rust-R3b 远端停止挂起与现场黑屏 — IN PROGRESS
+
+远端 worker 在多次 stop 宽限内未退出，缺发送端日志/线程栈，Npcap/GPU/teardown 卡点未定；无现场像素，格式打开顺序行为已隔离复现但未证明现场根因。D39已实现有界回读/取消与启动时序修复，344项Rust总门、Raw/REST/GUI及WGC真实窗口→私有DShow回归通过；本机DDA最终1796次Acquire全超时，独立原生探针149次同样0帧，解锁/Default桌面检查正常，具体OS/驱动交付原因未定，源门禁保留FAIL。有帧DDA停止、实际远端与现场黑屏仍未验收；证据见[记录](docs/bringup/bringup-20261126-stop-pending-black-output.md#实际修复迭代d39)。未提交、打包、部署、操作PC2、强卸载或清理当前虚拟卡归属。
 
 ### Rust-R3 模块化全Rust产品 — IN PROGRESS
 

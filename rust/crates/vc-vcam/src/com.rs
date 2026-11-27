@@ -330,6 +330,7 @@ impl FilterCore {
         let first_repeat_ns = frame_ns * 3 / 2;
 
         let mut last_good = vec![0u8; frame_bytes];
+        let mut scratch = vec![0u8; frame_bytes];
         let mut has_last_good = false;
         let mut last_fid = 0u32;
         let mut last_pub = 0u64;
@@ -344,12 +345,12 @@ impl FilterCore {
                 break;
             }
 
-            let (view, ev0, ev1, vstat) = {
+            let ((view, ev0, ev1, vstat), input, alloc, clock, state, t0) = {
                 let mut shared = self.lock_shared();
                 if shared.shm.is_none() {
                     shared.shm = ShmSet::open(&win::frame_map_name(), geometry);
                 }
-                match &shared.shm {
+                let shm_handles = match &shared.shm {
                     Some(set) => (set.view(), set.event(0), set.event(1), set.vstat()),
                     None => (
                         ptr::null_mut(),
@@ -357,7 +358,15 @@ impl FilterCore {
                         HANDLE::default(),
                         ptr::null_mut(),
                     ),
-                }
+                };
+                (
+                    shm_handles,
+                    shared.input.clone(),
+                    shared.alloc.clone(),
+                    shared.clock.clone(),
+                    shared.state,
+                    shared.t_start,
+                )
             };
 
             let mut fresh = false;
@@ -438,16 +447,6 @@ impl FilterCore {
                 continue;
             }
 
-            let (input, alloc, clock, state, t0) = {
-                let shared = self.lock_shared();
-                (
-                    shared.input.clone(),
-                    shared.alloc.clone(),
-                    shared.clock.clone(),
-                    shared.state,
-                    shared.t_start,
-                )
-            };
             let (Some(input), Some(alloc)) = (input, alloc) else {
                 break;
             };
@@ -466,21 +465,16 @@ impl FilterCore {
             let mut flags = 0u32;
             let mut ok = false;
             if fresh
-                && !buf.is_null()
-                && let Some(copy) = unsafe { shm::copy_slot(view, slot, seq, buf) }
+                && let Some(copy) = unsafe { shm::copy_slot(view, slot, seq, scratch.as_mut_ptr()) }
             {
                 ok = true;
                 out_fid = copy.frame_id;
                 out_pub = copy.qpc_pub_ns;
                 last_tok = ((slot as u64) << 32) | (seq as u32 as u64);
-            }
-            if !ok && !buf.is_null() && has_last_good {
-                unsafe {
-                    ptr::copy_nonoverlapping(last_good.as_ptr(), buf, frame_bytes);
-                }
-                out_fid = last_fid;
-                out_pub = last_pub;
-                flags = VSTAT_FLAG_REPEAT;
+                std::mem::swap(&mut scratch, &mut last_good);
+                has_last_good = true;
+                last_fid = out_fid;
+                last_pub = out_pub;
             }
             if !ok && !has_last_good {
                 drop(sample);
@@ -488,13 +482,16 @@ impl FilterCore {
                 next_ns = win::qpc_ns().saturating_add(frame_ns);
                 continue;
             }
-            if ok {
+            if !ok {
+                out_fid = last_fid;
+                out_pub = last_pub;
+                flags = VSTAT_FLAG_REPEAT;
+            }
+            if !buf.is_null() {
+                // 只对下游 DirectShow 缓冲做单向写入，避免从可能的 WC/非缓存内存回读。
                 unsafe {
-                    ptr::copy_nonoverlapping(buf, last_good.as_mut_ptr(), frame_bytes);
+                    ptr::copy_nonoverlapping(last_good.as_ptr(), buf, frame_bytes);
                 }
-                has_last_good = true;
-                last_fid = out_fid;
-                last_pub = out_pub;
             }
 
             let _ = unsafe { sample.SetActualDataLength(frame_bytes as i32) };

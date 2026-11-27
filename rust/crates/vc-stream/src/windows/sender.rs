@@ -98,7 +98,7 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
             "width":args.common.width,"height":args.common.height,"fps":args.common.fps,
         })
     });
-    let mut hashlog = take_writer(args.hash_file.take(), args.hashlog.as_deref())?;
+    let mut hashlog = take_log_writer(args.hash_file.take(), args.hashlog.as_deref())?;
     let mut source_frame = vec![0u8; frame_bytes];
     let mut tx = FrameTransmitter::new(
         &api,
@@ -134,7 +134,8 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
     publish_progress(args.progress.as_deref(), args.ready.as_deref(), &ready)?;
     let cpu_start = process_cpu_ns()?;
     let started = Instant::now();
-    let mut pacer = FramePacer::new(args.common.fps, qpc_ns());
+    let start_qpc = qpc_ns();
+    let mut pacer = FramePacer::new(args.common.fps, start_qpc);
     let mut limiter = (!raw).then(|| ByteWindow::new(args.codec.max_bitrate_bps));
     let period = 1_000_000_000u64.div_ceil(u64::from(args.common.fps));
     let mut previous_send = 0u64;
@@ -156,6 +157,9 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
     let mut audit_timing = Samples::default();
     let mut log_timing = Samples::default();
     let mut capture_to_send = Samples::default();
+    let mut rate_window = RateWindow::new(start_qpc);
+    let mut live_pc1 = TimedWindow::default();
+    let mut live_source = TimedWindow::default();
     let mut last_progress = Instant::now();
     loop {
         if args.frames > 0 && frames == args.frames {
@@ -174,9 +178,28 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
             // 取消才会结束等待。
             let mut captured = false;
             while !stopped(args.stop.as_deref()) {
-                if source.capture(&mut source_frame)? {
+                if source.capture_cancellable(
+                    &mut source_frame,
+                    Some(args.stop.as_deref().unwrap_or(&CLI_STOP)),
+                )? {
                     captured = true;
                     break;
+                }
+                // 静态/未到首帧时仍刷新最近 1 秒滑窗计数，空闲超过 1 秒自动归零。
+                if last_progress.elapsed() >= Duration::from_millis(250) {
+                    live_sender_progress(
+                        args.progress.as_deref(),
+                        started,
+                        frames,
+                        packets,
+                        bytes,
+                        encoded_bytes,
+                        Some(source),
+                        &mut rate_window,
+                        &mut live_pc1,
+                        &mut live_source,
+                    );
+                    last_progress = Instant::now();
                 }
                 thread::yield_now();
             }
@@ -212,16 +235,6 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
                 args.codec.max_au_bytes,
             )?;
         }
-        // 审计哈希读取完整源帧与编码帧。放在等待下一个发送槽之前做，避免
-        // 诊断工作占用本应属于下一个 240 Hz 帧的时间。
-        let audit_started = qpc_ns();
-        let transport_hash = fnv1a64_hex(fnv1a64(frame));
-        let source_hash = if raw {
-            transport_hash.clone()
-        } else {
-            fnv1a64_hex(fnv1a64(&source_frame))
-        };
-        let audit_ns = qpc_ns().saturating_sub(audit_started);
 
         let earliest = if !raw && frames > 0 {
             previous_send.saturating_add(period)
@@ -255,39 +268,75 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
         }
         last_send = sent.end_ns;
         let encode_ns = encode_done.saturating_sub(encode_started);
+        let source_ns = source_ready.saturating_sub(frame_start);
+        let pc1_ns = sent.end_ns.saturating_sub(source_ready);
         encode_total_ns += encode_ns;
         rate_wait_ns += sent.wait_ns;
         generation_send_ns += sent.end_ns.saturating_sub(frame_start);
-        source_timing.push(source_ready.saturating_sub(frame_start));
+        source_timing.push(source_ns);
         encode_timing.push(encode_ns);
         rate_timing.push(sent.wait_ns);
         transmit_timing.push(sent.end_ns.saturating_sub(sent.start_ns));
         capture_to_send.push(sent.start_ns.saturating_sub(frame_start));
-        pc1.push(sent.end_ns.saturating_sub(source_ready));
+        pc1.push(pc1_ns);
+        live_source.push(sent.end_ns, source_ns);
+        live_pc1.push(sent.end_ns, pc1_ns);
+        // 审计哈希在发包之后且仅当启用 hashlog 时计算，避免拖慢线缆发送。
+        let audit_started = qpc_ns();
+        let hashes = hashlog.as_ref().map(|_| {
+            let transport_hash = fnv1a64(frame);
+            let source_hash = if raw {
+                transport_hash
+            } else {
+                fnv1a64(&source_frame)
+            };
+            (transport_hash, source_hash)
+        });
+        let audit_ns = qpc_ns().saturating_sub(audit_started);
         audit_timing.push(audit_ns);
         let log_started = qpc_ns();
-        if let Some(writer) = hashlog.as_mut() {
-            let row = if raw {
-                json!({"frame_id":frame_id,"hash":transport_hash,"qpc_ns":frame_start,"source_ready_qpc_ns":source_ready,"send_qpc_ns":sent.start_ns})
-            } else {
-                json!({"frame_id":frame_id,"source_hash":source_hash,"transport_hash":transport_hash,
-                    "encoded_bytes":frame.len(),"keyframe":true,"fault_injected":false,
-                    "qpc_ns":frame_start,"source_ready_qpc_ns":source_ready,"send_qpc_ns":sent.start_ns,
-                    "encode_wait_ns":encode_ns,"prepare_lead_ns":0,
-                    "prepare_work_ns":if source.is_none(){Some(encode_done.saturating_sub(frame_start))}else{None::<u64>}})
-            };
-            serde_json::to_writer(&mut *writer, &row)?;
-            writer.write_all(b"\n")?;
-            writer.flush()?;
+        if let (Some(writer), Some((transport_hash, source_hash))) = (hashlog.as_mut(), hashes) {
+            writer.write_line(|w| {
+                if raw {
+                    writeln!(
+                        w,
+                        "{{\"frame_id\":{frame_id},\"hash\":\"{transport_hash:016x}\",\"qpc_ns\":{frame_start},\"source_ready_qpc_ns\":{source_ready},\"send_qpc_ns\":{}}}",
+                        sent.start_ns
+                    )
+                } else if source.is_none() {
+                    writeln!(
+                        w,
+                        "{{\"frame_id\":{frame_id},\"source_hash\":\"{source_hash:016x}\",\"transport_hash\":\"{transport_hash:016x}\",\"encoded_bytes\":{},\"keyframe\":true,\"fault_injected\":false,\"qpc_ns\":{frame_start},\"source_ready_qpc_ns\":{source_ready},\"send_qpc_ns\":{},\"encode_wait_ns\":{encode_ns},\"prepare_lead_ns\":0,\"prepare_work_ns\":{}}}",
+                        frame.len(),
+                        sent.start_ns,
+                        encode_done.saturating_sub(frame_start)
+                    )
+                } else {
+                    writeln!(
+                        w,
+                        "{{\"frame_id\":{frame_id},\"source_hash\":\"{source_hash:016x}\",\"transport_hash\":\"{transport_hash:016x}\",\"encoded_bytes\":{},\"keyframe\":true,\"fault_injected\":false,\"qpc_ns\":{frame_start},\"source_ready_qpc_ns\":{source_ready},\"send_qpc_ns\":{},\"encode_wait_ns\":{encode_ns},\"prepare_lead_ns\":0,\"prepare_work_ns\":null}}",
+                        frame.len(),
+                        sent.start_ns
+                    )
+                }
+            })?;
         }
         log_timing.push(qpc_ns().saturating_sub(log_started));
         frames += 1;
+        rate_window.maybe_record(sent.end_ns, frames, packets, bytes);
         if last_progress.elapsed() >= Duration::from_millis(250) {
-            if let Some(progress) = args.progress.as_deref() {
-                progress.update(&json!({"frames":frames,"sent_frames":frames,"sent_packets":packets,"bytes":bytes,
-                    "fps_actual":frames as f64/started.elapsed().as_secs_f64().max(0.000001),
-                    "encoded_bytes":encoded_bytes,"source_info":source.as_ref().map(DesktopSource::stats)}));
-            }
+            live_sender_progress(
+                args.progress.as_deref(),
+                started,
+                frames,
+                packets,
+                bytes,
+                encoded_bytes,
+                source.as_ref(),
+                &mut rate_window,
+                &mut live_pc1,
+                &mut live_source,
+            );
             last_progress = Instant::now();
         }
     }
@@ -345,6 +394,46 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
         progress.update(&final_value);
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn live_sender_progress(
+    progress: Option<&Progress>,
+    started: Instant,
+    frames: u64,
+    packets: u64,
+    bytes: u64,
+    encoded_bytes: u64,
+    source: Option<&DesktopSource>,
+    rate_window: &mut RateWindow,
+    live_pc1: &mut TimedWindow,
+    live_source: &mut TimedWindow,
+) {
+    let Some(progress) = progress else {
+        return;
+    };
+    let now_ns = qpc_ns();
+    let rate = rate_window.sample(now_ns, frames, packets, bytes);
+    let pc1_live = live_pc1.summary_at(now_ns);
+    let source_live = live_source.summary_at(now_ns);
+    let uptime = started.elapsed().as_secs_f64().max(0.000_001);
+    progress.update(&json!({
+        "frames": frames,
+        "sent_frames": frames,
+        "sent_packets": packets,
+        "bytes": bytes,
+        "encoded_bytes": encoded_bytes,
+        "pps": rate.pps,
+        "bps": rate.bps,
+        "fps_actual": rate.fps,
+        "uptime_s": uptime,
+        "pc1_seg_avg_ms": pc1_live["avg_ms"],
+        "pc1_seg_p99_ms": pc1_live["p99_ms"],
+        "timing_ms": {
+            "source": source_live,
+        },
+        "source_info": source.map(DesktopSource::stats),
+    }));
 }
 
 #[derive(Default)]

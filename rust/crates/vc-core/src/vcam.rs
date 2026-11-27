@@ -272,21 +272,28 @@ fn read_local_owner(global: &OwnerRecord) -> Option<OwnerRecord> {
     read_local_owner_at(&crate::paths::root(), global)
 }
 
-fn read_registry_owner() -> Result<Option<OwnerRecord>, ()> {
+enum RegistryOwnerRead {
+    Missing,
+    Valid(OwnerRecord),
+    /// `VirtualCaptureOwner` 存在但内容损坏、schema/字段无效或路径非规范；
+    /// 若解析出 `OwnerRecord`，保留供存活检查，避免误删存活主机记录。
+    Invalid(Option<OwnerRecord>),
+    /// 注册表访问失败（权限/IO），绝不当作空闲或可清除。
+    ReadError,
+}
+
+fn read_registry_owner_detail() -> RegistryOwnerRead {
     match read_registry_string(
         &format!(r"Software\Classes\CLSID\{CLSID}"),
         OWNER_REGISTRY_VALUE,
     ) {
-        RegistryRead::Missing => Ok(None),
-        RegistryRead::Unknown => Err(()),
-        RegistryRead::Value(text) => {
-            let record: OwnerRecord = serde_json::from_str(&text).map_err(|_| ())?;
-            if valid_owner(&record) {
-                Ok(Some(record))
-            } else {
-                Err(())
-            }
-        }
+        RegistryRead::Missing => RegistryOwnerRead::Missing,
+        RegistryRead::Unknown => RegistryOwnerRead::ReadError,
+        RegistryRead::Value(text) => match serde_json::from_str::<OwnerRecord>(&text) {
+            Err(_) => RegistryOwnerRead::Invalid(None),
+            Ok(record) if valid_owner(&record) => RegistryOwnerRead::Valid(record),
+            Ok(record) => RegistryOwnerRead::Invalid(Some(record)),
+        },
     }
 }
 
@@ -430,12 +437,18 @@ fn write_owner(dll: &std::path::Path) -> Result<(), String> {
         pid: std::process::id(),
         start_time,
     };
-    let previous = read_registry_owner().map_err(|()| recovery_error(Recovery::Unknown))?;
-    if let Some(previous) = &previous
-        && (!same_path(&record.root, &previous.root) || read_local_owner(previous).is_none())
-    {
-        return Err(recovery_error(Recovery::Unknown));
-    }
+    let previous = match read_registry_owner_detail() {
+        RegistryOwnerRead::Missing => None,
+        RegistryOwnerRead::Valid(previous) => {
+            if !same_path(&record.root, &previous.root) || read_local_owner(&previous).is_none() {
+                return Err(recovery_error(Recovery::Unknown));
+            }
+            Some(previous)
+        }
+        RegistryOwnerRead::Invalid(_) | RegistryOwnerRead::ReadError => {
+            return Err(recovery_error(Recovery::Unknown));
+        }
+    };
     write_owner_transaction(&root, &record, previous.as_ref(), |value| {
         write_string_value(OWNER_REGISTRY_VALUE, value)
     })
@@ -583,9 +596,9 @@ pub(crate) enum Recovery {
     StaleOwned,
     /// 另一个存活主机持有该全局 CLSID 注册；不得抢占。
     Busy,
-    /// 无法证明属于本运行根；不得复用或注销。
+    /// 注册属于其他目录/缺少有效本地或全局归属，且已确认无存活宿主；启动时可自动移除并重注册，停止时不主动注销。
     Foreign,
-    /// 所有权记录缺失/不可读，或属主存活状态无法确认；保守拒绝。
+    /// 注册表或属主存活状态无法确认；保守拒绝，启动和停止均不自动修改。
     Unknown,
 }
 
@@ -636,39 +649,28 @@ fn decide_recovery_with_global_owner_using(
     let Some(registry_owner) = registry_owner else {
         return if registered.is_empty() {
             Recovery::Fresh
-        } else if same_path(registered, local) {
-            Recovery::Unknown
         } else {
+            // 无全局 owner 的旧版或手工注册：启动时可自动移除并重注册，停止时不主动注销。
             Recovery::Foreign
         };
     };
+    match owner_liveness {
+        OwnerLiveness::LiveElsewhere => return Recovery::Busy,
+        OwnerLiveness::Unknown => return Recovery::Unknown,
+        OwnerLiveness::SelfProcess | OwnerLiveness::Dead => {}
+    }
     if !valid_owner_using(registry_owner, normalize_path)
         || (!registered.is_empty() && !same_path(registered, &registry_owner.dll))
+        || !same_path(root, &registry_owner.root)
     {
-        return Recovery::Unknown;
-    }
-
-    // 注册表记录对每个用户的 CLSID 是全局的。先查它，再看任何 run-root
-    // 本地记录，这样其他根无法占用共享 DLL。
-    if !same_path(root, &registry_owner.root) {
-        return match owner_liveness {
-            OwnerLiveness::LiveElsewhere => Recovery::Busy,
-            OwnerLiveness::SelfProcess | OwnerLiveness::Dead => Recovery::Foreign,
-            OwnerLiveness::Unknown => Recovery::Unknown,
-        };
+        return Recovery::Foreign;
     }
 
     let Some(local_owner) = local_owner else {
-        return Recovery::Unknown;
+        return Recovery::Foreign;
     };
     if !same_owner_using(registry_owner, local_owner, &same_path) {
-        return Recovery::Unknown;
-    }
-    if owner_liveness == OwnerLiveness::LiveElsewhere {
-        return Recovery::Busy;
-    }
-    if owner_liveness == OwnerLiveness::Unknown {
-        return Recovery::Unknown;
+        return Recovery::Foreign;
     }
     if registered.is_empty() {
         return Recovery::Fresh;
@@ -688,25 +690,50 @@ fn current_recovery(status: &VcamStatus) -> Recovery {
         return Recovery::Unknown;
     }
     let root = crate::paths::root();
-    let registry_owner = match read_registry_owner() {
-        Ok(record) => record,
-        Err(()) => return Recovery::Unknown,
-    };
-    let local_owner = registry_owner.as_ref().and_then(read_local_owner);
-    let owner_liveness = registry_owner
-        .as_ref()
-        .map(|record| classify_owner(record, std::process::id(), process_liveness(record.pid)))
-        .unwrap_or(OwnerLiveness::Unknown);
-    let inside_root = path_inside_root(&status.registered, &root.to_string_lossy());
-    decide_recovery_with_global_owner(
-        &status.registered,
-        &status.dll,
-        &root.to_string_lossy(),
-        local_owner.as_ref(),
-        registry_owner.as_ref(),
-        owner_liveness,
-        inside_root,
+    match read_registry_owner_detail() {
+        RegistryOwnerRead::ReadError => Recovery::Unknown,
+        RegistryOwnerRead::Missing => {
+            if status.registered.is_empty() {
+                Recovery::Fresh
+            } else {
+                Recovery::Foreign
+            }
+        }
+        RegistryOwnerRead::Invalid(Some(record)) if record.pid != 0 && record.start_time != 0 => {
+            match classify_owner(&record, std::process::id(), process_liveness(record.pid)) {
+                OwnerLiveness::LiveElsewhere => Recovery::Busy,
+                OwnerLiveness::Unknown => Recovery::Unknown,
+                OwnerLiveness::SelfProcess | OwnerLiveness::Dead => Recovery::Foreign,
+            }
+        }
+        RegistryOwnerRead::Invalid(_) => Recovery::Foreign,
+        RegistryOwnerRead::Valid(record) => {
+            let local_owner = read_local_owner(&record);
+            let owner_liveness =
+                classify_owner(&record, std::process::id(), process_liveness(record.pid));
+            let inside_root = path_inside_root(&status.registered, &root.to_string_lossy());
+            decide_recovery_with_global_owner(
+                &status.registered,
+                &status.dll,
+                &root.to_string_lossy(),
+                local_owner.as_ref(),
+                Some(&record),
+                owner_liveness,
+                inside_root,
+            )
+        }
+    }
+}
+
+fn is_start_recoverable(recovery: Recovery) -> bool {
+    matches!(
+        recovery,
+        Recovery::Fresh | Recovery::Local | Recovery::StaleOwned | Recovery::Foreign
     )
+}
+
+fn can_unregister_on_stop(recovery: Recovery) -> bool {
+    matches!(recovery, Recovery::Local | Recovery::StaleOwned)
 }
 
 /// 供主机控制器区分：Unknown 时必须保留 `vcam_owned` 并拒绝注销。
@@ -718,25 +745,34 @@ pub(crate) fn recovery_error(recovery: Recovery) -> String {
     match recovery {
         Recovery::Busy => "虚拟卡正由另一台存活的主机使用；请先关闭那台主机。".into(),
         Recovery::Foreign => {
-            "虚拟采集卡已注册到其他目录；先关闭并停用已有主机，避免覆盖稳定部署。".into()
+            "虚拟采集卡已注册到其他目录；当前注册不属于本运行根，停止时不会主动注销。".into()
         }
-        Recovery::Unknown => {
-            "无法证明虚拟卡注册属于本运行根（所有权记录缺失、不可读或属主状态未知）；\
+        Recovery::Unknown => "无法确认虚拟卡注册表或原属主状态；\
              请确认没有其他主机在使用后手工清理注册。"
-                .into()
-        }
+            .into(),
         _ => "虚拟采集卡注册状态不可复用。".into(),
     }
 }
 
-/// 启动前只读检查：只在“无注册 / 可证明属于本根的本目录注册 /
-/// 可证明属于本根的已停止残留”三种情况下放行；其他目录、存活主机或
-/// 无法证明的注册一律拒绝，不静默接管。这里只是预检；register 会在
-/// 跨进程注册锁内重新判定一次。
+/// 启动前只读检查：无注册、本目录注册，以及已确认无存活属主占用的旧版/他根/
+/// 无记录残留注册均放行（注册阶段会先自动移除再重注册）；存活主机或状态未知
+/// 仍拒绝。这里只是预检；register 会在跨进程注册锁内重新判定一次。
 pub fn check_available(status: &VcamStatus) -> Result<(), String> {
-    match current_recovery(status) {
-        Recovery::Fresh | Recovery::Local | Recovery::StaleOwned => Ok(()),
-        recovery => Err(recovery_error(recovery)),
+    let recovery = current_recovery(status);
+    if is_start_recoverable(recovery) {
+        Ok(())
+    } else {
+        Err(availability_error(status, recovery))
+    }
+}
+
+/// 启动预检错误；附加注册表当前路径，避免只看到“其他目录”却无法判断冲突来源。
+fn availability_error(status: &VcamStatus, recovery: Recovery) -> String {
+    let base = recovery_error(recovery);
+    if status.registered.is_empty() {
+        base
+    } else {
+        format!("{base}（当前注册：{}）", status.registered)
     }
 }
 
@@ -853,10 +889,11 @@ fn lock_registration() -> Result<RegistrationLock, String> {
 
 /// 注册本目录 DLL，并写入产品固定 FrameMap/Motion。
 ///
-/// 崩溃重启后可复用指向本目录 DLL 的既有注册；OTA 后如注册仍指向本运行根
-/// 上一版本且原属主已退出，则先回收该残留再注册。其他目录或存活主机的注册
-/// 一律拒绝，绝不接管/注销。整个“检查 → 写记录 → regsvr → 复核”序列在
-/// 全机互斥体内完成，避免其他运行根的主机同时通过检查。
+/// 崩溃重启后可复用指向本目录 DLL 的既有注册；若当前注册指向本运行根上一版本、
+/// 其他已退出目录或缺少有效归属记录（且确认无存活宿主占用），则先自动移除该
+/// 旧注册再注册本目录 DLL。其他存活主机或状态未知的注册仍一律拒绝。整个
+/// “检查 →（移除旧注册）→ 写记录 → regsvr → 复核”序列在全机互斥体内完成，
+/// 避免其他运行根的主机同时通过检查。
 pub fn register(shm: &str) -> Result<VcamStatus, String> {
     let dll = dll_path();
     if !dll.exists() {
@@ -866,8 +903,8 @@ pub fn register(shm: &str) -> Result<VcamStatus, String> {
     let current = status();
     match current_recovery(&current) {
         Recovery::Fresh | Recovery::Local => {}
-        Recovery::StaleOwned => unregister_stale_owned()?,
-        recovery => return Err(recovery_error(recovery)),
+        Recovery::StaleOwned | Recovery::Foreign => unregister_stale_registration(&current)?,
+        recovery => return Err(availability_error(&current, recovery)),
     }
     // 先写所有权记录再注册：这样即便 regsvr/FrameMap 失败，后续清理也能
     // 证明这条同目录注册是本进程刚写的，而不是另一台主机的。
@@ -886,7 +923,8 @@ pub fn register(shm: &str) -> Result<VcamStatus, String> {
         ));
     }
     if current_recovery(&status) != Recovery::Local {
-        return Err(recovery_error(current_recovery(&status)));
+        let recovery = current_recovery(&status);
+        return Err(availability_error(&status, recovery));
     }
     Ok(status)
 }
@@ -903,29 +941,35 @@ pub fn unregister() -> Result<VcamStatus, String> {
         return Err(recovery_error(Recovery::Unknown));
     }
     if current.registered.is_empty() {
-        if let Some(owner) = read_registry_owner()
-            .map_err(|()| recovery_error(Recovery::Unknown))?
-            .filter(|owner| same_path(&owner.root, &crate::paths::root().to_string_lossy()))
-        {
-            let local_owner =
-                read_local_owner(&owner).ok_or_else(|| recovery_error(Recovery::Unknown))?;
-            let liveness = classify_owner(&owner, std::process::id(), process_liveness(owner.pid));
-            if !same_owner(&owner, &local_owner)
-                || !matches!(liveness, OwnerLiveness::SelfProcess | OwnerLiveness::Dead)
-            {
-                return Err(recovery_error(match liveness {
-                    OwnerLiveness::LiveElsewhere => Recovery::Busy,
-                    _ => Recovery::Unknown,
-                }));
+        match read_registry_owner_detail() {
+            RegistryOwnerRead::Missing => {}
+            RegistryOwnerRead::Valid(owner) => {
+                if same_path(&owner.root, &crate::paths::root().to_string_lossy()) {
+                    let local_owner = read_local_owner(&owner)
+                        .ok_or_else(|| recovery_error(Recovery::Unknown))?;
+                    let liveness =
+                        classify_owner(&owner, std::process::id(), process_liveness(owner.pid));
+                    if !same_owner(&owner, &local_owner)
+                        || !matches!(liveness, OwnerLiveness::SelfProcess | OwnerLiveness::Dead)
+                    {
+                        return Err(recovery_error(match liveness {
+                            OwnerLiveness::LiveElsewhere => Recovery::Busy,
+                            _ => Recovery::Unknown,
+                        }));
+                    }
+                    clear_registry_owner()?;
+                }
             }
-            clear_registry_owner()?;
+            RegistryOwnerRead::Invalid(_) | RegistryOwnerRead::ReadError => {
+                return Err(recovery_error(Recovery::Unknown));
+            }
         }
         clear_owner();
         return Ok(current);
     }
-    match current_recovery(&current) {
-        Recovery::Local | Recovery::StaleOwned => {}
-        recovery => return Err(recovery_error(recovery)),
+    let recovery = current_recovery(&current);
+    if !can_unregister_on_stop(recovery) {
+        return Err(recovery_error(recovery));
     }
     regsvr_unregister()?;
     let after = status();
@@ -977,25 +1021,31 @@ fn regsvr_unregister() -> Result<(), String> {
     Ok(())
 }
 
-/// 回收已证明属于本运行根、且原属主已退出的上一版本注册。
+/// 回收已确认无存活属主占用的旧版、他根或无记录残留注册。
 ///
 /// 只由 `register` 在持有注册锁时调用；不要单独加锁，否则会改变调用者的序列。
-fn unregister_stale_owned() -> Result<(), String> {
-    let recovery = current_recovery(&status());
-    if recovery != Recovery::StaleOwned {
-        return Err(recovery_error(recovery));
+fn unregister_stale_registration(current: &VcamStatus) -> Result<(), String> {
+    let recovery = current_recovery(current);
+    if !matches!(recovery, Recovery::StaleOwned | Recovery::Foreign) {
+        return Err(availability_error(current, recovery));
     }
     // DllUnregisterServer 删除共享 CLSID 键，与注册时使用的 release 无关；
-    // 用当前 DLL 执行即可，不加载/执行上一版本二进制。
+    // 用当前 DLL 执行即可，不加载/执行上一版本或已删除的二进制。
     regsvr_unregister()?;
+    clear_registry_owner()?;
     let after = status();
     if after.registration_unknown {
         return Err(recovery_error(Recovery::Unknown));
     }
     if !after.registered.is_empty() {
-        return Err("旧版本虚拟卡注册未能清除，已停止启动；请手动检查注册表。".into());
+        return Err(format!(
+            "旧版本虚拟卡注册未能清除，已停止启动；请手动检查注册表（当前注册：{}）。",
+            after.registered
+        ));
     }
-    // CLSID owner 值随服务器注册一起被删除。
+    if !matches!(read_registry_owner_detail(), RegistryOwnerRead::Missing) {
+        return Err("旧版本虚拟卡所有权记录未能清除，已停止启动；请手动检查注册表。".into());
+    }
     clear_owner();
     Ok(())
 }
@@ -1470,8 +1520,8 @@ mod tests {
                 OwnerLiveness::Dead,
                 true,
             ),
-            Recovery::Unknown,
-            "without resolving the alias, the global owner mismatch fails closed"
+            Recovery::Foreign,
+            "without resolving the alias, the global owner mismatch is not local/stale-owned"
         );
         assert_eq!(
             decide_recovery_with_global_owner_using(
@@ -1893,15 +1943,15 @@ mod tests {
             decide_recovery("", &local, None, OwnerLiveness::Unknown, true),
             Recovery::Fresh
         );
-        // 同路径但没有记录/记录不符：无法证明属于本根，保守拒绝。
+        // 同路径但没有记录/记录不符：不可直接复用，启动时可自动移除并重注册，停止时不注销。
         assert_eq!(
             decide_recovery(&local, &local, None, OwnerLiveness::Unknown, true),
-            Recovery::Unknown
+            Recovery::Foreign
         );
         let previous = root.owner("app/releases/b1/vc_vcam.dll", 1234);
         assert_eq!(
             decide_recovery(&local, &local, Some(&previous), OwnerLiveness::Dead, true),
-            Recovery::Unknown
+            Recovery::Foreign
         );
         let record = root.owner("app/releases/b2/vc_vcam.dll", 1234);
         assert_eq!(
@@ -2043,7 +2093,7 @@ mod tests {
             ),
             Recovery::Foreign
         );
-        // 损坏/缺失的本地镜像不能用来恢复全局记录。
+        // 损坏/缺失的本地镜像：不可作为本根自有恢复，但属主已死时启动可自动移除重注册。
         assert_eq!(
             decide_recovery_with_global_owner(
                 &shared,
@@ -2054,7 +2104,107 @@ mod tests {
                 OwnerLiveness::Dead,
                 false,
             ),
+            Recovery::Foreign
+        );
+    }
+
+    #[test]
+    fn start_allows_stale_or_foreign_without_live_owner_while_stop_stays_strict() {
+        for recovery in [
+            Recovery::Fresh,
+            Recovery::Local,
+            Recovery::StaleOwned,
+            Recovery::Foreign,
+        ] {
+            assert!(is_start_recoverable(recovery), "{recovery:?}");
+        }
+        for recovery in [Recovery::Busy, Recovery::Unknown] {
+            assert!(!is_start_recoverable(recovery), "{recovery:?}");
+        }
+
+        for recovery in [Recovery::Local, Recovery::StaleOwned] {
+            assert!(can_unregister_on_stop(recovery), "{recovery:?}");
+        }
+        for recovery in [
+            Recovery::Fresh,
+            Recovery::Busy,
+            Recovery::Foreign,
+            Recovery::Unknown,
+        ] {
+            assert!(!can_unregister_on_stop(recovery), "{recovery:?}");
+        }
+    }
+
+    #[test]
+    fn dead_foreign_owner_and_unowned_legacy_registration_are_recoverable_on_start() {
+        let root_a = OwnerTestRoot::new();
+        let root_b = OwnerTestRoot::new();
+        let dll_a = root_a.path("app/releases/b1/vc_vcam.dll");
+        let dll_b = root_b.path("app/releases/b2/vc_vcam.dll");
+        let owner_a = owner_at(&dll_a, &root_a.0.to_string_lossy(), 1234);
+
+        // 其他目录已退出属主的旧注册（或仅保留预约）：分类为 Foreign（启动自动移除）。
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                &dll_a,
+                &dll_b,
+                &root_b.0.to_string_lossy(),
+                None,
+                Some(&owner_a),
+                OwnerLiveness::Dead,
+                false,
+            ),
+            Recovery::Foreign
+        );
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                "",
+                &dll_b,
+                &root_b.0.to_string_lossy(),
+                None,
+                Some(&owner_a),
+                OwnerLiveness::Dead,
+                false,
+            ),
+            Recovery::Foreign
+        );
+        // 存活或存活未知仍保守拒绝。
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                "",
+                &dll_b,
+                &root_b.0.to_string_lossy(),
+                None,
+                Some(&owner_a),
+                OwnerLiveness::LiveElsewhere,
+                false,
+            ),
+            Recovery::Busy
+        );
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                &dll_a,
+                &dll_b,
+                &root_b.0.to_string_lossy(),
+                None,
+                Some(&owner_a),
+                OwnerLiveness::Unknown,
+                false,
+            ),
             Recovery::Unknown
+        );
+        // 无全局 owner 的旧版注册也分类为 Foreign（启动自动移除，停止不主动注销）。
+        assert_eq!(
+            decide_recovery_with_global_owner(
+                &dll_a,
+                &dll_b,
+                &root_b.0.to_string_lossy(),
+                None,
+                None,
+                OwnerLiveness::Unknown,
+                false,
+            ),
+            Recovery::Foreign
         );
     }
 

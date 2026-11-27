@@ -199,7 +199,7 @@ pub enum PlanStatus {
     Unknown,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VideoBudget {
     pub width: u32,
     pub height: u32,
@@ -210,7 +210,7 @@ pub struct VideoBudget {
     pub frame_bytes: u64,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NetworkBudget {
     pub status: PlanStatus,
     pub is_estimate: bool,
@@ -232,7 +232,7 @@ pub struct NetworkBudget {
     pub max_raw_fps: Option<u64>,
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Plan {
     pub video: VideoBudget,
     pub network: NetworkBudget,

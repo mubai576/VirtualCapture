@@ -56,8 +56,10 @@ pub enum Layout {
 }
 
 pub const CONFIG_FILE_NAME: &str = "vc-rust-config.json";
-pub const UPDATE_TOKEN_FILE_NAME: &str = "update-token.json";
-pub const PEER_UPDATE_TOKEN_FILE_NAME: &str = "update-peer-token.json";
+/// 旧版采集端更新令牌文件名。程序不再读取或创建；仅用于升级基线与打包排除。
+pub const LEGACY_UPDATE_TOKEN_FILE: &str = "update-token.json";
+/// 旧版主机端配对令牌文件名。程序不再读取或创建；仅用于升级基线与打包排除。
+pub const LEGACY_PEER_UPDATE_TOKEN_FILE: &str = "update-peer-token.json";
 pub const APP_DIR: &str = "app";
 pub const CURRENT_FILE_NAME: &str = "current.json";
 pub const DATA_DIR: &str = "data";
@@ -123,30 +125,6 @@ pub fn run_dir() -> PathBuf {
     match layout() {
         Layout::Managed => data_dir().join("run"),
         Layout::Legacy => root().join("run"),
-    }
-}
-
-/// 更新令牌只保护 `/update/*`。Managed 放在 `data/`，Legacy 保持根目录。
-pub fn update_token_path() -> PathBuf {
-    update_token_path_at(&root())
-}
-
-pub fn update_token_path_at(root: &Path) -> PathBuf {
-    match layout_at(root) {
-        Layout::Managed => root.join(DATA_DIR).join(UPDATE_TOKEN_FILE_NAME),
-        Layout::Legacy => root.join(UPDATE_TOKEN_FILE_NAME),
-    }
-}
-
-/// 主机保存“被采集机更新令牌”的独立文件；不写入配置、不记录日志。
-pub fn peer_update_token_path() -> PathBuf {
-    peer_update_token_path_at(&root())
-}
-
-pub fn peer_update_token_path_at(root: &Path) -> PathBuf {
-    match layout_at(root) {
-        Layout::Managed => root.join(DATA_DIR).join(PEER_UPDATE_TOKEN_FILE_NAME),
-        Layout::Legacy => root.join(PEER_UPDATE_TOKEN_FILE_NAME),
     }
 }
 

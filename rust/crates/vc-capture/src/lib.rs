@@ -34,9 +34,6 @@ pub struct Options {
     /// 在统一桌面窗口内运行采集后台（内部入口）。
     #[arg(long, hide = true)]
     desktop: bool,
-    /// 打印更新令牌文件路径与令牌后退出，用于主机一次性配对。
-    #[arg(long)]
-    print_update_token: bool,
 }
 
 impl Default for Options {
@@ -54,12 +51,11 @@ impl Options {
             list_adapters: false,
             allow_loopback_diagnostics: false,
             desktop: false,
-            print_update_token: false,
         }
     }
 
     pub fn is_diagnostic(&self) -> bool {
-        self.print_config || self.list_adapters || self.print_update_token
+        self.print_config || self.list_adapters
     }
 
     pub fn is_desktop(&self) -> bool {
@@ -85,7 +81,6 @@ impl Options {
                 "--allow-loopback-diagnostics",
             ),
             (self.desktop, "--desktop"),
-            (self.print_update_token, "--print-update-token"),
         ] {
             if enabled {
                 command.arg(flag);
@@ -116,15 +111,6 @@ async fn serve(
         );
         return Ok(());
     }
-    if cli.print_update_token {
-        let token = vc_core::update::token().map_err(anyhow::Error::msg)?;
-        println!(
-            "update token file: {}",
-            vc_core::paths::update_token_path().display()
-        );
-        println!("{token}");
-        return Ok(());
-    }
     if cli.list_adapters {
         let module = vc_core::dataplane::load().map_err(anyhow::Error::msg)?;
         let items = vc_core::adapters::enumerate(&module).map_err(anyhow::Error::msg)?;
@@ -132,10 +118,6 @@ async fn serve(
         return Ok(());
     }
 
-    // 让主机可以配对更新；令牌只写本地文件，不进入日志。
-    if let Err(error) = vc_core::update::token() {
-        eprintln!("update token unavailable: {error}");
-    }
     let config = vc_core::Config::load_root()?;
     let agent = Arc::new(Mutex::new(
         Agent::new(config).with_loopback_diagnostics(cli.allow_loopback_diagnostics),

@@ -24,6 +24,7 @@
 pub mod au;
 
 mod config;
+mod native_path;
 
 #[cfg(windows)]
 mod codec;
@@ -36,6 +37,7 @@ pub use config::{
     CodecConfig, MAX_AU_BYTES, MAX_BITRATE_BPS, MIN_AU_BYTES, MIN_BITRATE_BPS, MJPEG_UNSUPPORTED,
     PYROWAVE_IDENTITY, capabilities, pyrowave_frame_budget, validate,
 };
+pub use native_path::load_library_path;
 
 #[cfg(windows)]
 pub use codec::{Decoder, Encoder, OperationState, default_library_directory};

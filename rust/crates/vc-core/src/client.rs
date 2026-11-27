@@ -21,7 +21,6 @@ const ERROR_BODY_CHARS: usize = 512;
 pub struct PeerClient {
     base: String,
     agent: ureq::Agent,
-    update_token: Option<String>,
 }
 
 impl PeerClient {
@@ -34,29 +33,11 @@ impl PeerClient {
         Self {
             base: base.trim().trim_end_matches('/').to_string(),
             agent: config.into(),
-            update_token: None,
         }
     }
 
     pub fn base(&self) -> &str {
         &self.base
-    }
-
-    /// 更新令牌仅用于更新端点，不随健康/配置请求发送。
-    pub fn with_update_token(mut self, token: Option<String>) -> Self {
-        self.update_token = token;
-        self
-    }
-
-    fn update_authorization(&self) -> Result<String, String> {
-        let token = self
-            .update_token
-            .as_deref()
-            .ok_or("请先配对被采集机的更新令牌。")?;
-        if !crate::update::valid_token(token) {
-            return Err("更新令牌必须是64位十六进制字符。".into());
-        }
-        Ok(format!("Bearer {token}"))
     }
 
     fn request(&self, path: &str, body: Option<&Value>) -> Result<Value, String> {
@@ -74,36 +55,21 @@ impl PeerClient {
         } else {
             REQUEST_TIMEOUT
         };
-        let authorization = if path.starts_with("/update/") {
-            Some(self.update_authorization()?)
-        } else {
-            None
-        };
         let result = match body {
-            Some(body) => {
-                let mut request = self
-                    .agent
-                    .post(&url)
-                    .config()
-                    .timeout_global(Some(timeout))
-                    .build();
-                if let Some(value) = &authorization {
-                    request = request.header("Authorization", value);
-                }
-                request.send_json(body)
-            }
-            None => {
-                let mut request = self
-                    .agent
-                    .get(&url)
-                    .config()
-                    .timeout_global(Some(timeout))
-                    .build();
-                if let Some(value) = &authorization {
-                    request = request.header("Authorization", value);
-                }
-                request.call()
-            }
+            Some(body) => self
+                .agent
+                .post(&url)
+                .config()
+                .timeout_global(Some(timeout))
+                .build()
+                .send_json(body),
+            None => self
+                .agent
+                .get(&url)
+                .config()
+                .timeout_global(Some(timeout))
+                .build()
+                .call(),
         };
         let mut response = result.map_err(|error| match error {
             ureq::Error::Timeout(_) => format!(
@@ -230,11 +196,9 @@ impl PeerClient {
             return Err("更新包在读取期间发生变化，请重试。".into());
         }
         let digest = format!("{:x}", Sha256::digest(&payload));
-        let authorization = self.update_authorization()?;
         let mut response = self
             .agent
             .post(format!("{}/update/stage", self.base))
-            .header("Authorization", authorization)
             .header("X-VC-SHA256", digest)
             .header("Content-Type", "application/zip")
             .config()
@@ -423,41 +387,21 @@ mod tests {
     }
 
     #[test]
-    fn update_token_is_sent_only_to_update_routes() {
-        let token = "ab".repeat(32);
+    fn update_requests_need_no_token() {
         let (base, handle) = serve_once(http_response("200 OK", r#"{"ok":true}"#));
-        PeerClient::new(&base)
-            .with_update_token(Some(token.clone()))
-            .health()
-            .unwrap();
+        PeerClient::new(&base).health().unwrap();
+        let request = handle.join().unwrap();
         assert!(
-            !handle
-                .join()
-                .unwrap()
-                .to_ascii_lowercase()
-                .contains("authorization:")
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "{request}"
         );
         let (base, handle) = serve_once(http_response("200 OK", r#"{"ok":true}"#));
-        PeerClient::new(&base)
-            .with_update_token(Some(token.clone()))
-            .update_status()
-            .unwrap();
+        PeerClient::new(&base).update_status().unwrap();
         let request = handle.join().unwrap();
-        assert!(request.starts_with("GET /update/status "));
-        assert!(request.contains(&format!("Bearer {token}")));
-    }
-
-    #[test]
-    fn update_without_pairing_is_rejected_locally() {
-        let error = PeerClient::new("http://127.0.0.1:1")
-            .update_status()
-            .unwrap_err();
-        assert!(error.contains("配对"));
-        let error = PeerClient::new("http://127.0.0.1:1")
-            .with_update_token(Some("bad\r\nheader".into()))
-            .update_status()
-            .unwrap_err();
-        assert!(error.contains("64"));
+        assert!(
+            !request.to_ascii_lowercase().contains("authorization:"),
+            "{request}"
+        );
     }
 
     #[test]

@@ -12,19 +12,19 @@
 - 产品唯一workspace/锁为 `rust/Cargo.toml` / `rust/Cargo.lock`，构建/门禁/唯一完整包见 `docs/runbooks/build.md`。CMake仅构建固定PyroWave第三方库，旧根CMake已移除。
 - 主程序两种角色接受 `--root` / `--native-dir` 与 `VC_ROOT` / `VC_NATIVE_DIR`，CLI 优先。默认 DLL 目录为实际角色 EXE 所在目录；显式目录缺文件即失败，源码运行可指向 Rust 产物目录。
 - 主程序以 Windows GUI 子系统和原生图标构建，无需启动包装。实际 GUI 的 PID/ROOT/EXE 回执写 `run/host-*`（Managed 为 `data/run/host-*`），无令牌。采集模式附着已有父控制台，保留重定向；`vc-updater launch --root <ROOT> --role capture` 提供同步等待。
-- ROOT固定。有 `app/current.json` 时：`app/releases/<build_id>/`程序、`data/vc-rust-config.json`配置、`data/run/`证据、`updates/{staged,worker,incoming}/`与history.jsonl。无current保留扁平配置/run，首次激活只复制配置/凭据，不搬动旧证据；回滚指针恢复旧布局。
+- ROOT固定。有 `app/current.json` 时：`app/releases/<build_id>/`程序、`data/vc-rust-config.json`配置、`data/run/`证据、`updates/{staged,worker,incoming}/`与history.jsonl。无current保留扁平配置/run，首次激活只复制配置，不搬动旧证据；回滚指针恢复旧布局。
 - 不读取/迁移旧Python `vc-config.json`。Rust配置缺失才用默认；语法/版本错误明确失败，保存临时文件刷盘后原子替换。入口不自动部署/接管旧服务/注册真实虚拟卡。
 
 ## REST v2
 
-普通控制API仅用于受控直连网络；更新接口要求独立Bearer令牌。没有 `/exec`、`/files`、浏览器 `/ui`。
+控制API不设应用层鉴权，只用于受控直连网络；部署须把 5143 限制在可信网段。没有 `/exec`、`/files`、浏览器 `/ui`。
 主机通过 `implementation=virtualcapture-rust`、`api_revision=2`、`role=capture`、`ok=true` 验证身份，
 拒绝旧 Python 后台；HTTP 失败保留具体错误体。普通请求总超时5s，网卡枚举/prepare/start为40s，
 容纳有界的原生枚举10s、PowerShell元数据15s和能力探测；超时仍按会话清理。
 
 | 方法 | 路径 | 请求 / 返回 |
 |---|---|---|
-| GET | `/health` | `ok,implementation,api_revision,version,role,running,pid,root,session_id,build,layout`；pid 是提供该 HTTP 服务的进程 pid（桌面采集时即 GUI 宿主），session_id 当前恒为 null，build为active标识或null，不含更新令牌 |
+| GET | `/health` | `ok,implementation,api_revision,version,role,running,pid,root,session_id,build,layout`；pid 是提供该 HTTP 服务的进程 pid（桌面采集时即 GUI 宿主），session_id 当前恒为 null，build为active标识或null |
 | GET | `/version` | Rust crate version + implementation/api_revision；不以旧 version.json 充当 Rust 版本 |
 | GET/POST | `/config` | GET 完整 Config；POST 部分对象合并校验，失败不写，运行中409；成功 `{saved,config}` |
 | GET | `/adapters?refresh=true` | `{items:[AdapterInfo...]}`，refresh 强制重新探测；普通查询缓存10s |
@@ -61,7 +61,9 @@ PreparedSession为 `{capture,batch_packets,session_id,source_mac,adapter:Adapter
 - crop：居中1:1，源不能小于输出；stretch：整幅映射；fit：等比缩小活动范围、偶数尺寸/偏移、黑边Y0/UV128；fill：居中偶数裁切后铺满。
 - 全部为整数最近邻及整数BT.601；真相源vc-source/transform.rs与desktop/gpu.rs，GPU逐字节对照独立整数参考。UNORM解码例外不授权浮点图案生成。
 - DDA/WGC强制gpu_convert=true且只用硬件D3D11；pattern须false，是显式合成诊断。旧配置只改mode=pattern却遗留gpu_convert=true时启动明确拒绝，不静默修改。
+- GPU NV12 回读只用 `Map(READ, DO_NOT_WAIT)`，两平面共用 1s 截止时间；等待间响应同会话取消，取消的半成品不发送。超时/设备错误明确失败，不改成阻塞式 Map、CPU/WARP 或替代源。此截止时间不保证任意驱动调用/资源销毁能中断，stop/destroy 仍以 worker 自然退出并 join 为准。WGC FreeThreaded 帧池先启用同设备即时上下文的 D3D11 多线程保护。
 - fps是发送上限，不保证源/设备达到；无桌面更新不重放旧图制造FPS。帧开始发送间隔至少ceil(1e9/fps)ns，不补发追赶。所有QPC分段只在同机比较。
+- DDA 的 `source_info.capture_diagnostics` 回显本会话 `acquire_attempts/acquire_timeouts/acquired_frames/converted_frames/last_present_ticks`，区分 DXGI 没有交付帧与转换后没有发送；这些是观测计数，不把超时改判成功。WGC 当前该字段为 null。
 
 Raw预算：`P=mtu−42; B=w*h*3/2; N=ceil(B/P); last=B−(N−1)*P; wire_frame_bytes=B+N*66+max(0,18−last)`；66含以太头/VC头/FCS/preamble/IFG。`wire_bps=wire_frame_bytes*8*fps`；`usable=min(host_rx,capture_tx)*(100−headroom_pct)/100`，预留默认20%。不含VLAN/其他业务，也不是实测。
 
@@ -69,9 +71,9 @@ Raw预算：`P=mtu−42; B=w*h*3/2; N=ceil(B/P); last=B−(N−1)*P; wire_frame_
 
 ## Rust OTA v1（D27）
 
-更新端点全部要求 `Authorization: Bearer <64hex>`，普通控制请求不携带令牌。采集端首次创建
-`data/update-token.json`（legacy根目录）；仅显式`--print-update-token`可打印，health/日志不泄漏。
-主机一次配对存`update-peer-token.json`，不进普通配置/包。错误令牌401。
+更新端点不要求令牌：能连上采集端控制端口即可查询、上传和激活，主机连接后直接更新。
+不再创建 `update-token.json`/`update-peer-token.json`，也没有 `--print-update-token` 或配对输入。
+磁盘上的旧令牌文件不再读取、显示或删除，仅继续排除出升级基线和包。新旧版本混用时，旧采集端仍会拒绝无令牌请求。
 
 | 方法 | 路径 | 请求 / 返回 |
 |---|---|---|
@@ -86,7 +88,7 @@ ZIP须单一顶层目录、`package-manifest.json` product/schema/version/build_
 采集确认 Rust 身份、实际子 PID、ROOT/build 与就绪；主机通过 `--update-ready <唯一path>` 在首帧后写精确 PID/ROOT/build。统一版本就绪后补齐缺失的固定 ROOT 主程序，或原子替换清单和哈希可确认的旧图形启动器。旧角色 EXE、旧脚本及旧 ROOT 更新器不改；启动请用新主程序。失败恢复原指针并重启，失败回滚与回滚失败分开记录；暂存或 HTTP 202 不等于激活成功。
 
 主机更新入口在折叠面板，选择同一ZIP可分别暂存本机/上传采集机；应用本机更新正常退出后由helper重开。
-令牌可重新配对，更新错误必须可见；回滚只选择校验通过且保留的历史build。
+连接后即可更新，更新错误必须可见；回滚只选择校验通过且保留的历史build。
 上传预检/哈希/HTTP均在工作线程，上传总超时180s；采集端激活后主机有界确认新PID/build。
 旧0.1.0程序尚无OTA，首次进入新通道需要一次bootstrap；后续使用固定ROOT更新，不上传到旧Python `/update`。
 目录与事务设计见`docs/proposals/rust-ota-layout-20261114.md`。
@@ -100,7 +102,7 @@ ZIP须单一顶层目录、`package-manifest.json` product/schema/version/build_
 - stop/destroy仅0确认释放，1表示pending可重试；destroy其他码为状态未知，不盲重试/卸载。pending保留worker/句柄/DLL，并锁配置、OTA与虚拟卡操作；不安全对象有意留至进程退出。
 - 真实注册前由当前主程序另起 `__vcam-probe --dll <实际 DLL>`，有界地读取 `VCStreamCapabilities`；不加载 COM graph，不回退旧路径或注册表枚举。构建树的隔离 graph 验证与注册前探测是两项检查。SHM/动态格式/D12 细节见 `docs/spec/shm-v3.md` 与 `docs/runbooks/vcam.md`。
 
-开始：验证 Rust 对端 → fresh 网卡/prepare/预算 → 注册本目录虚拟卡 → 进程内 receiver → 进程内 sender → 参数回显。
+开始：验证 Rust 对端 → fresh 网卡/prepare/预算 → 只读虚拟卡归属/能力预检 → 进程内 receiver 确认真正 SHM 几何就绪 → 发布本目录虚拟卡注册 → 进程内 sender → 参数回显。receiver 失败不注册，注册失败回收已启动 receiver；已有下游 graph 的固定格式不会自动改变，变更几何须重开设备。
 虚拟卡归属由匹配 DLL 路径、HKCU CLSID 的 `VirtualCaptureOwner` 全局记录与本根的一份有效
 本地证明共同确定（schema 2：DLL/运行根/PID/进程创建时间必须一致）。镜像固定为
 `ROOT/data/run/vcam-owned.json`（current）与 `ROOT/data/run/vcam-owned.pending.json`，不随
@@ -110,9 +112,8 @@ Legacy/Managed 布局或 OTA 激活/回滚切换；查找兼容旧 `ROOT/run/vca
 只有 `NotFound` 可按缺失组件继续向上；访问错误、悬空重解析点及含 `/`、`.`、`..` 的歧义 verbatim 路径保持未证明并拒绝恢复，不退回词法相等。
 支持盘符、UNC 与合法 `\\?\Volume{GUID}\` 文件系统路径；比较时仅折叠盘符/UNC 的 verbatim 前缀，卷 GUID 保留完整命名空间，不接受任意设备命名空间。若 Windows 将卷 GUID 路径规范化为已分配盘符，必须查询盘符根对应的卷 GUID，并确认重建后的完整路径一致；查询失败或路径不同均拒绝。
 全局 owner 的 DLL/根路径必须仍是规范拼写，新记录写入 canonicalize 得到的运行根/DLL。
-共享 `--native-dir` 下 DLL 路径不代表运行根相同。其他运行根、其他存活宿主或无法确定归属/进程存活/
-注册表读取结果时均拒绝接管或注销；尚无 InprocServer32 的全局 owner 预约也不能被另一宿主当作空闲。
-缺少全局 owner 值的旧注册不自动恢复。同运行根的本进程或确认已退出属主可恢复。
+共享 `--native-dir` 下 DLL 路径不代表运行根相同。其他存活宿主（`Busy`）或无法确定注册表读取结果/属主存活状态（`Unknown`）时，启动和停止均拒绝接管或注销；尚无 InprocServer32 但存在存活属主（或存活状态未知）的全局 owner 预约同样拒绝。
+已确认无存活宿主占用的旧版、其他目录、本地证明不完整、损坏或缺少全局 owner 值的旧注册（`StaleOwned` / `Foreign`）：启动在全局 CLSID 互斥锁内先用当前 `vc_vcam.dll` 执行注销并清除旧 `VirtualCaptureOwner`、验证注册表与全局记录均已清空后重新注册本目录 DLL；停止仍只回收证明属于本根的 `Local` / `StaleOwned`，绝不主动注销其他目录或未证明归属的注册。
 所有注册/恢复/注销的检查、owner 记录写入、regsvr 与结果复核使用按 CLSID 命名的跨运行根
 Windows mutex 串行化；获取失败或超时先报错，不修改注册。持锁写入顺序：若有旧全局 owner，
 先将其匹配证明保存为 current，再写入并刷盘新 pending，提交注册表，最后将 pending 提升为 current。
@@ -131,6 +132,7 @@ session 替代时取消旧 claim，不停止新 session；缺少/非布尔 `runn
 重试本机 receiver/虚拟卡回收；含远端 claim 时走显式 Stop。对端失联只保留精确目标，不以失联当作已停止。
 NativeSlot 正常释放会 join DLL 工作线程，并读取最终 stats；停止未确认时保留会话与模块句柄，
 不 Drop 活动句柄。PyroWave ready 等待上限30秒，其他会话10秒；冷启动与每步5秒原生看门狗分别计时。
+UI 的实际发送/接收帧率只读取 `fps_actual`：运行中（`running=true`）的 `fps_actual`、`pps`、`bps` 与实时分段耗时（`pc1_seg`/`timing_ms.source`/`rseg`/`inter_arrival`）均按最近 1 秒滑动窗口计算，静态源或读包空闲超过 1 秒归零或清空为 `null`（UI 渲染 `—`），恢复流后 1 秒内回到真实速率，不冻结最后读数；停止后终态（`running=false`）保留整场会话均值与全窗耗时摘要。`fps`/`fps_limit` 是目标，缺少实测值显示未知，不以目标回填。本机会话接收错误及精确匹配的远端终结错误在回收前保留到主机错误区，正常完成/取消不造错误。`running=false` 但 `cleanup_pending=true` 时显示“待清理”及本机/远端停止未确认提示，不能显示为普通“待开始”或被预算警告掩盖；完整失败响应保留在最近活动中。
 ABI start 的输出文件预约或 worker spawn 失败只回滚本次新建的空文件，不覆盖已有证据。
 强杀/断电不保证用户态清理。
 
@@ -138,6 +140,6 @@ ABI start 的输出文件预约或 worker spawn 失败只回滚本次新建的�
 
 `scripts/verify.py`现为Rust总闸：fmt/workspace tests/全target Clippy/Release/独立Python图案和wire向量/DLL self-check，默认不采集/收发/注册。专项脚本与前提见docs/runbooks/rust.md。
 
-DLL Raw/PyroWave Loopback、私有WGC GPU窗口、Rust隔离COM、REST随机端口/独立ROOT与GUI均分项验收，互不补PASS。GUI必须真实交互且截图非空白，黑屏硬失败。旧三编码报告只代表当时版本；当前CPU MJPEG已移除。
+DLL Raw/PyroWave Loopback、私有WGC GPU窗口、Rust隔离COM、REST随机端口/独立ROOT与GUI均分项验收，互不补PASS。source DLL smoke 在真实动态窗口上新增 DDA/WGC 无限会话，各自至少发/收10帧后精确停止，stop+destroy 共用2秒绝对期限（即使最后返回0，超时仍失败），核对取消终态、DLL仍加载、全量Raw哈希与私有SHM。部分失败也保留已执行组合、请求、fixture状态与逐会话清理证据；只有明确无DXGI输出且显式允许时可记DDA BLOCKED，零帧超时仍FAIL。fixture 的 primary-monitor 定位是代理，不冒充DXGI output身份。GUI必须真实交互且截图非空白，黑屏硬失败。旧三编码报告只代表当时版本；当前CPU MJPEG已移除。
 
 旧双机自动T1–T5编排/完整取证工具已移除，Rust等价工具尚未实现；REST没有/files或receiver/report，不可声称自动完整保全双端hashlog。物理NIC/双机/长稳/画质/完整DShow与完整包/OTA仍须专项；缺测/BLOCKED/失败不算通过。历史报告不回填新结果，不自动部署或注册。

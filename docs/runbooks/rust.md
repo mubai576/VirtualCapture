@@ -49,7 +49,7 @@ updates/staged/ worker/ incoming/
 updates/history.jsonl         激活与回滚历史
 ```
 
-首次激活复制配置/配对凭据，不移动旧 run；失败可恢复原布局。统一版就绪后，固定 ROOT 补齐缺失的 `VirtualCapture.exe`，或替换经旧清单和哈希确认的旧图形启动器。旧 ROOT 更新器和旧启动脚本保留原样；迁移后从 ROOT 用新主程序，采集沿用原 `--bind` / `--port`。令牌仅通过用户明确操作配对，不进 health、普通配置或日志；开发操作不读取、显示、打包或删除现存令牌。
+首次激活复制配置，不移动旧 run；失败可恢复原布局。统一版就绪后，固定 ROOT 补齐缺失的 `VirtualCapture.exe`，或替换经旧清单和哈希确认的旧图形启动器。旧 ROOT 更新器和旧启动脚本保留原样；迁移后从 ROOT 用新主程序，采集沿用原 `--bind` / `--port`。更新不再需要配对令牌，连接后即可操作；控制端口 5143 须限制在可信网段。旧令牌文件不读取、不显示、不打包、不删除。
 
 完整Rust ZIP先stage校验，停止且无cleanup_pending才activate；helper等待旧PID退出、复核载荷，按manifest capabilities选择目标启动参数，切current并确认新ROOT/build/就绪，失败恢复旧指针重启。旧D34 unified版本没有新角色参数能力标记，回滚不传 `--start-role`/`--resume-role`；图形采集更新目标需声明 `desktop_capture`，否则在停止旧进程前拒绝。HTTP202不是成功证明。与旧Python OTA不互通；版本校验/SHA256不等于发布者签名。不要手动改staging/prev或owner证明。
 
@@ -64,7 +64,7 @@ updates/history.jsonl         激活与回滚历史
 | `raw_stream_perf.py --batch 1` | motion/640²@240/2400帧/Loopback，同机cadence/延迟与独立CPU门 |
 | `dll_stream_smoke.py --package rust/target/release` | 真实DLL同进程ABI、Raw收发/完整hash/SHM、stop/destroy |
 | `dll_stream_smoke.py --package rust/target/release --codec pyrowave` | 显式PyroWave压缩传输/解码证据，需同目录原生库 |
-| `source_dll_smoke.py --dll rust/target/release/vc_stream.dll --allow-dda-unavailable` | 私有Tk动态窗口、WGC硬件GPU/缩放/关闭；DDA无输出记BLOCKED，不换源 |
+| `source_dll_smoke.py --dll rust/target/release/vc_stream.dll --allow-dda-unavailable` | 私有Tk动态窗口、DDA/WGC硬件GPU/缩放/关闭；无限运行至少10帧后精确 stop+destroy 共用2秒期限。DDA仅确认无输出可记BLOCKED；0帧超时仍FAIL，不换源 |
 | `vcam_dll_smoke.py` | Rust隔离验证器真实加载COM DLL、SHM/重复/阻塞Stop/Disconnect七场景，不注册 |
 | `adapter_smoke.py --package rust/target/release` | CLI完整枚举与产品物理列表、非显式Loopback拒绝；不收发物理网卡 |
 | `control_smoke.py` | 随机端口/独立ROOT，REST+真实DLL Raw回环、精确停止与证据保护，不注册 |
@@ -77,8 +77,9 @@ updates/history.jsonl         激活与回滚历史
 
 ## 故障边界
 
-- pending不是释放；DLL stop/destroy未确认不得卸载，也不能改配置/OTA/注册。PyroWave每操作5秒看门狗只标粘性错误，可能挂起的对象留至进程退出。
-- 虚拟卡只允许匹配全局owner与本根精确schema2证明的恢复；其他根、其他存活宿主、旧注册无owner、路径/进程状态未知均拒绝。不要手动绕过保护。
+- pending不是释放；DLL stop/destroy未确认不得卸载，也不能改配置/OTA/注册。DDA/WGC 的 NV12 回读使用非阻塞 Map、两平面共用1秒期限并响应停止，超时为真实失败、无CPU/WARP降级；不保证任意驱动调用或 teardown 可被中断。PyroWave每操作5秒看门狗只标粘性错误，可能挂起的对象留至进程退出。
+- 开始时先只读预检归属/能力，再等 receiver 的真实 SHM 几何就绪后注册虚拟卡；接着启动远端 sender。下游已打开的 graph 不随输出尺寸自动换档；修改尺寸须停止并重开设备。只有 ready 不等于首帧或画质验收，主机深色尺寸框仍不是实时预览。
+- 虚拟卡停止只回收证明属于本根的注册；启动在全局 CLSID 锁内确认无存活宿主占用后，可自动移除旧版、其他目录、损坏或无全局 owner 的残留注册并重注册当前 DLL；其他存活宿主或注册表/进程状态未知仍拒绝。不要手动绕过保护。
 - 无DXGI输出只把DDA实采记BLOCKED；不能用WGC或pattern给DDA补PASS。GUI黑屏就是FAIL。
 - 旧双机自动矩阵工具已移除，Rust替代尚缺；门限不变。实际物理NIC/双机/长稳/画质/完整产品DShow及便携门仍须独立证据。
 - 历史本机结果在 `docs/bringup/bringup-20261119-rust-r3-local.md`；其中旧MJPEG数据仅属当时版本，不是当前支持。

@@ -113,7 +113,8 @@ impl DllDirectory {
                 resolved.display()
             );
             // SAFETY: 路径来自已验证的绝对目录；搜索标志限制依赖解析范围。
-            let library = unsafe { Library::load_with_flags(&resolved, SEARCH_FLAGS) }
+            let load_path = crate::load_library_path(&resolved);
+            let library = unsafe { Library::load_with_flags(load_path.as_ref(), SEARCH_FLAGS) }
                 .with_context(|| format!("加载 {label} 失败：{}", resolved.display()))?;
             return Ok(library);
         }

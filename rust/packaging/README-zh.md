@@ -33,13 +33,13 @@ data/vc-rust-config.json / data/run/
 updates/staged/ worker/ incoming/ history.jsonl
 ```
 
-首次激活复制旧扁平配置/配对凭据，不移动旧 run 或覆盖证据。新版本就绪后补齐缺失的固定入口，或替换清单与哈希可确认的旧版 `VirtualCapture.exe` 启动器。不要在运行时移动程序目录。
+首次激活复制旧扁平配置，不移动旧 run 或覆盖证据。新版本就绪后补齐缺失的固定入口，或替换清单与哈希可确认的旧版 `VirtualCapture.exe` 启动器。不要在运行时移动程序目录。
 
 ## 更新
 
-主机“应用更新”面板用于配对和上传完整Rust ZIP；配对凭据只保存在独立令牌文件，不进入普通配置。stage校验不切版本；采集/待清理时禁止激活。
+主机“应用更新”面板在连接后可直接上传完整Rust ZIP；不再需要配对令牌，控制端口须限制在可信网段。stage校验不切版本；采集/待清理时禁止激活。
 
-应用更新后helper等旧进程退出、复核载荷、切current并确认新版本就绪；失败尝试恢复旧版本，结果记updates/history.jsonl。HTTP202不等于成功。仅保留且验证有效的build可回滚；不兼容旧Python更新端点。不要把令牌、配置或run证据放进包。
+应用更新后helper等旧进程退出、复核载荷、切current并确认新版本就绪；失败尝试恢复旧版本，结果记updates/history.jsonl。HTTP202不等于成功。仅保留且验证有效的build可回滚；不兼容旧Python更新端点。不要把配置、旧令牌或run证据放进包。
 
 ## 载荷与校验
 

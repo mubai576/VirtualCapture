@@ -335,7 +335,7 @@ pub fn random_hex(bytes: usize) -> String {
 }
 
 fn weak_random_hex(bytes: usize) -> String {
-    // 仅在系统 CSPRNG 不可用时兜底；令牌仍绑定短生命周期与本地文件。
+    // 仅在系统 CSPRNG 不可用时兜底；只用于暂存目录/文件的临时名。
     let mut hasher = Sha256::new();
     hasher.update(
         SystemTime::now()
@@ -406,121 +406,6 @@ fn validate_relative(name: &str) -> Result<String, String> {
         }
     }
     Ok(name.to_string())
-}
-
-// ---------------------------------------------------------------- 令牌与配对
-
-#[derive(Serialize, Deserialize)]
-struct TokenFile {
-    schema: u32,
-    token: String,
-    created_utc: String,
-}
-
-const TOKEN_FILE_MAX_BYTES: u64 = 4096;
-
-/// 配对令牌统一格式：64 位十六进制（32 字节随机数的十六进制表示）。
-pub fn valid_token(token: &str) -> bool {
-    token.len() == 64 && token.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-fn read_token_file(path: &Path) -> Option<String> {
-    let file = File::open(path).ok()?;
-    let mut text = String::new();
-    file.take(TOKEN_FILE_MAX_BYTES)
-        .read_to_string(&mut text)
-        .ok()?;
-    let value: TokenFile = serde_json::from_str(&text).ok()?;
-    (value.schema == 1 && valid_token(&value.token)).then_some(value.token)
-}
-
-fn create_token_file(path: &Path) -> Result<String, String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|e| format!("无法创建令牌目录 {}：{e}", parent.display()))?;
-    }
-    let token = random_hex(32);
-    let body = serde_json::to_vec(&TokenFile {
-        schema: 1,
-        token: token.clone(),
-        created_utc: now_utc(),
-    })
-    .map_err(|e| e.to_string())?;
-    match OpenOptions::new().write(true).create_new(true).open(path) {
-        Ok(mut file) => {
-            file.write_all(&body).map_err(|e| e.to_string())?;
-            file.sync_all().map_err(|e| e.to_string())?;
-            Ok(token)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => read_token_file(path)
-            .ok_or_else(|| "令牌文件存在但无法解析；请检查后删除再生成。".into()),
-        Err(e) => error(format!("无法创建更新令牌 {}：{e}", path.display())),
-    }
-}
-
-pub fn token_at(root: &Path) -> Result<String, String> {
-    let path = paths::update_token_path_at(root);
-    if let Some(token) = read_token_file(&path) {
-        return Ok(token);
-    }
-    create_token_file(&path)
-}
-
-/// 当前 ROOT 的更新令牌；不存在则创建。绝不写入日志或状态响应。
-pub fn token() -> Result<String, String> {
-    token_at(&paths::root())
-}
-
-pub fn peek_token_at(root: &Path) -> Option<String> {
-    read_token_file(&paths::update_token_path_at(root))
-}
-
-pub fn peek_token() -> Option<String> {
-    peek_token_at(&paths::root())
-}
-
-/// 常量时间比较，避免按字节短路泄漏令牌长度/前缀。
-pub fn token_matches(expected: &str, supplied: &str) -> bool {
-    let (a, b) = (expected.as_bytes(), supplied.as_bytes());
-    if a.len() != b.len() || a.is_empty() {
-        return false;
-    }
-    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
-pub fn load_peer_token_at(root: &Path) -> Option<String> {
-    read_token_file(&paths::peer_update_token_path_at(root))
-}
-
-pub fn load_peer_token() -> Option<String> {
-    load_peer_token_at(&paths::root())
-}
-
-pub fn save_peer_token_at(root: &Path, token: &str) -> Result<(), String> {
-    if !valid_token(token) {
-        return error("更新令牌格式无效：需要 64 位十六进制字符串。");
-    }
-    let path = paths::peer_update_token_path_at(root);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    let body = serde_json::to_vec(&TokenFile {
-        schema: 1,
-        token: token.to_string(),
-        created_utc: now_utc(),
-    })
-    .map_err(|e| e.to_string())?;
-    let temp = path.with_extension("json.tmp");
-    {
-        let mut file = File::create(&temp).map_err(|e| e.to_string())?;
-        file.write_all(&body).map_err(|e| e.to_string())?;
-        file.sync_all().map_err(|e| e.to_string())?;
-    }
-    fs::rename(&temp, &path).map_err(|e| e.to_string())
-}
-
-pub fn save_peer_token(token: &str) -> Result<(), String> {
-    save_peer_token_at(&paths::root(), token)
 }
 
 /// 主机首个窗口渲染后写更新就绪回执；`create_new` 保证不会被旧文件冒充。
@@ -1153,7 +1038,6 @@ pub fn status_at(root: &Path) -> Result<Value, String> {
         "active": read_pointer_at(root),
         "staged": newest_staged_at(root),
         "history": read_history_at(root, 5),
-        "token_present": paths::update_token_path_at(root).is_file(),
     }))
 }
 
@@ -1408,8 +1292,8 @@ fn write_legacy_baseline(
         paths::DATA_DIR,
         paths::UPDATES_DIR,
         "run",
-        paths::UPDATE_TOKEN_FILE_NAME,
-        paths::PEER_UPDATE_TOKEN_FILE_NAME,
+        paths::LEGACY_UPDATE_TOKEN_FILE,
+        paths::LEGACY_PEER_UPDATE_TOKEN_FILE,
     ];
     let mut entries = Vec::new();
     let reader = fs::read_dir(root).map_err(|e| format!("读取 {} 失败：{e}", root.display()))?;
@@ -1913,29 +1797,6 @@ fn restart_previous(job: &ActivationJob, root: &Path) -> Result<(), String> {
     }
 }
 
-/// 进入 Managed 布局时把旧扁平令牌复制到 `data/`，保持主机配对不失效。
-fn migrate_credentials(root: &Path) -> Result<(), String> {
-    if paths::layout_at(root) != paths::Layout::Managed {
-        return Ok(());
-    }
-    let data = root.join(paths::DATA_DIR);
-    for (legacy_name, name) in [
-        (paths::UPDATE_TOKEN_FILE_NAME, paths::UPDATE_TOKEN_FILE_NAME),
-        (
-            paths::PEER_UPDATE_TOKEN_FILE_NAME,
-            paths::PEER_UPDATE_TOKEN_FILE_NAME,
-        ),
-    ] {
-        let legacy = root.join(legacy_name);
-        let managed = data.join(name);
-        if legacy.is_file() && !managed.exists() {
-            fs::create_dir_all(&data).map_err(|e| e.to_string())?;
-            fs::copy(&legacy, &managed).map_err(|e| format!("无法迁移 {legacy_name}：{e}"))?;
-        }
-    }
-    Ok(())
-}
-
 /// 激活失败后的统一回滚：恢复原指针并重启旧版本；任一失败以 code 6 退出并记入历史。
 fn rollback_after_failure(
     job: &ActivationJob,
@@ -2054,19 +1915,16 @@ pub fn execute_activation(job: &ActivationJob) -> Result<(), ActivationError> {
             format!("切换版本指针失败：{e}"),
         ));
     }
-    // 指针已切到 Managed 后、启动新进程前，把旧扁平配置/令牌搬进 `data/`；
-    // 否则新进程会读到默认配置并生成新令牌，破坏主机配对。
-    let migration = paths::migrate_legacy_config(&root)
-        .map_err(|e| e.to_string())
-        .and_then(|_| migrate_credentials(&root));
-    if let Err(e) = migration {
+    // 指针已切到 Managed 后、启动新进程前，把旧扁平配置搬进 `data/`，
+    // 否则新进程会读到默认配置。
+    if let Err(e) = paths::migrate_legacy_config(&root) {
         return Err(rollback_after_failure(
             job,
             &root,
             previous_bytes.as_deref(),
             &meta.version,
             4,
-            format!("迁移本地配置/令牌失败：{e}"),
+            format!("迁移本地配置失败：{e}"),
         ));
     }
     let ready = job.ready_path.as_ref().map(PathBuf::from);
@@ -2311,14 +2169,6 @@ mod tests {
     }
 
     #[test]
-    fn token_comparison_rejects_prefixes() {
-        let token = "a".repeat(64);
-        assert!(token_matches(&token, &token));
-        assert!(!token_matches(&token, &token[..63]));
-        assert!(!token_matches(&token, ""));
-    }
-
-    #[test]
     fn iso_time_is_well_formed() {
         assert_eq!(iso8601(0), "1970-01-01T00:00:00Z");
         assert_eq!(iso8601(1_700_000_000), "2023-11-14T22:13:20Z");
@@ -2355,37 +2205,6 @@ mod tests {
         ));
         fs::create_dir_all(&dir).unwrap();
         dir
-    }
-
-    #[test]
-    fn tokens_are_strictly_64_hex() {
-        assert!(valid_token(&"a".repeat(64)));
-        assert!(!valid_token(&"a".repeat(63)));
-        assert!(!valid_token(&"g".repeat(64)));
-        assert!(!valid_token(""));
-    }
-
-    #[test]
-    fn token_file_read_stops_at_limit() {
-        let dir = temp_dir("token");
-        let path = dir.join("update-token.json");
-        fs::write(
-            &path,
-            format!(
-                r#"{{"schema":1,"token":"{}","created_utc":"x"}}"#,
-                "a".repeat(5_000)
-            ),
-        )
-        .unwrap();
-        assert!(read_token_file(&path).is_none());
-        let expected = "a".repeat(64);
-        fs::write(
-            &path,
-            format!(r#"{{"schema":1,"token":"{expected}","created_utc":"x"}}"#),
-        )
-        .unwrap();
-        assert_eq!(read_token_file(&path), Some(expected));
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

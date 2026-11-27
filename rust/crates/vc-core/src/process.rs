@@ -131,7 +131,10 @@ impl NativeSlot {
 
     pub fn running(&mut self) -> bool {
         if self.cleanup_pending {
-            return true;
+            self.retry_completed_cleanup();
+            if self.cleanup_pending {
+                return true;
+            }
         }
         let status = match self.session.as_ref() {
             Some(session) => session.stats(),
@@ -224,7 +227,35 @@ impl NativeSlot {
         }
     }
 
+    /// 仅当 DLL 明确报告 worker 已结束时尝试 join/reap；不在此路径发停止信号。
+    /// ABI 状态查询失败或仍运行时保留原句柄与 fail-closed 门禁。
+    fn retry_completed_cleanup(&mut self) {
+        if !self.cleanup_pending {
+            return;
+        }
+        if self.session.is_none() {
+            self.cleanup_pending = false;
+            return;
+        }
+        let terminal = match self.session.as_ref().map(StreamSession::stats) {
+            Some(Ok(status)) => {
+                if let Some(map) = status.as_object() {
+                    self.record_status(map);
+                }
+                !status_running(&status)
+            }
+            _ => false,
+        };
+        if !terminal {
+            return;
+        }
+        let _ = self.stop_inner(Duration::ZERO, false, "已回收此前结束的数据面会话");
+    }
+
     fn stop_previous(&mut self) -> Result<(), String> {
+        if self.cleanup_pending {
+            self.retry_completed_cleanup();
+        }
         if self.session.is_none() {
             self.cleanup_pending = false;
             return Ok(());
@@ -316,6 +347,15 @@ impl NativeSlot {
 
     /// 请求停止。只有 `Ok(Stopped)` 才释放句柄；Pending/Err 都保留以便重试。
     pub fn stop(&mut self) -> Result<StopOutcome, String> {
+        self.stop_inner(STOP_GRACE, true, "数据面会话已停止并完成回收")
+    }
+
+    fn stop_inner(
+        &mut self,
+        grace: Duration,
+        log_request: bool,
+        stopped_message: &str,
+    ) -> Result<StopOutcome, String> {
         let Some(mut session) = self.session.take() else {
             self.cleanup_pending = false;
             self.started_at = None;
@@ -326,10 +366,12 @@ impl NativeSlot {
         if let Ok(Value::Object(status)) = session.stats() {
             self.record_status(&status);
         }
-        self.log_line("请求停止数据面会话");
+        if log_request {
+            self.log_line("请求停止数据面会话");
+        }
         let mut outcome = session.stop();
-        if matches!(outcome, Ok(false)) {
-            let deadline = Instant::now() + STOP_GRACE;
+        if matches!(outcome, Ok(false)) && !grace.is_zero() {
+            let deadline = Instant::now() + grace;
             while Instant::now() < deadline {
                 std::thread::sleep(READY_POLL);
                 outcome = session.stop();
@@ -340,13 +382,13 @@ impl NativeSlot {
         }
         match outcome {
             Ok(true) => {
-                self.log_line("数据面会话已停止并完成回收");
                 // 工作线程已 join，句柄仍有效：补抓一次终态，让 last_stats/
                 // last_exit/last_error 与落盘 stats 文件一致，而不是停在停止前的
                 // 中间状态。
                 if let Ok(Value::Object(status)) = session.stats() {
                     self.record_status(&status);
                 }
+                self.log_line(stopped_message);
                 self.cleanup_pending = false;
                 self.started_at = None;
                 if self.last_exit.is_none() {
@@ -356,13 +398,19 @@ impl NativeSlot {
                 Ok(StopOutcome::Stopped)
             }
             Ok(false) => {
-                self.log_line("停止未完成：保留会话句柄等待重试");
+                if log_request {
+                    self.log_line("停止未完成：保留会话句柄等待重试");
+                }
                 self.session = Some(session);
                 self.cleanup_pending = true;
                 Ok(StopOutcome::Pending)
             }
             Err(error) => {
-                self.log_line(&format!("停止失败：保留会话句柄等待重试：{error}"));
+                if log_request {
+                    self.log_line(&format!("停止失败：保留会话句柄等待重试：{error}"));
+                } else {
+                    self.log_line(&format!("回收已结束的数据面会话失败：{error}"));
+                }
                 self.last_error = Some(error.clone());
                 self.session = Some(session);
                 self.cleanup_pending = true;
@@ -373,6 +421,9 @@ impl NativeSlot {
 
     /// DLL 状态 + 控制面字段。会话停止后继续返回最后一次状态，便于 UI 展示。
     pub fn stats(&mut self) -> Value {
+        if self.cleanup_pending {
+            self.retry_completed_cleanup();
+        }
         let status = self.session.as_ref().map(StreamSession::stats);
         let mut query_error: Option<String> = None;
         let mut map = self.last_stats.clone();
@@ -1353,5 +1404,26 @@ mod tests {
         let mut healthy = object(json!({"running": true}));
         attach_error(&mut healthy, None, None);
         assert!(healthy.get("error").is_none());
+    }
+
+    #[test]
+    fn retry_completed_cleanup_clears_stale_pending_without_session_and_nonblocking_stop_releases_empty_slot()
+     {
+        let mut slot = NativeSlot::new(Kind::Sender);
+        slot.cleanup_pending = true;
+        assert!(!slot.running());
+        assert!(!slot.cleanup_pending());
+
+        let mut empty = NativeSlot::new(Kind::Receiver);
+        empty.cleanup_pending = true;
+        let started = Instant::now();
+        assert_eq!(
+            empty
+                .stop_inner(Duration::ZERO, false, "已回收此前结束的数据面会话")
+                .unwrap(),
+            StopOutcome::Stopped
+        );
+        assert!(!empty.cleanup_pending());
+        assert!(started.elapsed() < Duration::from_millis(50));
     }
 }

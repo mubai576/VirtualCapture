@@ -7114,6 +7114,7 @@ dependencies = [
  "serde_json",
  "vc-capture",
  "vc-core",
+ "vc-media",
  "windows-sys 0.61.2",
 ]
 

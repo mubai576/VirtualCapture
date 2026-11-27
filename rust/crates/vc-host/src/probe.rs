@@ -21,7 +21,8 @@ pub(crate) fn run(dll: &Path) -> anyhow::Result<()> {
     }
 
     let dll = std::fs::canonicalize(dll)?;
-    let wide: Vec<_> = dll.as_os_str().encode_wide().chain(Some(0)).collect();
+    let load_path = vc_media::load_library_path(&dll);
+    let wide: Vec<_> = load_path.as_os_str().encode_wide().chain(Some(0)).collect();
     // 安全：传入绝对路径的 NUL 结尾 UTF-16 缓冲区。不搜索当前工作目录。
     let handle = unsafe {
         LoadLibraryExW(

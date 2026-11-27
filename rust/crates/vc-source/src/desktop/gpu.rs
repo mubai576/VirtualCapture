@@ -8,13 +8,16 @@
 //! 任何初始化/编译/Map 失败都返回错误；调用方不得改走 CPU。
 
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_ENABLE_STRICTNESS, D3DCompile};
 use windows::Win32::Graphics::Direct3D::{D3D_SRV_DIMENSION_TEXTURE2D, ID3DBlob, ID3DInclude};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC, D3D11_BUFFER_UAV,
-    D3D11_CPU_ACCESS_READ, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
+    D3D11_CPU_ACCESS_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, D3D11_MAP_READ, D3D11_MAPPED_SUBRESOURCE,
     D3D11_RESOURCE_MISC_BUFFER_STRUCTURED, D3D11_SHADER_RESOURCE_VIEW_DESC,
     D3D11_SHADER_RESOURCE_VIEW_DESC_0, D3D11_TEX2D_SRV, D3D11_UAV_DIMENSION_BUFFER,
     D3D11_UNORDERED_ACCESS_VIEW_DESC, D3D11_UNORDERED_ACCESS_VIEW_DESC_0, D3D11_USAGE_DEFAULT,
@@ -22,17 +25,21 @@ use windows::Win32::Graphics::Direct3D11::{
     ID3D11DeviceContext, ID3D11ShaderResourceView, ID3D11Texture2D, ID3D11UnorderedAccessView,
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_UNKNOWN};
-use windows::core::PCSTR;
+use windows::Win32::Graphics::Dxgi::DXGI_ERROR_WAS_STILL_DRAWING;
+use windows::Win32::System::Threading::{
+    CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, SetWaitableTimer,
+    TIMER_ALL_ACCESS, WaitForSingleObject,
+};
+use windows::core::{PCSTR, PCWSTR};
 
 use crate::transform::Transform;
 
-/// 与本模块整数参考公式对应的计算着色器。
+/// 与本模块整数参考公式对应的计算着色器；Y/UV 合并写入同一 NV12 缓冲区。
 const HLSL: &str = r#"
 Texture2D<float4> g_src : register(t0);
-RWStructuredBuffer<uint> g_y : register(u0);
-RWStructuredBuffer<uint> g_uv : register(u1);
+RWStructuredBuffer<uint> g_nv12 : register(u0);
 cbuffer CC : register(b0) {
-  uint ox,oy,rw,rh; uint dx,dy,dw,dh; uint width,height,pad0,pad1;
+  uint ox,oy,rw,rh; uint dx,dy,dw,dh; uint width,height,y_u32_offset,pad1;
 };
 int C8(int v){ return clamp(v,0,255); }
 int3 RGB(uint x,uint y){
@@ -51,7 +58,7 @@ void CSY(uint3 tid : SV_DispatchThreadID){
     int3 c=RGB(pos%width,pos/width);
     packed |= uint((77*c.x+150*c.y+29*c.z)>>8)<<(k*8);
   }
-  g_y[index]=packed;
+  g_nv12[index]=packed;
 }
 [numthreads(64,1,1)]
 void CSU(uint3 tid : SV_DispatchThreadID){
@@ -66,7 +73,7 @@ void CSU(uint3 tid : SV_DispatchThreadID){
     uint v=uint(C8(((127*c.x-106*c.y-21*c.z)>>8)+128));
     packed |= u<<(k*16); packed |= v<<(k*16+8);
   }
-  g_uv[index]=packed;
+  g_nv12[y_u32_offset+index]=packed;
 }
 "#;
 
@@ -74,19 +81,22 @@ const THREADS_PER_GROUP: u64 = 64;
 /// DXGI/D3D11 `Dispatch` 的 X 上限（线程组数）。HLSL 用
 /// `tid.y * (65535*64)` 作为跨行偏移，与此对应。
 const MAX_GROUPS_X: u64 = 65_535;
+/// 等待驱动完成已提交的回读；到期显式失败，不进入阻塞式 Map 或换用 CPU。
+const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
+/// 先短时自旋（不触发 syscall），再切到私有高分辨率 waitable timer，避免
+/// `thread::sleep(1ms)` 在默认 15.6 ms 时钟粒度下放大延迟。
+const READBACK_FAST_POLL: Duration = Duration::from_micros(150);
+const READBACK_TIMER_WAIT_NS: u64 = 250_000;
 
-/// 可复用的 GPU 转换器。持有 shader、UAV 与 CPU 回读 staging buffer。
+/// 可复用的 GPU 转换器。持有 shader、合并后的 NV12 UAV 与单份 CPU 回读 staging buffer。
 pub(crate) struct GpuConverter {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
     cs_y: ID3D11ComputeShader,
     cs_u: ID3D11ComputeShader,
-    y_buf: ID3D11Buffer,
-    uv_buf: ID3D11Buffer,
-    y_staging: ID3D11Buffer,
-    uv_staging: ID3D11Buffer,
-    y_uav: ID3D11UnorderedAccessView,
-    uv_uav: ID3D11UnorderedAccessView,
+    nv12_buf: ID3D11Buffer,
+    nv12_staging: ID3D11Buffer,
+    nv12_uav: ID3D11UnorderedAccessView,
     cbuf: ID3D11Buffer,
     y_n: u32,
     uv_n: u32,
@@ -94,6 +104,7 @@ pub(crate) struct GpuConverter {
     uv_bytes: usize,
     width: u32,
     height: u32,
+    last_transform: Option<Transform>,
 }
 
 impl GpuConverter {
@@ -111,41 +122,30 @@ impl GpuConverter {
         }
         let y_bytes = width as usize * height as usize;
         let uv_bytes = y_bytes / 2;
-        let y_n = y_bytes.div_ceil(4) as u32;
+        // 宽高均为偶数，y_bytes 恒为 4 的倍数；合并写入同一 NV12 缓冲时 UV 起始 uint 精确对齐。
+        let y_n = (y_bytes / 4) as u32;
         let uv_n = uv_bytes.div_ceil(4) as u32;
+        let total_n = y_n
+            .checked_add(uv_n)
+            .context("gpu-convert buffer element count overflow")?;
 
         let cs_y = compile_shader(device, "CSY")?;
         let cs_u = compile_shader(device, "CSU")?;
-        let y_buf = create_structured_buffer(
+        let nv12_buf = create_structured_buffer(
             device,
-            y_n,
+            total_n,
             D3D11_USAGE_DEFAULT,
             D3D11_BIND_UNORDERED_ACCESS.0 as u32,
             0,
         )?;
-        let uv_buf = create_structured_buffer(
+        let nv12_staging = create_structured_buffer(
             device,
-            uv_n,
-            D3D11_USAGE_DEFAULT,
-            D3D11_BIND_UNORDERED_ACCESS.0 as u32,
-            0,
-        )?;
-        let y_staging = create_structured_buffer(
-            device,
-            y_n,
+            total_n,
             D3D11_USAGE_STAGING,
             0,
             D3D11_CPU_ACCESS_READ.0 as u32,
         )?;
-        let uv_staging = create_structured_buffer(
-            device,
-            uv_n,
-            D3D11_USAGE_STAGING,
-            0,
-            D3D11_CPU_ACCESS_READ.0 as u32,
-        )?;
-        let y_uav = create_uav(device, &y_buf, y_n)?;
-        let uv_uav = create_uav(device, &uv_buf, uv_n)?;
+        let nv12_uav = create_uav(device, &nv12_buf, total_n)?;
         let cbuf = create_constant_buffer(device)?;
 
         Ok(Self {
@@ -153,12 +153,9 @@ impl GpuConverter {
             context: context.clone(),
             cs_y,
             cs_u,
-            y_buf,
-            uv_buf,
-            y_staging,
-            uv_staging,
-            y_uav,
-            uv_uav,
+            nv12_buf,
+            nv12_staging,
+            nv12_uav,
             cbuf,
             y_n,
             uv_n,
@@ -166,46 +163,55 @@ impl GpuConverter {
             uv_bytes,
             width,
             height,
+            last_transform: None,
         })
     }
 
     /// 对 `source`（整张 BGRA 纹理）执行与 CPU 相同的几何采样并回读 NV12。
     pub(crate) fn convert(
-        &self,
+        &mut self,
         source: &ID3D11Texture2D,
         transform: &Transform,
         destination: &mut [u8],
-    ) -> Result<()> {
-        if destination.len() < self.y_bytes + self.uv_bytes {
+        stop: Option<&AtomicBool>,
+    ) -> Result<bool> {
+        if cancelled(stop) {
+            return Ok(false);
+        }
+        let total_bytes = self.y_bytes + self.uv_bytes;
+        if destination.len() < total_bytes {
             bail!(
                 "gpu-convert destination too small: need {}, got {}",
-                self.y_bytes + self.uv_bytes,
+                total_bytes,
                 destination.len()
             );
         }
-        let constants = [
-            transform.ox,
-            transform.oy,
-            transform.rw,
-            transform.rh,
-            transform.dx,
-            transform.dy,
-            transform.dw,
-            transform.dh,
-            self.width,
-            self.height,
-            0,
-            0,
-        ];
-        unsafe {
-            self.context.UpdateSubresource(
-                &self.cbuf,
+        if self.last_transform.as_ref() != Some(transform) {
+            let constants = [
+                transform.ox,
+                transform.oy,
+                transform.rw,
+                transform.rh,
+                transform.dx,
+                transform.dy,
+                transform.dw,
+                transform.dh,
+                self.width,
+                self.height,
+                self.y_n,
                 0,
-                None,
-                constants.as_ptr() as *const c_void,
-                0,
-                0,
-            );
+            ];
+            unsafe {
+                self.context.UpdateSubresource(
+                    &self.cbuf,
+                    0,
+                    None,
+                    constants.as_ptr() as *const c_void,
+                    0,
+                    0,
+                );
+            }
+            self.last_transform = Some(*transform);
         }
 
         let srv_desc = D3D11_SHADER_RESOURCE_VIEW_DESC {
@@ -226,14 +232,14 @@ impl GpuConverter {
         .context("gpu-convert CreateShaderResourceView failed")?;
         let srv = srv.context("gpu-convert CreateShaderResourceView returned null")?;
 
-        let srvs = [Some(srv.clone())];
-        let uavs = [Some(self.y_uav.clone()), Some(self.uv_uav.clone())];
+        let srvs = [Some(srv)];
+        let uavs = [Some(self.nv12_uav.clone())];
         let cbufs = [Some(self.cbuf.clone())];
         unsafe {
             self.context.CSSetConstantBuffers(0, Some(&cbufs));
             self.context.CSSetShaderResources(0, Some(&srvs));
             self.context
-                .CSSetUnorderedAccessViews(0, 2, Some(uavs.as_ptr()), None);
+                .CSSetUnorderedAccessViews(0, 1, Some(uavs.as_ptr()), None);
 
             self.context.CSSetShader(&self.cs_y, None);
             let (gx, gy) = dispatch_grid(self.y_n);
@@ -243,25 +249,29 @@ impl GpuConverter {
             let (gx, gy) = dispatch_grid(self.uv_n);
             self.context.Dispatch(gx, gy, 1);
 
-            let no_uavs: [Option<ID3D11UnorderedAccessView>; 2] = [None, None];
+            let no_uavs: [Option<ID3D11UnorderedAccessView>; 1] = [None];
             let no_srvs: [Option<ID3D11ShaderResourceView>; 1] = [None];
             let no_cbufs: [Option<ID3D11Buffer>; 1] = [None];
             self.context
-                .CSSetUnorderedAccessViews(0, 2, Some(no_uavs.as_ptr()), None);
+                .CSSetUnorderedAccessViews(0, 1, Some(no_uavs.as_ptr()), None);
             self.context.CSSetShaderResources(0, Some(&no_srvs));
             self.context.CSSetConstantBuffers(0, Some(&no_cbufs));
             self.context.CSSetShader(None::<&ID3D11ComputeShader>, None);
 
-            self.context.CopyResource(&self.y_staging, &self.y_buf);
-            self.context.CopyResource(&self.uv_staging, &self.uv_buf);
+            self.context
+                .CopyResource(&self.nv12_staging, &self.nv12_buf);
+            // 非阻塞 Map 不负责等待/提交驱动批次，先提交再按同一截止时间轮询。
+            self.context.Flush();
         }
 
-        let (y_dst, uv_dst) =
-            destination[..self.y_bytes + self.uv_bytes].split_at_mut(self.y_bytes);
-        map_copy(&self.context, &self.y_staging, y_dst)?;
-        map_copy(&self.context, &self.uv_staging, uv_dst)?;
-        let _ = srv;
-        Ok(())
+        let deadline = Instant::now() + READBACK_TIMEOUT;
+        map_copy(
+            &self.context,
+            &self.nv12_staging,
+            &mut destination[..total_bytes],
+            stop,
+            deadline,
+        )
     }
 }
 
@@ -389,14 +399,104 @@ fn dispatch_grid(elements: u32) -> (u32, u32) {
     (x, y)
 }
 
+fn cancelled(stop: Option<&AtomicBool>) -> bool {
+    stop.is_some_and(|stop| stop.load(Ordering::Acquire))
+}
+
+struct ReadbackTimer(HANDLE);
+
+impl ReadbackTimer {
+    fn new() -> Self {
+        let handle = unsafe {
+            CreateWaitableTimerExW(
+                None,
+                PCWSTR::null(),
+                CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                TIMER_ALL_ACCESS.0,
+            )
+        }
+        .unwrap_or_default();
+        Self(handle)
+    }
+
+    fn wait(&self, ns: u64) {
+        let due = -(ns.div_ceil(100) as i64);
+        if !self.0.is_invalid()
+            && unsafe { SetWaitableTimer(self.0, &due, 0, None, None, false).is_ok() }
+            && unsafe { WaitForSingleObject(self.0, 20) == WAIT_OBJECT_0 }
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+impl Drop for ReadbackTimer {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            let _ = unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+fn wait_readback_step() {
+    thread_local! {
+        static TIMER: ReadbackTimer = ReadbackTimer::new();
+    }
+    TIMER.with(|timer| timer.wait(READBACK_TIMER_WAIT_NS));
+}
+
+/// 只轮询非阻塞操作；取消不展开任何在途原生调用，也不宣称已释放 GPU/DLL。
+fn wait_readback(
+    stop: Option<&AtomicBool>,
+    deadline: Instant,
+    mut try_map: impl FnMut() -> Result<bool>,
+) -> Result<bool> {
+    let started = Instant::now();
+    loop {
+        if cancelled(stop) {
+            return Ok(false);
+        }
+        if Instant::now() >= deadline {
+            bail!("gpu-convert readback timed out (DO_NOT_WAIT); no CPU/WARP fallback");
+        }
+        if try_map()? {
+            return Ok(true);
+        }
+        if started.elapsed() < READBACK_FAST_POLL {
+            std::hint::spin_loop();
+        } else {
+            wait_readback_step();
+        }
+    }
+}
+
 fn map_copy(
     context: &ID3D11DeviceContext,
     resource: &ID3D11Buffer,
     destination: &mut [u8],
-) -> Result<()> {
+    stop: Option<&AtomicBool>,
+    deadline: Instant,
+) -> Result<bool> {
     let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-    unsafe { context.Map(resource, 0, D3D11_MAP_READ, 0, Some(&mut mapped)) }
-        .context("gpu-convert Map(readback) failed")?;
+    let ready = wait_readback(stop, deadline, || {
+        match unsafe {
+            context.Map(
+                resource,
+                0,
+                D3D11_MAP_READ,
+                D3D11_MAP_FLAG_DO_NOT_WAIT.0 as u32,
+                Some(&mut mapped),
+            )
+        } {
+            Ok(()) => Ok(true),
+            Err(error) if error.code() == DXGI_ERROR_WAS_STILL_DRAWING => Ok(false),
+            Err(error) => Err(error).context("gpu-convert Map(readback, DO_NOT_WAIT) failed"),
+        }
+    })?;
+    if !ready {
+        return Ok(false);
+    }
     if mapped.pData.is_null() {
         unsafe { context.Unmap(resource, 0) };
         bail!("gpu-convert Map(readback) returned null");
@@ -409,7 +509,7 @@ fn map_copy(
         );
         context.Unmap(resource, 0);
     }
-    Ok(())
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -420,6 +520,72 @@ mod tests {
         D3D11_BIND_SHADER_RESOURCE, D3D11_SUBRESOURCE_DATA, D3D11_TEXTURE2D_DESC,
     };
     use windows::Win32::Graphics::Dxgi::Common::DXGI_SAMPLE_DESC;
+
+    #[test]
+    fn readback_retries_only_until_ready() {
+        let mut attempts = 0;
+        assert!(
+            wait_readback(None, Instant::now() + Duration::from_secs(1), || {
+                attempts += 1;
+                Ok(attempts == 3)
+            })
+            .unwrap()
+        );
+        assert_eq!(attempts, 3);
+    }
+
+    #[test]
+    fn readback_cancellation_does_not_enter_or_repeat_map() {
+        let stop = AtomicBool::new(true);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        assert!(!wait_readback(Some(&stop), deadline, || panic!("cancelled Map")).unwrap());
+        stop.store(false, Ordering::Release);
+        let mut attempts = 0;
+        assert!(
+            !wait_readback(Some(&stop), deadline, || {
+                attempts += 1;
+                stop.store(true, Ordering::Release);
+                Ok(false)
+            })
+            .unwrap()
+        );
+        assert_eq!(attempts, 1);
+    }
+
+    #[test]
+    fn readback_fast_poll_retries_without_long_sleep() {
+        let mut attempts = 0;
+        let started = Instant::now();
+        assert!(
+            wait_readback(None, Instant::now() + Duration::from_secs(1), || {
+                attempts += 1;
+                Ok(attempts == 5)
+            })
+            .unwrap()
+        );
+        assert_eq!(attempts, 5);
+        assert!(
+            started.elapsed() < Duration::from_millis(15),
+            "fast poll should not hit a 15.6 ms OS timer tick on brief retries"
+        );
+    }
+
+    #[test]
+    fn readback_timeout_and_native_error_are_fatal() {
+        let mut attempts = 0;
+        let error = wait_readback(None, Instant::now() + Duration::from_millis(10), || {
+            attempts += 1;
+            Ok(false)
+        })
+        .unwrap_err();
+        assert!(error.to_string().contains("timed out"));
+        assert!(attempts > 0);
+        let error = wait_readback(None, Instant::now() + Duration::from_secs(1), || {
+            bail!("device removed")
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "device removed");
+    }
 
     #[test]
     fn dispatch_grid_matches_native_limits() {
@@ -484,7 +650,7 @@ mod tests {
             eprintln!("跳过：没有可用的硬件 D3D11 设备");
             return;
         };
-        let converter = GpuConverter::new(&context.device, &context.context, 64, 64)
+        let mut converter = GpuConverter::new(&context.device, &context.context, 64, 64)
             .expect("GPU converter init");
         let cases = [
             (96u32, 80u32, TransformMode::Crop),
@@ -499,9 +665,12 @@ mod tests {
             let mut expected = vec![0u8; 64 * 64 * 3 / 2];
             bgra_to_nv12(&source, width as usize * 4, &transform, &mut expected).unwrap();
             let mut actual = vec![0u8; expected.len()];
-            converter
-                .convert(&texture, &transform, &mut actual)
-                .expect("GPU conversion failed");
+            assert!(
+                converter
+                    .convert(&texture, &transform, &mut actual, None)
+                    .expect("GPU conversion failed"),
+                "GPU conversion was unexpectedly cancelled"
+            );
             if actual != expected {
                 let offset = actual
                     .iter()

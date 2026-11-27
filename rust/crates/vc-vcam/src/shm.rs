@@ -198,10 +198,10 @@ pub unsafe fn copy_slot(view: *mut u8, slot: u32, seq: i32, dst: *mut u8) -> Opt
     let s = slot_ptr(view, slot);
     let frame_id = ptr::read_volatile(&(*s).frame_id);
     let qpc_pub_ns = ptr::read_volatile(&(*s).qpc_pub_ns);
-    core::sync::atomic::fence(Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::Acquire);
     let frame_bytes = (*(view as *const ShmHeader)).frame_bytes as usize;
     ptr::copy_nonoverlapping(data_ptr(view, slot), dst, frame_bytes);
-    core::sync::atomic::fence(Ordering::SeqCst);
+    core::sync::atomic::fence(Ordering::Acquire);
     if ptr::read_volatile(&(*s).seq) == seq {
         Some(SlotCopy {
             frame_id,

@@ -19,7 +19,6 @@ struct Args {
     host_root: PathBuf,
     bin_dir: PathBuf,
     peer_url: String,
-    peer_token: String,
     peer_zip: PathBuf,
     peer_build: String,
     local_zip: PathBuf,
@@ -47,21 +46,7 @@ fn run() -> Result<(), String> {
         evidence: Vec::new(),
     };
 
-    // --- 令牌格式与本地/对端命令的无效状态拒绝 -----------------------------
-    // SetPeerUpdateToken reports format errors in update_message without an event.
-    harness.send(Command::SetPeerUpdateToken("not-a-token".into()));
-    let snapshot = harness.wait_message(
-        "无效令牌被拒绝",
-        Duration::from_secs(10),
-        |m| m.contains("格式无效"),
-    )?;
-    if snapshot.update_token_paired {
-        return Err("无效令牌竟被标记为已配对".into());
-    }
-    if paths::peer_update_token_path().exists() {
-        return Err("无效令牌被写入了令牌文件".into());
-    }
-
+    // --- 本地/对端命令的无效状态拒绝 ---------------------------------------
     let missing = args.host_root.join("missing-package.zip");
     harness.send(Command::ActivatePeerUpdate("missing-build".into()));
     harness.wait_message(
@@ -104,22 +89,7 @@ fn run() -> Result<(), String> {
         return Err("未暂存版本触发了重启".into());
     }
 
-    // --- 有效配对、连接与对端更新 -----------------------------------------
-    harness.send(Command::SetPeerUpdateToken(args.peer_token.clone()));
-    harness.wait_for(
-        "有效令牌保存",
-        Duration::from_secs(10),
-        |s| {
-            s.update_token_paired
-                && s.update_message
-                    .as_deref()
-                    .is_some_and(|m| m.contains("已保存"))
-        },
-    )?;
-    if vc_core::update::load_peer_token().as_deref() != Some(args.peer_token.as_str()) {
-        return Err("保存后的对端令牌无法读回".into());
-    }
-
+    // --- 连接与对端更新（无需令牌） ---------------------------------------
     harness.send(Command::Connect(args.peer_url.clone()));
     let snapshot = harness.wait_for(
         "连接私有采集后台",
@@ -287,9 +257,8 @@ impl Harness {
             }
             if Instant::now() >= deadline {
                 return Err(format!(
-                    "等待“{label}”超时；connected={} paired={} busy={} restart={} message={:?} error={:?}",
+                    "等待“{label}”超时；connected={} busy={} restart={} message={:?} error={:?}",
                     snapshot.connected,
-                    snapshot.update_token_paired,
                     snapshot.busy,
                     snapshot.restart_requested,
                     snapshot.update_message,
@@ -330,7 +299,6 @@ fn parse_args() -> Result<Args, String> {
     let mut host_root = None;
     let mut bin_dir = None;
     let mut peer_url = None;
-    let mut peer_token = None;
     let mut peer_zip = None;
     let mut peer_build = None;
     let mut local_zip = None;
@@ -343,7 +311,6 @@ fn parse_args() -> Result<Args, String> {
             "--host-root" => host_root = value(),
             "--bin" => bin_dir = value(),
             "--peer-url" => peer_url = value(),
-            "--peer-token" => peer_token = value(),
             "--peer-zip" => peer_zip = value().map(PathBuf::from),
             "--peer-build" => peer_build = value(),
             "--local-zip" => local_zip = value().map(PathBuf::from),
@@ -356,7 +323,6 @@ fn parse_args() -> Result<Args, String> {
         host_root: PathBuf::from(need(host_root, "--host-root")?),
         bin_dir: PathBuf::from(need(bin_dir, "--bin")?),
         peer_url: need(peer_url, "--peer-url")?,
-        peer_token: need(peer_token, "--peer-token")?,
         peer_zip: need(peer_zip, "--peer-zip")?,
         peer_build: need(peer_build, "--peer-build")?,
         local_zip: need(local_zip, "--local-zip")?,

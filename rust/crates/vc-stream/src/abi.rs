@@ -654,6 +654,67 @@ mod tests {
         }
     }
 
+    #[test]
+    fn repeated_stop_reports_pending_until_the_blocked_worker_exits() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let completion = Arc::new(Mutex::new(None));
+        let worker_completion = completion.clone();
+        let session = Box::new(Session {
+            thread: Mutex::new(Some(std::thread::spawn(move || {
+                rx.recv().unwrap();
+                *worker_completion.lock().unwrap() = Some(Ok(()));
+            }))),
+            stop: Arc::new(AtomicBool::new(false)),
+            completion,
+            progress: Arc::new(Progress::new(json!({}))),
+            operation: OperationState::new(),
+        });
+        let handle = Box::into_raw(session).cast::<c_void>();
+        let mut error = [0i8; 256];
+        let mut error_written = 0;
+        for _ in 0..3 {
+            assert_eq!(
+                unsafe { stop_session(handle, error.as_mut_ptr(), 256, &mut error_written) },
+                1
+            );
+            assert_eq!(unsafe { destroy_session(handle) }, 1);
+            let mut output = [0i8; 4096];
+            let mut written = 0;
+            assert_eq!(
+                unsafe {
+                    session_status(
+                        handle,
+                        output.as_mut_ptr(),
+                        4096,
+                        &mut written,
+                        error.as_mut_ptr(),
+                        256,
+                        &mut error_written,
+                    )
+                },
+                0
+            );
+            let status: Value =
+                serde_json::from_str(unsafe { CStr::from_ptr(output.as_ptr()) }.to_str().unwrap())
+                    .unwrap();
+            assert_eq!(status["running"], true);
+            assert_eq!(status["stopping"], true);
+            assert!(status["exit_code"].is_null());
+        }
+        tx.send(()).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        loop {
+            let code = unsafe { stop_session(handle, error.as_mut_ptr(), 256, &mut error_written) };
+            if code != 1 {
+                assert_eq!(code, 0);
+                break;
+            }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert_eq!(unsafe { destroy_session(handle) }, 0);
+    }
+
     fn unique_directory(tag: &str) -> PathBuf {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)

@@ -176,6 +176,10 @@ struct Slot {
 pub struct Reassembler {
     config: Config,
     slots: Vec<Slot>,
+    /// 复用的帧缓冲区与到达标记切片，避免逐帧大内存分配与页清零。
+    free_buffers: Vec<Vec<u8>>,
+    free_gots: Vec<Vec<bool>>,
+    free_pool_cap: usize,
     buffered_bytes: usize,
     stats: Stats,
     have_seen: bool,
@@ -205,9 +209,14 @@ impl Reassembler {
                 payload_max: config.payload_max,
             });
         }
+        let slot_cap = config.max_inflight_frames.min(16);
+        let free_pool_cap = slot_cap + 2;
         Ok(Self {
             config,
-            slots: Vec::with_capacity(config.max_inflight_frames.min(16)),
+            slots: Vec::with_capacity(slot_cap),
+            free_buffers: Vec::with_capacity(free_pool_cap),
+            free_gots: Vec::with_capacity(free_pool_cap),
+            free_pool_cap,
             buffered_bytes: 0,
             stats: Stats::default(),
             have_seen: false,
@@ -218,6 +227,40 @@ impl Reassembler {
             inter_arrival_ns: VecDeque::with_capacity(INTER_ARRIVAL_WINDOW),
             origin: Instant::now(),
         })
+    }
+
+    /// 归还已消费的完整帧缓冲区以供后续帧复用，避免重复触发系统页分配。
+    pub fn recycle(&mut self, mut buffer: Vec<u8>) {
+        let frame_bytes = self.config.geometry.frame_bytes();
+        if buffer.capacity() >= frame_bytes && self.free_buffers.len() < self.free_pool_cap {
+            buffer.resize(frame_bytes, 0);
+            self.free_buffers.push(buffer);
+        }
+    }
+
+    fn take_buffer(&mut self, frame_bytes: usize) -> Vec<u8> {
+        if let Some(mut buffer) = self.free_buffers.pop() {
+            buffer.resize(frame_bytes, 0);
+            buffer
+        } else {
+            vec![0u8; frame_bytes]
+        }
+    }
+
+    fn take_got(&mut self, total: usize) -> Vec<bool> {
+        if let Some(mut got) = self.free_gots.pop() {
+            got.fill(false);
+            got.resize(total, false);
+            got
+        } else {
+            vec![false; total]
+        }
+    }
+
+    fn recycle_got(&mut self, got: Vec<bool>) {
+        if self.free_gots.len() < self.free_pool_cap {
+            self.free_gots.push(got);
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -276,6 +319,17 @@ impl Reassembler {
         arrived_ns: u64,
         completed_at: impl FnOnce() -> u64,
     ) -> PushOutcome {
+        self.push_ethernet_timed_lazy(frame, || arrived_ns, completed_at)
+    }
+
+    /// 实时接收优化路径：仅在为新帧创建槽位时才调用 `on_first_packet`，避免非首片
+    /// 或无关包触发不必要的时间戳读取。
+    pub fn push_ethernet_timed_lazy(
+        &mut self,
+        frame: &[u8],
+        on_first_packet: impl FnOnce() -> u64,
+        completed_at: impl FnOnce() -> u64,
+    ) -> PushOutcome {
         if frame.len() < ETHERNET_HEADER_LEN + HEADER_LEN {
             return PushOutcome::Ignored(IgnoreReason::ShortFrame);
         }
@@ -295,7 +349,7 @@ impl Reassembler {
             Err(_) => return PushOutcome::Ignored(IgnoreReason::ShortFrame),
         };
         let payload = &frame[ETHERNET_HEADER_LEN + HEADER_LEN..];
-        self.push_packet_timed(header, payload, source, arrived_ns, completed_at)
+        self.push_packet_timed_lazy(header, payload, source, on_first_packet, completed_at)
     }
 
     /// 已解析包头的路径。`source_mac` 只在配置了会话源 MAC 时使用：
@@ -307,15 +361,27 @@ impl Reassembler {
         source_mac: Option<[u8; 6]>,
         now_ns: u64,
     ) -> PushOutcome {
-        self.push_packet_timed(header, payload, source_mac, now_ns, || now_ns)
+        self.push_packet_timed_lazy(header, payload, source_mac, || now_ns, || now_ns)
     }
 
+    #[cfg(test)]
     fn push_packet_timed(
         &mut self,
         header: Header,
         payload: &[u8],
         source_mac: Option<[u8; 6]>,
         arrived_ns: u64,
+        completed_at: impl FnOnce() -> u64,
+    ) -> PushOutcome {
+        self.push_packet_timed_lazy(header, payload, source_mac, || arrived_ns, completed_at)
+    }
+
+    fn push_packet_timed_lazy(
+        &mut self,
+        header: Header,
+        payload: &[u8],
+        source_mac: Option<[u8; 6]>,
+        on_first_packet: impl FnOnce() -> u64,
         completed_at: impl FnOnce() -> u64,
     ) -> PushOutcome {
         if let Some(expected) = self.config.source_mac
@@ -377,14 +443,17 @@ impl Reassembler {
                 if let Err(reason) = self.make_room() {
                     return PushOutcome::Ignored(reason);
                 }
+                let first_ns = on_first_packet();
+                let buffer = self.take_buffer(frame_bytes);
+                let got = self.take_got(header.total as usize);
                 self.slots.push(Slot {
                     frame_id: header.frame_id,
                     total: header.total,
                     pattern: header.pattern,
                     key_frame: header.is_key_frame(),
-                    first_ns: arrived_ns,
-                    buffer: vec![0u8; frame_bytes],
-                    got: vec![false; header.total as usize],
+                    first_ns,
+                    buffer,
+                    got,
                     got_n: 0,
                 });
                 self.buffered_bytes += frame_bytes;
@@ -416,6 +485,7 @@ impl Reassembler {
 
         let slot = self.slots.remove(index);
         self.buffered_bytes -= slot.buffer.len();
+        self.recycle_got(slot.got);
         self.stats.complete += 1;
         let rseg = completed_ns.saturating_sub(slot.first_ns);
         push_window(&mut self.rseg_ns, rseg, RSEG_WINDOW);
@@ -482,6 +552,8 @@ impl Reassembler {
         self.buffered_bytes = self.buffered_bytes.saturating_sub(slot.buffer.len());
         self.stats.dropped += 1;
         self.stats.packets_lost += slot.total.wrapping_sub(slot.got_n) as u64;
+        self.recycle(slot.buffer);
+        self.recycle_got(slot.got);
     }
 }
 
@@ -805,5 +877,50 @@ mod tests {
         .unwrap();
         assert_eq!(part.header.flags, FLAG_KEY_FRAME);
         assert_eq!(part.header.magic, MAGIC);
+    }
+
+    #[test]
+    fn recycle_reuses_buffer_and_lazy_timestamp_runs_once_per_frame() {
+        let mut r = Reassembler::new(config()).unwrap();
+        let data = frame(13, 6144);
+        let pkts = packets(1, &data, 1458);
+        let mut first_calls = 0usize;
+        let mut ptr_first = std::ptr::null();
+        for (i, (h, p)) in pkts.iter().enumerate() {
+            let mut eth = vec![0u8; 14 + 28 + p.len()];
+            eth[12..14].copy_from_slice(&ETHERTYPE.to_be_bytes());
+            eth[14..42].copy_from_slice(&h.encode());
+            eth[42..].copy_from_slice(p);
+            let outcome = r.push_ethernet_timed_lazy(
+                &eth,
+                || {
+                    first_calls += 1;
+                    1_000
+                },
+                || 2_000,
+            );
+            if i + 1 == pkts.len() {
+                let PushOutcome::Completed(done) = outcome else {
+                    panic!("expected completed frame");
+                };
+                assert_eq!(done.data, data);
+                ptr_first = done.data.as_ptr();
+                r.recycle(done.data);
+            }
+        }
+        assert_eq!(first_calls, 1, "首包时间戳只应在建槽时读取一次");
+
+        let data2 = frame(14, 6144);
+        let pkts2 = packets(2, &data2, 1458);
+        for (i, (h, p)) in pkts2.iter().enumerate() {
+            let outcome = r.push_packet_at(*h, p, None, 3_000);
+            if i + 1 == pkts2.len() {
+                let PushOutcome::Completed(done) = outcome else {
+                    panic!("expected second completed frame");
+                };
+                assert_eq!(done.data, data2);
+                assert_eq!(done.data.as_ptr(), ptr_first, "应复用归还的帧缓冲区");
+            }
+        }
     }
 }

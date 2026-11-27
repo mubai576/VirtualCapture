@@ -70,7 +70,7 @@ python scripts/package.py --allow-dirty
 5. CLI/API/IPC/拓扑/判据变化，同一改动更新 skill `references/` 与 PLAN §1。使用真实能力和精确会话回显，不以预算或枚举当实测。
 6. 停止/销毁未确认不得卸载 DLL；pending 锁配置、OTA、虚拟卡操作。禁止强制展开挂起 GPU 调用。
 7. 二进制/日志/运行数据不进 Git；删 PASS/receiver 证据前先归档 `run/archive.d/`。双机结束立即保全双端完整 hashlog；Rust 没有旧 `/files`，须另行安排完整取证路径。
-8. 不读取、显示、提交或删除现有 `update-token.json`；不动 `staging/`、`prev/`。部署、PC2 操作、改物理网卡参数、真实 DirectShow 注册须单独授权。
+8. 旧版 `update-token.json`/`update-peer-token.json` 已废弃但仍在磁盘上时，不读取、显示、提交或删除；不动 `staging/`、`prev/`。部署、PC2 操作、改物理网卡参数、真实 DirectShow 注册须单独授权；控制面 5143 无应用层鉴权，只可暴露在可信网段。
 
 ## 协作
 

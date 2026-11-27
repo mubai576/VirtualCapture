@@ -94,7 +94,7 @@ fn receive_raw(
 ) -> anyhow::Result<()> {
     let _priority = ThreadPriority::capture();
     let frame_bytes = geometry.frame_bytes();
-    let mut hashlog = match take_writer(args.hash_file.take(), args.hashlog.as_deref()) {
+    let mut hashlog = match take_log_writer(args.hash_file.take(), args.hashlog.as_deref()) {
         Ok(writer) => writer,
         Err(error) => {
             return fail_early(args, &progress, &adapter, error.context("open Raw hashlog"));
@@ -208,10 +208,7 @@ fn receive_raw(
     if let Some(writer) = hashlog.as_mut()
         && let Err(error) = writer.flush()
     {
-        outcome = merge_error(
-            outcome,
-            anyhow::Error::new(error).context("flush Raw hashlog"),
-        );
+        outcome = merge_error(outcome, error.context("flush Raw hashlog"));
     }
     let stats = reassembler.stats();
     if outcome.is_ok() && !counters.cancelled && args.expect_frames > 0 {
@@ -310,29 +307,51 @@ fn raw_capture_loop(
     geometry: Geometry,
     reassembler: &mut Reassembler,
     publisher: &mut Option<Publisher>,
-    hashlog: &mut Option<BufWriter<File>>,
+    hashlog: &mut Option<BufferedLog>,
     counters: &mut RawCounters,
     started: Instant,
     deadline: Option<Instant>,
 ) -> anyhow::Result<()> {
     let frame_bytes = geometry.frame_bytes();
+    let mut rate_window = RateWindow::new(qpc_ns());
+    let mut live_rseg = TimedWindow::default();
+    let mut live_inter_arrival = TimedWindow::default();
     let mut last_progress = Instant::now();
+    let mut pkt_tick = 0u32;
     loop {
-        if stopped(args.stop.as_deref()) {
+        if pkt_tick & 15 == 0 && stopped(args.stop.as_deref()) {
             counters.cancelled = true;
             break;
         }
         if args.expect_frames > 0 && counters.hashes >= args.expect_frames {
             break;
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            counters.timed_out = true;
-            break;
+        if pkt_tick & 63 == 0 {
+            let now = Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                counters.timed_out = true;
+                break;
+            }
+            // 空闲超时、无关包或畸形包也不能冻结实际帧率；最近 1 秒滑窗会在空闲后归零。
+            if now.duration_since(last_progress) >= PROGRESS_INTERVAL {
+                live_raw_progress(
+                    args,
+                    reassembler,
+                    counters,
+                    started,
+                    &mut rate_window,
+                    &mut live_rseg,
+                    &mut live_inter_arrival,
+                );
+                last_progress = now;
+            }
         }
+        pkt_tick = pkt_tick.wrapping_add(1);
         let mut header = ptr::null_mut();
         let mut data: *const c_uchar = ptr::null();
         let rc = unsafe { (api.next_ex)(handle, &mut header, &mut data) };
         if rc == 0 {
+            pkt_tick = 0;
             continue;
         }
         if rc < 0 {
@@ -346,10 +365,9 @@ fn raw_capture_loop(
             continue;
         }
         let packet = unsafe { std::slice::from_raw_parts(data, caplen) };
-        let arrived_ns = qpc_ns();
         counters.bytes = counters.bytes.saturating_add(caplen as u64);
         if let PushOutcome::Completed(frame) =
-            reassembler.push_ethernet_timed(packet, arrived_ns, qpc_ns)
+            reassembler.push_ethernet_timed_lazy(packet, qpc_ns, qpc_ns)
         {
             ensure!(
                 frame.data.len() == frame_bytes,
@@ -357,61 +375,100 @@ fn raw_capture_loop(
                 frame.frame_id,
                 frame.data.len()
             );
-            let hash = fnv1a64(&frame.data);
+            // 先发布到 SHM，把哈希与图案校验留在延迟敏感发布之后。
+            let token = if let Some(shm) = publisher.as_mut() {
+                Some(shm.publish(frame.frame_id, frame.first_packet_ns, &frame.data, qpc_ns)?)
+            } else {
+                None
+            };
+            let hash = if publisher.is_some() || hashlog.is_some() {
+                fnv1a64(&frame.data)
+            } else {
+                0
+            };
+            if let (Some(shm), Some(token)) = (publisher.as_mut(), token) {
+                shm.mark_hash(token, hash);
+                counters.shm_published += 1;
+            }
             if let Some(pattern) = Pattern::from_id(frame.pattern) {
                 pattern.fill(geometry, frame.frame_id, &mut counters.expected_frame);
                 if counters.expected_frame != frame.data {
                     counters.hash_mismatch += 1;
                 }
             }
-            let token = if let Some(shm) = publisher.as_mut() {
-                Some(shm.publish(frame.frame_id, frame.first_packet_ns, &frame.data, qpc_ns)?)
-            } else {
-                None
-            };
-            if let (Some(shm), Some(token)) = (publisher.as_mut(), token) {
-                shm.mark_hash(token, hash);
-                counters.shm_published += 1;
-            }
             if let Some(writer) = hashlog.as_mut() {
-                let row = json!({
-                    "frame_id":frame.frame_id,"hash":fnv1a64_hex(hash),
-                    "qpc_ns":frame.completed_ns,"first_packet_qpc_ns":frame.first_packet_ns,
-                });
-                serde_json::to_writer(&mut *writer, &row)?;
-                writer.write_all(b"\n")?;
-                writer.flush()?;
+                writer.write_line(|w| {
+                    writeln!(
+                        w,
+                        "{{\"frame_id\":{},\"hash\":\"{hash:016x}\",\"qpc_ns\":{},\"first_packet_qpc_ns\":{}}}",
+                        frame.frame_id, frame.completed_ns, frame.first_packet_ns
+                    )
+                })?;
                 counters.hash_rows += 1;
+            }
+            let frame_id = frame.frame_id;
+            let first_packet_ns = frame.first_packet_ns;
+            let completed_ns = frame.completed_ns;
+            reassembler.recycle(frame.data);
+            live_rseg.push(completed_ns, completed_ns.saturating_sub(first_packet_ns));
+            if counters.hashes > 0 && counters.last_completed_ns > 0 {
+                live_inter_arrival.push(
+                    completed_ns,
+                    completed_ns.saturating_sub(counters.last_completed_ns),
+                );
             }
             counters.hashes += 1;
             if counters.hashes == 1 {
-                counters.first_completed_ns = frame.completed_ns;
+                counters.first_completed_ns = completed_ns;
             }
-            counters.last_completed_ns = frame.completed_ns;
-            counters.last_frame_id = Some(frame.frame_id);
-        }
-        if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            if let Some(progress) = args.progress.as_deref() {
-                let stats = reassembler.stats();
-                let uptime = started.elapsed().as_secs_f64().max(0.000_001);
-                progress.update(&json!({
-                    "running":true,"complete":stats.complete,"hash_rows":counters.hash_rows,
-                    "dropped":stats.dropped,"packets_recv":stats.packets_recv,
-                    "packets_lost":stats.packets_lost,"crc_errors":stats.crc_errors,
-                    "duplicate":stats.duplicate,"gaps":stats.gaps,
-                    "hash_mismatch":counters.hash_mismatch,
-                    "shm_published":counters.shm_published,
-                    "bytes_captured":counters.bytes,
-                    "pps":stats.packets_recv as f64/uptime,
-                    "bps":counters.bytes as f64*8.0/uptime,
-                    "fps_actual":counters.hashes as f64/uptime,"uptime_s":uptime,
-                    "last_frame_id":counters.last_frame_id,
-                }));
-            }
-            last_progress = Instant::now();
+            counters.last_completed_ns = completed_ns;
+            counters.last_frame_id = Some(frame_id);
+            rate_window.maybe_record(
+                completed_ns,
+                counters.hashes,
+                reassembler.stats().packets_recv,
+                counters.bytes,
+            );
+            pkt_tick = 0;
         }
     }
     Ok(())
+}
+
+fn live_raw_progress(
+    args: &ReceiveArgs,
+    reassembler: &Reassembler,
+    counters: &RawCounters,
+    started: Instant,
+    rate_window: &mut RateWindow,
+    live_rseg: &mut TimedWindow,
+    live_inter_arrival: &mut TimedWindow,
+) {
+    if let Some(progress) = args.progress.as_deref() {
+        let stats = reassembler.stats();
+        let now_ns = qpc_ns();
+        let rate = rate_window.sample(now_ns, counters.hashes, stats.packets_recv, counters.bytes);
+        let rseg = live_rseg.summary_at(now_ns);
+        let inter_arrival = live_inter_arrival.summary_at(now_ns);
+        let uptime = started.elapsed().as_secs_f64().max(0.000_001);
+        progress.update(&json!({
+            "running":true,"complete":stats.complete,"hash_rows":counters.hash_rows,
+            "dropped":stats.dropped,"packets_recv":stats.packets_recv,
+            "packets_lost":stats.packets_lost,"crc_errors":stats.crc_errors,
+            "duplicate":stats.duplicate,"gaps":stats.gaps,
+            "hash_mismatch":counters.hash_mismatch,
+            "shm_published":counters.shm_published,
+            "bytes_captured":counters.bytes,
+            "pps":rate.pps,
+            "bps":rate.bps,
+            "fps_actual":rate.fps,"uptime_s":uptime,
+            "rseg":rseg,
+            "inter_arrival":inter_arrival,
+            "last_frame_id":counters.last_frame_id,
+            "first_completed_qpc_ns":counters.first_completed_ns,
+            "last_completed_qpc_ns":counters.last_completed_ns,
+        }));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -564,7 +621,8 @@ fn receive_encoded(
     let _priority = ThreadPriority::capture();
     let frame_bytes = geometry.frame_bytes();
     let transport_path = args.hashlog.as_deref().map(transport_path);
-    let mut transport = match take_writer(args.transport_file.take(), transport_path.as_deref()) {
+    let mut transport = match take_log_writer(args.transport_file.take(), transport_path.as_deref())
+    {
         Ok(writer) => writer,
         Err(error) => {
             return fail_early(
@@ -771,10 +829,7 @@ fn receive_encoded(
     if let Some(writer) = transport.as_mut()
         && let Err(error) = writer.flush()
     {
-        outcome = merge_error(
-            outcome,
-            anyhow::Error::new(error).context("flush transport log"),
-        );
+        outcome = merge_error(outcome, error.context("flush transport log"));
     }
 
     let decoded = shared.decoded();
@@ -908,16 +963,21 @@ fn encoded_capture_loop(
     handle: *mut c_void,
     session: AuSession,
     reassembler: &mut EncodedReassembler,
-    transport: &mut Option<BufWriter<File>>,
+    transport: &mut Option<BufferedLog>,
     shared: &SharedDecoder,
     counters: &mut EncodedCounters,
     deadline: Option<Instant>,
 ) -> anyhow::Result<()> {
     let mut discontinuity = false;
+    let mut rate_window = RateWindow::new(qpc_ns());
+    let mut live_rseg = TimedWindow::default();
+    let mut live_inter_arrival = TimedWindow::default();
+    let mut prev_completed_ns = 0u64;
     let mut last_progress = Instant::now();
     let started = Instant::now();
+    let mut pkt_tick = 0u32;
     loop {
-        if stopped(args.stop.as_deref()) {
+        if pkt_tick & 15 == 0 && stopped(args.stop.as_deref()) {
             counters.cancelled = true;
             break;
         }
@@ -935,14 +995,33 @@ fn encoded_capture_loop(
         if args.expect_frames > 0 && shared.decoded() >= args.expect_frames {
             break;
         }
-        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-            counters.timed_out = true;
-            break;
+        if pkt_tick & 63 == 0 {
+            let now = Instant::now();
+            if deadline.is_some_and(|deadline| now >= deadline) {
+                counters.timed_out = true;
+                break;
+            }
+            // 空闲超时或无关/畸形包也不能冻结实际帧率；最近 1 秒滑窗会在空闲后归零。
+            if now.duration_since(last_progress) >= PROGRESS_INTERVAL {
+                live_encoded_progress(
+                    args,
+                    reassembler,
+                    shared,
+                    counters,
+                    started,
+                    &mut rate_window,
+                    &mut live_rseg,
+                    &mut live_inter_arrival,
+                );
+                last_progress = now;
+            }
         }
+        pkt_tick = pkt_tick.wrapping_add(1);
         let mut header = ptr::null_mut();
         let mut data: *const c_uchar = ptr::null();
         let rc = unsafe { (api.next_ex)(handle, &mut header, &mut data) };
         if rc == 0 {
+            pkt_tick = 0;
             continue;
         }
         if rc < 0 {
@@ -956,16 +1035,32 @@ fn encoded_capture_loop(
             continue;
         }
         let packet = unsafe { std::slice::from_raw_parts(data, caplen) };
-        let arrived_ns = qpc_ns();
         let PushOutcome::Completed(completed) =
-            reassembler.push_ethernet_timed(packet, arrived_ns, qpc_ns)
+            reassembler.push_ethernet_timed_lazy(packet, qpc_ns, qpc_ns)
         else {
-            if last_progress.elapsed() >= PROGRESS_INTERVAL {
-                live_encoded_progress(args, reassembler, shared, counters, started);
-                last_progress = Instant::now();
-            }
             continue;
         };
+        live_rseg.push(
+            completed.completed_ns,
+            completed
+                .completed_ns
+                .saturating_sub(completed.first_packet_ns),
+        );
+        if prev_completed_ns > 0 {
+            live_inter_arrival.push(
+                completed.completed_ns,
+                completed.completed_ns.saturating_sub(prev_completed_ns),
+            );
+        }
+        prev_completed_ns = completed.completed_ns;
+        let rx_stats = reassembler.stats();
+        rate_window.maybe_record(
+            completed.completed_ns,
+            shared.decoded(),
+            rx_stats.packets_recv,
+            rx_stats.bytes_recv,
+        );
+        pkt_tick = 0;
         let transport_hash = completed.hash();
         match parse_au(
             &completed.data,
@@ -988,15 +1083,14 @@ fn encoded_capture_loop(
                     if !eos {
                         counters.valid_units = counters.valid_units.saturating_add(1);
                         if let Some(writer) = transport.as_mut() {
-                            let row = json!({
-                                "frame_id":completed.frame_id,
-                                "encoded_bytes":completed.data.len(),
-                                "keyframe":true,
-                                "transport_hash":fnv1a64_hex(transport_hash),
-                            });
-                            serde_json::to_writer(&mut *writer, &row)?;
-                            writer.write_all(b"\n")?;
-                            writer.flush()?;
+                            writer.write_line(|w| {
+                                writeln!(
+                                    w,
+                                    "{{\"frame_id\":{},\"encoded_bytes\":{},\"keyframe\":true,\"transport_hash\":\"{transport_hash:016x}\"}}",
+                                    completed.frame_id,
+                                    completed.data.len()
+                                )
+                            })?;
                         }
                     } else {
                         counters.received_eos = true;
@@ -1075,27 +1169,31 @@ fn encoded_capture_loop(
                 }
             }
         }
-        if last_progress.elapsed() >= PROGRESS_INTERVAL {
-            live_encoded_progress(args, reassembler, shared, counters, started);
-            last_progress = Instant::now();
-        }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn live_encoded_progress(
     args: &ReceiveArgs,
     reassembler: &EncodedReassembler,
     shared: &SharedDecoder,
     counters: &EncodedCounters,
     started: Instant,
+    rate_window: &mut RateWindow,
+    live_rseg: &mut TimedWindow,
+    live_inter_arrival: &mut TimedWindow,
 ) {
     let Some(progress) = args.progress.as_deref() else {
         return;
     };
     let stats = reassembler.stats();
+    let now_ns = qpc_ns();
     let uptime = started.elapsed().as_secs_f64().max(0.000_001);
     let decoded = shared.decoded();
+    let rate = rate_window.sample(now_ns, decoded, stats.packets_recv, stats.bytes_recv);
+    let rseg = live_rseg.summary_at(now_ns);
+    let inter_arrival = live_inter_arrival.summary_at(now_ns);
     progress.update(&json!({
         "running":true,"complete":decoded,"compressed_complete":counters.valid_units,
         "transport_frames":counters.valid_units,"hash_rows":decoded,
@@ -1115,9 +1213,11 @@ fn live_encoded_progress(
         "waiting_idr":shared.waiting_idr.load(Ordering::Acquire),
         "shm_published":shared.shm_published.load(Ordering::Acquire),
         "bytes_captured":stats.bytes_recv,
-        "pps":stats.packets_recv as f64/uptime,
-        "bps":stats.bytes_recv as f64*8.0/uptime,
-        "fps_actual":decoded as f64/uptime,"uptime_s":uptime,
+        "pps":rate.pps,
+        "bps":rate.bps,
+        "fps_actual":rate.fps,"uptime_s":uptime,
+        "rseg":rseg,
+        "inter_arrival":inter_arrival,
         "last_frame_id":shared.last_frame_id_plus_one
             .load(Ordering::Acquire).checked_sub(1).map(|value|value as u32),
     }));
@@ -1140,7 +1240,7 @@ fn worker_main(
     init: mpsc::Sender<WorkerInit>,
 ) -> anyhow::Result<()> {
     let _priority = ThreadPriority::capture();
-    let mut log = match take_writer(hash_file, hashlog.as_deref()) {
+    let mut log = match take_log_writer(hash_file, hashlog.as_deref()) {
         Ok(log) => log,
         Err(error) => {
             return Err(init_failure(
@@ -1203,7 +1303,7 @@ fn worker_main(
     let flush = match log.as_mut() {
         Some(writer) => writer
             .flush()
-            .map_err(|error| anyhow::Error::new(error).context("flush decoded hashlog")),
+            .map_err(|error| error.context("flush decoded hashlog")),
         None => Ok(()),
     };
     match (loop_result, flush) {
@@ -1223,7 +1323,7 @@ fn worker_loop(
     shared: &Arc<SharedDecoder>,
     decoder: &mut Option<Decoder>,
     publisher: &mut Option<Publisher>,
-    log: &mut Option<BufWriter<File>>,
+    log: &mut Option<BufferedLog>,
 ) -> anyhow::Result<()> {
     let frame_bytes = geometry.frame_bytes();
     let mut have_last = false;
@@ -1305,20 +1405,19 @@ fn worker_loop(
             shared.shm_published.fetch_add(1, Ordering::AcqRel);
         }
         if let Some(writer) = log.as_mut() {
-            let row = json!({
-                "frame_id":work.frame_id,
-                "decoded_hash":fnv1a64_hex(hash),
-                "transport_hash":fnv1a64_hex(work.transport_hash),
-                "qpc_ns":now,
-                "decode_pipeline_ms":now.saturating_sub(work.first_ns) as f64/1e6,
-                "queued_qpc_ns":work.queued_ns,"decode_started_qpc_ns":decode_started_ns,
-                "queue_wait_ms":decode_started_ns.saturating_sub(work.queued_ns) as f64/1e6,
-                "decode_ms":now.saturating_sub(decode_started_ns) as f64/1e6,
-                "encoded_bytes":work.au.len(),
-            });
-            serde_json::to_writer(&mut *writer, &row)?;
-            writer.write_all(b"\n")?;
-            writer.flush()?;
+            let decode_pipeline_ms = now.saturating_sub(work.first_ns) as f64 / 1e6;
+            let queue_wait_ms = decode_started_ns.saturating_sub(work.queued_ns) as f64 / 1e6;
+            let decode_ms = now.saturating_sub(decode_started_ns) as f64 / 1e6;
+            let transport_hash = work.transport_hash;
+            writer.write_line(|w| {
+                writeln!(
+                    w,
+                    "{{\"frame_id\":{},\"decoded_hash\":\"{hash:016x}\",\"transport_hash\":\"{transport_hash:016x}\",\"qpc_ns\":{now},\"decode_pipeline_ms\":{decode_pipeline_ms},\"queued_qpc_ns\":{},\"decode_started_qpc_ns\":{decode_started_ns},\"queue_wait_ms\":{queue_wait_ms},\"decode_ms\":{decode_ms},\"encoded_bytes\":{}}}",
+                    work.frame_id,
+                    work.queued_ns,
+                    work.au.len()
+                )
+            })?;
         }
         let count = shared.decoded.fetch_add(1, Ordering::AcqRel) + 1;
         if count == 1 {

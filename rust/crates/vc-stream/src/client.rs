@@ -26,9 +26,10 @@ impl Module {
     pub fn load(path: &Path) -> Result<Self, String> {
         let path = std::fs::canonicalize(path)
             .map_err(|e| format!("data-plane DLL {}: {e}", path.display()))?;
+        let load_path = vc_media::load_library_path(&path);
         let library = unsafe {
             Library::load_with_flags(
-                &path,
+                load_path.as_ref(),
                 LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32,
             )
         }

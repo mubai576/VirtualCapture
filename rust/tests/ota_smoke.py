@@ -1,7 +1,7 @@
 """End-to-end OTA smoke test on a private temporary root and random port.
 
 Stages synthetic `unified-v1` ZIPs (and a real candidate when supplied) through
-`VirtualCapture.exe capture` and its token-protected REST API. Exercises the real
+`VirtualCapture.exe capture` and its unauthenticated REST API. Exercises the real
 updater, activation, rollback, and failed activation. No registry, Npcap capture
 or deployed installation is touched.
 """
@@ -43,11 +43,9 @@ def sha(data):
     return hashlib.sha256(data).hexdigest()
 
 
-def request(path, method="GET", token=None, body=None, headers=None, timeout=10):
+def request(path, method="GET", body=None, headers=None, timeout=10):
     url = path if path.startswith("http") else f"http://127.0.0.1:{PORT}{path}"
     req = urllib.request.Request(url, data=body, method=method)
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
     for key, value in (headers or {}).items():
         req.add_header(key, value)
     try:
@@ -157,20 +155,19 @@ def capture_package(build_id, version, binaries):
                         capture_payload(version, binaries), build_id, version)
 
 
-def stage(zip_bytes, token, declared_hash=None):
+def stage(zip_bytes, declared_hash=None):
     digest = declared_hash or sha(zip_bytes)
     return request(
         "/update/stage",
         method="POST",
-        token=token,
         body=zip_bytes,
         headers={"Content-Type": "application/zip", "X-VC-SHA256": digest},
         timeout=120,
     )
 
 
-def activate(build_id, token, path="/update/activate"):
-    return request(path, method="POST", token=token, body=json.dumps({"build_id": build_id}).encode(), headers={"Content-Type": "application/json"}, timeout=30)
+def activate(build_id, path="/update/activate"):
+    return request(path, method="POST", body=json.dumps({"build_id": build_id}).encode(), headers={"Content-Type": "application/json"}, timeout=30)
 
 
 def wait_log(root, needle, timeout=40):
@@ -189,10 +186,6 @@ def history_at(root):
         return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
     except FileNotFoundError:
         return []
-
-
-def token_from(path):
-    return json.loads(path.read_text(encoding="utf-8"))["token"]
 
 
 def kill_tree(pid):
@@ -293,25 +286,10 @@ def main(package_dir=None, candidate=None):
         expect_capture(first, RUN, None, proc.pid)
         checks.append("unified capture starts directly in a flat ROOT (legacy data layout)")
 
-        status, _ = request("/update/status")
-        assert status == 401, status
-        token_path = RUN / "update-token.json"
-        token = token_from(token_path)
-        status, value = request("/update/status", token=token)
+        status, value = request("/update/status")
         assert status == 200 and value["layout"] == "legacy" and value["active"] is None, value
-        checks.append("update token required")
-
-        printed = subprocess.run(
-            [str(capture_exe), "capture", "--root", str(RUN), "--native-dir", str(BIN), "--print-update-token"],
-            capture_output=True, encoding="utf-8", timeout=20, check=True,
-        ).stdout.splitlines()
-        label = "update token file: "
-        assert len(printed) == 2 and printed[0].startswith(label) and printed[1] == token, (
-            "print-update-token did not return the fixture's token")
-        assert Path(printed[0][len(label):]).samefile(token_path)
-        log.flush()
-        assert token not in (RUN / "capture.log").read_text(errors="replace")
-        checks.append("pairing token explicitly printable, never logged")
+        assert not (RUN / "update-token.json").exists(), "control API must not create a token file"
+        checks.append("update status reachable without a token; no token file created")
 
         launch_root.mkdir()
         flat_files = capture_payload("0.1.0", binaries)
@@ -331,7 +309,7 @@ def main(package_dir=None, candidate=None):
             b1 = "ota-b1-" + uuid.uuid4().hex[:6]
             valid1 = capture_package(b1, "0.1.0", binaries)
 
-        status, _ = stage(valid1, token, declared_hash="0" * 64)
+        status, _ = stage(valid1, declared_hash="0" * 64)
         assert status == 400, status
         leftovers = list((RUN / "updates/incoming").glob("upload-*.zip"))
         assert not leftovers, leftovers
@@ -346,7 +324,7 @@ def main(package_dir=None, candidate=None):
             for name, data in stub_files.items():
                 archive.writestr(f"pkg/{name}", data)
             archive.writestr("pkg/../evil.txt", b"x")
-        status, _ = stage(traversal.getvalue(), token)
+        status, _ = stage(traversal.getvalue())
         assert status == 400, status
         checks.append("zip path traversal rejected")
 
@@ -354,7 +332,7 @@ def main(package_dir=None, candidate=None):
         manifest_files = manifest_entries(mismatch_files)
         next(item for item in manifest_files if item["path"] == "version.json")["sha256"] = "0" * 64
         mismatch = package_path("pkg", mismatch_files, "ota-bad-hash", "0.1.0", manifest_files)
-        status, _ = stage(mismatch, token)
+        status, _ = stage(mismatch)
         assert status == 400, status
         assert not (RUN / "updates/staged/ota-bad-hash").exists()
         checks.append("per-file hash mismatch rejected without staging")
@@ -369,12 +347,12 @@ def main(package_dir=None, candidate=None):
             ("legacy-ps1", {**stub_files, "scripts/Start-Capture.ps1": b"# fixture"}, ENTRYPOINT),
         ):
             bad_package = package_path("pkg", files, build_id, "0.1.0", entrypoint=entrypoint)
-            status, value = stage(bad_package, token)
+            status, value = stage(bad_package)
             assert status == 400, (build_id, status, value)
             assert not (RUN / "updates/staged" / build_id).exists(), build_id
         checks.append("missing/unknown unified marker, extra/nested EXE and legacy scripts rejected")
 
-        status, value = stage(valid1, token)
+        status, value = stage(valid1)
         assert status == 200 and value["staged"]["build_id"] == b1, value
         checks.append("valid package staged")
 
@@ -384,9 +362,9 @@ def main(package_dir=None, candidate=None):
         staged_meta.pop("capabilities", None)
         staged_meta_path.write_text(json.dumps(staged_meta), encoding="utf-8")
 
-        status, _ = activate("ota-missing-" + uuid.uuid4().hex[:4], token)
+        status, _ = activate("ota-missing-" + uuid.uuid4().hex[:4])
         assert status == 409, status
-        status, value = activate(b1, token)
+        status, value = activate(b1)
         assert status == 202 and value["activating"]["build_id"] == b1, value
         first_activation_log = value["activating"]["log"]
         baseline = json.loads((RUN / "updates/legacy-baseline.json").read_text(encoding="utf-8"))
@@ -414,10 +392,9 @@ def main(package_dir=None, candidate=None):
         assert (release / "vc_stream.dll").is_file(), "activated release must carry vc_stream.dll"
         migrated = json.loads((RUN / "data/vc-rust-config.json").read_text(encoding="utf-8"))
         assert migrated["capture"]["fps"] == 77, migrated
-        assert token_from(RUN / "data/update-token.json") == token
-        _, config = request("/config", token=token)
+        _, config = request("/config")
         assert config["capture"]["fps"] == 77, config
-        checks.append("atomic switch, config and token migration")
+        checks.append("atomic switch and config migration")
         checks.append("activated release contains vc_stream.dll")
         assert "capabilities" not in json.loads(staged_meta_path.read_text(encoding="utf-8"))
         checks.append("D34 staged metadata without capabilities activates using the verified new manifest")
@@ -441,9 +418,9 @@ def main(package_dir=None, candidate=None):
 
         b2 = "ota-b2-" + uuid.uuid4().hex[:6]
         valid2 = capture_package(b2, "0.1.1", binaries)
-        assert stage(valid2, token)[0] == 200
+        assert stage(valid2)[0] == 200
         staged_b2 = RUN / "updates/staged" / b2
-        assert activate(b2, token)[0] == 202
+        assert activate(b2)[0] == 202
         # 202 之后、helper 复核之前塞入清单外 DLL：必须被激活前复核拒绝并重启旧版。
         (staged_b2 / "evil.dll").write_bytes(b"MZ")
         wait_for(lambda: any(entry["build_id"] == b2 and entry["state"] == "rolled_back"
@@ -458,7 +435,7 @@ def main(package_dir=None, candidate=None):
         checks.append("staged extra file rejected; old build restarted")
 
         (staged_b2 / "evil.dll").unlink()
-        assert activate(b2, token)[0] == 202
+        assert activate(b2)[0] == 202
         third = wait_for(lambda: (lambda h: h if h and h.get("build") == b2 else None)(health()),
                          60, label="second activated capture")
         expect_capture(third, RUN, b2)
@@ -473,7 +450,7 @@ def main(package_dir=None, candidate=None):
         assert stale.returncode == 2 and not stale.stdout.strip() and "当前版本" in stale.stderr, stale
         checks.append("direct stale release launch rejects the active pointer mismatch")
 
-        assert activate(b1, token, "/update/rollback")[0] == 202
+        assert activate(b1, "/update/rollback")[0] == 202
         fourth = wait_for(lambda: (lambda h: h if h and h.get("build") == b1 else None)(health()),
                           60, label="explicit rollback capture")
         pids.add(fourth["pid"])
@@ -482,8 +459,8 @@ def main(package_dir=None, candidate=None):
         failing_binaries = {**binaries, APP_EXE: b"not a windows executable"}
         b3 = "ota-b3-" + uuid.uuid4().hex[:6]
         valid3 = capture_package(b3, "0.1.2", failing_binaries)
-        assert stage(valid3, token)[0] == 200
-        assert activate(b3, token)[0] == 202
+        assert stage(valid3)[0] == 200
+        assert activate(b3)[0] == 202
         wait_for(lambda: any(entry["build_id"] == b3 and entry["state"] == "rolled_back"
                              for entry in history_at(RUN)),
                  40, label="failing build rollback history")
@@ -496,7 +473,7 @@ def main(package_dir=None, candidate=None):
         checks.append("failed new build rolled back and old build restarted")
 
         # code 6：把指针设为只读，使恢复指针失败（重启旧版仍成功），确认报 6 并保留旧版本运行。
-        assert activate(b2, token)[0] == 202
+        assert activate(b2)[0] == 202
         sixth = wait_for(lambda: (lambda h: h if h and h.get("build") == b2 else None)(health()),
                          60, label="b2 active before code6 case")
         pids.add(sixth["pid"])
@@ -505,8 +482,8 @@ def main(package_dir=None, candidate=None):
         try:
             b4 = "ota-b4-" + uuid.uuid4().hex[:6]
             valid4 = capture_package(b4, "0.1.3", failing_binaries)
-            assert stage(valid4, token)[0] == 200
-            assert activate(b4, token)[0] == 202
+            assert stage(valid4)[0] == 200
+            assert activate(b4)[0] == 202
             wait_log(RUN, "failed code=6", 60)
             entry = wait_for(lambda: next((item for item in history_at(RUN)
                                            if item["build_id"] == b4 and item["state"] == "rollback_failed"), None),

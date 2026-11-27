@@ -239,12 +239,19 @@ fn noise(fid: u32, y: &mut [u8], uv: &mut [u8]) {
 
 // 拟游戏压力帧：滚动背景 + 4 个 64 像素弹跳色块 + 中央 min(256,w,h) 噪声窗。
 fn motion(fid: u32, width: usize, height: usize, y: &mut [u8], uv: &mut [u8]) {
+    // 背景按 256 像素周期线性递增，每 4 行右移 1 像素；用 512 字节循环模板批量拷贝。
+    let mut ramp = [0u8; 512];
+    for (i, slot) in ramp.iter_mut().enumerate() {
+        *slot = i as u8;
+    }
+    let fid_offset = fid.wrapping_mul(3);
     for (row, line) in y.chunks_exact_mut(width).enumerate() {
-        let base = (row >> 2) as u32;
-        for (col, pixel) in line.iter_mut().enumerate() {
-            *pixel = (col as u32)
-                .wrapping_add(fid.wrapping_mul(3))
-                .wrapping_add(base) as u8;
+        let start = (fid_offset.wrapping_add((row >> 2) as u32) & 0xFF) as usize;
+        let mut dst = line;
+        while !dst.is_empty() {
+            let take = dst.len().min(256);
+            dst[..take].copy_from_slice(&ramp[start..start + take]);
+            dst = &mut dst[take..];
         }
     }
 
@@ -281,12 +288,26 @@ fn motion(fid: u32, width: usize, height: usize, y: &mut [u8], uv: &mut [u8]) {
         fill_prng(&mut state, &mut y[start..start + window]);
     }
 
+    let u0 = fid as u8;
+    let u_init = u64::from(u0)
+        | (u64::from(u0.wrapping_add(2)) << 16)
+        | (u64::from(u0.wrapping_add(4)) << 32)
+        | (u64::from(u0.wrapping_add(6)) << 48);
     for (row, line) in uv.chunks_exact_mut(width).enumerate() {
-        let yy = row as u32;
-        for (col, pair) in line.chunks_exact_mut(2).enumerate() {
-            let xx = (col as u32) * 2;
+        let v = (row as u32).wrapping_mul(2).wrapping_sub(fid) as u8;
+        let v_word = u64::from(v).wrapping_mul(0x0100_0100_0100_0100);
+        let mut u_word = u_init;
+        let mut chunks = line.chunks_exact_mut(8);
+        for chunk in chunks.by_ref() {
+            chunk.copy_from_slice(&(u_word | v_word).to_le_bytes());
+            u_word = u_word.wrapping_add(0x0008_0008_0008_0008) & 0x00FF_00FF_00FF_00FF;
+        }
+        let rem = chunks.into_remainder();
+        let base_col = (width - rem.len()) as u32;
+        for (col, pair) in rem.chunks_exact_mut(2).enumerate() {
+            let xx = base_col + (col as u32) * 2;
             pair[0] = xx.wrapping_add(fid) as u8;
-            pair[1] = yy.wrapping_mul(2).wrapping_sub(fid) as u8;
+            pair[1] = v;
         }
     }
 }

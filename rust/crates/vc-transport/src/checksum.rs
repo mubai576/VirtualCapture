@@ -60,23 +60,36 @@ pub fn crc32(data: &[u8]) -> u32 {
 }
 
 /// 整帧 FNV-1a64（与 `vc_fnv1a64` 相同）。
-pub fn fnv1a64(data: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &byte in data {
+#[inline]
+fn fnv1a64_step(mut h: u64, data: &[u8]) -> u64 {
+    // 按 8 字节分块读取，减少逐字节访存开销，保持逐字节乘法语义。
+    let (chunks, tail) = data.as_chunks::<8>();
+    for &chunk in chunks {
+        let w = u64::from_le_bytes(chunk);
+        h = (h ^ (w & 0xFF)).wrapping_mul(FNV_PRIME);
+        h = (h ^ ((w >> 8) & 0xFF)).wrapping_mul(FNV_PRIME);
+        h = (h ^ ((w >> 16) & 0xFF)).wrapping_mul(FNV_PRIME);
+        h = (h ^ ((w >> 24) & 0xFF)).wrapping_mul(FNV_PRIME);
+        h = (h ^ ((w >> 32) & 0xFF)).wrapping_mul(FNV_PRIME);
+        h = (h ^ ((w >> 40) & 0xFF)).wrapping_mul(FNV_PRIME);
+        h = (h ^ ((w >> 48) & 0xFF)).wrapping_mul(FNV_PRIME);
+        h = (h ^ (w >> 56)).wrapping_mul(FNV_PRIME);
+    }
+    for &byte in tail {
         h ^= byte as u64;
         h = h.wrapping_mul(FNV_PRIME);
     }
     h
 }
 
+pub fn fnv1a64(data: &[u8]) -> u64 {
+    fnv1a64_step(FNV_OFFSET, data)
+}
+
 /// 两段拼接的 FNV-1a64，等价于先拼再算，但不复制（对应 `vc_fnv1a64_two`）。
 pub fn fnv1a64_two(a: &[u8], b: &[u8]) -> u64 {
-    let mut h = FNV_OFFSET;
-    for &byte in a.iter().chain(b) {
-        h ^= byte as u64;
-        h = h.wrapping_mul(FNV_PRIME);
-    }
-    h
+    let h = fnv1a64_step(FNV_OFFSET, a);
+    fnv1a64_step(h, b)
 }
 
 /// 小写 16 位 hex（对应 `vc_fnv1a64_hex`）。

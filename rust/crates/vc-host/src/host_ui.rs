@@ -1,6 +1,7 @@
 //! 主机采集工作台：GPUI 展示层，所有会话与进程编排由 vc-core 管理。
 
 use std::path::PathBuf;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use gpui_kit::component::button::{Button, ButtonVariants};
@@ -91,8 +92,8 @@ impl UpdateSummary {
 pub(crate) struct HostApp {
     controller: HostController,
     snapshot: Snapshot,
+    snapshot_version: u64,
     peer_input: Entity<InputState>,
-    update_token: Entity<InputState>,
     /// 显式 MTU 输入框；点击 1500/9000 芯片时同步写入该值。
     mtu_input: Entity<InputState>,
     /// 输入框本地校验错误；只影响展示，不写入配置。
@@ -100,8 +101,6 @@ pub(crate) struct HostApp {
     startup_notice: Option<String>,
     show_details: bool,
     show_updates: bool,
-    /// 已配对时展开令牌输入，用于更换配对令牌。
-    pair_edit: bool,
     ready_path: Option<PathBuf>,
     ready_written: bool,
     restart_quit: bool,
@@ -163,28 +162,27 @@ impl HostApp {
                 .placeholder("1500..9000")
                 .default_value(initial_mtu)
         });
-        let update_token = cx.new(|cx| {
-            InputState::new(window, cx)
-                .placeholder("配对令牌（64 位十六进制）")
-                .masked(true)
-        });
-        let snapshot = controller
+        let (snapshot, snapshot_version) = controller
             .shared
             .snapshot
             .lock()
-            .map(|state| state.clone())
+            .map(|state| {
+                (
+                    state.clone(),
+                    controller.shared.version.load(Ordering::Acquire),
+                )
+            })
             .unwrap_or_default();
         let app = Self {
             controller,
             snapshot,
+            snapshot_version,
             peer_input,
-            update_token,
             mtu_input,
             mtu_error: None,
             startup_notice,
             show_details: false,
             show_updates: false,
-            pair_edit: false,
             ready_path,
             ready_written: false,
             restart_quit: false,
@@ -195,16 +193,32 @@ impl HostApp {
 
     fn start_ticker(&self, cx: &mut Context<Self>) {
         let shared = self.controller.shared.clone();
+        let mut last_version = self.snapshot_version;
+        let mut ready_written = self.ready_written;
         cx.spawn(async move |this, cx| {
             loop {
                 cx.background_executor()
                     .timer(Duration::from_millis(350))
                     .await;
-                let snapshot = shared.snapshot.lock().ok().map(|state| state.clone());
+                let current_version = shared.version.load(Ordering::Acquire);
+                if current_version == last_version && ready_written {
+                    continue;
+                }
+                let (current_version, snapshot) = if current_version != last_version {
+                    match shared.snapshot.lock() {
+                        Ok(state) => (shared.version.load(Ordering::Acquire), Some(state.clone())),
+                        Err(_) => (last_version, None),
+                    }
+                } else {
+                    (last_version, None)
+                };
                 if this
                     .update(cx, |view, cx| {
+                        let mut changed = false;
                         if let Some(snapshot) = snapshot {
                             view.snapshot = snapshot;
+                            view.snapshot_version = current_version;
+                            changed = true;
                         }
                         if !view.ready_written {
                             view.ready_written = true;
@@ -214,17 +228,22 @@ impl HostApp {
                                 view.startup_notice =
                                     Some(format!("更新就绪标记写入失败：{error}"));
                             }
+                            changed = true;
                         }
                         if view.snapshot.restart_requested && !view.restart_quit {
                             view.restart_quit = true;
                             cx.quit();
                         }
-                        cx.notify();
+                        if changed {
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
                     break;
                 }
+                last_version = current_version;
+                ready_written = true;
             }
         })
         .detach();
@@ -490,6 +509,7 @@ impl HostApp {
                 } else {
                     this.startup_notice = Some("请输入有效的 IPv4 地址，可附加端口。".into());
                 }
+                app.notify();
             }));
         let refresh = Button::new("refresh")
             .label("刷新")
@@ -777,14 +797,12 @@ impl HostApp {
     fn update_panel(&self, cx: &mut Context<Self>) -> Div {
         let locked = self.locked();
         let connected = self.snapshot.connected && self.snapshot.peer_online;
-        let paired = self.snapshot.update_token_paired;
         let local = UpdateSummary::parse(&self.snapshot.local_update);
         let peer = UpdateSummary::parse(&self.snapshot.peer_update);
-        let token_ready = vc_core::update::valid_token(self.update_token.read(cx).value().trim());
         let local_id = local.staged.as_ref().map(|build| build.build_id.clone());
         let local_ready = local_id.is_some() && !locked;
         let peer_id = peer.staged.as_ref().map(|build| build.build_id.clone());
-        let peer_ready = peer_id.is_some() && !locked && connected && paired;
+        let peer_ready = peer_id.is_some() && !locked && connected;
         let pick_local = {
             let disabled = locked;
             Button::new("pick-local-update")
@@ -795,7 +813,7 @@ impl HostApp {
                 .on_click(cx.listener(|this, _, _, cx| this.pick_update_zip(false, cx)))
         };
         let pick_peer = {
-            let disabled = locked || !connected || !paired;
+            let disabled = locked || !connected;
             Button::new("pick-peer-update")
                 .label("选择 ZIP 上传")
                 .ghost()
@@ -823,60 +841,12 @@ impl HostApp {
                     this.send(Command::ActivatePeerUpdate(build_id));
                 }
             }));
-        let pair = Button::new("pair-update-token")
-            .label("配对")
-            .compact()
-            .disabled(locked || !token_ready)
-            .on_click(cx.listener(|this, _, window, app| {
-                let token = this.update_token.read(app).value().trim().to_string();
-                if !token.is_empty() {
-                    this.send(Command::SetPeerUpdateToken(token));
-                    this.pair_edit = false;
-                    this.update_token
-                        .update(app, |state, cx| state.set_value("", window, cx));
-                }
-            }));
-        let repair = Button::new("repair-update-token")
-            .label("更换令牌")
-            .ghost()
-            .compact()
-            .disabled(locked)
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.pair_edit = true;
-                cx.notify();
-            }));
-        let cancel_repair = Button::new("cancel-repair-update-token")
-            .label("取消")
-            .ghost()
-            .compact()
-            .on_click(cx.listener(|this, _, _, cx| {
-                this.pair_edit = false;
-                cx.notify();
-            }));
-        let peer_controls = if paired && !self.pair_edit {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(div().text_size(px(11.)).text_color(rgb(OK)).child("已配对"))
-                .child(repair)
-                .child(pick_peer)
-                .child(apply_peer)
-        } else {
-            div()
-                .flex()
-                .items_center()
-                .gap_2()
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .h(px(32.))
-                        .child(Input::new(&self.update_token)),
-                )
-                .child(pair)
-                .when(paired, |this| this.child(cancel_repair))
-        };
+        let peer_controls = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(pick_peer)
+            .child(apply_peer);
         let local_rollback = local.rollback.as_ref().map(|target| {
             let build_id = target.build_id.clone();
             div()
@@ -921,7 +891,7 @@ impl HostApp {
                         .label("回滚")
                         .ghost()
                         .compact()
-                        .disabled(locked || !connected || !paired)
+                        .disabled(locked || !connected)
                         .on_click(cx.listener(move |this, _, _, _| {
                             this.send(Command::RollbackPeerUpdate(build_id.clone()));
                         })),
@@ -1119,6 +1089,9 @@ impl HostApp {
             .or(self.snapshot.error.as_ref())
         {
             return Some(("暂时无法继续".into(), error.clone(), ERR));
+        }
+        if let Some(notice) = cleanup_notice(&self.snapshot) {
+            return Some(notice);
         }
         if self.snapshot.connected && !self.snapshot.peer_online {
             return Some((
@@ -1533,6 +1506,7 @@ impl HostApp {
                     });
                 }
                 this.send(Command::PatchCapture(patch.clone()));
+                app.notify();
             }));
         }
         chip
@@ -1548,8 +1522,20 @@ impl HostApp {
                 .justify_between()
                 .child(section_heading("activity", "运行状态"))
                 .child(status_pill(
-                    if running { "采集中" } else { "待开始" },
-                    if running { OK } else { TEXT_DIM },
+                    if running {
+                        "采集中"
+                    } else if self.snapshot.cleanup_pending {
+                        "待清理"
+                    } else {
+                        "待开始"
+                    },
+                    if running {
+                        OK
+                    } else if self.snapshot.cleanup_pending {
+                        WARN
+                    } else {
+                        TEXT_DIM
+                    },
                 )),
         );
         if running {
@@ -1564,7 +1550,7 @@ impl HostApp {
                     ))
                     .child(reading(
                         "接收帧率",
-                        field(&self.snapshot.receiver, "fps", true, num),
+                        actual_fps(&self.snapshot.receiver, true),
                         "fps",
                     ))
                     .child(reading(
@@ -1599,18 +1585,21 @@ impl HostApp {
                                 div()
                                     .text_size(px(14.))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .child(if self.snapshot.connected {
+                                    .child(if self.snapshot.cleanup_pending {
+                                        "上次会话尚未完成清理"
+                                    } else if self.snapshot.connected {
                                         "设备已就位，等待开始采集"
                                     } else {
                                         "连接后，你的画面将在这里启程"
                                     }),
                             )
-                            .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(rgb(TEXT_DIM))
-                                    .child("开始采集后，将显示真实帧率、传输与完整性数据。"),
-                            ),
+                            .child(div().text_size(px(12.)).text_color(rgb(TEXT_DIM)).child(
+                                if self.snapshot.cleanup_pending {
+                                    "停止确认前不能重新开始；请重试停止或清理本地残留。"
+                                } else {
+                                    "开始采集后，将显示真实帧率、传输与完整性数据。"
+                                },
+                            )),
                     ),
             );
         }
@@ -1657,7 +1646,7 @@ impl HostApp {
             .child(stat_row(
                 "实际帧率",
                 field(sender, "fps_actual", sl, num),
-                field_any(receiver, &["fps", "fps_actual"], running, num),
+                actual_fps(receiver, running),
             ))
             .child(stat_row(
                 "完成帧数",
@@ -1691,7 +1680,12 @@ impl HostApp {
             ))
             .child(stat_row(
                 "采集转换 p99",
-                field(sender, "cap_lag_p99_ms", sl, ms),
+                field_any(
+                    sender,
+                    &["timing_ms.source.p99_ms", "cap_lag_p99_ms"],
+                    sl,
+                    ms,
+                ),
                 "—".into(),
             ))
             .child(stat_row(
@@ -1711,7 +1705,7 @@ impl HostApp {
             ))
             .child(stat_row(
                 "GPU / 虚拟卡交付",
-                field(sender, "gpu_ms", sl, ms),
+                field_any(sender, &["timing_ms.source.avg_ms", "gpu_ms"], sl, ms),
                 field_any(receiver, &["vcam_delivered", "shm_published"], running, num),
             ))
             .child(stat_row(
@@ -2005,7 +1999,7 @@ fn field(stats: &Value, key: &str, enabled: bool, format: fn(&Value) -> String) 
         "—".into()
     }
 }
-/// 依次尝试多个兼容键；点号表示读取嵌套对象（如 `rseg.p99_ms`）。
+/// 依次尝试多个兼容键；点号表示读取嵌套对象（如 `rseg.p99_ms`），跳过 `null`。
 fn field_any(stats: &Value, keys: &[&str], enabled: bool, format: fn(&Value) -> String) -> String {
     if !enabled {
         return "—".into();
@@ -2016,7 +2010,7 @@ fn field_any(stats: &Value, keys: &[&str], enabled: bool, format: fn(&Value) -> 
             for part in key.split('.') {
                 value = value.get(part)?;
             }
-            Some(format(value))
+            (!value.is_null()).then(|| format(value))
         })
         .unwrap_or_else(|| "—".into())
 }
@@ -2120,6 +2114,29 @@ fn display(value: &Value) -> String {
 fn num(value: &Value) -> String {
     display(value)
 }
+/// `fps` 是会话目标，不能在缺少实测值时冒充接收帧率。
+fn actual_fps(stats: &Value, enabled: bool) -> String {
+    field(stats, "fps_actual", enabled, num)
+}
+/// 停止未确认时优先说明资源保留，不能被普通链路预算提示掩盖。
+fn cleanup_notice(snapshot: &Snapshot) -> Option<(String, String, u32)> {
+    if snapshot.running || !snapshot.cleanup_pending {
+        return None;
+    }
+    if snapshot.remote_pending {
+        Some((
+            "远端采集停止未确认".into(),
+            "尚未确认远端会话停止与释放；配置、更新和虚拟卡回收仍被锁定。可重试停止，具体响应见最近活动；失联不视为已停止，不会强制卸载数据面。".into(),
+            WARN,
+        ))
+    } else {
+        Some((
+            "本机资源尚待清理".into(),
+            "接收会话或虚拟卡尚未确认回收；配置与更新仍被锁定。请使用清理本地残留重试，具体原因见最近活动。".into(),
+            WARN,
+        ))
+    }
+}
 fn ms(value: &Value) -> String {
     value
         .as_f64()
@@ -2148,6 +2165,79 @@ fn peer_url_from_input(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn actual_fps_never_uses_the_configured_target() {
+        assert_eq!(
+            actual_fps(&json!({"fps":240,"fps_actual":2.7805}), true),
+            "2.78"
+        );
+        assert_eq!(actual_fps(&json!({"fps":240,"fps_actual":0}), true), "0");
+        assert_eq!(actual_fps(&json!({"fps":240}), true), "—");
+        assert_eq!(actual_fps(&json!({"fps_actual":12.5}), false), "—");
+    }
+
+    #[test]
+    fn field_any_reads_nested_timing_and_skips_null_entries() {
+        let sender = json!({
+            "timing_ms": {
+                "source": {
+                    "avg_ms": 1.25,
+                    "p99_ms": 2.5
+                }
+            }
+        });
+        assert_eq!(
+            field_any(
+                &sender,
+                &["timing_ms.source.p99_ms", "cap_lag_p99_ms"],
+                true,
+                ms
+            ),
+            "2.50 ms"
+        );
+        assert_eq!(
+            field_any(&sender, &["timing_ms.source.avg_ms", "gpu_ms"], true, ms),
+            "1.25 ms"
+        );
+        let idle = json!({
+            "timing_ms": {"source": {"avg_ms": null, "p99_ms": null}},
+            "gpu_ms": 3.0
+        });
+        assert_eq!(
+            field_any(
+                &idle,
+                &["timing_ms.source.p99_ms", "cap_lag_p99_ms"],
+                true,
+                ms
+            ),
+            "—"
+        );
+        assert_eq!(
+            field_any(&idle, &["timing_ms.source.avg_ms", "gpu_ms"], true, ms),
+            "3.00 ms"
+        );
+    }
+
+    #[test]
+    fn cleanup_notice_distinguishes_remote_and_local_pending() {
+        let mut snapshot = Snapshot {
+            cleanup_pending: true,
+            remote_pending: true,
+            ..Default::default()
+        };
+        let (title, body, color) = cleanup_notice(&snapshot).unwrap();
+        assert_eq!(title, "远端采集停止未确认");
+        assert!(body.contains("尚未确认远端会话停止与释放"));
+        assert_eq!(color, WARN);
+        snapshot.remote_pending = false;
+        assert_eq!(cleanup_notice(&snapshot).unwrap().0, "本机资源尚待清理");
+        snapshot.running = true;
+        assert!(cleanup_notice(&snapshot).is_none());
+        snapshot.running = false;
+        snapshot.cleanup_pending = false;
+        assert!(cleanup_notice(&snapshot).is_none());
+    }
 
     #[test]
     fn capture_intent_distinguishes_local_cleanup_from_remote_stop() {

@@ -10,6 +10,9 @@ capture backends:
 * WGC GPU `crop` against the private Tk window, including a live window resize
   that must make the frame pool recreate and the source dimensions update;
 * WGC GPU `stretch` against the same private window (integer scaling);
+* DDA and WGC unlimited-sender cooperative stop runs (`frames=0`): after real
+  frames advance, stopping the exact sender session must return from native
+  stop/destroy within the 2 s cooperative-stop grace while the DLL stays loaded;
 * a WGC close lifecycle run (sender only) where closing the fixture window
   must surface the terminal `WGC capture item closed` error instead of
   hanging or silently repeating frames.
@@ -32,6 +35,11 @@ Gates (functional, not capacity):
   agree on every frame; the latest SHM v3 frame matches the receiver hash;
 * captured NV12 is non-blank and changes across frames (the fixture animates);
 * the resize run observes new WGC source dimensions and still completes;
+* unlimited DDA/WGC senders advance real TX/RX frames before a cooperative
+  stop; the exact sessions stop and destroy within 2 s and keep the DLL loaded;
+* the private DDA fixture is made visible/topmost and its hwnd, rect,
+  visibility and output-0/primary-proxy monitor evidence is recorded; only that
+  fixture is restored/closed;
 * the close run exits `running=false, exit_code=1` with a closed-item error;
 * every session stops/destroys cleanly and the DLL stays loaded until then.
 
@@ -86,8 +94,17 @@ RESIZE_FRAMES = 90
 RESIZE_AFTER_FRAMES = 10
 RESIZE_TO = (640, 480)
 CLOSE_MIN_FRAMES = 5
+COOP_MIN_FRAMES = 10
+COOP_STOP_GRACE_S = 2.0
+COOP_FRAME_TIMEOUT_S = 15.0
 
 if sys.platform == "win32":
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD),
+                    ("rcMonitor", wintypes.RECT),
+                    ("rcWork", wintypes.RECT),
+                    ("dwFlags", wintypes.DWORD)]
+
     USER32 = ctypes.WinDLL("user32", use_last_error=True)
     USER32.EnumWindows.argtypes = [ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND,
                                                       wintypes.LPARAM), wintypes.LPARAM]
@@ -110,13 +127,26 @@ if sys.platform == "win32":
     USER32.PostMessageW.argtypes = [wintypes.HWND, wintypes.UINT,
                                     wintypes.WPARAM, wintypes.LPARAM]
     USER32.PostMessageW.restype = wintypes.BOOL
+    USER32.GetWindowRect.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+    USER32.GetWindowRect.restype = wintypes.BOOL
+    USER32.MonitorFromWindow.argtypes = [wintypes.HWND, wintypes.DWORD]
+    USER32.MonitorFromWindow.restype = ctypes.c_void_p
+    USER32.GetMonitorInfoW.argtypes = [ctypes.c_void_p, ctypes.POINTER(MONITORINFO)]
+    USER32.GetMonitorInfoW.restype = wintypes.BOOL
 else:
     USER32 = None
 
 WM_CLOSE = 0x0010
+HWND_TOPMOST = -1
+HWND_NOTOPMOST = -2
+SWP_NOSIZE = 0x0001
 SWP_NOMOVE = 0x0002
 SWP_NOZORDER = 0x0004
 SWP_NOACTIVATE = 0x0010
+SWP_SHOWWINDOW = 0x0040
+MONITOR_DEFAULTTOPRIMARY = 1
+MONITOR_DEFAULTTONEAREST = 2
+MONITORINFOF_PRIMARY = 0x1
 
 
 class FixtureError(RuntimeError):
@@ -178,6 +208,20 @@ def _fixture_main(args):
                            fill="#ff5020", outline="#20ff80", width=3)
         canvas.create_text(8, 8, anchor="nw", text=f"frame={index}",
                            fill="white", font=("Consolas", 12))
+        # Keep all 16 luma levels inside a centred crop after resizing.  The
+        # moving bands alone can leave only 4 bands + 3 overlay colours in a
+        # 320x240 crop; that is valid pixels but insufficient fixture coverage
+        # for the unchanged >=8 distinct-Y non-blank gate.
+        left = width // 2 - 32
+        top = height // 2 - 32
+        for row in range(4):
+            for column in range(4):
+                level = (row * 4 + column) * 17
+                colour = f"#{level:02x}{level:02x}{level:02x}"
+                canvas.create_rectangle(left + column * 16, top + row * 16,
+                                        left + (column + 1) * 16,
+                                        top + (row + 1) * 16,
+                                        fill=colour, outline="")
         root.after(15, draw)
 
     draw()
@@ -241,7 +285,11 @@ def _start_fixture(title, width, height):
          "--window-fixture", "--title", title,
          "--width", str(width), "--height", str(height)],
         stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-    found = _wait_window(process, title, "Tk fixture")
+    try:
+        found = _wait_window(process, title, "Tk fixture")
+    except Exception:
+        _terminate_silently(process)
+        raise
     return process, found[0]
 
 
@@ -254,12 +302,78 @@ def _resize_window(hwnd, width, height):
                                     SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE))
 
 
+def _rect_values(rect):
+    return [int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)]
+
+
+def _monitor_evidence(hwnd):
+    monitor = USER32.MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)
+    primary = USER32.MonitorFromWindow(None, MONITOR_DEFAULTTOPRIMARY)
+    info = MONITORINFO()
+    info.cbSize = ctypes.sizeof(MONITORINFO)
+    valid = bool(USER32.GetMonitorInfoW(monitor, ctypes.byref(info))) if monitor else False
+    return {
+        "monitor": int(monitor) if monitor else None,
+        "primary_monitor": int(primary) if primary else None,
+        "monitor_rect": _rect_values(info.rcMonitor) if valid else None,
+        "monitor_work": _rect_values(info.rcWork) if valid else None,
+        "primary_monitor_flag": bool(info.dwFlags & MONITORINFOF_PRIMARY) if valid else False,
+        "on_primary": bool(monitor and primary and int(monitor) == int(primary)),
+    }
+
+
+def _fixture_evidence(hwnd, label):
+    """Record only the private fixture window; never inspect/modify other windows."""
+    if USER32 is None:
+        raise FixtureError(f"{label}: fixture window control requires Windows")
+    rect = wintypes.RECT()
+    _require(bool(USER32.GetWindowRect(hwnd, ctypes.byref(rect))),
+             f"{label}: GetWindowRect failed, win32 error {ctypes.get_last_error()}")
+    monitor = _monitor_evidence(hwnd)
+    return {
+        "hwnd": int(hwnd),
+        "rect": _rect_values(rect),
+        "visible": bool(USER32.IsWindowVisible(hwnd)),
+        "iconic": bool(USER32.IsIconic(hwnd)),
+        # DXGI output ordinals are not in the ready marker; primary-monitor
+        # membership is the verifiable proxy recorded for requested output 0.
+        "chosen_output": 0,
+        "chosen_output_proxy": "primary_monitor",
+        "on_chosen_output": monitor["on_primary"],
+        **monitor,
+    }
+
+
+def _set_fixture_topmost(hwnd, topmost):
+    """Make only the private fixture visible/topmost, or restore its z-order."""
+    if USER32 is None:
+        raise FixtureError("fixture window control requires Windows")
+    insert_after = HWND_TOPMOST if topmost else HWND_NOTOPMOST
+    flags = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE
+    if topmost:
+        flags |= SWP_SHOWWINDOW
+    action = "topmost" if topmost else "restore"
+    _require(bool(USER32.SetWindowPos(hwnd, insert_after, 0, 0, 0, 0, flags)),
+             f"fixture: SetWindowPos({action}) failed, win32 error "
+             f"{ctypes.get_last_error()}")
+    evidence = _fixture_evidence(hwnd, f"fixture {action}")
+    if topmost:
+        _require(evidence["visible"] and not evidence["iconic"],
+                 f"fixture: window is not visible after topmost: {evidence}")
+    return evidence
+
+
 def _stop_process(process, hwnd=None, timeout=5.0):
     if process is None:
         return {"was_running": False}
     was_running = process.poll() is None
-    if hwnd:
-        _close_window(hwnd)
+    if hwnd and was_running and USER32 is not None:
+        # Post only while the handle still belongs to the private fixture;
+        # never close a recycled or foreign window.
+        pid = wintypes.DWORD(0)
+        USER32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+        if int(pid.value) == int(process.pid):
+            _close_window(hwnd)
     try:
         process.wait(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -322,6 +436,24 @@ def _source_config(mode, window, transform, gpu_convert):
     }
 
 
+def _unlimited_config(width, height):
+    """frames=0 keeps an unlimited sender/receiver alive until an exact stop."""
+    frame_bytes = width * height * 3 // 2
+    payload = MTU - smoke.PACKET_OVERHEAD
+    return {
+        "frames": 0,
+        "fps": FPS,
+        "width": width,
+        "height": height,
+        "mtu": MTU,
+        "frame_bytes": frame_bytes,
+        "total_packets": (frame_bytes + payload - 1) // payload,
+        "ready_timeout_s": 15.0,
+        "stream_timeout_s": 30.0,
+        "receiver_timeout_s": 30,
+    }
+
+
 def _codec_raw():
     return dll._codec_config("raw", None, None, None)
 
@@ -340,22 +472,30 @@ def _receiver_request(cfg, session, source_mac, shm_name, stats, hashlog):
 # Status helpers
 
 
-def _wait_frames(api, handle, session_id, label, minimum, timeout):
+def _wait_counter(api, handle, session_id, label, key, minimum, timeout):
     deadline = time.monotonic() + timeout
     last = None
     while True:
         status = dll._check_status(api.status(handle, label), session_id, label)
         last = status
         if status.get("running") is False:
-            raise dll.DllError(f"{label}: worker ended before reaching {minimum} frames: "
+            raise dll.DllError(f"{label}: worker ended before reaching {minimum} {key}: "
                                f"{dll._brief(status)}")
-        frames = status.get("frames")
-        if smoke.is_int(frames) and frames >= minimum:
+        value = status.get(key)
+        if smoke.is_int(value) and value >= minimum:
             return status
         if time.monotonic() >= deadline:
-            raise dll.DllError(f"{label}: only {frames!r} frames after {timeout:.1f}s "
+            raise dll.DllError(f"{label}: only {value!r} {key} after {timeout:.1f}s "
                                f"(wanted >= {minimum}): {dll._brief(last)}")
         time.sleep(dll.POLL_SECONDS)
+
+
+def _wait_frames(api, handle, session_id, label, minimum, timeout):
+    return _wait_counter(api, handle, session_id, label, "frames", minimum, timeout)
+
+
+def _wait_complete(api, handle, session_id, label, minimum, timeout):
+    return _wait_counter(api, handle, session_id, label, "complete", minimum, timeout)
 
 
 def _wait_stopped(api, handle, session_id, label, timeout):
@@ -496,6 +636,106 @@ def _validate_motion(tx_rows, frames, label):
     return {"frames": frames, "unique_source_hashes": unique}
 
 
+def _validate_stopped_sender_stats(stats, cfg, session, source, label, minimum):
+    _require(isinstance(stats, dict), f"{label}: stats is not a JSON object")
+    smoke.require_session(stats.get("session_id"), session, label)
+    smoke.require_adapter(stats.get("adapter"), label)
+    _require(stats.get("running") is False, f"{label}: running {stats.get('running')!r}")
+    _require(stats.get("failed") is False, f"{label}: failed {stats.get('failed')!r}")
+    _require(stats.get("exit_code") == 0, f"{label}: exit_code {stats.get('exit_code')!r}")
+    _require(stats.get("cancelled") is True,
+             f"{label}: cancelled {stats.get('cancelled')!r}; stop was not cooperative")
+    _require(stats.get("send_errors") == 0,
+             f"{label}: send_errors {stats.get('send_errors')!r}")
+    sent = stats.get("sent_frames")
+    frames = stats.get("frames")
+    _require(smoke.is_int(sent) and sent >= minimum,
+             f"{label}: sent_frames {sent!r} < {minimum}")
+    _require(frames == sent, f"{label}: frames {frames!r} != sent_frames {sent!r}")
+    actual = stats.get("fps_actual")
+    _require(_is_number(actual) and actual > 0, f"{label}: fps_actual {actual!r}")
+    source_info = _validate_source_info(stats.get("source_info"), cfg, source, label)
+    return {"frames": sent, "fps_actual": actual, "source_info": source_info}
+
+
+def _validate_stopped_receiver_stats(stats, cfg, session, label, minimum):
+    _require(isinstance(stats, dict), f"{label}: stats is not a JSON object")
+    smoke.require_session(stats.get("session_id"), session, label)
+    smoke.require_adapter(stats.get("adapter"), label)
+    _require(stats.get("running") is False, f"{label}: running {stats.get('running')!r}")
+    _require(stats.get("failed") is False, f"{label}: failed {stats.get('failed')!r}")
+    _require(stats.get("error") is None, f"{label}: error {stats.get('error')!r}")
+    _require(stats.get("cancelled") is True,
+             f"{label}: cancelled {stats.get('cancelled')!r}; stop was not cooperative")
+    _require(stats.get("expect_frames") == 0,
+             f"{label}: expect_frames {stats.get('expect_frames')!r} is not unlimited")
+    _require(smoke.is_int(stats.get("timeout_s")) and stats["timeout_s"] > 0,
+             f"{label}: timeout_s {stats.get('timeout_s')!r}")
+    _require(smoke.is_int(stats.get("hash_mismatch")) and stats["hash_mismatch"] == 0,
+             f"{label}: hash_mismatch {stats.get('hash_mismatch')!r}")
+    complete = stats.get("complete")
+    hash_rows = stats.get("hash_rows")
+    _require(smoke.is_int(complete) and complete >= minimum,
+             f"{label}: complete {complete!r} < {minimum}")
+    _require(smoke.is_int(hash_rows) and hash_rows >= minimum,
+             f"{label}: hash_rows {hash_rows!r} < {minimum}")
+    _require(hash_rows == complete,
+             f"{label}: hash_rows {hash_rows!r} != complete {complete!r}")
+    return {"complete": complete, "hash_rows": hash_rows}
+
+
+def _validate_unlimited_shm(view, shm_name, cfg, rx_rows, minimum_seq, label):
+    """Validate the private SHM v3 header and latest published frame after stop."""
+    header = struct.unpack(smoke.SHM_HDR_FMT, view.read(0, smoke.SHM_HDR_SIZE))
+    (magic, version, slots, frame_bytes, data_off, latest_slot, latest_seq,
+     writer_pid, width, height, fps) = header
+    _require(magic == smoke.SHM_MAGIC, f"{label}: SHM magic 0x{magic:08x}")
+    _require(version == smoke.SHM_VERSION, f"{label}: SHM version {version}")
+    _require(slots == smoke.SHM_SLOTS, f"{label}: SHM slots {slots}")
+    _require(data_off == smoke.SHM_DATA_OFF, f"{label}: SHM data_off {data_off}")
+    _require(frame_bytes == cfg["frame_bytes"],
+             f"{label}: SHM frame_bytes {frame_bytes} != {cfg['frame_bytes']}")
+    _require((width, height, fps) == (cfg["width"], cfg["height"], cfg["fps"]),
+             f"{label}: SHM geometry {width}x{height}@{fps} != "
+             f"{cfg['width']}x{cfg['height']}@{cfg['fps']}")
+    _require(writer_pid == os.getpid(),
+             f"{label}: SHM writer_pid {writer_pid} != live host pid {os.getpid()}")
+    _require(smoke.is_int(latest_seq) and latest_seq >= minimum_seq,
+             f"{label}: SHM latest_seq {latest_seq!r} < {minimum_seq}")
+    _require(0 <= latest_slot < smoke.SHM_SLOTS,
+             f"{label}: SHM latest_slot {latest_slot} is outside 0..{smoke.SHM_SLOTS - 1}")
+    slot_offset = dll.SHM_HEADER_BYTES + dll.SHM_SLOT_BYTES * latest_slot
+    seq1, frame_id, qpc_first, qpc_pub, slot_hash, hash_fid = struct.unpack(
+        smoke.SHM_SLOT_FMT, view.read(slot_offset, smoke.SHM_SLOT_SIZE))
+    _require(seq1 % 2 == 0, f"{label}: latest SHM slot seq {seq1} is odd")
+    _require(0 <= frame_id < latest_seq,
+             f"{label}: latest SHM frame_id {frame_id} is outside 0..{latest_seq - 1}")
+    _require(qpc_first > 0 and qpc_pub >= qpc_first,
+             f"{label}: invalid SHM QPC fields first={qpc_first} pub={qpc_pub}")
+    rows = {row["frame_id"]: row for row in rx_rows}
+    _require(frame_id in rows,
+             f"{label}: latest SHM frame {frame_id} is missing from the RX hashlog")
+    payload = _latest_payload(view, {"latest_slot": latest_slot})
+    actual = smoke.pattern_ref.fnv1a64_hex(payload)
+    _require(actual == rows[frame_id]["hash"],
+             f"{label}: SHM frame {frame_id} FNV {actual} != RX hash "
+             f"{rows[frame_id]['hash']}")
+    _require(hash_fid == frame_id,
+             f"{label}: SHM hash_fid {hash_fid} != frame_id {frame_id}")
+    _require(slot_hash == int(actual, 16),
+             f"{label}: SHM slot.hash 0x{slot_hash:016x} != FNV 0x{int(actual, 16):016x}")
+    return {
+        "name": shm_name,
+        "version": version,
+        "geometry": [width, height, fps],
+        "latest_slot": latest_slot,
+        "latest_seq": latest_seq,
+        "latest_frame_id": frame_id,
+        "latest_hash": actual,
+        "hash_marked": True,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Live combos
 
@@ -504,8 +744,267 @@ def _cleanup_entry(api, entry, label):
     return dll._stop_then_destroy(api, entry, label)
 
 
+def _cooperative_stop_destroy(api, session_entry, session_id, label,
+                              timeout=COOP_STOP_GRACE_S):
+    """Stop and destroy one exact session inside one absolute native grace.
+
+    The deadline is enforced even when the final stop/destroy calls return 0:
+    a late successful return is still a failure of the 2 s cooperative gate.
+    """
+    handle = session_entry["handle"]
+    started = time.monotonic()
+    deadline = started + timeout
+    stop_codes = []
+    while True:
+        code = api.stop(handle, f"{label} cooperative stop")
+        stop_codes.append(code)
+        if code == 0:
+            break
+        if time.monotonic() >= deadline:
+            raise dll.PendingError(
+                f"{label}: stop_session stayed pending beyond {timeout:.1f}s native "
+                f"grace; codes={stop_codes[-8:]}")
+        time.sleep(0.01)
+    stopped_at = time.monotonic()
+    status = dll._check_status(api.status(handle, f"{label} status after stop"),
+                               session_id, label)
+    loaded_after_stop = dll._module_loaded()
+    _require(loaded_after_stop is True,
+             f"{label}: vc_stream.dll was unloaded after stop before destroy")
+    destroy_codes = []
+    while True:
+        code = api.destroy(handle, f"{label} destroy")
+        destroy_codes.append(code)
+        if code == 0:
+            break
+        if time.monotonic() >= deadline:
+            raise dll.PendingError(
+                f"{label}: destroy_session stayed pending beyond {timeout:.1f}s native "
+                f"grace; codes={destroy_codes[-8:]}")
+        time.sleep(0.01)
+    destroyed_at = time.monotonic()
+    # destroy_session returned 0, so the handle is invalid now.  Mark it before
+    # any check that can raise, otherwise the caller would retry a dead handle.
+    session_entry["destroyed"] = True
+    loaded_after_destroy = dll._module_loaded()
+    cleanup = {
+        "stop_codes": stop_codes,
+        "destroy_codes": destroy_codes,
+        "native_stop_grace_s": timeout,
+        "stop_elapsed_s": round(stopped_at - started, 6),
+        "destroy_elapsed_s": round(destroyed_at - stopped_at, 6),
+        "total_elapsed_s": round(destroyed_at - started, 6),
+        "status_after_stop": status,
+        "module_loaded_after_stop": loaded_after_stop,
+        "module_loaded_after_destroy": loaded_after_destroy,
+    }
+    session_entry["cleanup"] = cleanup
+    _require(loaded_after_destroy is True,
+             f"{label}: vc_stream.dll was unloaded by destroy")
+    total_elapsed = destroyed_at - started
+    if total_elapsed > timeout:
+        raise dll.DllError(
+            f"{label}: stop+destroy completed after {total_elapsed:.3f}s, "
+            f"exceeding the {timeout:.1f}s native stop grace; "
+            f"stop_codes={stop_codes[-8:]}, destroy_codes={destroy_codes[-8:]}")
+    return cleanup
+
+
+def run_cooperative_stop(api, run_dir, token, name, source, width, height,
+                         fixture_evidence=None, entries=None):
+    """Unlimited TX/RX: advance real frames, then stop exact sessions within 2 s."""
+    _require(source.get("gpu_convert") is True,
+             f"{name}: desktop capture is GPU-only; gpu_convert=false is not allowed")
+    cfg = _unlimited_config(width, height)
+    tx_session = f"src-{token}-{name}-tx"
+    rx_session = f"src-{token}-{name}-rx"
+    shm_name = f"Local\\VirtualCaptureSourceSmoke.{token}.{name}"
+    source_mac = dll._random_source_mac()
+    tx_stats_path = run_dir / f"{name}-tx-stats.json"
+    tx_hashlog_path = run_dir / f"{name}-tx-hash.jsonl"
+    rx_stats_path = run_dir / f"{name}-rx-stats.json"
+    rx_hashlog_path = run_dir / f"{name}-rx-hash.jsonl"
+
+    tx_request = _sender_request(cfg, tx_session, source, source_mac,
+                                 tx_stats_path, tx_hashlog_path)
+    rx_request = _receiver_request(cfg, rx_session, source_mac, shm_name,
+                                   rx_stats_path, rx_hashlog_path)
+    entry = {
+        "name": name,
+        "kind": "cooperative-stop",
+        "config": cfg,
+        "source": source,
+        "sessions_requested": {"sender": tx_session, "receiver": rx_session},
+        "shm": shm_name,
+        "requests": {"sender": tx_request, "receiver": rx_request},
+        "evidence": {
+            "tx_stats": str(tx_stats_path),
+            "tx_hashlog": str(tx_hashlog_path),
+            "rx_stats": str(rx_stats_path),
+            "rx_hashlog": str(rx_hashlog_path),
+        },
+        "frames_floor": COOP_MIN_FRAMES,
+        "native_stop_grace_s": COOP_STOP_GRACE_S,
+        "sessions": {
+            "sender": {"session_id": tx_session},
+            "receiver": {"session_id": rx_session},
+        },
+    }
+    if fixture_evidence is not None:
+        entry["fixture_evidence"] = fixture_evidence
+    if entries is not None:
+        entries.append(entry)
+    sessions = {}
+    view = None
+    try:
+        rx_handle = api.start(dll.ROLE_RECEIVER, rx_request, f"{name} RX start")
+        sessions["rx"] = {"handle": rx_handle, "destroyed": False}
+        rx_ready = dll._wait_ready(api, rx_handle, rx_session, f"{name} RX",
+                                   cfg["ready_timeout_s"])
+        dll._validate_receiver_ready(rx_ready, cfg, rx_session, _codec_raw())
+        entry["sessions"]["receiver"]["ready"] = rx_ready
+        view = dll._open_shm_view(shm_name, f"{name} RX", cfg["ready_timeout_s"])
+
+        tx_handle = api.start(dll.ROLE_SENDER, tx_request, f"{name} TX start")
+        sessions["tx"] = {"handle": tx_handle, "destroyed": False}
+        tx_ready = dll._wait_ready(api, tx_handle, tx_session, f"{name} TX",
+                                   cfg["ready_timeout_s"])
+        ready_source = _validate_sender_ready_source(tx_ready, cfg, tx_session, source)
+        entry["sessions"]["sender"]["ready"] = tx_ready
+        entry["sessions"]["sender"]["ready_source_info"] = ready_source
+
+        tx_before = _wait_frames(api, tx_handle, tx_session, f"{name} TX",
+                                 COOP_MIN_FRAMES, COOP_FRAME_TIMEOUT_S)
+        rx_before = _wait_complete(api, rx_handle, rx_session, f"{name} RX",
+                                   COOP_MIN_FRAMES, COOP_FRAME_TIMEOUT_S)
+        entry["sessions"]["sender"]["before_stop"] = dll._brief(tx_before)
+        entry["sessions"]["receiver"]["before_stop"] = dll._brief(rx_before)
+
+        tx_cleanup = _cooperative_stop_destroy(
+            api, sessions["tx"], tx_session, f"{name} TX")
+        sessions["tx"]["cleanup"] = tx_cleanup
+        entry["sessions"]["sender"]["cleanup"] = tx_cleanup
+        entry["sessions"]["sender"]["final"] = tx_cleanup["status_after_stop"]
+
+        rx_cleanup = _cooperative_stop_destroy(
+            api, sessions["rx"], rx_session, f"{name} RX")
+        sessions["rx"]["cleanup"] = rx_cleanup
+        entry["sessions"]["receiver"]["cleanup"] = rx_cleanup
+        entry["sessions"]["receiver"]["final"] = rx_cleanup["status_after_stop"]
+
+        tx_status = tx_cleanup["status_after_stop"]
+        _require(tx_status.get("running") is False,
+                 f"{name} TX: running {tx_status.get('running')!r} after stop")
+        _require(tx_status.get("cancelled") is True,
+                 f"{name} TX: cancelled {tx_status.get('cancelled')!r} after stop")
+        _require(tx_status.get("exit_code") == 0,
+                 f"{name} TX: exit_code {tx_status.get('exit_code')!r} after stop")
+        tx_frames_before = tx_before.get("frames")
+        tx_frames_final = tx_status.get("frames")
+        _require(smoke.is_int(tx_frames_final) and tx_frames_final >= COOP_MIN_FRAMES,
+                 f"{name} TX: final frames {tx_frames_final!r} < {COOP_MIN_FRAMES}")
+        _require(tx_frames_final >= tx_frames_before,
+                 f"{name} TX: final frames {tx_frames_final!r} < before-stop "
+                 f"{tx_frames_before!r}")
+
+        rx_status = rx_cleanup["status_after_stop"]
+        _require(rx_status.get("running") is False,
+                 f"{name} RX: running {rx_status.get('running')!r} after stop")
+        _require(rx_status.get("cancelled") is True,
+                 f"{name} RX: cancelled {rx_status.get('cancelled')!r} after stop")
+        _require(rx_status.get("exit_code") == 0,
+                 f"{name} RX: exit_code {rx_status.get('exit_code')!r} after stop")
+        rx_complete_final = rx_status.get("complete")
+        _require(smoke.is_int(rx_complete_final) and rx_complete_final >= COOP_MIN_FRAMES,
+                 f"{name} RX: complete {rx_complete_final!r} < {COOP_MIN_FRAMES}")
+
+        tx_stats = smoke.read_json(tx_stats_path, f"{name} TX stats")
+        rx_stats = smoke.read_json(rx_stats_path, f"{name} RX stats")
+        entry["stats"] = {"tx": tx_stats, "rx": rx_stats}
+        tx_final = _validate_stopped_sender_stats(
+            tx_stats, cfg, tx_session, source, f"{name} TX stats", COOP_MIN_FRAMES)
+        rx_final = _validate_stopped_receiver_stats(
+            rx_stats, cfg, rx_session, f"{name} RX stats", COOP_MIN_FRAMES)
+        _require(tx_final["frames"] == tx_frames_final,
+                 f"{name} TX: stats frames {tx_final['frames']} != stopped status "
+                 f"{tx_frames_final}")
+        _require(rx_final["complete"] == rx_complete_final,
+                 f"{name} RX: stats complete {rx_final['complete']} != stopped status "
+                 f"{rx_complete_final}")
+
+        tx_rows = _read_partial_rows(tx_hashlog_path, f"{name} TX hashlog")
+        rx_rows = _read_partial_rows(rx_hashlog_path, f"{name} RX hashlog")
+        _require(len(tx_rows) == tx_final["frames"],
+                 f"{name} TX: {len(tx_rows)} hash rows != {tx_final['frames']} frames")
+        _require(len(rx_rows) == rx_final["complete"],
+                 f"{name} RX: {len(rx_rows)} hash rows != {rx_final['complete']} complete")
+        _require(len(rx_rows) <= len(tx_rows),
+                 f"{name}: RX has {len(rx_rows)} hash rows but TX sent {len(tx_rows)}")
+        smoke.require_no_mismatch(
+            {row["frame_id"]: row["hash"] for row in tx_rows},
+            {row["frame_id"]: row["hash"] for row in rx_rows},
+            f"{name} TX hashlog", f"{name} RX hashlog", "Raw source hash agreement")
+        motion = _validate_motion(tx_rows, len(tx_rows), name)
+        shm_summary = _validate_unlimited_shm(
+            view, shm_name, cfg, rx_rows, COOP_MIN_FRAMES, f"{name} RX SHM")
+
+        entry["result"] = {
+            "status": "PASS",
+            "mode": "unlimited-cooperative-stop",
+            "frames": tx_frames_final,
+            "fps_target": cfg["fps"],
+            "fps_actual_tx": tx_final["fps_actual"],
+            "frames_floor": COOP_MIN_FRAMES,
+            "tx_frames_before_stop": tx_frames_before,
+            "tx_frames_final": tx_frames_final,
+            "rx_complete_before_stop": rx_before.get("complete"),
+            "rx_complete_final": rx_complete_final,
+            "native_stop_grace_s": COOP_STOP_GRACE_S,
+            "tx_stop_elapsed_s": tx_cleanup["stop_elapsed_s"],
+            "tx_total_elapsed_s": tx_cleanup["total_elapsed_s"],
+            "rx_stop_elapsed_s": rx_cleanup["stop_elapsed_s"],
+            "rx_total_elapsed_s": rx_cleanup["total_elapsed_s"],
+            "module_loaded_after_stop": True,
+            "module_loaded_after_destroy": True,
+            "motion": motion,
+            "shm": {key: shm_summary.get(key) for key in
+                    ("version", "geometry", "latest_seq", "latest_frame_id",
+                     "latest_hash", "hash_marked")},
+            "source_info_ready": ready_source,
+            "source_info_final": tx_final["source_info"],
+        }
+        return entry
+    except Exception as exc:
+        entry["status"] = "FAIL"
+        entry["result"] = {**entry.get("result", {}), "status": "FAIL"}
+        entry["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        entry["traceback"] = traceback.format_exc()
+        raise
+    finally:
+        if view is not None:
+            view.close()
+        pending = []
+        for role in ("tx", "rx"):
+            session = sessions.get(role)
+            if session is None or session.get("destroyed"):
+                continue
+            try:
+                session["cleanup"] = _cleanup_entry(
+                    api, session, f"{name} {role.upper()} cleanup")
+            except Exception as exc:  # noqa: BLE001
+                pending.append(f"{role.upper()}: {exc}")
+                session["cleanup"] = {"error": str(exc)}
+        entry["cleanup"] = {role: sessions.get(role, {}).get("cleanup")
+                            for role in ("tx", "rx")}
+        entry["cleanup_errors"] = pending
+        if pending:
+            partial = entries if entries is not None else [entry]
+            dll._hard_exit_pending(run_dir, {"status": "FAIL", "combos": partial},
+                                   "; ".join(pending))
+
+
 def run_combo(api, run_dir, token, name, source, width, height, frames,
-              resize=None, fixture_hwnd=None):
+              resize=None, fixture_hwnd=None, fixture_evidence=None, entries=None):
     _require(source.get("gpu_convert") is True,
              f"{name}: desktop capture is GPU-only; gpu_convert=false is not allowed")
     cfg = smoke.build_config(frames, FPS, width, height, MTU, 1)
@@ -535,6 +1034,12 @@ def run_combo(api, run_dir, token, name, source, width, height, frames,
             "rx_hashlog": str(rx_hashlog_path),
         },
     }
+    if fixture_evidence is not None:
+        entry["fixture_evidence"] = fixture_evidence
+    # Publish the partial entry before any DLL/native work so a failed run is
+    # still present in failure.json together with its staged status/cleanup.
+    if entries is not None:
+        entries.append(entry)
     sessions = {}
     view = None
     try:
@@ -651,6 +1156,12 @@ def run_combo(api, run_dir, token, name, source, width, height, frames,
         _require(entry["module_loaded_after_cleanup"] is not False,
                  f"{name}: vc_stream.dll was unloaded before session cleanup")
         return entry
+    except Exception as exc:
+        entry["status"] = "FAIL"
+        entry["result"] = {**entry.get("result", {}), "status": "FAIL"}
+        entry["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        entry["traceback"] = traceback.format_exc()
+        raise
     finally:
         if view is not None:
             view.close()
@@ -669,7 +1180,8 @@ def run_combo(api, run_dir, token, name, source, width, height, frames,
                             for role in ("tx", "rx")}
         entry["cleanup_errors"] = pending
         if pending:
-            dll._hard_exit_pending(run_dir, {"status": "FAIL", "combos": entry},
+            partial = entries if entries is not None else [entry]
+            dll._hard_exit_pending(run_dir, {"status": "FAIL", "combos": partial},
                                    "; ".join(pending))
 
 
@@ -696,7 +1208,7 @@ def _read_partial_rows(path, label):
     return rows
 
 
-def run_close_lifecycle(api, run_dir, token, source, fixture):
+def run_close_lifecycle(api, run_dir, token, source, fixture, entries=None):
     _require(source.get("gpu_convert") is True,
              "wgc-close: desktop capture is GPU-only; gpu_convert=false is not allowed")
     name = "wgc-close"
@@ -721,6 +1233,8 @@ def run_close_lifecycle(api, run_dir, token, source, fixture):
     entry = {"name": name, "config": cfg, "source": source, "request": request,
              "evidence": {"tx_stats": str(stats_path),
                           "tx_hashlog": str(hashlog_path)}}
+    if entries is not None:
+        entries.append(entry)
     handle = None
     session_entry = None
     try:
@@ -765,6 +1279,12 @@ def run_close_lifecycle(api, run_dir, token, source, fixture):
         _require(entry["module_loaded_after_cleanup"] is not False,
                  f"{name}: vc_stream.dll was unloaded before session cleanup")
         return entry
+    except Exception as exc:
+        entry["status"] = "FAIL"
+        entry["result"] = {**entry.get("result", {}), "status": "FAIL"}
+        entry["error"] = {"type": type(exc).__name__, "message": str(exc)}
+        entry["traceback"] = traceback.format_exc()
+        raise
     finally:
         if session_entry is not None and not session_entry.get("destroyed"):
             try:
@@ -785,15 +1305,44 @@ def _dda_unavailable(error):
         or "0x887a0002" in text)
 
 
-def run_combos(api, run_dir, token, allow_dda_unavailable=False):
+def run_combos(api, run_dir, token, allow_dda_unavailable=False, combos=None):
+    if combos is None:
+        combos = []
     fixture_process = None
     fixture_hwnd = None
     fixture_title = FIXTURE_TITLE_PREFIX + token
-    combos = []
+    fixture_evidence = None
     dda_blocked = None
+
+    def mark_dda_blocked(name, source, error, reason):
+        nonlocal dda_blocked
+        dda_blocked = str(error)
+        record = {
+            "name": name,
+            "status": "BLOCKED",
+            "reason": reason,
+            "source": source,
+            "dda_error": dda_blocked,
+        }
+        if combos and combos[-1].get("name") == name \
+                and combos[-1].get("status") == "FAIL":
+            # Keep the partial entry (sessions/cleanup/error) but stop reporting
+            # an expected missing-output host as an unhandled smoke failure.
+            combos[-1].update(record)
+            combos[-1]["result"] = {"status": "BLOCKED"}
+        else:
+            combos.append(record)
+
     try:
         fixture_process, fixture_hwnd = _start_fixture(
             fixture_title, RESIZE_TO[0] - 160, 360)
+
+        def raise_fixture():
+            # Re-assert only the private fixture before each DDA capture: it may
+            # otherwise sit behind another window and produce no new content.
+            # This is recorded evidence, not an assertion about an earlier failure.
+            return {"topmost": _set_fixture_topmost(fixture_hwnd, True)}
+
         dda_specs = (
             ("dda-gpu-stretch", _source_config("dda", "", "stretch", True),
              DDA_WIDTH, DDA_HEIGHT, DDA_FRAMES),
@@ -806,45 +1355,80 @@ def run_combos(api, run_dir, token, allow_dda_unavailable=False):
                     "name": name,
                     "status": "BLOCKED",
                     "reason": "skipped because the host exposes no DXGI output",
-                    "dda_error": dda_blocked,
-                })
-                continue
-            try:
-                combos.append(run_combo(
-                    api, run_dir, token, name, source, width, height, frames))
-            except dll.DllError as exc:
-                if not (allow_dda_unavailable and _dda_unavailable(exc)):
-                    raise
-                dda_blocked = str(exc)
-                combos.append({
-                    "name": name,
-                    "status": "BLOCKED",
-                    "reason": ("host has no DXGI output for DDA; the requested source "
-                               "was not silently replaced"),
                     "source": source,
                     "dda_error": dda_blocked,
                 })
+                continue
+            fixture_evidence = raise_fixture()
+            try:
+                run_combo(api, run_dir, token, name, source, width, height,
+                          frames, fixture_evidence=fixture_evidence,
+                          entries=combos)
+            except dll.DllError as exc:
+                if not (allow_dda_unavailable and _dda_unavailable(exc)):
+                    raise
+                mark_dda_blocked(
+                    name, source, exc,
+                    "host has no DXGI output for DDA; the requested source "
+                    "was not silently replaced")
 
-        combos.append(run_combo(
+        dda_stop_source = _source_config("dda", "", "stretch", True)
+        if dda_blocked is not None:
+            combos.append({
+                "name": "dda-gpu-stop",
+                "status": "BLOCKED",
+                "reason": "skipped because the host exposes no DXGI output",
+                "source": dda_stop_source,
+                "dda_error": dda_blocked,
+            })
+        else:
+            fixture_evidence = raise_fixture()
+            try:
+                run_cooperative_stop(
+                    api, run_dir, token, "dda-gpu-stop", dda_stop_source,
+                    DDA_WIDTH, DDA_HEIGHT, fixture_evidence=fixture_evidence,
+                    entries=combos)
+            except dll.DllError as exc:
+                if not (allow_dda_unavailable and _dda_unavailable(exc)):
+                    raise
+                mark_dda_blocked(
+                    "dda-gpu-stop", dda_stop_source, exc,
+                    "host has no DXGI output for DDA; the requested source "
+                    "was not silently replaced")
+
+        restore = _set_fixture_topmost(fixture_hwnd, False)
+        fixture_evidence = {**(fixture_evidence or {}), "restore": restore}
+
+        run_combo(
             api, run_dir, token, "wgc-gpu-crop-resize",
             _source_config("wgc", fixture_title, "crop", True),
             WGC_WIDTH, WGC_HEIGHT, RESIZE_FRAMES,
             resize={"after_frames": RESIZE_AFTER_FRAMES,
                     "width": RESIZE_TO[0], "height": RESIZE_TO[1]},
-            fixture_hwnd=fixture_hwnd))
-        combos.append(run_combo(
+            fixture_hwnd=fixture_hwnd, entries=combos)
+        run_combo(
             api, run_dir, token, "wgc-gpu-stretch",
             _source_config("wgc", fixture_title, "stretch", True),
-            WGC_WIDTH, WGC_HEIGHT, WGC_FRAMES))
-        combos.append(run_close_lifecycle(
+            WGC_WIDTH, WGC_HEIGHT, WGC_FRAMES, entries=combos)
+        run_cooperative_stop(
+            api, run_dir, token, "wgc-gpu-stop",
+            _source_config("wgc", fixture_title, "crop", True),
+            WGC_WIDTH, WGC_HEIGHT, entries=combos)
+        run_close_lifecycle(
             api, run_dir, token,
             _source_config("wgc", fixture_title, "crop", True),
-            (fixture_process, fixture_hwnd)))
-        combos.append({"fixture_cleanup": _stop_process(fixture_process)})
-        fixture_process = None
+            (fixture_process, fixture_hwnd), entries=combos)
         return combos
     finally:
-        _terminate_silently(fixture_process)
+        cleanup = None
+        try:
+            cleanup = _stop_process(fixture_process, fixture_hwnd)
+        except Exception as exc:  # noqa: BLE001 - fixture teardown must be recorded
+            cleanup = {"error": str(exc)}
+        finally:
+            _terminate_silently(fixture_process)
+        combos.append({"fixture_cleanup": cleanup,
+                       "fixture_evidence": fixture_evidence})
 
 
 # ---------------------------------------------------------------------------
@@ -895,9 +1479,89 @@ def self_check():
              "self-check: missing-DXGI-output classification")
     _require(not _dda_unavailable(dll.DllError("WGC capture item closed")),
              "self-check: unrelated failures must not be treated as DDA blocked")
+
+    stop_cfg = _unlimited_config(DDA_WIDTH, DDA_HEIGHT)
+    stop_payload = MTU - smoke.PACKET_OVERHEAD
+    _require(stop_cfg["frames"] == 0, "self-check: cooperative stop config is limited")
+    _require(stop_cfg["frame_bytes"] == DDA_WIDTH * DDA_HEIGHT * 3 // 2,
+             "self-check: cooperative stop frame_bytes")
+    _require(stop_cfg["total_packets"] ==
+             (stop_cfg["frame_bytes"] + stop_payload - 1) // stop_payload,
+             "self-check: cooperative stop packet count")
+    _require(stop_cfg["receiver_timeout_s"] > COOP_FRAME_TIMEOUT_S,
+             "self-check: receiver timeout must outlive the frame-advance window")
+    _require(COOP_MIN_FRAMES >= 1 and COOP_STOP_GRACE_S == 2.0
+             and COOP_FRAME_TIMEOUT_S > COOP_STOP_GRACE_S,
+             "self-check: cooperative stop constants")
+
+    stop_source = _source_config("wgc", "", "stretch", True)
+    stop_stats = {
+        "session_id": "self-stop-tx",
+        "adapter": smoke.LOOPBACK,
+        "running": False,
+        "failed": False,
+        "exit_code": 0,
+        "cancelled": True,
+        "send_errors": 0,
+        "frames": COOP_MIN_FRAMES,
+        "sent_frames": COOP_MIN_FRAMES,
+        "fps_actual": 30.0,
+        "source_info": {
+            "mode": "wgc",
+            "window": "",
+            "transform": "stretch",
+            "output": 0,
+            "gpu_convert": True,
+            "gpu": "Self Check GPU",
+            "source_width": WGC_WIDTH,
+            "source_height": WGC_HEIGHT,
+            "output_width": stop_cfg["width"],
+            "output_height": stop_cfg["height"],
+            "frame_bytes": stop_cfg["frame_bytes"],
+            "source_skipped": 0,
+        },
+    }
+    stopped_tx = _validate_stopped_sender_stats(
+        stop_stats, stop_cfg, "self-stop-tx", stop_source,
+        "self-check stop TX", COOP_MIN_FRAMES)
+    _require(stopped_tx["frames"] == COOP_MIN_FRAMES,
+             "self-check: stopped sender frame count")
+    try:
+        _validate_stopped_sender_stats(
+            {**stop_stats, "cancelled": False}, stop_cfg, "self-stop-tx",
+            stop_source, "self-check non-cooperative TX", COOP_MIN_FRAMES)
+    except smoke.SmokeError:
+        pass
+    else:
+        raise smoke.SmokeError(
+            "self-check: stopped sender validator accepted cancelled=false")
+
+    stop_rx = {
+        "session_id": "self-stop-rx",
+        "adapter": smoke.LOOPBACK,
+        "running": False,
+        "failed": False,
+        "error": None,
+        "cancelled": True,
+        "expect_frames": 0,
+        "timeout_s": stop_cfg["receiver_timeout_s"],
+        "hash_mismatch": 0,
+        "complete": COOP_MIN_FRAMES,
+        "hash_rows": COOP_MIN_FRAMES,
+    }
+    stopped_rx = _validate_stopped_receiver_stats(
+        stop_rx, stop_cfg, "self-stop-rx", "self-check stop RX", COOP_MIN_FRAMES)
+    _require(stopped_rx["complete"] == COOP_MIN_FRAMES,
+             "self-check: stopped receiver frame count")
+    _require(_validate_cooperative_late_stop_selfcheck(),
+             "self-check: cooperative late stop")
+
     return {"source_keys": sorted(source), "frames": cfg["frames"],
             "fps": cfg["fps"], "geometry": [cfg["width"], cfg["height"]],
-            "gpu_convert": source["gpu_convert"]}
+            "gpu_convert": source["gpu_convert"],
+            "coop_frames_floor": COOP_MIN_FRAMES,
+            "coop_stop_grace_s": COOP_STOP_GRACE_S,
+            "coop_late_stop_checked": True}
 
 
 def _validate_nv12_stats_selfcheck():
@@ -908,6 +1572,70 @@ def _validate_nv12_stats_selfcheck():
     _validate_nv12_content(stats, "self-check")
     _require(stats["y_unique"] == 8 and stats["uv_unique"] == 4,
              "self-check: NV12 distinct counts")
+    return True
+
+
+def _validate_cooperative_late_stop_selfcheck():
+    """Exercise the real stop helper: rc=0 after the grace must still fail."""
+    original_monotonic = time.monotonic
+    original_module_loaded = dll._module_loaded
+    status = {
+        "session_id": "self-coop-late",
+        "pid": os.getpid(),
+        "module": dll.DLL_NAME,
+        "abi_version": dll.ABI_VERSION,
+        "running": False,
+        "cancelled": True,
+        "exit_code": 0,
+        "frames": COOP_MIN_FRAMES,
+    }
+
+    class FakeApi:
+        def stop(self, handle, label):
+            return 0
+
+        def destroy(self, handle, label):
+            return 0
+
+        def status(self, handle, label):
+            return dict(status)
+
+    clock = [0.0]
+
+    def fake_monotonic():
+        value = clock[0]
+        clock[0] += 1.25
+        return value
+
+    session_entry = {"handle": 0xC0FFEE}
+    time.monotonic = fake_monotonic
+    dll._module_loaded = lambda: True
+    try:
+        try:
+            _cooperative_stop_destroy(FakeApi(), session_entry, "self-coop-late",
+                                      "self-check late stop")
+        except dll.DllError as exc:
+            message = str(exc)
+        else:
+            raise smoke.SmokeError(
+                "self-check: late rc=0 stop/destroy was accepted")
+        _require("native stop grace" in message,
+                 f"self-check: late stop error {message!r}")
+        _require(session_entry.get("destroyed") is True,
+                 "self-check: late destroy did not mark the session destroyed")
+        cleanup = session_entry.get("cleanup")
+        _require(isinstance(cleanup, dict),
+                 "self-check: late stop did not preserve cleanup evidence")
+        _require(cleanup.get("stop_codes") == [0]
+                 and cleanup.get("destroy_codes") == [0],
+                 "self-check: late stop codes")
+        _require(cleanup.get("total_elapsed_s") == 2.5,
+                 f"self-check: late stop total {cleanup.get('total_elapsed_s')!r}")
+        _require(cleanup.get("module_loaded_after_destroy") is True,
+                 "self-check: late stop module evidence")
+    finally:
+        time.monotonic = original_monotonic
+        dll._module_loaded = original_module_loaded
     return True
 
 
@@ -931,6 +1659,9 @@ def parse_args(argv=None):
 
 
 def execute(args, source_dll, run_dir, token, report):
+    # Publish the empty list before any native work so failure.json always has a
+    # combos field, even when staging or capability checks fail.
+    report["combos"] = []
     stage, staged_dll, copied = _stage_module(source_dll, token)
     report["staging"] = {"source": str(Path(source_dll).resolve()),
                          "staged_dir": str(stage),
@@ -971,8 +1702,9 @@ def execute(args, source_dll, run_dir, token, report):
     report["scope"] = ("same-process vc_stream.dll ABI v1, same-host Npcap Loopback, "
                        "GPU-only desktop capture, private window and SHM; not a 240 fps, "
                        "physical-link, two-machine or capacity acceptance")
-    report["combos"] = run_combos(api, run_dir, token,
-                                  allow_dda_unavailable=args.allow_dda_unavailable)
+    run_combos(api, run_dir, token,
+               allow_dda_unavailable=args.allow_dda_unavailable,
+               combos=report["combos"])
     blocked = [combo for combo in report["combos"]
                if combo.get("status") == "BLOCKED"]
     if blocked:

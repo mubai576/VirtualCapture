@@ -73,6 +73,9 @@ pub struct EncodedReassembler {
     max_total: u16,
     source_mac: Option<[u8; 6]>,
     slots: Vec<Slot>,
+    /// 复用 AU 缓冲区与 seen 位图，减少频繁堆分配。
+    free_buffers: Vec<Vec<u8>>,
+    free_seens: Vec<Vec<u8>>,
     buffered_bytes: usize,
     stats: Stats,
     have_seen: bool,
@@ -83,6 +86,8 @@ pub struct EncodedReassembler {
     rseg_ns: VecDeque<u64>,
     inter_arrival_ns: VecDeque<u64>,
 }
+
+const FREE_POOL_CAP: usize = MAX_INFLIGHT_AUS + 2;
 
 impl EncodedReassembler {
     /// `mtu` 决定 `payload_max = mtu - 42`；`max_au_bytes` 含调用方的 48B 封装。
@@ -102,6 +107,8 @@ impl EncodedReassembler {
             max_total,
             source_mac,
             slots: Vec::with_capacity(MAX_INFLIGHT_AUS),
+            free_buffers: Vec::with_capacity(FREE_POOL_CAP),
+            free_seens: Vec::with_capacity(FREE_POOL_CAP),
             buffered_bytes: 0,
             stats: Stats::default(),
             have_seen: false,
@@ -112,6 +119,38 @@ impl EncodedReassembler {
             rseg_ns: VecDeque::with_capacity(1024),
             inter_arrival_ns: VecDeque::with_capacity(INTER_ARRIVAL_WINDOW),
         })
+    }
+
+    /// 归还已消费的 AU 缓冲区，避免后续帧重复触发堆分配。
+    pub fn recycle(&mut self, buffer: Vec<u8>) {
+        if self.free_buffers.len() < FREE_POOL_CAP && buffer.capacity() > 0 {
+            self.free_buffers.push(buffer);
+        }
+    }
+
+    fn take_buffer(&mut self, capacity: usize) -> Vec<u8> {
+        if let Some(mut buffer) = self.free_buffers.pop() {
+            buffer.resize(capacity, 0);
+            buffer
+        } else {
+            vec![0u8; capacity]
+        }
+    }
+
+    fn take_seen(&mut self, seen_len: usize) -> Vec<u8> {
+        if let Some(mut seen) = self.free_seens.pop() {
+            seen.fill(0);
+            seen.resize(seen_len, 0);
+            seen
+        } else {
+            vec![0u8; seen_len]
+        }
+    }
+
+    fn recycle_seen(&mut self, seen: Vec<u8>) {
+        if self.free_seens.len() < FREE_POOL_CAP {
+            self.free_seens.push(seen);
+        }
     }
 
     /// 计数器快照。
@@ -157,6 +196,16 @@ impl EncodedReassembler {
         arrived_ns: u64,
         completed_at: impl FnOnce() -> u64,
     ) -> PushOutcome {
+        self.push_ethernet_timed_lazy(frame, || arrived_ns, completed_at)
+    }
+
+    /// 实时接收优化路径：仅在为新 AU 创建槽位时调用 `on_first_packet`。
+    pub fn push_ethernet_timed_lazy(
+        &mut self,
+        frame: &[u8],
+        on_first_packet: impl FnOnce() -> u64,
+        completed_at: impl FnOnce() -> u64,
+    ) -> PushOutcome {
         if frame.len() < ETHERNET_HEADER_LEN + HEADER_LEN {
             return PushOutcome::Ignored(IgnoreReason::ShortFrame);
         }
@@ -176,14 +225,14 @@ impl EncodedReassembler {
             Err(_) => return PushOutcome::Ignored(IgnoreReason::ShortFrame),
         };
         let payload = &frame[ETHERNET_HEADER_LEN + HEADER_LEN..];
-        self.push_packet_timed(header, payload, arrived_ns, completed_at)
+        self.push_packet_timed_lazy(header, payload, on_first_packet, completed_at)
     }
 
-    fn push_packet_timed(
+    fn push_packet_timed_lazy(
         &mut self,
         header: Header,
         payload: &[u8],
-        arrived_ns: u64,
+        on_first_packet: impl FnOnce() -> u64,
         completed_at: impl FnOnce() -> u64,
     ) -> PushOutcome {
         // 先校验所有元数据，再决定是否分配/写入。任何超限声明都不会触发大分配。
@@ -268,6 +317,9 @@ impl EncodedReassembler {
                     .min((total as usize).saturating_mul(self.payload_max));
                 let seen_len = (total as usize).div_ceil(8);
                 debug_assert!(capacity > 0, "校验后 AU 缓冲必须非空");
+                let first_ns = on_first_packet();
+                let buffer = self.take_buffer(capacity);
+                let seen = self.take_seen(seen_len);
                 self.buffered_bytes += capacity + seen_len;
                 self.slots.push(Slot {
                     frame_id: fid,
@@ -275,9 +327,9 @@ impl EncodedReassembler {
                     pattern: header.pattern,
                     flags: header.flags,
                     qpc_ns: header.qpc_ns,
-                    first_ns: arrived_ns,
-                    buffer: vec![0u8; capacity],
-                    seen: vec![0u8; seen_len],
+                    first_ns,
+                    buffer,
+                    seen,
                     got_n: 0,
                     tail: 0,
                 });
@@ -337,6 +389,7 @@ impl EncodedReassembler {
         let completed_ns = completed_at();
         let mut slot = self.slots.remove(index);
         self.buffered_bytes = self.buffered_bytes.saturating_sub(slot.allocated_bytes());
+        self.recycle_seen(slot.seen);
         let actual = (slot.total as usize - 1) * self.payload_max + slot.tail as usize;
         debug_assert!(actual <= slot.buffer.len());
         // 变长 AU：返回真实字节数，而不是 total*payload_max 的分配长度。
@@ -396,6 +449,10 @@ impl EncodedReassembler {
         self.buffered_bytes = self.buffered_bytes.saturating_sub(slot.allocated_bytes());
         self.stats.dropped += 1;
         self.stats.packets_lost += slot.total.wrapping_sub(slot.got_n) as u64;
+        if self.free_buffers.len() < FREE_POOL_CAP {
+            self.free_buffers.push(slot.buffer);
+        }
+        self.recycle_seen(slot.seen);
     }
 }
 
@@ -975,5 +1032,46 @@ mod tests {
         assert_eq!(r.inflight_bytes(), 0);
         assert_eq!(r.stats().dropped, 3);
         assert_eq!(r.stats().packets_lost, 6);
+    }
+
+    #[test]
+    fn lazy_timestamp_runs_once_and_recycle_reuses_capacity() {
+        let mut r = EncodedReassembler::new(1500, 16 * 1024, None).unwrap();
+        let data = pattern(6000, 9);
+        let pkts = packets(&data, 1, 1458, 7, 0);
+        let mut first_calls = 0usize;
+        let mut ptr_first = std::ptr::null();
+        for (i, (h, p)) in pkts.iter().enumerate() {
+            let frame = ethernet(h, p, SRC);
+            let outcome = r.push_ethernet_timed_lazy(
+                &frame,
+                || {
+                    first_calls += 1;
+                    1_000
+                },
+                || 2_000,
+            );
+            if i + 1 == pkts.len() {
+                let PushOutcome::Completed(done) = outcome else {
+                    panic!("expected completed AU");
+                };
+                assert_eq!(done.data, data);
+                ptr_first = done.data.as_ptr();
+                r.recycle(done.data);
+            }
+        }
+        assert_eq!(first_calls, 1);
+        let data2 = pattern(5000, 10);
+        let pkts2 = packets(&data2, 2, 1458, 8, 0);
+        for (i, (h, p)) in pkts2.iter().enumerate() {
+            let outcome = push(&mut r, h, p, 3_000);
+            if i + 1 == pkts2.len() {
+                let PushOutcome::Completed(done) = outcome else {
+                    panic!("expected second AU");
+                };
+                assert_eq!(done.data, data2);
+                assert_eq!(done.data.as_ptr(), ptr_first);
+            }
+        }
     }
 }

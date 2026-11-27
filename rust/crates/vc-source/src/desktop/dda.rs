@@ -1,10 +1,11 @@
 //! DXGI 桌面复制与硬件 GPU 转换；旧 `sender/dda.h` 仅保留在 Git 历史。
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use serde_json::{Value, json};
 use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Texture2D};
 use windows::Win32::Graphics::Dxgi::Common::{
     DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION_IDENTITY, DXGI_MODE_ROTATION_UNSPECIFIED,
@@ -35,6 +36,10 @@ pub(crate) struct DdaSource {
     skipped: Arc<AtomicU64>,
     adapter_name: String,
     last_present: i64,
+    acquire_attempts: u64,
+    acquire_timeouts: u64,
+    acquired_frames: u64,
+    converted_frames: u64,
 }
 
 impl DdaSource {
@@ -101,6 +106,10 @@ impl DdaSource {
             skipped,
             adapter_name,
             last_present: 0,
+            acquire_attempts: 0,
+            acquire_timeouts: 0,
+            acquired_frames: 0,
+            converted_frames: 0,
         })
     }
 
@@ -112,9 +121,26 @@ impl DdaSource {
         &self.adapter_name
     }
 
-    pub(crate) fn capture(&mut self, destination: &mut [u8]) -> Result<bool> {
+    pub(crate) fn diagnostics(&self) -> Value {
+        json!({
+            "acquire_attempts": self.acquire_attempts,
+            "acquire_timeouts": self.acquire_timeouts,
+            "acquired_frames": self.acquired_frames,
+            "converted_frames": self.converted_frames,
+            "last_present_ticks": self.last_present,
+        })
+    }
+
+    pub(crate) fn capture(
+        &mut self,
+        destination: &mut [u8],
+        stop: Option<&AtomicBool>,
+    ) -> Result<bool> {
         let deadline = Instant::now() + CAPTURE_TIMEOUT;
         loop {
+            if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+                return Ok(false);
+            }
             let now = Instant::now();
             if now >= deadline {
                 return Ok(false);
@@ -122,12 +148,16 @@ impl DdaSource {
             let timeout_ms = (deadline - now).as_millis().clamp(1, 20) as u32;
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
+            self.acquire_attempts += 1;
             match unsafe {
                 self.duplication
                     .AcquireNextFrame(timeout_ms, &mut info, &mut resource)
             } {
-                Ok(()) => {}
-                Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => return Ok(false),
+                Ok(()) => self.acquired_frames += 1,
+                Err(error) if error.code() == DXGI_ERROR_WAIT_TIMEOUT => {
+                    self.acquire_timeouts += 1;
+                    return Ok(false);
+                }
                 Err(error)
                     if error.code() == DXGI_ERROR_ACCESS_LOST
                         || error.code() == DXGI_ERROR_INVALID_CALL =>
@@ -170,14 +200,17 @@ impl DdaSource {
                 self.transform_mode,
             )
             .context("DDA source/output geometry is unsupported")?;
-            self.source_width = texture_desc.Width;
-            self.source_height = texture_desc.Height;
-            self.last_present = info.LastPresentTime;
-
-            self.gpu
-                .convert(&texture, &transform, destination)
+            let converted = self
+                .gpu
+                .convert(&texture, &transform, destination, stop)
                 .context("DDA GPU 转换失败；桌面采集不回退 CPU/WARP")?;
-            return Ok(true);
+            if converted {
+                self.source_width = texture_desc.Width;
+                self.source_height = texture_desc.Height;
+                self.last_present = info.LastPresentTime;
+                self.converted_frames += 1;
+            }
+            return Ok(converted);
         }
     }
 }

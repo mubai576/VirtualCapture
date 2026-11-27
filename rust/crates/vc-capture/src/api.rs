@@ -1,6 +1,7 @@
 //! Rust REST v2；阻塞的数据面/网卡探测在 blocking pool 执行。
 //!
-//! `/update/*` 由本地更新令牌保护；`/health` 等只读/控制接口保持协议不变。
+//! 控制面不设更新令牌：能连上本机 5143 的主机即可直接查询、上传和激活更新。
+//! 部署边界应把该端口限制在可信网段。
 use crate::state::Agent;
 use axum::{
     Json, Router,
@@ -60,23 +61,6 @@ fn error(code: StatusCode, message: impl Into<String>) -> Reply {
     (code, Json(json!({"error":message.into()})))
 }
 
-fn authorized(headers: &HeaderMap) -> bool {
-    let Some(expected) = update::peek_token() else {
-        return false;
-    };
-    let supplied = headers
-        .get("authorization")
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .unwrap_or("")
-        .trim();
-    update::token_matches(&expected, supplied)
-}
-
-fn unauthorized() -> Reply {
-    error(StatusCode::UNAUTHORIZED, "需要更新令牌")
-}
-
 async fn blocking(agent: Shared, task: impl FnOnce(&mut Agent) -> Reply + Send + 'static) -> Reply {
     tokio::task::spawn_blocking(move || match agent.lock() {
         Ok(mut agent) => task(&mut agent),
@@ -92,7 +76,7 @@ pub fn router(agent: Shared, server: ServerInfo, shutdown: watch::Sender<bool>) 
         server,
         shutdown,
     };
-    // 只在 OTA 路由放宽请求体上限，避免未鉴权的 /config 等接口接受超大请求。
+    // 只在 OTA 路由放宽请求体上限，避免 /config 等接口接受超大请求。
     let updates = Router::new()
         .route("/update/status", get(update_status))
         .route("/update/stage", post(update_stage))
@@ -115,22 +99,22 @@ pub fn router(agent: Shared, server: ServerInfo, shutdown: watch::Sender<bool>) 
 }
 
 async fn health(State(state): State<AppState>) -> Reply {
-    let running = match state.agent.lock() {
-        Ok(mut agent) => agent.running(),
-        Err(_) => false,
-    };
-    let build = paths::current_build_id();
-    let layout = match paths::layout() {
-        paths::Layout::Managed => "managed",
-        paths::Layout::Legacy => "legacy",
-    };
-    (
-        StatusCode::OK,
-        Json(json!({"ok":true,"implementation":session::IMPLEMENTATION,
-            "api_revision":session::API_REVISION,"version":env!("CARGO_PKG_VERSION"),"role":"capture",
-            "running":running,"pid":std::process::id(),"root":paths::root(),"session_id":null,
-            "build":build,"layout":layout})),
-    )
+    blocking(state.agent, |agent| {
+        let running = agent.running();
+        let build = paths::current_build_id();
+        let layout = match paths::layout() {
+            paths::Layout::Managed => "managed",
+            paths::Layout::Legacy => "legacy",
+        };
+        (
+            StatusCode::OK,
+            Json(json!({"ok":true,"implementation":session::IMPLEMENTATION,
+                "api_revision":session::API_REVISION,"version":env!("CARGO_PKG_VERSION"),"role":"capture",
+                "running":running,"pid":std::process::id(),"root":paths::root(),"session_id":null,
+                "build":build,"layout":layout})),
+        )
+    })
+    .await
 }
 
 async fn version() -> Reply {
@@ -243,21 +227,27 @@ async fn stats(State(state): State<AppState>) -> Reply {
 
 // ---------------------------------------------------------------- OTA（升级）
 
-async fn update_status(State(state): State<AppState>, headers: HeaderMap) -> Reply {
-    if !authorized(&headers) {
-        return unauthorized();
-    }
-    let running = match state.agent.lock() {
-        Ok(mut agent) => agent.running(),
-        Err(_) => false,
-    };
+async fn update_status(State(state): State<AppState>) -> Reply {
     let root = paths::root();
-    match tokio::task::spawn_blocking(move || update::status_at(&root)).await {
-        Ok(Ok(mut value)) => {
-            value["running"] = json!(running);
-            (StatusCode::OK, Json(value))
-        }
-        Ok(Err(e)) => error(StatusCode::INTERNAL_SERVER_ERROR, e),
+    match tokio::task::spawn_blocking(move || {
+        let running = match state.agent.lock() {
+            Ok(mut agent) => agent.running(),
+            Err(_) => {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "状态锁不可用".to_string(),
+                ));
+            }
+        };
+        let mut value =
+            update::status_at(&root).map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, e))?;
+        value["running"] = json!(running);
+        Ok(value)
+    })
+    .await
+    {
+        Ok(Ok(value)) => (StatusCode::OK, Json(value)),
+        Ok(Err((code, message))) => error(code, message),
         Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
@@ -267,9 +257,6 @@ async fn update_stage(
     headers: HeaderMap,
     request: Request,
 ) -> Reply {
-    if !authorized(&headers) {
-        return unauthorized();
-    }
     let Some(expected) = headers
         .get("x-vc-sha256")
         .and_then(|value| value.to_str().ok())
@@ -353,19 +340,23 @@ struct TargetRequest {
     build_id: String,
 }
 
-async fn begin_activation(state: &AppState, target: String) -> Reply {
-    {
-        let Ok(mut agent) = state.agent.lock() else {
-            return error(StatusCode::INTERNAL_SERVER_ERROR, "状态锁不可用");
-        };
-        if agent.running() {
-            return error(StatusCode::CONFLICT, "采集运行中；先停止采集再激活更新。");
+/// 激活准备失败或任务取消时自动复位 `shutting_down`，避免异常/panic 后永久锁死控制面。
+struct ActivationResetGuard {
+    agent: Shared,
+    armed: bool,
+}
+
+impl Drop for ActivationResetGuard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Ok(mut agent) = self.agent.lock()
+        {
+            agent.shutting_down = false;
         }
-        if agent.shutting_down {
-            return error(StatusCode::CONFLICT, "后台正在退出。");
-        }
-        agent.shutting_down = true;
     }
+}
+
+async fn begin_activation(state: &AppState, target: String) -> Reply {
     let root = paths::root();
     let request = ActivationRequest {
         role: Role::Capture,
@@ -379,8 +370,36 @@ async fn begin_activation(state: &AppState, target: String) -> Reply {
         capture_desktop: state.server.desktop,
         start_role: None,
     };
-    let prepared =
-        tokio::task::spawn_blocking(move || update::prepare_activation_at(&root, request)).await;
+    let shared = state.agent.clone();
+    let prepared = tokio::task::spawn_blocking(move || {
+        {
+            let Ok(mut agent) = shared.lock() else {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "状态锁不可用".to_string(),
+                ));
+            };
+            if agent.running() {
+                return Err((
+                    StatusCode::CONFLICT,
+                    "采集运行中；先停止采集再激活更新。".to_string(),
+                ));
+            }
+            if agent.shutting_down {
+                return Err((StatusCode::CONFLICT, "后台正在退出。".to_string()));
+            }
+            agent.shutting_down = true;
+        }
+        let mut reset_guard = ActivationResetGuard {
+            agent: shared,
+            armed: true,
+        };
+        let activation =
+            update::prepare_activation_at(&root, request).map_err(|e| (StatusCode::CONFLICT, e))?;
+        reset_guard.armed = false;
+        Ok(activation)
+    })
+    .await;
     match prepared {
         Ok(Ok(activation)) => {
             let shutdown = state.shutdown.clone();
@@ -395,40 +414,22 @@ async fn begin_activation(state: &AppState, target: String) -> Reply {
                     "helper_pid":activation.helper_pid,"log":activation.log_path}})),
             )
         }
-        Ok(Err(e)) => {
-            if let Ok(mut agent) = state.agent.lock() {
-                agent.shutting_down = false;
-            }
-            error(StatusCode::CONFLICT, e)
-        }
-        Err(e) => {
-            if let Ok(mut agent) = state.agent.lock() {
-                agent.shutting_down = false;
-            }
-            error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
-        }
+        Ok(Err((code, message))) => error(code, message),
+        Err(e) => error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
 }
 
 async fn update_activate(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<TargetRequest>,
 ) -> Reply {
-    if !authorized(&headers) {
-        return unauthorized();
-    }
     begin_activation(&state, request.build_id).await
 }
 
 async fn update_rollback(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(request): Json<TargetRequest>,
 ) -> Reply {
-    if !authorized(&headers) {
-        return unauthorized();
-    }
     let target = request.build_id;
     let root = paths::root();
     let check = target.clone();
@@ -438,4 +439,76 @@ async fn update_rollback(
         Err(e) => return error(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
     }
     begin_activation(&state, target).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> (AppState, watch::Receiver<bool>) {
+        let agent = Arc::new(Mutex::new(Agent::new(vc_core::Config::default())));
+        let (shutdown, rx) = watch::channel(false);
+        (
+            AppState {
+                agent,
+                server: ServerInfo {
+                    bind: "127.0.0.1".into(),
+                    port: 5143,
+                    desktop: false,
+                },
+                shutdown,
+            },
+            rx,
+        )
+    }
+
+    #[tokio::test]
+    async fn health_and_update_status_run_on_blocking_pool_without_stalling_runtime() {
+        let (state, _rx) = test_state();
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let agent = state.agent.clone();
+        let holder = std::thread::spawn(move || {
+            let _guard = agent.lock().unwrap();
+            locked_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+        });
+        locked_rx.recv().unwrap();
+
+        let state_clone = state.clone();
+        let health_task = tokio::spawn(async move { health(State(state_clone)).await });
+        // 即使 agent 锁被后台线程持有，异步调度器仍可继续调度其他任务，不会死锁。
+        tokio::task::yield_now().await;
+        assert!(!health_task.is_finished());
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+
+        let (status, Json(body)) = health_task.await.unwrap();
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["ok"], json!(true));
+        assert_eq!(body["running"], json!(false));
+
+        let (status, Json(update_body)) = update_status(State(state)).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(update_body["ok"], json!(true));
+        assert_eq!(update_body["running"], json!(false));
+    }
+
+    #[tokio::test]
+    async fn begin_activation_resets_shutting_down_on_failure_and_rejects_when_exiting() {
+        let (state, _rx) = test_state();
+        let (status, Json(body)) = begin_activation(&state, "missing-build".into()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(body["error"].as_str().is_some());
+        assert!(!state.agent.lock().unwrap().shutting_down);
+
+        state.agent.lock().unwrap().shutting_down = true;
+        let (status, Json(body)) = begin_activation(&state, "missing-build".into()).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|text| text.contains("正在退出"))
+        );
+    }
 }

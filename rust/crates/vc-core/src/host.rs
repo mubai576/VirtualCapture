@@ -11,6 +11,7 @@ use crate::{
 use serde_json::{Value, json};
 use std::sync::{
     Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
     mpsc::{self, Receiver, Sender},
 };
 use std::thread::JoinHandle;
@@ -28,7 +29,7 @@ pub enum HostScan {
     /// 枚举失败；旧列表已清空，不能用于启动。
     Failed,
 }
-#[derive(Clone, Default)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Snapshot {
     pub peer_url: String,
     pub connected: bool,
@@ -61,7 +62,6 @@ pub struct Snapshot {
     pub peer_update: Value,
     pub local_update: Value,
     pub update_message: Option<String>,
-    pub update_token_paired: bool,
     pub restart_requested: bool,
     /// 工作线程已确认空闲并结束；UI 此时才允许离开接收角色。
     pub role_selection_ready: bool,
@@ -74,6 +74,8 @@ impl Snapshot {
 }
 pub struct Shared {
     pub snapshot: Mutex<Snapshot>,
+    /// 仅在 Snapshot 内容实际变更时递增，避免 UI 定时器空转重绘。
+    pub version: AtomicU64,
 }
 pub enum Command {
     Connect(String),
@@ -86,7 +88,6 @@ pub enum Command {
     Stop,
     /// 只清理本机接收/虚拟卡；绝不探测或停止远端会话。
     CleanupLocal,
-    SetPeerUpdateToken(String),
     RefreshUpdates,
     StagePeerUpdate(std::path::PathBuf),
     ActivatePeerUpdate(String),
@@ -121,6 +122,7 @@ pub fn spawn() -> HostController {
     let (tx, rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         snapshot: Mutex::new(Snapshot::default()),
+        version: AtomicU64::new(0),
     });
     let worker_shared = shared.clone();
     let thread = std::thread::Builder::new()
@@ -171,7 +173,6 @@ impl Worker {
             error,
             vcam: vcam::status(),
             local_update: crate::update::status().unwrap_or_else(|e| json!({"error": e})),
-            update_token_paired: crate::update::load_peer_token().is_some(),
             ..Default::default()
         };
         Self {
@@ -227,8 +228,11 @@ impl Worker {
         self.state.remote_pending =
             self.sender_pending || self.remote_stop_pending || self.discovered_sender.is_some();
         self.state.cleanup_pending = self.cleanup_pending();
-        if let Ok(mut state) = self.shared.snapshot.lock() {
+        if let Ok(mut state) = self.shared.snapshot.lock()
+            && (*state != self.state || self.shared.version.load(Ordering::Relaxed) == 0)
+        {
             *state = self.state.clone();
+            self.shared.version.fetch_add(1, Ordering::Release);
         }
     }
     fn event(&mut self, message: impl Into<String>) {
@@ -298,11 +302,18 @@ impl Worker {
         }
         match command {
             Command::Shutdown | Command::SelectRole => {}
-            Command::CleanupLocal => self.stop_inner(false),
+            Command::CleanupLocal => {
+                if !self.config_error {
+                    self.state.error = None;
+                }
+                self.stop_inner(false);
+            }
             Command::Connect(url) => self.connect(url),
             Command::Refresh => {
                 if let Err(e) = self.refresh() {
                     self.fail(e);
+                } else if !self.config_error && !self.cleanup_pending() {
+                    self.state.error = None;
                 }
             }
             Command::SelectHostAdapter(name) => {
@@ -320,6 +331,9 @@ impl Worker {
                 self.state.host_adapter = name.clone();
                 self.state.config.adapter = name;
                 self.host_selection_needs_user = false;
+                if !self.config_error {
+                    self.state.error = None;
+                }
                 self.save();
             }
             Command::SelectPeerAdapter(name) => {
@@ -334,23 +348,18 @@ impl Worker {
                     return;
                 }
                 self.state.peer_adapter = name;
+                if !self.config_error {
+                    self.state.error = None;
+                }
             }
             Command::PatchCapture(patch) => self.apply_patch("capture", patch),
             Command::PatchTransport(patch) => self.apply_patch("transport", patch),
             Command::Start => self.start(),
-            Command::Stop => self.stop_explicit(),
-            Command::SetPeerUpdateToken(token) => {
-                match crate::update::save_peer_token(token.trim()) {
-                    Ok(()) => {
-                        self.state.update_token_paired = true;
-                        if let Some(peer) = self.peer.take() {
-                            self.peer =
-                                Some(peer.with_update_token(crate::update::load_peer_token()));
-                        }
-                        self.state.update_message = Some("更新令牌已保存。".into());
-                    }
-                    Err(error) => self.state.update_message = Some(error),
+            Command::Stop => {
+                if !self.config_error {
+                    self.state.error = None;
                 }
+                self.stop_explicit();
             }
             Command::RefreshUpdates => self.refresh_updates(),
             Command::StagePeerUpdate(path) => self.stage_peer_update(&path),
@@ -483,10 +492,29 @@ impl Worker {
         let patch = json!({section: patch});
         let errors = self.state.config.apply_patch(&patch);
         if errors.is_empty() {
+            if !self.config_error {
+                self.state.error = None;
+            }
             self.save();
         } else {
             self.fail(errors.join("；"));
         }
+    }
+    fn finish_connect_ok(&mut self, peer: PeerClient, url: String, health: &Value) {
+        self.state.peer_version = health["version"].as_str().unwrap_or("?").into();
+        self.state.peer_online = true;
+        self.state.connected = true;
+        self.state.peer_url = url.clone();
+        self.state.config.peer_url = url;
+        self.state.peer_adapter.clear();
+        self.state.sender = Value::Null;
+        // 若未保存过显式本机网卡，连接新对端时重新按控制路由选卡。
+        if self.state.config.adapter.is_empty() {
+            self.state.host_adapter.clear();
+            self.host_selection_needs_user = false;
+        }
+        self.peer = Some(peer.clone());
+        self.state.peer_update = peer.update_status().unwrap_or_else(|e| json!({"error": e}));
     }
     fn connect(&mut self, url: String) {
         if !crate::config::valid_peer_url(&url) {
@@ -501,20 +529,14 @@ impl Worker {
         self.state.busy = true;
         self.state.error = None;
         self.publish();
-        let peer = PeerClient::new(&url).with_update_token(crate::update::load_peer_token());
+        let peer = PeerClient::new(&url);
         let result = peer.health().and_then(|h| {
             session::require_peer(&h)?;
             Ok(h)
         });
         match result {
             Ok(h) => {
-                self.state.peer_version = h["version"].as_str().unwrap_or("?").into();
-                self.state.peer_online = true;
-                self.state.connected = true;
-                self.state.peer_url = url.clone();
-                self.state.config.peer_url = url;
-                self.state.peer_adapter.clear();
-                self.peer = Some(peer);
+                self.finish_connect_ok(peer, url, &h);
                 self.save();
                 if let Err(e) = self.refresh() {
                     self.event(e);
@@ -525,6 +547,11 @@ impl Worker {
                 self.peer = None;
                 self.state.connected = false;
                 self.state.peer_online = false;
+                self.state.peer_version.clear();
+                self.state.peer_adapters.clear();
+                self.state.peer_adapter.clear();
+                self.state.peer_update = Value::Null;
+                self.state.sender = Value::Null;
                 self.fail(e);
             }
         }
@@ -591,6 +618,9 @@ impl Worker {
         Ok(())
     }
     fn auto_select_host_adapter(&mut self) {
+        if self.state.host_adapters.is_empty() {
+            return;
+        }
         let Some(ip) = self
             .state
             .peer_url
@@ -657,7 +687,12 @@ impl Worker {
         self.state.plan = Some(plan);
     }
     fn request(&self, host: &AdapterInfo, mut capture: crate::config::Capture) -> SenderRequest {
-        if let Some(mac) = &host.mac {
+        if let Some(mac) = host
+            .mac
+            .as_deref()
+            .map(str::trim)
+            .filter(|mac| !mac.is_empty())
+        {
             capture.dst_mac = mac.replace('-', ":").to_ascii_lowercase();
         }
         SenderRequest {
@@ -741,16 +776,18 @@ impl Worker {
         }
         self.state.effective_mtu = Some(effective.capture.mtu);
         self.state.plan = Some(plan);
-        if self.state.config.receive.vcam_autoregister {
+        // 虚拟卡预检仍是只读门禁，必须在启动数据面之前完成；已确认无存活宿主
+        // 占用的旧版/他根/无记录注册会在注册阶段自动移除并重注册，真正发布
+        // 注册仍固定放在接收端就绪之后，见下面的阶段顺序。
+        let register_vcam = self.state.config.receive.vcam_autoregister;
+        let replaced_vcam = if register_vcam {
             let before = vcam::status();
-            // 崩溃重启后注册表可能仍指向本目录 DLL；OTA 后可能指向上一个
-            // release。只有可证明属于本运行根且原属主已退出的注册才允许复用/
-            // 回收，其他目录或存活主机一律拒绝，绝不静默接管。
             vcam::check_available(&before)?;
             vcam::require_capabilities()?;
-            self.vcam_owned = true; // 即使注册部分失败，也尝试回收。
-            self.state.vcam = vcam::register(&self.state.config.receive.shm)?;
-        }
+            (!before.registered.is_empty() && !before.match_local).then_some(before.registered)
+        } else {
+            None
+        };
         let run_dir = crate::paths::run_dir();
         let (stats, hashlog, _) =
             process::session_paths(&run_dir, &request.session_id, Kind::Receiver);
@@ -762,13 +799,39 @@ impl Worker {
             &hashlog,
             &request.source_mac,
         )?;
-        self.receiver.start(
-            &request_json,
-            &host.name,
-            &request.session_id,
-            &run_dir,
-            BatchEcho::Ignore,
+        // 顺序固定：receiver.start 只在真实 SHM 几何就绪后返回；虚拟卡注册
+        // 必须在其后发布，避免新枚举到的采集卡先固定到默认 640。
+        let shm = self.state.config.receive.shm.clone();
+        let vcam_registration = if register_vcam {
+            Some(|| {
+                self.vcam_owned = true; // 即使注册部分失败，也尝试回收。
+                vcam::register(&shm)
+            })
+        } else {
+            None
+        };
+        let registration = start_receiver_then_register(
+            || {
+                self.receiver
+                    .start(
+                        &request_json,
+                        &host.name,
+                        &request.session_id,
+                        &run_dir,
+                        BatchEcho::Ignore,
+                    )
+                    .map(|_| ())
+            },
+            vcam_registration,
         )?;
+        if let Some(status) = registration {
+            if let Some(replaced) = replaced_vcam {
+                self.event(format!(
+                    "已自动移除旧虚拟卡注册（{replaced}），并重新注册当前虚拟卡。"
+                ));
+            }
+            self.state.vcam = status;
+        }
         self.session_id = request.session_id.clone();
         self.sender_pending = true; // HTTP 超时也可能已经开始，必须按会话停止。
         self.discovered_sender = None;
@@ -1044,8 +1107,28 @@ impl Worker {
         }
         resolved
     }
+    /// 注册表是跨进程共享资源：其他主机退出或清理注册后，界面必须自动反映，
+    /// 不能把上一次启动失败的提示永久留在界面上。
+    fn refresh_vcam(&mut self) {
+        if self.state.busy {
+            return;
+        }
+        self.state.vcam = vcam::status();
+        if self
+            .state
+            .error
+            .as_deref()
+            .is_some_and(is_vcam_recovery_error)
+            && vcam::check_available(&self.state.vcam).is_ok()
+        {
+            self.state.error = None;
+            self.event("虚拟采集卡注册已释放，可以重新开始采集。");
+        }
+    }
     fn poll(&mut self) {
+        self.refresh_vcam();
         let Some(peer) = self.peer.clone() else {
+            self.publish();
             return;
         };
         match peer.health().and_then(|h| {
@@ -1057,16 +1140,29 @@ impl Worker {
                 match peer.sender_stats() {
                     Ok(stats) => {
                         let was_running = self.state.running;
+                        let had_own_claim = self.sender_pending;
                         self.state.sender = stats.clone();
                         // running 缺失/类型错误时不做回收结论，保持待清理状态。
                         if let Some(remote_running) = stats.get("running").and_then(Value::as_bool)
                         {
                             let resolved = self.reconcile_claims(&stats);
                             if (was_running && !remote_running) || resolved {
+                                // stop 会清空 stats；先保存本会话的真实终结错误，不能
+                                // 把 GPU/Npcap 失败回收成无错误的“待开始”。
+                                let failure = ((was_running || had_own_claim)
+                                    && !remote_running
+                                    && !self.session_id.is_empty()
+                                    && stats["session_id"].as_str()
+                                        == Some(self.session_id.as_str()))
+                                .then(|| terminal_failure(&stats, "被采集机采集"))
+                                .flatten();
                                 if was_running && !remote_running {
                                     self.event("采集会话已结束，回收会话。");
                                 }
                                 self.stop();
+                                if let Some(failure) = failure {
+                                    self.fail(failure);
+                                }
                             }
                         }
                     }
@@ -1085,16 +1181,79 @@ impl Worker {
                 }
             }
         }
+        let receiver_was_pending = self.receiver.cleanup_pending();
         let receiver_running = self.receiver.running();
-        if self.state.running || receiver_running || self.receiver.cleanup_pending() {
+        let receiver_resolved = receiver_was_pending && !self.receiver.cleanup_pending();
+        if self.state.running
+            || receiver_running
+            || self.receiver.cleanup_pending()
+            || receiver_resolved
+        {
             self.state.receiver = self.receiver.stats();
             if self.state.running && !receiver_running {
+                let failure = terminal_failure(&self.state.receiver, "本机接收");
                 self.event("本机接收会话已结束，停止并回收会话。");
                 self.stop();
+                if let Some(failure) = failure {
+                    self.fail(failure);
+                }
+            } else if receiver_resolved {
+                let failure = terminal_failure(&self.state.receiver, "本机接收");
+                if !self.sender_pending {
+                    self.event("本机接收残留已结束，继续回收会话。");
+                    self.stop();
+                }
+                if let Some(failure) = failure {
+                    self.fail(failure);
+                }
             }
         }
         self.publish();
     }
+}
+
+/// 正常完成不造错误；失败文本必须在清理丢弃 stats 之前复制到主机错误区。
+fn terminal_failure(stats: &Value, role: &str) -> Option<String> {
+    let error = stats["error"]
+        .as_str()
+        .filter(|text| !text.trim().is_empty());
+    let code = stats["exit_code"].as_i64().filter(|code| *code != 0);
+    if error.is_none() && code.is_none() && stats["failed"] != true {
+        return None;
+    }
+    Some(format!(
+        "{role}失败：{}",
+        error
+            .map(str::to_owned)
+            .unwrap_or_else(|| code.map_or("数据面异常结束".into(), |code| format!(
+                "exit_code={code}"
+            )))
+    ))
+}
+
+/// 启动阶段顺序：`start_receiver` 只在真实 SHM 几何就绪后才返回，新的虚拟卡
+/// 注册必须在其后发布，避免消费者在 SHM 就绪前把采集卡固定到默认尺寸。
+/// 任一阶段失败都向上返回；已启动的接收句柄仍由调用方的精确 `stop()` 回收。
+fn start_receiver_then_register(
+    start_receiver: impl FnOnce() -> Result<(), String>,
+    register_vcam: Option<impl FnOnce() -> Result<VcamStatus, String>>,
+) -> Result<Option<VcamStatus>, String> {
+    start_receiver()?;
+    match register_vcam {
+        Some(register_vcam) => register_vcam().map(Some),
+        None => Ok(None),
+    }
+}
+
+/// `check_available` 会在冲突原因后附加当前注册路径；按前缀识别全部三种冲突。
+fn is_vcam_recovery_error(message: &str) -> bool {
+    [
+        vcam::Recovery::Busy,
+        vcam::Recovery::Foreign,
+        vcam::Recovery::Unknown,
+    ]
+    .into_iter()
+    .any(|recovery| message.starts_with(&vcam::recovery_error(recovery)))
 }
 
 /// 本机 sender claim 与远端当前 stats 的关系。
@@ -1364,6 +1523,72 @@ mod tests {
         assert!(!controller.shared.snapshot.lock().unwrap().running);
     }
 
+    #[test]
+    fn receiver_shm_ready_precedes_new_vcam_registration() {
+        let stages = std::cell::RefCell::new(Vec::new());
+        let registration = start_receiver_then_register(
+            || {
+                stages.borrow_mut().push("receiver_shm_ready");
+                Ok(())
+            },
+            Some(|| {
+                stages.borrow_mut().push("vcam_register");
+                Ok(VcamStatus::default())
+            }),
+        )
+        .unwrap();
+        assert_eq!(*stages.borrow(), ["receiver_shm_ready", "vcam_register"]);
+        assert!(registration.is_some());
+    }
+
+    #[test]
+    fn receiver_start_failure_never_publishes_vcam_registration() {
+        let mut registered = false;
+        let error = start_receiver_then_register(
+            || Err("receiver not ready".into()),
+            Some(|| {
+                registered = true;
+                Ok(VcamStatus::default())
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("receiver not ready"));
+        assert!(!registered);
+    }
+
+    #[test]
+    fn vcam_registration_failure_propagates_after_receiver_start() {
+        let stages = std::cell::RefCell::new(Vec::new());
+        let error = start_receiver_then_register(
+            || {
+                stages.borrow_mut().push("receiver_shm_ready");
+                Ok(())
+            },
+            Some(|| {
+                stages.borrow_mut().push("vcam_register");
+                Err::<VcamStatus, _>("register failed".into())
+            }),
+        )
+        .unwrap_err();
+        assert!(error.contains("register failed"));
+        assert_eq!(*stages.borrow(), ["receiver_shm_ready", "vcam_register"]);
+    }
+
+    #[test]
+    fn autoregister_disabled_starts_receiver_without_vcam_stage() {
+        let mut receiver_started = false;
+        let registration = start_receiver_then_register(
+            || {
+                receiver_started = true;
+                Ok(())
+            },
+            Option::<fn() -> Result<VcamStatus, String>>::None,
+        )
+        .unwrap();
+        assert!(receiver_started);
+        assert!(registration.is_none());
+    }
+
     // ---------------------------------------------------------- 模拟对端
     //
     // 这些测试只运行真实 HostController 工作线程代码和本机回环 HTTP，不启动
@@ -1376,6 +1601,7 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
             snapshot: Mutex::new(Snapshot::default()),
+            version: AtomicU64::new(0),
         });
         let mut worker = Worker::new(shared, rx);
         worker.config_error = false;
@@ -1773,6 +1999,56 @@ mod tests {
     }
 
     #[test]
+    fn repeated_pending_stop_keeps_the_exact_claim_and_vcam() {
+        let responses = (0..3)
+            .flat_map(|_| {
+                [
+                    http_response(
+                        "409 Conflict",
+                        &json!({"error":"停止未确认：数据面会话句柄已保留，未释放；请重试停止。"})
+                            .to_string(),
+                    ),
+                    http_response("200 OK", r#"{"running":true,"session_id":"s-own"}"#),
+                ]
+            })
+            .collect();
+        let peer = FakePeer::start(responses);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.sender_pending = true;
+        worker.session_id = "s-own".into();
+        worker.state.running = true;
+        // 只模拟归属标记；远端始终 pending，绝不执行真实注册或注销。
+        worker.vcam_owned = true;
+        for _ in 0..3 {
+            worker.stop_explicit();
+            assert!(worker.sender_pending);
+            assert!(worker.vcam_owned);
+            assert!(worker.cleanup_pending());
+            assert!(worker.state.cleanup_pending);
+            assert!(worker.state.remote_pending);
+            assert!(!worker.state.running);
+            assert_eq!(worker.session_id, "s-own");
+        }
+        let requests = peer.take(6);
+        assert_eq!(requests.len(), 6, "{requests:?}");
+        for pair in requests.chunks_exact(2) {
+            assert!(pair[0].starts_with("POST /sender/stop "), "{}", pair[0]);
+            assert!(pair[0].contains("\"s-own\""), "{}", pair[0]);
+            assert!(pair[1].starts_with("GET /sender/stats "), "{}", pair[1]);
+        }
+        assert_eq!(
+            worker
+                .state
+                .events
+                .iter()
+                .filter(|event| event.contains("暂不注销虚拟卡"))
+                .count(),
+            3
+        );
+        peer.assert_no_more();
+    }
+
+    #[test]
     fn unknown_discovery_stop_surfaces_pending_without_an_id() {
         let peer = FakePeer::start(vec![
             http_response("200 OK", &health_body(true)),
@@ -1832,6 +2108,42 @@ mod tests {
         assert!(!worker.state.remote_pending);
         assert!(!worker.state.running);
         peer.assert_no_more();
+    }
+
+    #[test]
+    fn poll_preserves_our_terminal_sender_failure_after_cleanup() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(false)),
+            http_response(
+                "200 OK",
+                &json!({"running":false,"session_id":"s-own","exit_code":1,
+                    "failed":true,"error":"DDA GPU readback timed out"})
+                .to_string(),
+            ),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.sender_pending = true;
+        worker.session_id = "s-own".into();
+        worker.state.running = true;
+        worker.poll();
+        assert_eq!(
+            worker.state.error.as_deref(),
+            Some("被采集机采集失败：DDA GPU readback timed out")
+        );
+        assert!(!worker.state.running);
+        assert!(!worker.cleanup_pending());
+        let requests = peer.take(2);
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn terminal_failure_does_not_turn_clean_cancel_into_an_error() {
+        assert!(terminal_failure(&json!({"exit_code":0,"cancelled":true}), "本机接收").is_none());
+        assert_eq!(
+            terminal_failure(&json!({"exit_code":2}), "本机接收").as_deref(),
+            Some("本机接收失败：exit_code=2")
+        );
     }
 
     #[test]
@@ -1916,5 +2228,164 @@ mod tests {
         assert!(worker.cleanup_pending());
         assert!(!worker.state.running);
         peer.assert_no_more();
+    }
+
+    #[test]
+    fn vcam_conflict_errors_are_recognized_including_registered_path() {
+        for recovery in [
+            vcam::Recovery::Busy,
+            vcam::Recovery::Foreign,
+            vcam::Recovery::Unknown,
+        ] {
+            let base = vcam::recovery_error(recovery);
+            assert!(is_vcam_recovery_error(&base));
+            assert!(is_vcam_recovery_error(&format!(
+                "{base}（当前注册：D:\\old\\vc_vcam.dll）"
+            )));
+        }
+        assert!(!is_vcam_recovery_error("请选择本机接收网卡。"));
+    }
+
+    #[test]
+    fn poll_preserves_terminal_sender_failure_when_pending_claim_resolves() {
+        let peer = FakePeer::start(vec![
+            http_response("200 OK", &health_body(false)),
+            http_response(
+                "200 OK",
+                &json!({"running":false,"session_id":"s-own","exit_code":1,
+                    "failed":true,"error":"DDA GPU readback timed out"})
+                .to_string(),
+            ),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.sender_pending = true;
+        worker.session_id = "s-own".into();
+        worker.state.running = false;
+        worker.poll();
+        assert_eq!(
+            worker.state.error.as_deref(),
+            Some("被采集机采集失败：DDA GPU readback timed out")
+        );
+        assert!(!worker.state.running);
+        assert!(!worker.cleanup_pending());
+        let requests = peer.take(2);
+        assert!(requests.iter().all(|request| request.starts_with("GET ")));
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn explicit_stop_clears_stale_error_but_keeps_config_error() {
+        let peer = FakePeer::start(vec![
+            http_response(
+                "409 Conflict",
+                &json!({"error":"停止未确认：数据面会话句柄已保留，未释放；请重试停止。"})
+                    .to_string(),
+            ),
+            http_response("200 OK", r#"{"running":true,"session_id":"s-own"}"#),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.sender_pending = true;
+        worker.session_id = "s-own".into();
+        worker.state.error = Some("旧的连接或启动错误".into());
+        worker.handle(Command::Stop);
+        assert!(worker.state.error.is_none());
+        assert!(worker.cleanup_pending());
+        assert!(worker.state.remote_pending);
+        let requests = peer.take(2);
+        assert_eq!(requests.len(), 2, "{requests:?}");
+        peer.assert_no_more();
+
+        let peer2 = FakePeer::start(vec![http_response("200 OK", &health_body(false))]);
+        let (mut cfg_worker, _tx2) = test_worker(&peer2.base);
+        cfg_worker.config_error = true;
+        cfg_worker.state.error = Some("配置读取失败".into());
+        cfg_worker.handle(Command::Stop);
+        assert_eq!(cfg_worker.state.error.as_deref(), Some("配置读取失败"));
+        assert_eq!(peer2.take(1).len(), 1);
+        peer2.assert_no_more();
+    }
+
+    #[test]
+    fn publish_bumps_version_only_when_snapshot_changes() {
+        let (mut worker, _tx) = test_worker("http://127.0.0.1:1");
+        assert_eq!(worker.shared.version.load(Ordering::Acquire), 0);
+        worker.publish();
+        assert_eq!(worker.shared.version.load(Ordering::Acquire), 1);
+        // 状态无变化时重复 publish 不递增版本号，避免 UI 定时器空转重绘。
+        worker.publish();
+        assert_eq!(worker.shared.version.load(Ordering::Acquire), 1);
+        worker.state.peer_online = true;
+        worker.publish();
+        assert_eq!(worker.shared.version.load(Ordering::Acquire), 2);
+    }
+
+    #[test]
+    fn auto_select_empty_adapters_does_not_lock_out_future_auto_select() {
+        let (mut worker, _tx) = test_worker("http://127.0.0.1:1");
+        worker.auto_select_host_adapter();
+        assert!(!worker.host_selection_needs_user);
+    }
+
+    #[test]
+    fn connect_refreshes_peer_update_and_failure_clears_stale_peer_state() {
+        let peer = FakePeer::start(vec![
+            http_response(
+                "200 OK",
+                &json!({"ok":true,"layout":"managed","active":{"build_id":"b1","version":"0.2.1"}})
+                    .to_string(),
+            ),
+            http_response("503 Service Unavailable", r#"{"error":"offline"}"#),
+        ]);
+        let (mut worker, _tx) = test_worker(&peer.base);
+        worker.state.host_adapter = r"\Device\NPF_{OLD_AUTO}".into();
+        worker.host_selection_needs_user = true;
+        worker.state.peer_adapters = vec![nic(r"\Device\NPF_{P}")];
+        worker.state.peer_adapter = r"\Device\NPF_{P}".into();
+        worker.state.sender = json!({"running":false});
+
+        let client = PeerClient::new(&peer.base);
+        worker.finish_connect_ok(client, peer.base.clone(), &json!({"version":"0.2.1"}));
+        assert_eq!(worker.state.peer_update["active"]["build_id"], json!("b1"));
+        assert!(worker.state.host_adapter.is_empty());
+        assert!(!worker.host_selection_needs_user);
+        assert!(worker.state.peer_adapter.is_empty());
+        assert!(worker.state.sender.is_null());
+
+        worker.handle(Command::Connect(peer.base.clone()));
+        assert!(!worker.state.connected);
+        assert!(!worker.state.peer_online);
+        assert!(worker.state.peer_version.is_empty());
+        assert!(worker.state.peer_adapters.is_empty());
+        assert!(worker.state.peer_adapter.is_empty());
+        assert!(worker.state.peer_update.is_null());
+        assert!(worker.state.sender.is_null());
+        assert_eq!(peer.take(2).len(), 2);
+        peer.assert_no_more();
+    }
+
+    #[test]
+    fn transient_error_clears_on_select_peer_adapter_but_keeps_config_error() {
+        let (mut worker, _tx) = test_worker("http://127.0.0.1:1");
+        worker.state.peer_adapters = vec![nic(r"\Device\NPF_{P}")];
+        worker.state.error = Some("旧错误".into());
+        worker.handle(Command::SelectPeerAdapter(r"\Device\NPF_{P}".into()));
+        assert!(worker.state.error.is_none());
+
+        worker.config_error = true;
+        worker.state.error = Some("配置读取失败".into());
+        worker.handle(Command::SelectPeerAdapter(String::new()));
+        assert_eq!(worker.state.error.as_deref(), Some("配置读取失败"));
+    }
+
+    #[test]
+    fn request_ignores_empty_host_mac() {
+        let (worker, _tx) = test_worker("http://127.0.0.1:1");
+        let mut host = nic(r"\Device\NPF_{H}");
+        host.mac = Some("  ".into());
+        let req = worker.request(&host, crate::config::Capture::default());
+        assert_eq!(req.capture.dst_mac, "ff:ff:ff:ff:ff:ff");
+        host.mac = Some("34-5A-60-4F-F2-33".into());
+        let req = worker.request(&host, crate::config::Capture::default());
+        assert_eq!(req.capture.dst_mac, "34:5a:60:4f:f2:33");
     }
 }

@@ -20,7 +20,9 @@ use windows::Graphics::DirectX::Direct3D11::IDirect3DDevice;
 use windows::Graphics::DirectX::DirectXPixelFormat;
 use windows::Graphics::SizeInt32;
 use windows::Win32::Foundation::{HWND, LPARAM, RECT, RPC_E_CHANGED_MODE};
-use windows::Win32::Graphics::Direct3D11::{D3D11_TEXTURE2D_DESC, ID3D11Texture2D};
+use windows::Win32::Graphics::Direct3D11::{
+    D3D11_TEXTURE2D_DESC, ID3D11Multithread, ID3D11Texture2D,
+};
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::System::Threading::GetCurrentProcessId;
@@ -160,18 +162,23 @@ impl WgcSharedState {
                 return;
             }
         };
-        let mut inner = self.lock_inner();
-        if self.closing.load(Ordering::Acquire) {
-            drop(inner);
-            let _ = frame.Close();
-            return;
-        }
-        if let Some(previous) = inner.pending.replace(frame) {
+        let previous = {
+            let mut inner = self.lock_inner();
+            if self.closing.load(Ordering::Acquire) {
+                drop(inner);
+                let _ = frame.Close();
+                return;
+            }
+            let previous = inner.pending.replace(frame);
+            if previous.is_some() {
+                self.skipped.fetch_add(1, Ordering::Relaxed);
+            }
+            inner.signal = inner.signal.wrapping_add(1);
+            previous
+        };
+        if let Some(previous) = previous {
             let _ = previous.Close();
-            self.skipped.fetch_add(1, Ordering::Relaxed);
         }
-        inner.signal = inner.signal.wrapping_add(1);
-        drop(inner);
         self.frame_ready.notify_all();
     }
 
@@ -352,6 +359,16 @@ impl WgcSource {
         }
 
         let device = create_device()?;
+        // FreeThreaded 帧池会在内部线程使用同一 D3D11 设备；即时上下文默认
+        // 不保护并发访问，必须先启用驱动锁，不能仅靠 pending/pool_gate 的 Rust 锁。
+        let multithread: ID3D11Multithread = device
+            .context
+            .cast()
+            .context("WGC immediate context lacks ID3D11Multithread")?;
+        let _ = unsafe { multithread.SetMultithreadProtected(true) };
+        if !unsafe { multithread.GetMultithreadProtected() }.as_bool() {
+            bail!("WGC could not enable D3D11 multithread protection");
+        }
         let adapter_name = device.adapter_name.clone();
         let dxgi: windows::Win32::Graphics::Dxgi::IDXGIDevice = device
             .device
@@ -472,7 +489,14 @@ impl WgcSource {
         &self.adapter_name
     }
 
-    pub(crate) fn capture(&mut self, destination: &mut [u8]) -> Result<bool> {
+    pub(crate) fn capture(
+        &mut self,
+        destination: &mut [u8],
+        stop: Option<&AtomicBool>,
+    ) -> Result<bool> {
+        if stop.is_some_and(|stop| stop.load(Ordering::Acquire)) {
+            return Ok(false);
+        }
         if self.pool.is_none() {
             bail!("WGC not initialized");
         }
@@ -565,13 +589,15 @@ impl WgcSource {
 
         let result = self
             .gpu
-            .convert(&texture, &transform, destination)
+            .convert(&texture, &transform, destination, stop)
             .context("WGC GPU 转换失败；桌面采集不回退 CPU/WARP");
         let _ = frame.Close();
-        result?;
-        self.source_width = source_width;
-        self.source_height = source_height;
-        Ok(true)
+        let captured = result?;
+        if captured {
+            self.source_width = source_width;
+            self.source_height = source_height;
+        }
+        Ok(captured)
     }
 
     /// 在采集线程（不是 FrameArrived 回调）重建帧池。先撤销 FrameArrived，
@@ -670,12 +696,15 @@ impl Drop for WgcSource {
         if let Some(token) = self.closed_token.take() {
             let _ = self.item.RemoveClosed(token);
         }
+        // 在关闭会话/帧池前有界排空已进入 pool_gate 的回调，并保持与回调一致的锁顺序。
+        let gate = lock_pool_gate(&self.shared).ok();
         if let Some(session) = self.session.take() {
             let _ = session.Close();
         }
         if let Some(pool) = self.pool.take() {
             let _ = pool.Close();
         }
+        drop(gate);
         let mut inner = self.shared.lock_inner();
         if let Some(frame) = inner.pending.take() {
             let _ = frame.Close();

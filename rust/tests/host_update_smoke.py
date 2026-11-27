@@ -9,8 +9,8 @@ the parent Python process waits for its first-frame ready marker, verifies the
 native window, posts WM_CLOSE, and checks for a zero exit code.
 
 On the peer side `VirtualCapture.exe capture` runs on a random loopback port in
-a private ROOT. The driver pairs its token and stages and activates a synthetic
-package through HostController; the real capture helper restarts it.
+a private ROOT. The driver connects directly, then stages and activates a
+synthetic package through HostController; the real capture helper restarts it.
 
 Both roots are private. With --package, the local update uses the original
 manifest and verified payload of the supplied candidate. Nothing is registered
@@ -426,7 +426,8 @@ def rezip_extracted_package(package, target):
 
     Only files named by the manifest are copied, plus the manifest itself. The
     extracted root may also contain runtime data left by earlier smoke runs
-    (for example `update-token.json`); `rglob` would leak that into the update.
+    (for example configuration or legacy token files); `rglob` would leak that
+    into the update.
     """
     manifest_path = package / "package-manifest.json"
     if not manifest_path.is_file():
@@ -562,12 +563,8 @@ def main():
                          if title == "VirtualCapture · 采集端"] or None,
                 30, "original desktop capture window")
             window_screenshot(peer_windows[0][0], "desktop-capture-before-ota.png")
-        token_path = wait_for(
-            lambda: (peer_root / "update-token.json") if (peer_root / "update-token.json").is_file() else None,
-            15, "capture update token")
-        peer_token = read_json(token_path)["token"]
-        assert len(peer_token) == 64 and all(ch in "0123456789abcdefABCDEF" for ch in peer_token)
-        checks.append("private unified capture started on a random port with its own token")
+        assert not (peer_root / "update-token.json").exists(), "capture must not create a token file"
+        checks.append("private unified capture started on a random port without a token file")
 
         print(f"building standalone fixture (independent target, no workspace build): {RUN / 'fixture'}")
         fixture_exe = build_fixture()
@@ -579,7 +576,7 @@ def main():
             fixture = subprocess.Popen(
                 [str(fixture_exe),
                  "--host-root", str(host_root), "--bin", str(native_dir),
-                 "--peer-url", f"http://127.0.0.1:{port}", "--peer-token", peer_token,
+                 "--peer-url", f"http://127.0.0.1:{port}",
                  "--peer-zip", str(peer_zip), "--peer-build", peer_build,
                  "--local-zip", str(local_zip), "--local-build", local_build,
                  "--result", str(result_path)],
@@ -597,7 +594,7 @@ def main():
         result = read_json(result_path)
         assert result["ok"] is True, result
         assert result["peer_build"] == peer_build and result["local_build"] == local_build, result
-        checks.append("HostController: token format rejection, no-session rejects, Connect, peer stage/activate, local stage/activate")
+        checks.append("HostController: no-session rejects, direct Connect, peer stage/activate, local stage/activate")
 
         peer_after = wait_for(
             lambda: (lambda value: value if value and value.get("build") == peer_build and value.get("pid") != first_pid else None)(capture_health(port)),
@@ -727,12 +724,11 @@ def main():
         assert capture_health(select_port) is None, "selected capture listener survived window close"
         checks.append("ROOT --select-role forwarded chooser and custom loopback port; real click saved data/vc-startup.json")
 
-        peer_token_file = host_root / "data/update-peer-token.json"
-        assert read_json(peer_token_file)["token"] == peer_token, peer_token_file
-        assert read_json(peer_root / "data/update-token.json")["token"] == peer_token
+        assert not (host_root / "data/update-peer-token.json").exists()
+        assert not (peer_root / "data/update-token.json").exists()
         host_config = read_json(host_root / "data/vc-rust-config.json")
         assert host_config["peer_url"] == f"http://127.0.0.1:{port}", host_config
-        checks.append("pairing token, peer token and config survived flat -> managed migration")
+        checks.append("config survived flat -> managed migration without token files")
 
         dshow_after = dshow_registration()
         assert dshow_before == dshow_after, (dshow_before, dshow_after)

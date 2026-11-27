@@ -19,7 +19,7 @@ use libloading::os::windows::{
 use serde_json::{Value, json};
 use vc_media::{AuSession, CodecConfig, Decoder, Encoder, OperationState, parse_au};
 use vc_source::{DesktopSource, SourceConfig};
-use vc_transport::checksum::{fnv1a64, fnv1a64_hex};
+use vc_transport::checksum::fnv1a64;
 use vc_transport::encoded::EncodedReassembler;
 use vc_transport::fragment::{FragmentConfig, fragments, write_ethernet};
 use vc_transport::{
@@ -34,6 +34,9 @@ use crate::pattern::Pattern;
 use crate::shm::Publisher;
 
 const MAX_CAPTURE: usize = 1024 * 1024;
+const RATE_WINDOW_NS: u64 = 1_000_000_000;
+const RATE_SAMPLE_STEP_NS: u64 = 50_000_000;
+const LIVE_TIMING_MAX_SAMPLES: usize = 1024;
 static CLI_STOP: AtomicBool = AtomicBool::new(false);
 static QPC_FREQ: OnceLock<u64> = OnceLock::new();
 static NEXT_SESSION: AtomicU64 = AtomicU64::new(1);
@@ -490,11 +493,10 @@ fn loop_sleep(target_ns: u64, stop: Option<&AtomicBool>) -> bool {
         if remaining == 0 {
             return true;
         }
-        // 高分辨率定时器投递仍可能迟到约半毫秒。提前越过该窗口唤醒，再用
-        // QPC 完成精度尾部：相对发送上限无法靠下一帧提前发送来弥补睡过头
-        // 的时间。尾部保持在一毫秒以内，避免等待耗尽 MMCSS 的 CPU 预算。
-        if remaining > 800_000 {
-            scheduling::wait_for((remaining - 700_000).min(5_000_000));
+        // 高分辨率定时器投递仍可能迟到约 0.35~0.4 ms。提前 ~420 us 越过该窗口唤醒，
+        // 再用 QPC 完成精度尾部，既避免越过 FramePacer 的 1/8 周期容差，又压低自旋 CPU。
+        if remaining > 500_000 {
+            scheduling::wait_for((remaining - 420_000).min(5_000_000));
         } else {
             std::hint::spin_loop();
         }
@@ -513,6 +515,170 @@ pub(crate) use sender::send;
 
 fn timing_value(timing: TimingSummary) -> Value {
     json!({"samples":timing.samples,"avg_ms":timing.avg_ms,"p50_ms":timing.p50_ms,"p99_ms":timing.p99_ms,"max_ms":timing.max_ms})
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RateSample {
+    at_ns: u64,
+    frames: u64,
+    packets: u64,
+    bytes: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct RateSnapshot {
+    pub(crate) fps: f64,
+    pub(crate) pps: f64,
+    pub(crate) bps: f64,
+}
+
+/// 最近 1 秒滑动窗口速率统计：运行中反映当前真实帧率/包率/码率，空闲 1 秒后归零。
+pub(crate) struct RateWindow {
+    samples: VecDeque<RateSample>,
+}
+
+impl RateWindow {
+    pub(crate) fn new(start_ns: u64) -> Self {
+        let mut samples = VecDeque::with_capacity(32);
+        samples.push_back(RateSample {
+            at_ns: start_ns,
+            frames: 0,
+            packets: 0,
+            bytes: 0,
+        });
+        Self { samples }
+    }
+
+    pub(crate) fn maybe_record(&mut self, now_ns: u64, frames: u64, packets: u64, bytes: u64) {
+        let should_record = self.samples.back().is_none_or(|last| {
+            now_ns.saturating_sub(last.at_ns) >= RATE_SAMPLE_STEP_NS
+                || (frames > 0 && last.frames == 0)
+        });
+        if should_record {
+            self.push_monotonic(now_ns, frames, packets, bytes);
+            self.evict(now_ns);
+        }
+    }
+
+    pub(crate) fn sample(
+        &mut self,
+        now_ns: u64,
+        frames: u64,
+        packets: u64,
+        bytes: u64,
+    ) -> RateSnapshot {
+        self.push_monotonic(now_ns, frames, packets, bytes);
+        self.evict(now_ns);
+        let Some(first) = self.samples.front().copied() else {
+            return RateSnapshot::default();
+        };
+        let now_ns = self.samples.back().map_or(now_ns, |last| last.at_ns);
+        let cutoff = now_ns.saturating_sub(RATE_WINDOW_NS);
+        let (base_frames, base_packets, base_bytes, dt_s) = if first.at_ns >= cutoff {
+            let dt_ns = now_ns.saturating_sub(first.at_ns);
+            if dt_ns == 0 {
+                return RateSnapshot::default();
+            }
+            (
+                first.frames as f64,
+                first.packets as f64,
+                first.bytes as f64,
+                (dt_ns as f64 / 1e9).max(0.001),
+            )
+        } else if let Some(next) = self.samples.get(1).copied()
+            && next.at_ns > cutoff
+        {
+            let span = (next.at_ns - first.at_ns) as f64;
+            let alpha = (cutoff - first.at_ns) as f64 / span;
+            (
+                first.frames as f64 + (next.frames.saturating_sub(first.frames)) as f64 * alpha,
+                first.packets as f64 + (next.packets.saturating_sub(first.packets)) as f64 * alpha,
+                first.bytes as f64 + (next.bytes.saturating_sub(first.bytes)) as f64 * alpha,
+                RATE_WINDOW_NS as f64 / 1e9,
+            )
+        } else {
+            let dt_ns = now_ns.saturating_sub(first.at_ns);
+            if dt_ns == 0 {
+                return RateSnapshot::default();
+            }
+            (
+                first.frames as f64,
+                first.packets as f64,
+                first.bytes as f64,
+                (dt_ns as f64 / 1e9).max(0.001),
+            )
+        };
+        let last = self.samples.back().copied().unwrap_or(first);
+        RateSnapshot {
+            fps: (last.frames as f64 - base_frames).max(0.0) / dt_s,
+            pps: (last.packets as f64 - base_packets).max(0.0) / dt_s,
+            bps: (last.bytes as f64 - base_bytes).max(0.0) * 8.0 / dt_s,
+        }
+    }
+
+    fn push_monotonic(&mut self, now_ns: u64, frames: u64, packets: u64, bytes: u64) {
+        if let Some(last) = self.samples.back_mut()
+            && now_ns <= last.at_ns
+        {
+            last.frames = last.frames.max(frames);
+            last.packets = last.packets.max(packets);
+            last.bytes = last.bytes.max(bytes);
+            return;
+        }
+        self.samples.push_back(RateSample {
+            at_ns: now_ns,
+            frames,
+            packets,
+            bytes,
+        });
+    }
+
+    fn evict(&mut self, now_ns: u64) {
+        let cutoff = now_ns.saturating_sub(RATE_WINDOW_NS);
+        while self.samples.len() >= 2 && self.samples[1].at_ns <= cutoff {
+            self.samples.pop_front();
+        }
+    }
+}
+
+/// 最近 1 秒滑动窗口耗时摘要（`avg`/`p50`/`p99`/`max`）；1 秒内无样本时返回空摘要。
+#[derive(Default)]
+pub(crate) struct TimedWindow {
+    samples: VecDeque<(u64, u64)>,
+}
+
+impl TimedWindow {
+    pub(crate) fn push(&mut self, at_ns: u64, duration_ns: u64) {
+        self.trim(at_ns);
+        if self.samples.len() >= LIVE_TIMING_MAX_SAMPLES {
+            self.samples.pop_front();
+        }
+        self.samples.push_back((at_ns, duration_ns));
+    }
+
+    pub(crate) fn summary_at(&mut self, now_ns: u64) -> Value {
+        self.trim(now_ns);
+        if self.samples.is_empty() {
+            return json!({"samples":0,"avg_ms":null,"p50_ms":null,"p99_ms":null,"max_ms":null});
+        }
+        let mut values: Vec<u64> = self.samples.iter().map(|(_, ns)| *ns).collect();
+        values.sort_unstable();
+        let n = values.len();
+        json!({
+            "samples": n,
+            "avg_ms": values.iter().map(|v| *v as f64).sum::<f64>() / n as f64 / 1e6,
+            "p50_ms": values[(n * 50).div_ceil(100) - 1] as f64 / 1e6,
+            "p99_ms": values[(n * 99).div_ceil(100) - 1] as f64 / 1e6,
+            "max_ms": values[n - 1] as f64 / 1e6,
+        })
+    }
+
+    fn trim(&mut self, now_ns: u64) {
+        let cutoff = now_ns.saturating_sub(RATE_WINDOW_NS);
+        while self.samples.front().is_some_and(|(ts, _)| *ts < cutoff) {
+            self.samples.pop_front();
+        }
+    }
 }
 
 fn atomic_write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
@@ -545,9 +711,60 @@ fn atomic_write_json(path: &Path, value: &Value) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn take_writer(file: Option<File>, path: Option<&Path>) -> anyhow::Result<Option<BufWriter<File>>> {
+const LOG_BUFFER_BYTES: usize = 64 * 1024;
+const LOG_FLUSH_ROWS: u32 = 64;
+const LOG_FLUSH_INTERVAL: Duration = Duration::from_millis(250);
+
+/// 周期性刷盘的 JSONL 日志写入器，避免 240 Hz 逐帧同步 `flush()` 系统调用，
+/// 同时在停止、错误或意外 Drop 时保证已缓冲行全部落盘。
+pub(crate) struct BufferedLog {
+    writer: BufWriter<File>,
+    pending_rows: u32,
+    last_flush: Instant,
+}
+
+impl BufferedLog {
+    fn new(file: File) -> Self {
+        Self {
+            writer: BufWriter::with_capacity(LOG_BUFFER_BYTES, file),
+            pending_rows: 0,
+            last_flush: Instant::now(),
+        }
+    }
+
+    pub(crate) fn write_line(
+        &mut self,
+        write: impl FnOnce(&mut BufWriter<File>) -> std::io::Result<()>,
+    ) -> anyhow::Result<()> {
+        write(&mut self.writer)?;
+        self.pending_rows = self.pending_rows.saturating_add(1);
+        if self.pending_rows >= LOG_FLUSH_ROWS || self.last_flush.elapsed() >= LOG_FLUSH_INTERVAL {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn flush(&mut self) -> anyhow::Result<()> {
+        if self.pending_rows > 0 {
+            self.writer.flush()?;
+            self.pending_rows = 0;
+            self.last_flush = Instant::now();
+        } else {
+            self.writer.flush()?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for BufferedLog {
+    fn drop(&mut self) {
+        let _ = self.writer.flush();
+    }
+}
+
+fn take_log_writer(file: Option<File>, path: Option<&Path>) -> anyhow::Result<Option<BufferedLog>> {
     if let Some(file) = file {
-        return Ok(Some(BufWriter::new(file)));
+        return Ok(Some(BufferedLog::new(file)));
     }
     path.map(|path| {
         if let Some(parent) = path.parent() {
@@ -563,7 +780,30 @@ fn take_writer(file: Option<File>, path: Option<&Path>) -> anyhow::Result<Option
                     path.display()
                 )
             })?;
-        Ok(BufWriter::new(file))
+        Ok(BufferedLog::new(file))
+    })
+    .transpose()
+}
+
+fn take_writer(file: Option<File>, path: Option<&Path>) -> anyhow::Result<Option<BufWriter<File>>> {
+    if let Some(file) = file {
+        return Ok(Some(BufWriter::with_capacity(LOG_BUFFER_BYTES, file)));
+    }
+    path.map(|path| {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .with_context(|| {
+                format!(
+                    "create evidence {} (existing evidence is never overwritten)",
+                    path.display()
+                )
+            })?;
+        Ok(BufWriter::with_capacity(LOG_BUFFER_BYTES, file))
     })
     .transpose()
 }
@@ -877,5 +1117,117 @@ mod tests {
         assert!(validate_common(&args).is_err());
         args.ethertype = vc_transport::wire::ETHERTYPE;
         assert!(validate_common(&args).is_ok());
+    }
+
+    #[test]
+    fn buffered_log_flushes_on_drop_and_threshold() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "vc-stream-log-test-{}-{unique}.jsonl",
+            std::process::id()
+        ));
+        {
+            let file = OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let mut log = BufferedLog::new(file);
+            for i in 0..5 {
+                log.write_line(|w| writeln!(w, "{{\"frame_id\":{i}}}"))
+                    .unwrap();
+            }
+        }
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 5);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn rate_window_tracks_startup_steady_idle_and_recovery() {
+        let mut window = RateWindow::new(0);
+        // 启动阶段不足 1 秒：250 ms 内 60 帧应立即接近 240 fps。
+        for i in 1..=60u64 {
+            window.maybe_record(i * 4_166_667, i, i * 69, i * 620_000);
+        }
+        let startup = window.sample(250_000_000, 60, 60 * 69, 60 * 620_000);
+        assert!(
+            (startup.fps - 240.0).abs() < 1.0,
+            "startup fps={}",
+            startup.fps
+        );
+
+        // 稳态 240 fps 到 2 秒：滑窗始终维持约 240 fps。
+        for i in 61..=480u64 {
+            window.maybe_record(i * 4_166_667, i, i * 69, i * 620_000);
+        }
+        let steady = window.sample(2_000_000_000, 480, 480 * 69, 480 * 620_000);
+        assert!(
+            (steady.fps - 240.0).abs() < 1.0,
+            "steady fps={}",
+            steady.fps
+        );
+
+        // 静止桌面超过 1 秒不再出新帧：速率应平滑衰减并归零。
+        let stale = window.sample(3_100_000_000, 480, 480 * 69, 480 * 620_000);
+        assert_eq!(stale.fps, 0.0);
+        assert_eq!(stale.pps, 0.0);
+        assert_eq!(stale.bps, 0.0);
+
+        // 静止 30 秒后恢复 240 fps 推流 1 秒：不被历史 30 秒分母拖低。
+        let resume_base = 33_000_000_000u64;
+        for i in 1..=240u64 {
+            window.maybe_record(
+                resume_base + i * 4_166_667,
+                480 + i,
+                (480 + i) * 69,
+                (480 + i) * 620_000,
+            );
+        }
+        let recovered = window.sample(resume_base + 1_000_000_000, 720, 720 * 69, 720 * 620_000);
+        assert!(
+            (recovered.fps - 240.0).abs() < 1.0,
+            "recovered fps={}",
+            recovered.fps
+        );
+
+        // 静止单帧场景：同时间戳不会除零；1 帧后经 500 ms 为 ~2 fps，超过 1 秒归零。
+        let mut single = RateWindow::new(100);
+        assert_eq!(single.sample(100, 0, 0, 0).fps, 0.0);
+        single.maybe_record(12_000_100, 1, 422, 632_124);
+        let at_half = single.sample(500_000_100, 1, 422, 632_124);
+        assert!(at_half.fps > 1.5 && at_half.fps < 2.5);
+        let after_one_sec = single.sample(1_012_000_100, 1, 422, 632_124);
+        assert_eq!(after_one_sec.fps, 0.0);
+    }
+
+    #[test]
+    fn timed_window_evicts_expired_samples_and_reports_p99() {
+        let mut window = TimedWindow::default();
+        for i in 1..=100u64 {
+            window.push(i * 5_000_000, i * 100_000);
+        }
+        let live = window.summary_at(500_000_000);
+        assert_eq!(live["samples"], 100);
+        assert_eq!(live["p50_ms"], 5.0);
+        assert_eq!(live["p99_ms"], 9.9);
+        assert_eq!(live["max_ms"], 10.0);
+
+        // 超过 1 秒后全部过期，返回 null 而非陈旧 p99。
+        let expired = window.summary_at(1_500_000_001);
+        assert_eq!(expired["samples"], 0);
+        assert!(expired["p99_ms"].is_null());
+        assert!(expired["avg_ms"].is_null());
+
+        // 超出上限只保留最近 LIVE_TIMING_MAX_SAMPLES 个样本。
+        let mut capped = TimedWindow::default();
+        for i in 0..(LIVE_TIMING_MAX_SAMPLES as u64 + 50) {
+            capped.push(1_000_000_000 + i * 1_000, i);
+        }
+        let summary = capped.summary_at(1_500_000_000);
+        assert_eq!(summary["samples"], LIVE_TIMING_MAX_SAMPLES as u64);
     }
 }

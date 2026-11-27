@@ -11,7 +11,7 @@ mod util;
 mod wgc;
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::{Result, bail};
 use serde_json::{Value, json};
@@ -28,10 +28,10 @@ enum Backend {
 }
 
 impl Backend {
-    fn capture(&mut self, destination: &mut [u8]) -> Result<bool> {
+    fn capture(&mut self, destination: &mut [u8], stop: Option<&AtomicBool>) -> Result<bool> {
         match self {
-            Self::Dda(source) => source.capture(destination),
-            Self::Wgc(source) => source.capture(destination),
+            Self::Dda(source) => source.capture(destination, stop),
+            Self::Wgc(source) => source.capture(destination, stop),
         }
     }
 
@@ -53,7 +53,8 @@ impl Backend {
 /// 桌面采集源。只接受 `dda` / `wgc`；输出帧为 packed NV12，且固定由硬件
 /// D3D11 compute shader 生成。
 ///
-/// `capture` 返回 `Ok(false)` 表示在不超过 20 ms 的等待窗口内没有新图像；
+/// 无新图像时最多等待约 20 ms；已取得帧的 GPU 回读共用 1 s 截止时间，
+/// `capture_cancellable` 还可在非阻塞 Map 的重试边界取消并返回 `Ok(false)`。
 /// 任何错误（采集项关闭、帧池重建失败、GPU 初始化/转换失败等）都是致命错误，
 /// 调用方必须停止，不能由本类型静默换后端或换转换方式。
 pub struct DesktopSource {
@@ -110,6 +111,16 @@ impl DesktopSource {
 
     /// 采集一帧到 `destination`。长度必须至少为 `width*height*3/2`。
     pub fn capture(&mut self, destination: &mut [u8]) -> Result<bool> {
+        self.capture_cancellable(destination, None)
+    }
+
+    /// 与 `capture` 相同；GPU 回读只轮询 DO_NOT_WAIT，在重试边界响应会话取消。
+    /// 返回 false 的半成品不得发送；驱动调用与 teardown 仍须自然返回后才能释放。
+    pub fn capture_cancellable(
+        &mut self,
+        destination: &mut [u8],
+        stop: Option<&AtomicBool>,
+    ) -> Result<bool> {
         let required = self.frame_bytes();
         if destination.len() < required {
             bail!(
@@ -117,7 +128,7 @@ impl DesktopSource {
                 destination.len()
             );
         }
-        self.backend.capture(destination)
+        self.backend.capture(destination, stop)
     }
 
     fn frame_bytes(&self) -> usize {
@@ -142,6 +153,10 @@ impl DesktopSource {
             "output_height": self.height,
             "frame_bytes": self.frame_bytes(),
             "source_skipped": self.skipped.load(Ordering::Relaxed),
+            "capture_diagnostics": match &self.backend {
+                Backend::Dda(source) => source.diagnostics(),
+                Backend::Wgc(_) => Value::Null,
+            },
         })
     }
 }

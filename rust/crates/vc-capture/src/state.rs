@@ -40,7 +40,11 @@ impl Agent {
         }
     }
     pub fn running(&mut self) -> bool {
-        self.slot.running() || self.slot.cleanup_pending()
+        let active = self.slot.running() || self.slot.cleanup_pending();
+        if !active {
+            self.active_request = None;
+        }
+        active
     }
     /// 对外列表只含已连接的物理网卡；诊断模式额外列出回环。
     pub fn adapters(&mut self, refresh: bool) -> Result<Vec<AdapterInfo>, String> {
@@ -57,7 +61,13 @@ impl Agent {
         Ok(items)
     }
     pub fn stats(&mut self) -> Value {
-        self.slot.stats()
+        let stats = self.slot.stats();
+        if !self.slot.cleanup_pending()
+            && stats.get("running").and_then(Value::as_bool) == Some(false)
+        {
+            self.active_request = None;
+        }
+        stats
     }
     pub fn prepare(
         &mut self,
