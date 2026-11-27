@@ -55,15 +55,17 @@ impl PeerClient {
         } else {
             REQUEST_TIMEOUT
         };
-        let result = match body {
-            Some(body) => self
+        let result = match (body, timeout == REQUEST_TIMEOUT) {
+            (Some(body), true) => self.agent.post(&url).send_json(body),
+            (Some(body), false) => self
                 .agent
                 .post(&url)
                 .config()
                 .timeout_global(Some(timeout))
                 .build()
                 .send_json(body),
-            None => self
+            (None, true) => self.agent.get(&url).call(),
+            (None, false) => self
                 .agent
                 .get(&url)
                 .config()

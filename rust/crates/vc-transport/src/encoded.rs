@@ -19,10 +19,13 @@
 use std::collections::VecDeque;
 
 use crate::checksum::crc32;
-use crate::reassembly::{CompletedFrame, IgnoreReason, PushOutcome, Stats, TimingSummary};
+use crate::reassembly::{
+    CompletedFrame, IgnoreReason, PacketBitset, PushOutcome, Stats, TimingSummary, push_window,
+    summarize,
+};
 use crate::wire::{
-    ETHERNET_HEADER_LEN, ETHERTYPE, FLAG_KEY_FRAME, HEADER_LEN, Header, L2_OVERHEAD, WireError,
-    ethertype_at, is_after, packet_count, payload_max_for_mtu, source_mac_at,
+    ETHERNET_HEADER_LEN, ETHERTYPE, FLAG_KEY_FRAME, HEADER_LEN, Header, L2_OVERHEAD, MAGIC,
+    WireError, is_after, packet_count, payload_max_for_mtu,
 };
 
 /// 未完成 AU 上限（编码契约固定为 2）。
@@ -41,24 +44,17 @@ struct Slot {
     first_ns: u64,
     /// 按 `min(max_au_bytes, total*payload_max)` 分配；完成时截断到实际长度。
     buffer: Vec<u8>,
-    /// 每 seq 一位的到达位图；计入 `inflight_bytes`。
-    seen: Vec<u8>,
+    /// 紧凑到达位图：<=512 包内联 `[u64; 8]`，>512 包池化 `Vec<u64>`。
+    seen: PacketBitset,
     got_n: u16,
     /// 已到达的末片实际长度；仅当末片到达后非零。
     tail: u16,
 }
 
 impl Slot {
-    fn seen(&self, seq: u16) -> bool {
-        self.seen[seq as usize >> 3] & (1u8 << (seq & 7)) != 0
-    }
-
-    fn mark_seen(&mut self, seq: u16) {
-        self.seen[seq as usize >> 3] |= 1u8 << (seq & 7);
-    }
-
+    #[inline]
     fn allocated_bytes(&self) -> usize {
-        self.buffer.len() + self.seen.len()
+        self.buffer.len() + (self.total as usize).div_ceil(8)
     }
 }
 
@@ -73,9 +69,9 @@ pub struct EncodedReassembler {
     max_total: u16,
     source_mac: Option<[u8; 6]>,
     slots: Vec<Slot>,
-    /// 复用 AU 缓冲区与 seen 位图，减少频繁堆分配。
+    /// 复用 AU 缓冲区与超长 seen 位图，减少频繁堆分配。
     free_buffers: Vec<Vec<u8>>,
-    free_seens: Vec<Vec<u8>>,
+    free_bitsets: Vec<Vec<u64>>,
     buffered_bytes: usize,
     stats: Stats,
     have_seen: bool,
@@ -108,7 +104,7 @@ impl EncodedReassembler {
             source_mac,
             slots: Vec::with_capacity(MAX_INFLIGHT_AUS),
             free_buffers: Vec::with_capacity(FREE_POOL_CAP),
-            free_seens: Vec::with_capacity(FREE_POOL_CAP),
+            free_bitsets: Vec::with_capacity(FREE_POOL_CAP),
             buffered_bytes: 0,
             stats: Stats::default(),
             have_seen: false,
@@ -134,22 +130,6 @@ impl EncodedReassembler {
             buffer
         } else {
             vec![0u8; capacity]
-        }
-    }
-
-    fn take_seen(&mut self, seen_len: usize) -> Vec<u8> {
-        if let Some(mut seen) = self.free_seens.pop() {
-            seen.fill(0);
-            seen.resize(seen_len, 0);
-            seen
-        } else {
-            vec![0u8; seen_len]
-        }
-    }
-
-    fn recycle_seen(&mut self, seen: Vec<u8>) {
-        if self.free_seens.len() < FREE_POOL_CAP {
-            self.free_seens.push(seen);
         }
     }
 
@@ -200,34 +180,38 @@ impl EncodedReassembler {
     }
 
     /// 实时接收优化路径：仅在为新 AU 创建槽位时调用 `on_first_packet`。
+    #[inline]
     pub fn push_ethernet_timed_lazy(
         &mut self,
         frame: &[u8],
         on_first_packet: impl FnOnce() -> u64,
         completed_at: impl FnOnce() -> u64,
     ) -> PushOutcome {
-        if frame.len() < ETHERNET_HEADER_LEN + HEADER_LEN {
+        if frame.len() < L2_OVERHEAD {
             return PushOutcome::Ignored(IgnoreReason::ShortFrame);
         }
-        if ethertype_at(frame) != Some(ETHERTYPE) {
+        if u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE {
             return PushOutcome::Ignored(IgnoreReason::WrongEtherType);
         }
-        let source = source_mac_at(frame);
         if let Some(expected) = self.source_mac
-            && source != Some(expected)
+            && frame[6..12] != expected
         {
             self.stats.ignored_other_source += 1;
             return PushOutcome::Ignored(IgnoreReason::OtherSource);
         }
-        let header = match Header::parse(&frame[ETHERNET_HEADER_LEN..]) {
+        let hdr_bytes: &[u8; HEADER_LEN] = frame[ETHERNET_HEADER_LEN..L2_OVERHEAD]
+            .try_into()
+            .expect("28 字节");
+        let header = match Header::parse_array(hdr_bytes) {
             Ok(header) => header,
             Err(WireError::BadMagic(_)) => return PushOutcome::Ignored(IgnoreReason::BadMagic),
             Err(_) => return PushOutcome::Ignored(IgnoreReason::ShortFrame),
         };
-        let payload = &frame[ETHERNET_HEADER_LEN + HEADER_LEN..];
+        let payload = &frame[L2_OVERHEAD..];
         self.push_packet_timed_lazy(header, payload, on_first_packet, completed_at)
     }
 
+    #[inline]
     fn push_packet_timed_lazy(
         &mut self,
         header: Header,
@@ -235,6 +219,9 @@ impl EncodedReassembler {
         on_first_packet: impl FnOnce() -> u64,
         completed_at: impl FnOnce() -> u64,
     ) -> PushOutcome {
+        if header.magic != MAGIC {
+            return PushOutcome::Ignored(IgnoreReason::BadMagic);
+        }
         // 先校验所有元数据，再决定是否分配/写入。任何超限声明都不会触发大分配。
         let total = header.total;
         let seq = header.seq;
@@ -248,20 +235,9 @@ impl EncodedReassembler {
             self.stats.packets_lost += 1;
             return PushOutcome::Ignored(IgnoreReason::LengthMismatch);
         }
-        let offset = match (seq as usize).checked_mul(self.payload_max) {
-            Some(offset) => offset,
-            None => {
-                self.stats.packets_lost += 1;
-                return PushOutcome::Ignored(IgnoreReason::BadGeometry);
-            }
-        };
-        let end = match offset.checked_add(len) {
-            Some(end) => end,
-            None => {
-                self.stats.packets_lost += 1;
-                return PushOutcome::Ignored(IgnoreReason::BadGeometry);
-            }
-        };
+        // `seq < total <= max_total <= u16::MAX` 且 `payload_max <= MAX_MTU`，不会溢出。
+        let offset = (seq as usize) * self.payload_max;
+        let end = offset + len;
         if end > self.max_au_bytes {
             self.stats.packets_lost += 1;
             return PushOutcome::Ignored(IgnoreReason::BadGeometry);
@@ -276,11 +252,10 @@ impl EncodedReassembler {
             self.stats.packets_lost += 1;
             return PushOutcome::Ignored(IgnoreReason::BadGeometry);
         }
-        if payload.len() < len {
+        let Some(payload) = payload.get(..len) else {
             // 抓包截断不是对端坏包，不计丢包（与 Raw 一致）。
             return PushOutcome::Ignored(IgnoreReason::TruncatedPayload);
-        }
-        let payload = &payload[..len];
+        };
         if crc32(payload) != header.payload_crc {
             self.stats.packets_lost += 1;
             self.stats.crc_errors += 1;
@@ -315,13 +290,11 @@ impl EncodedReassembler {
                 let capacity = self
                     .max_au_bytes
                     .min((total as usize).saturating_mul(self.payload_max));
-                let seen_len = (total as usize).div_ceil(8);
                 debug_assert!(capacity > 0, "校验后 AU 缓冲必须非空");
                 let first_ns = on_first_packet();
                 let buffer = self.take_buffer(capacity);
-                let seen = self.take_seen(seen_len);
-                self.buffered_bytes += capacity + seen_len;
-                self.slots.push(Slot {
+                let seen = PacketBitset::take(&mut self.free_bitsets, total as usize);
+                let slot = Slot {
                     frame_id: fid,
                     total,
                     pattern: header.pattern,
@@ -332,36 +305,29 @@ impl EncodedReassembler {
                     seen,
                     got_n: 0,
                     tail: 0,
-                });
+                };
+                self.buffered_bytes += slot.allocated_bytes();
+                self.slots.push(slot);
                 self.slots.len() - 1
             }
         };
 
         // 同一 AU 的所有分片必须回显相同的 total/pattern/flags/qpc。
-        let metadata_conflict = {
-            let slot = &self.slots[index];
-            slot.total != total
-                || slot.pattern != header.pattern
-                || slot.flags != header.flags
-                || slot.qpc_ns != header.qpc_ns
-        };
-        if metadata_conflict {
+        let slot = &mut self.slots[index];
+        if slot.total != total
+            || slot.pattern != header.pattern
+            || slot.flags != header.flags
+            || slot.qpc_ns != header.qpc_ns
+        {
             self.stats.packets_lost += 1;
             return PushOutcome::Ignored(IgnoreReason::SlotConflict);
         }
 
         // 重复分片：完全一致才容忍；字节或末片长度冲突则丢整个未完成 AU，
         // 新包不写入（C++ 同样丢弃槽位且不覆盖）。
-        let duplicate = {
-            let slot = &self.slots[index];
-            if !slot.seen(seq) {
-                None
-            } else {
-                let tail_matches = seq + 1 != total || slot.tail as usize == len;
-                Some(tail_matches && slot.buffer[offset..end] == payload[..])
-            }
-        };
-        if let Some(identical) = duplicate {
+        if slot.seen.contains(seq) {
+            let tail_matches = seq + 1 != total || slot.tail as usize == len;
+            let identical = tail_matches && slot.buffer[offset..end] == *payload;
             self.stats.duplicate += 1;
             if identical {
                 return PushOutcome::Ignored(IgnoreReason::Duplicate);
@@ -371,17 +337,13 @@ impl EncodedReassembler {
             return PushOutcome::Ignored(IgnoreReason::SlotConflict);
         }
 
-        let complete = {
-            let slot = &mut self.slots[index];
-            slot.buffer[offset..end].copy_from_slice(payload);
-            slot.mark_seen(seq);
-            slot.got_n += 1;
-            if seq + 1 == total {
-                slot.tail = len as u16;
-            }
-            slot.got_n == slot.total
-        };
-        if !complete {
+        slot.buffer[offset..end].copy_from_slice(payload);
+        slot.seen.insert(seq);
+        slot.got_n += 1;
+        if seq + 1 == total {
+            slot.tail = len as u16;
+        }
+        if slot.got_n != slot.total {
             return PushOutcome::Accepted;
         }
 
@@ -389,7 +351,7 @@ impl EncodedReassembler {
         let completed_ns = completed_at();
         let mut slot = self.slots.remove(index);
         self.buffered_bytes = self.buffered_bytes.saturating_sub(slot.allocated_bytes());
-        self.recycle_seen(slot.seen);
+        slot.seen.recycle(&mut self.free_bitsets, FREE_POOL_CAP);
         let actual = (slot.total as usize - 1) * self.payload_max + slot.tail as usize;
         debug_assert!(actual <= slot.buffer.len());
         // 变长 AU：返回真实字节数，而不是 total*payload_max 的分配长度。
@@ -452,32 +414,7 @@ impl EncodedReassembler {
         if self.free_buffers.len() < FREE_POOL_CAP {
             self.free_buffers.push(slot.buffer);
         }
-        self.recycle_seen(slot.seen);
-    }
-}
-
-fn push_window(window: &mut VecDeque<u64>, value: u64, cap: usize) {
-    if window.len() >= cap {
-        window.pop_front();
-    }
-    window.push_back(value);
-}
-
-/// 与 Raw 相同的窗口摘要（最近窗口、百分位索引 `len*p/100`）。
-fn summarize(window: &VecDeque<u64>) -> TimingSummary {
-    if window.is_empty() {
-        return TimingSummary::default();
-    }
-    let mut sorted: Vec<u64> = window.iter().copied().collect();
-    sorted.sort_unstable();
-    let sum: u128 = sorted.iter().map(|value| *value as u128).sum();
-    let pct = |p: usize| sorted[(sorted.len() * p) / 100] as f64 / 1e6;
-    TimingSummary {
-        samples: sorted.len(),
-        avg_ms: (sum as f64 / sorted.len() as f64) / 1e6,
-        p50_ms: pct(50),
-        p99_ms: pct(99),
-        max_ms: *sorted.last().unwrap_or(&0) as f64 / 1e6,
+        slot.seen.recycle(&mut self.free_bitsets, FREE_POOL_CAP);
     }
 }
 
@@ -1073,5 +1010,48 @@ mod tests {
                 assert_eq!(done.data.as_ptr(), ptr_first);
             }
         }
+    }
+
+    #[test]
+    fn reassembles_422_and_over_512_packet_aus_with_compact_bitset() {
+        // 422 包（inline [u64; 8]）：614_000 字节 @ MTU 1500 -> 422 包
+        let mut r = EncodedReassembler::new(1500, 700_000, None).unwrap();
+        let data_422 = pattern(614_000, 31);
+        let pkts_422 = packets(&data_422, 10, 1458, 99, 0);
+        assert_eq!(pkts_422.len(), 422);
+        for (idx, (h, p)) in pkts_422.iter().rev().enumerate() {
+            let outcome = push(&mut r, h, p, 1_000 + idx as u64);
+            if idx + 1 == pkts_422.len() {
+                let PushOutcome::Completed(done) = outcome else {
+                    panic!("422 包 AU 应完成");
+                };
+                assert_eq!(done.data, data_422);
+            } else {
+                assert_eq!(outcome, PushOutcome::Accepted);
+            }
+        }
+        assert!(r.free_bitsets.is_empty(), "422 包 AU 不应分配堆位图");
+
+        // >512 包（pooled Vec<u64>）：874_000 字节 @ MTU 1500 -> 600 包
+        let mut r_big = EncodedReassembler::new(1500, 900_000, None).unwrap();
+        for fid in 1..=2u32 {
+            let data = pattern(874_000, fid + 40);
+            let pkts = packets(&data, fid, 1458, 123, 0);
+            assert_eq!(pkts.len(), 600);
+            for (idx, (h, p)) in pkts.iter().rev().enumerate() {
+                let outcome = push(&mut r_big, h, p, 2_000 + idx as u64);
+                if idx + 1 == pkts.len() {
+                    let PushOutcome::Completed(done) = outcome else {
+                        panic!("600 包 AU 应完成");
+                    };
+                    assert_eq!(done.data, data);
+                    r_big.recycle(done.data);
+                } else {
+                    assert_eq!(outcome, PushOutcome::Accepted);
+                }
+            }
+        }
+        assert_eq!(r_big.stats().complete, 2);
+        assert_eq!(r_big.free_bitsets.len(), 1, "超 512 包位图应被池化复用");
     }
 }

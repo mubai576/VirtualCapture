@@ -5,7 +5,7 @@ use std::io::{BufWriter, Seek, SeekFrom, Write};
 use std::mem::{MaybeUninit, size_of};
 use std::path::{Path, PathBuf};
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering, fence};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -25,7 +25,11 @@ use vc_transport::fragment::{FragmentConfig, fragments, write_ethernet};
 use vc_transport::{
     Config, Geometry, PushOutcome, Reassembler, TimingSummary, payload_max_for_mtu,
 };
-use windows_sys::Win32::Foundation::FILETIME;
+use windows_sys::Win32::Foundation::{CloseHandle, FILETIME, HANDLE};
+use windows_sys::Win32::System::Memory::{
+    FILE_MAP_READ, MEMORY_BASIC_INFORMATION, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
+    OpenFileMappingW, UnmapViewOfFile, VirtualQuery,
+};
 use windows_sys::Win32::System::Performance::{QueryPerformanceCounter, QueryPerformanceFrequency};
 use windows_sys::Win32::System::SystemInformation::GetSystemDirectoryW;
 use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
@@ -162,18 +166,18 @@ struct PcapIf {
 }
 
 #[repr(C)]
-struct PcapHeader {
-    ts_sec: u32,
-    ts_usec: u32,
-    caplen: u32,
-    len: u32,
+pub(crate) struct PcapHeader {
+    pub(crate) ts_sec: u32,
+    pub(crate) ts_usec: u32,
+    pub(crate) caplen: u32,
+    pub(crate) len: u32,
 }
 
 #[repr(C)]
-struct PcapSendQueue {
-    maxlen: c_uint,
-    len: c_uint,
-    buffer: *mut c_char,
+pub(crate) struct PcapSendQueue {
+    pub(crate) maxlen: c_uint,
+    pub(crate) len: c_uint,
+    pub(crate) buffer: *mut c_char,
 }
 
 type FindAllDevs = unsafe extern "C" fn(*mut *mut PcapIf, *mut c_char) -> c_int;
@@ -181,14 +185,14 @@ type FreeAllDevs = unsafe extern "C" fn(*mut PcapIf);
 type OpenLive =
     unsafe extern "C" fn(*const c_char, c_int, c_int, c_int, *mut c_char) -> *mut c_void;
 type SendPacket = unsafe extern "C" fn(*mut c_void, *const c_uchar, c_int) -> c_int;
-type NextEx = unsafe extern "C" fn(*mut c_void, *mut *mut PcapHeader, *mut *const c_uchar) -> c_int;
+pub(crate) type PcapHandler = unsafe extern "C" fn(*mut c_uchar, *const PcapHeader, *const c_uchar);
+type Dispatch = unsafe extern "C" fn(*mut c_void, c_int, PcapHandler, *mut c_uchar) -> c_int;
+type BreakLoop = unsafe extern "C" fn(*mut c_void);
 type SetBuff = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type SetMinToCopy = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type DataLink = unsafe extern "C" fn(*mut c_void) -> c_int;
 type SendQueueAlloc = unsafe extern "C" fn(c_uint) -> *mut PcapSendQueue;
 type SendQueueDestroy = unsafe extern "C" fn(*mut PcapSendQueue);
-type SendQueueQueue =
-    unsafe extern "C" fn(*mut PcapSendQueue, *const PcapHeader, *const c_uchar) -> c_int;
 type SendQueueTransmit = unsafe extern "C" fn(*mut c_void, *mut PcapSendQueue, c_int) -> c_uint;
 type GetErr = unsafe extern "C" fn(*mut c_void) -> *const c_char;
 type LibVersion = unsafe extern "C" fn() -> *const c_char;
@@ -200,13 +204,13 @@ pub(crate) struct Npcap {
     free_all_devs: FreeAllDevs,
     open_live: OpenLive,
     send_packet: SendPacket,
-    next_ex: NextEx,
+    dispatch: Dispatch,
+    breakloop: BreakLoop,
     set_buff: SetBuff,
     set_min_to_copy: SetMinToCopy,
     datalink: DataLink,
     queue_alloc: SendQueueAlloc,
     queue_destroy: SendQueueDestroy,
-    queue_packet: SendQueueQueue,
     queue_transmit: SendQueueTransmit,
     get_err: GetErr,
     lib_version: LibVersion,
@@ -229,13 +233,13 @@ impl Npcap {
                 free_all_devs: symbol!("pcap_freealldevs", FreeAllDevs),
                 open_live: symbol!("pcap_open_live", OpenLive),
                 send_packet: symbol!("pcap_sendpacket", SendPacket),
-                next_ex: symbol!("pcap_next_ex", NextEx),
+                dispatch: symbol!("pcap_dispatch", Dispatch),
+                breakloop: symbol!("pcap_breakloop", BreakLoop),
                 set_buff: symbol!("pcap_setbuff", SetBuff),
                 set_min_to_copy: symbol!("pcap_setmintocopy", SetMinToCopy),
                 datalink: symbol!("pcap_datalink", DataLink),
                 queue_alloc: symbol!("pcap_sendqueue_alloc", SendQueueAlloc),
                 queue_destroy: symbol!("pcap_sendqueue_destroy", SendQueueDestroy),
-                queue_packet: symbol!("pcap_sendqueue_queue", SendQueueQueue),
                 queue_transmit: symbol!("pcap_sendqueue_transmit", SendQueueTransmit),
                 get_err: symbol!("pcap_geterr", GetErr),
                 lib_version: symbol!("pcap_lib_version", LibVersion),
@@ -677,6 +681,229 @@ impl TimedWindow {
         let cutoff = now_ns.saturating_sub(RATE_WINDOW_NS);
         while self.samples.front().is_some_and(|(ts, _)| *ts < cutoff) {
             self.samples.pop_front();
+        }
+    }
+}
+
+/// 最近 10000 帧的耗时样本统计。
+#[derive(Default)]
+pub(crate) struct Samples(VecDeque<u64>);
+
+impl Samples {
+    pub(crate) fn push(&mut self, ns: u64) {
+        if self.0.len() == 10000 {
+            self.0.pop_front();
+        }
+        self.0.push_back(ns);
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn value(&self) -> Value {
+        if self.0.is_empty() {
+            return json!({"samples":0,"avg_ms":null,"p50_ms":null,"p99_ms":null,"max_ms":null});
+        }
+        let mut values: Vec<_> = self.0.iter().copied().collect();
+        values.sort_unstable();
+        let n = values.len();
+        json!({
+            "samples": n,
+            "avg_ms": values.iter().map(|v| *v as f64).sum::<f64>() / n as f64 / 1e6,
+            "p50_ms": values[(n * 50).div_ceil(100) - 1] as f64 / 1e6,
+            "p99_ms": values[(n * 99).div_ceil(100) - 1] as f64 / 1e6,
+            "max_ms": values[n - 1] as f64 / 1e6,
+        })
+    }
+}
+
+const VSTAT_MAGIC: u32 = 0x5453_5656; // "VVST"
+const VSTAT_CAP: u32 = 1024;
+const VSTAT_HDR_SIZE: usize = 16;
+const VSTAT_ENTRY_SIZE: usize = 32;
+const VSTAT_SIZE: usize = VSTAT_HDR_SIZE + VSTAT_CAP as usize * VSTAT_ENTRY_SIZE;
+const VSTAT_FLAG_REPEAT: u32 = 1;
+
+#[repr(C)]
+struct VstatHeader {
+    magic: u32,
+    widx: i32,
+    cap: u32,
+    reserved: u32,
+}
+
+#[repr(C)]
+struct VstatEntry {
+    n: u32,
+    frame_id: u32,
+    pub_ns: u64,
+    deliver_ns: u64,
+    flags: u32,
+    reserved: u32,
+}
+
+/// 只读观测 `<shm>.vcam` 反馈环（由 `vc_vcam` 写入），计算同机 `vseg = deliver_ns - pub_ns`。
+pub(crate) struct VstatReader {
+    name_w: Option<Vec<u16>>,
+    map: HANDLE,
+    view: MEMORY_MAPPED_VIEW_ADDRESS,
+    next_idx: u32,
+    delivered: u64,
+    samples: Samples,
+    live_window: TimedWindow,
+}
+
+impl VstatReader {
+    pub(crate) fn new(shm_name: Option<&str>) -> Self {
+        let name_w = shm_name.and_then(|name| {
+            let vcam = format!("{name}.vcam");
+            if vcam.is_empty() || vcam.contains('\0') {
+                None
+            } else {
+                Some(vcam.encode_utf16().chain(std::iter::once(0)).collect())
+            }
+        });
+        Self {
+            name_w,
+            map: ptr::null_mut(),
+            view: MEMORY_MAPPED_VIEW_ADDRESS {
+                Value: ptr::null_mut(),
+            },
+            next_idx: 0,
+            delivered: 0,
+            samples: Samples::default(),
+            live_window: TimedWindow::default(),
+        }
+    }
+
+    fn ensure_open(&mut self) -> bool {
+        if !self.view.Value.is_null() {
+            return true;
+        }
+        let Some(name_w) = self.name_w.as_ref() else {
+            return false;
+        };
+        let map = unsafe { OpenFileMappingW(FILE_MAP_READ, 0, name_w.as_ptr()) };
+        if map.is_null() {
+            return false;
+        }
+        let view = unsafe { MapViewOfFile(map, FILE_MAP_READ, 0, 0, VSTAT_SIZE) };
+        if view.Value.is_null() {
+            unsafe { CloseHandle(map) };
+            return false;
+        }
+        let mut mbi = MaybeUninit::<MEMORY_BASIC_INFORMATION>::uninit();
+        let queried = unsafe {
+            VirtualQuery(
+                view.Value,
+                mbi.as_mut_ptr(),
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        let valid_size = queried != 0 && unsafe { mbi.assume_init().RegionSize } >= VSTAT_SIZE;
+        if !valid_size {
+            unsafe {
+                UnmapViewOfFile(view);
+                CloseHandle(map);
+            }
+            return false;
+        }
+        let header = unsafe { &*(view.Value.cast::<VstatHeader>()) };
+        let magic = unsafe { ptr::read_volatile(ptr::addr_of!(header.magic)) };
+        let cap = unsafe { ptr::read_volatile(ptr::addr_of!(header.cap)) };
+        if magic != VSTAT_MAGIC || cap != VSTAT_CAP {
+            unsafe {
+                UnmapViewOfFile(view);
+                CloseHandle(map);
+            }
+            return false;
+        }
+        self.map = map;
+        self.view = view;
+        true
+    }
+
+    pub(crate) fn poll(&mut self) {
+        if !self.ensure_open() {
+            return;
+        }
+        let base = self.view.Value.cast::<u8>();
+        let header = base.cast::<VstatHeader>();
+        let widx = unsafe { ptr::read_volatile(ptr::addr_of!((*header).widx)) };
+        if widx <= 0 {
+            return;
+        }
+        let widx = widx as u32;
+        let delta = widx.wrapping_sub(self.next_idx);
+        if delta == 0 || delta > 0x8000_0000 {
+            return;
+        }
+        if delta > VSTAT_CAP {
+            self.next_idx = widx.wrapping_sub(VSTAT_CAP);
+        }
+        while self.next_idx != widx {
+            let slot = (self.next_idx % VSTAT_CAP) as usize;
+            let entry = unsafe {
+                base.add(VSTAT_HDR_SIZE + slot * VSTAT_ENTRY_SIZE)
+                    .cast::<VstatEntry>()
+            };
+            let n1 = unsafe { ptr::read_volatile(ptr::addr_of!((*entry).n)) };
+            if n1 == 0 {
+                // 写入端尚未完成该条目，等待下次轮询。
+                break;
+            }
+            fence(Ordering::Acquire);
+            let pub_ns = unsafe { ptr::read_volatile(ptr::addr_of!((*entry).pub_ns)) };
+            let deliver_ns = unsafe { ptr::read_volatile(ptr::addr_of!((*entry).deliver_ns)) };
+            let flags = unsafe { ptr::read_volatile(ptr::addr_of!((*entry).flags)) };
+            fence(Ordering::Acquire);
+            let n2 = unsafe { ptr::read_volatile(ptr::addr_of!((*entry).n)) };
+            if n1 != n2 {
+                break;
+            }
+            self.delivered = self.delivered.saturating_add(1);
+            if flags & VSTAT_FLAG_REPEAT == 0 && pub_ns > 0 && deliver_ns >= pub_ns {
+                let vseg_ns = deliver_ns - pub_ns;
+                self.samples.push(vseg_ns);
+                self.live_window.push(deliver_ns, vseg_ns);
+            }
+            self.next_idx = self.next_idx.wrapping_add(1);
+        }
+    }
+
+    pub(crate) fn live_fields(&mut self, now_ns: u64) -> (Option<u64>, Value, Value) {
+        self.poll();
+        if self.delivered == 0 {
+            return (None, Value::Null, Value::Null);
+        }
+        let summary = self.live_window.summary_at(now_ns);
+        let p99 = summary["p99_ms"].clone();
+        (Some(self.delivered), p99, summary)
+    }
+
+    pub(crate) fn final_fields(&mut self) -> (Option<u64>, Value, Value) {
+        self.poll();
+        if self.delivered == 0 {
+            return (None, Value::Null, Value::Null);
+        }
+        let summary = self.samples.value();
+        let p99 = summary["p99_ms"].clone();
+        (Some(self.delivered), p99, summary)
+    }
+}
+
+impl Drop for VstatReader {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.view.Value.is_null() {
+                UnmapViewOfFile(self.view);
+                self.view.Value = ptr::null_mut();
+            }
+            if !self.map.is_null() {
+                CloseHandle(self.map);
+                self.map = ptr::null_mut();
+            }
         }
     }
 }
@@ -1229,5 +1456,81 @@ mod tests {
         }
         let summary = capped.summary_at(1_500_000_000);
         assert_eq!(summary["samples"], LIVE_TIMING_MAX_SAMPLES as u64);
+    }
+
+    #[test]
+    fn vstat_reader_reads_non_repeat_deliveries_and_skips_repeat() {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::System::Memory::{
+            CreateFileMappingW, FILE_MAP_WRITE, PAGE_READWRITE,
+        };
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let shm_name = format!(
+            "Local\\vc-stream-vstat-test-{}-{unique}",
+            std::process::id()
+        );
+        let vcam_w: Vec<u16> = format!("{shm_name}.vcam")
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let map = unsafe {
+            CreateFileMappingW(
+                INVALID_HANDLE_VALUE,
+                ptr::null(),
+                PAGE_READWRITE,
+                0,
+                VSTAT_SIZE as u32,
+                vcam_w.as_ptr(),
+            )
+        };
+        assert!(!map.is_null());
+        let view = unsafe { MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, VSTAT_SIZE) };
+        assert!(!view.Value.is_null());
+        unsafe {
+            let hdr = view.Value.cast::<VstatHeader>();
+            ptr::write_volatile(ptr::addr_of_mut!((*hdr).cap), VSTAT_CAP);
+            ptr::write_volatile(ptr::addr_of_mut!((*hdr).widx), 2);
+            ptr::write_volatile(ptr::addr_of_mut!((*hdr).magic), VSTAT_MAGIC);
+
+            let e0 = view
+                .Value
+                .cast::<u8>()
+                .add(VSTAT_HDR_SIZE)
+                .cast::<VstatEntry>();
+            ptr::write_volatile(ptr::addr_of_mut!((*e0).frame_id), 0);
+            ptr::write_volatile(ptr::addr_of_mut!((*e0).pub_ns), 1_000_000_000);
+            ptr::write_volatile(ptr::addr_of_mut!((*e0).deliver_ns), 1_000_060_000);
+            ptr::write_volatile(ptr::addr_of_mut!((*e0).flags), 0);
+            ptr::write_volatile(ptr::addr_of_mut!((*e0).n), 1);
+
+            let e1 = view
+                .Value
+                .cast::<u8>()
+                .add(VSTAT_HDR_SIZE + VSTAT_ENTRY_SIZE)
+                .cast::<VstatEntry>();
+            ptr::write_volatile(ptr::addr_of_mut!((*e1).frame_id), 0);
+            ptr::write_volatile(ptr::addr_of_mut!((*e1).pub_ns), 1_000_000_000);
+            ptr::write_volatile(ptr::addr_of_mut!((*e1).deliver_ns), 1_005_000_000);
+            ptr::write_volatile(ptr::addr_of_mut!((*e1).flags), VSTAT_FLAG_REPEAT);
+            ptr::write_volatile(ptr::addr_of_mut!((*e1).n), 2);
+        }
+
+        let mut reader = VstatReader::new(Some(&shm_name));
+        let (delivered, live_p99, _) = reader.live_fields(1_005_000_000);
+        assert_eq!(delivered, Some(2));
+        assert_eq!(live_p99.as_f64(), Some(0.06));
+        let (final_delivered, final_p99, summary) = reader.final_fields();
+        assert_eq!(final_delivered, Some(2));
+        assert_eq!(final_p99.as_f64(), Some(0.06));
+        assert_eq!(summary["samples"], 1);
+
+        unsafe {
+            UnmapViewOfFile(view);
+            CloseHandle(map);
+        }
     }
 }

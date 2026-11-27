@@ -75,9 +75,9 @@ pub struct Header {
 }
 
 impl Header {
-    /// 按 `vc_pkt_hdr_t` 逐字段小端编码为 28 字节。
-    pub fn encode(&self) -> [u8; HEADER_LEN] {
-        let mut out = [0u8; HEADER_LEN];
+    /// 按 `vc_pkt_hdr_t` 逐字段小端写入 28 字节目标切片。
+    #[inline]
+    pub fn encode_into(&self, out: &mut [u8; HEADER_LEN]) {
         out[0..4].copy_from_slice(&self.magic.to_le_bytes());
         out[4..8].copy_from_slice(&self.frame_id.to_le_bytes());
         out[8..10].copy_from_slice(&self.seq.to_le_bytes());
@@ -87,25 +87,30 @@ impl Header {
         out[24..26].copy_from_slice(&self.payload_len.to_le_bytes());
         out[26] = self.flags;
         out[27] = self.pattern;
+    }
+
+    /// 按 `vc_pkt_hdr_t` 逐字段小端编码为 28 字节。
+    #[inline]
+    pub fn encode(&self) -> [u8; HEADER_LEN] {
+        let mut out = [0u8; HEADER_LEN];
+        self.encode_into(&mut out);
         out
     }
 
-    /// 从至少 28 字节的缓冲区解析；额外字节属于载荷，不在这里读取。
-    pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
-        if bytes.len() < HEADER_LEN {
-            return Err(WireError::TooShort {
-                needed: HEADER_LEN,
-                got: bytes.len(),
-            });
-        }
+    /// 从精确 28 字节数组解析并校验 magic。
+    #[inline]
+    pub fn parse_array(bytes: &[u8; HEADER_LEN]) -> Result<Self, WireError> {
         let out = Self {
-            magic: u32::from_le_bytes(bytes[0..4].try_into().expect("4 字节")),
-            frame_id: u32::from_le_bytes(bytes[4..8].try_into().expect("4 字节")),
-            seq: u16::from_le_bytes(bytes[8..10].try_into().expect("2 字节")),
-            total: u16::from_le_bytes(bytes[10..12].try_into().expect("2 字节")),
-            qpc_ns: u64::from_le_bytes(bytes[12..20].try_into().expect("8 字节")),
-            payload_crc: u32::from_le_bytes(bytes[20..24].try_into().expect("4 字节")),
-            payload_len: u16::from_le_bytes(bytes[24..26].try_into().expect("2 字节")),
+            magic: u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]),
+            frame_id: u32::from_le_bytes([bytes[4], bytes[5], bytes[6], bytes[7]]),
+            seq: u16::from_le_bytes([bytes[8], bytes[9]]),
+            total: u16::from_le_bytes([bytes[10], bytes[11]]),
+            qpc_ns: u64::from_le_bytes([
+                bytes[12], bytes[13], bytes[14], bytes[15], bytes[16], bytes[17], bytes[18],
+                bytes[19],
+            ]),
+            payload_crc: u32::from_le_bytes([bytes[20], bytes[21], bytes[22], bytes[23]]),
+            payload_len: u16::from_le_bytes([bytes[24], bytes[25]]),
             flags: bytes[26],
             pattern: bytes[27],
         };
@@ -115,7 +120,23 @@ impl Header {
         Ok(out)
     }
 
+    /// 从至少 28 字节的缓冲区解析；额外字节属于载荷，不在这里读取。
+    #[inline]
+    pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        let head: &[u8; HEADER_LEN] = match bytes.get(..HEADER_LEN) {
+            Some(slice) => slice.try_into().expect("28 字节"),
+            None => {
+                return Err(WireError::TooShort {
+                    needed: HEADER_LEN,
+                    got: bytes.len(),
+                });
+            }
+        };
+        Self::parse_array(head)
+    }
+
     /// `flags` bit0 是否置位（关键帧/pattern 起点）。
+    #[inline]
     pub fn is_key_frame(&self) -> bool {
         self.flags & FLAG_KEY_FRAME != 0
     }

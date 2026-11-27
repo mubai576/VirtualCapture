@@ -155,6 +155,8 @@ struct Worker {
     /// 已保存的接收网卡因不再合格而被清除后置位：后续扫描不再自动改选，
     /// 必须由用户显式重新选择，避免静默换到另一张网卡后直接启动。
     host_selection_needs_user: bool,
+    /// 推流期间降低注册表与 DLL 路径规范化轮询频率，空闲/待清理时仍保持每秒刷新。
+    last_vcam_poll: Instant,
 }
 impl Worker {
     fn new(shared: Arc<Shared>, commands: Receiver<Command>) -> Self {
@@ -188,6 +190,7 @@ impl Worker {
             vcam_owned: false,
             config_error,
             host_selection_needs_user: false,
+            last_vcam_poll: Instant::now(),
         }
     }
     fn run(mut self) {
@@ -1113,6 +1116,10 @@ impl Worker {
         if self.state.busy {
             return;
         }
+        if self.state.running && self.last_vcam_poll.elapsed() < Duration::from_secs(5) {
+            return;
+        }
+        self.last_vcam_poll = Instant::now();
         self.state.vcam = vcam::status();
         if self
             .state
@@ -1182,14 +1189,10 @@ impl Worker {
             }
         }
         let receiver_was_pending = self.receiver.cleanup_pending();
-        let receiver_running = self.receiver.running();
-        let receiver_resolved = receiver_was_pending && !self.receiver.cleanup_pending();
-        if self.state.running
-            || receiver_running
-            || self.receiver.cleanup_pending()
-            || receiver_resolved
-        {
-            self.state.receiver = self.receiver.stats();
+        if self.state.running || !self.receiver.is_idle() || receiver_was_pending {
+            let (receiver_running, receiver_stats) = self.receiver.poll_status();
+            let receiver_resolved = receiver_was_pending && !self.receiver.cleanup_pending();
+            self.state.receiver = receiver_stats;
             if self.state.running && !receiver_running {
                 let failure = terminal_failure(&self.state.receiver, "本机接收");
                 self.event("本机接收会话已结束，停止并回收会话。");

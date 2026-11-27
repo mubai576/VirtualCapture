@@ -53,8 +53,11 @@ pub(crate) fn receive(mut args: ReceiveArgs) -> anyhow::Result<()> {
 // Raw：单线程、零拷贝的解码/发布/哈希路径。
 // ---------------------------------------------------------------------------
 
+use crate::shm::PublishToken;
+
+const RX_AUDIT_QUEUE_CAP: usize = 4;
+
 struct RawCounters {
-    expected_frame: Vec<u8>,
     hashes: u64,
     hash_rows: u64,
     shm_published: u64,
@@ -68,9 +71,8 @@ struct RawCounters {
 }
 
 impl RawCounters {
-    fn new(frame_bytes: usize) -> Self {
+    fn new() -> Self {
         Self {
-            expected_frame: vec![0u8; frame_bytes],
             hashes: 0,
             hash_rows: 0,
             shm_published: 0,
@@ -81,6 +83,145 @@ impl RawCounters {
             last_completed_ns: 0,
             cancelled: false,
             timed_out: false,
+        }
+    }
+}
+
+struct RxAuditJob {
+    frame_id: u32,
+    pattern: u8,
+    first_packet_ns: u64,
+    completed_ns: u64,
+    token: Option<PublishToken>,
+    data: Vec<u8>,
+}
+
+struct RxAuditDone {
+    token: Option<PublishToken>,
+    hash: u64,
+    mismatch: bool,
+    logged: bool,
+    buffer: Vec<u8>,
+}
+
+struct RxAuditWorker {
+    tx: Option<mpsc::SyncSender<RxAuditJob>>,
+    done_rx: mpsc::Receiver<RxAuditDone>,
+    join: Option<JoinHandle<anyhow::Result<()>>>,
+}
+
+impl RxAuditWorker {
+    fn spawn(
+        geometry: Geometry,
+        frame_bytes: usize,
+        shm_enabled: bool,
+        mut hashlog: Option<BufferedLog>,
+        session: &str,
+    ) -> anyhow::Result<Self> {
+        let (tx, rx) = mpsc::sync_channel::<RxAuditJob>(RX_AUDIT_QUEUE_CAP);
+        let (done_tx, done_rx) = mpsc::channel::<RxAuditDone>();
+        let need_hash = shm_enabled || hashlog.is_some();
+        let join = thread::Builder::new()
+            .name(format!("vc-stream-rx-audit-{session}"))
+            .spawn(move || -> anyhow::Result<()> {
+                let mut expected_frame = vec![0u8; frame_bytes];
+                while let Ok(job) = rx.recv() {
+                    let hash = if need_hash { fnv1a64(&job.data) } else { 0 };
+                    let mismatch = if let Some(pattern) = Pattern::from_id(job.pattern) {
+                        pattern.fill(geometry, job.frame_id, &mut expected_frame);
+                        expected_frame != job.data
+                    } else {
+                        false
+                    };
+                    let logged = if let Some(writer) = hashlog.as_mut() {
+                        writer.write_line(|w| {
+                            writeln!(
+                                w,
+                                "{{\"frame_id\":{},\"hash\":\"{hash:016x}\",\"qpc_ns\":{},\"first_packet_qpc_ns\":{}}}",
+                                job.frame_id, job.completed_ns, job.first_packet_ns
+                            )
+                        })?;
+                        true
+                    } else {
+                        false
+                    };
+                    let _ = done_tx.send(RxAuditDone {
+                        token: job.token,
+                        hash,
+                        mismatch,
+                        logged,
+                        buffer: job.data,
+                    });
+                }
+                if let Some(writer) = hashlog.as_mut() {
+                    writer.flush()?;
+                }
+                Ok(())
+            })
+            .context("spawn receiver audit worker")?;
+        Ok(Self {
+            tx: Some(tx),
+            done_rx,
+            join: Some(join),
+        })
+    }
+
+    fn drain_done(
+        &self,
+        publisher: &mut Option<Publisher>,
+        reassembler: Option<&mut Reassembler>,
+        counters: &mut RawCounters,
+    ) {
+        let mut reassembler = reassembler;
+        while let Ok(done) = self.done_rx.try_recv() {
+            if let (Some(shm), Some(token)) = (publisher.as_mut(), done.token) {
+                shm.mark_hash(token, done.hash);
+                counters.shm_published += 1;
+            }
+            if done.mismatch {
+                counters.hash_mismatch += 1;
+            }
+            if done.logged {
+                counters.hash_rows += 1;
+            }
+            if let Some(r) = reassembler.as_deref_mut() {
+                r.recycle(done.buffer);
+            }
+        }
+    }
+
+    fn submit(&self, job: RxAuditJob) -> anyhow::Result<()> {
+        self.tx
+            .as_ref()
+            .context("receiver audit channel closed")?
+            .send(job)
+            .map_err(|_| anyhow::anyhow!("receiver audit worker exited unexpectedly"))
+    }
+
+    fn finish(
+        mut self,
+        publisher: &mut Option<Publisher>,
+        counters: &mut RawCounters,
+    ) -> anyhow::Result<()> {
+        self.tx.take();
+        let outcome = if let Some(join) = self.join.take() {
+            match join.join() {
+                Ok(res) => res,
+                Err(_) => Err(anyhow::anyhow!("receiver audit worker panicked")),
+            }
+        } else {
+            Ok(())
+        };
+        self.drain_done(publisher, None, counters);
+        outcome
+    }
+}
+
+impl Drop for RxAuditWorker {
+    fn drop(&mut self) {
+        self.tx.take();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
         }
     }
 }
@@ -180,8 +321,24 @@ fn receive_raw(
         Err(error) => Err(error.context("publish receiver readiness")),
     };
     let cpu_start = process_cpu_ns().ok();
-    let mut counters = RawCounters::new(frame_bytes);
-    if outcome.is_ok() {
+    let mut counters = RawCounters::new();
+    let mut vstat = VstatReader::new(shm_name.as_deref());
+    let mut audit_worker = match RxAuditWorker::spawn(
+        geometry,
+        frame_bytes,
+        shm_enabled,
+        hashlog.take(),
+        &args.common.session,
+    ) {
+        Ok(worker) => Some(worker),
+        Err(error) => {
+            outcome = merge_error(outcome, error);
+            None
+        }
+    };
+    if outcome.is_ok()
+        && let Some(audit) = audit_worker.as_ref()
+    {
         let loop_result = catch_unwind(AssertUnwindSafe(|| {
             raw_capture_loop(
                 &args,
@@ -190,8 +347,9 @@ fn receive_raw(
                 geometry,
                 &mut reassembler,
                 &mut publisher,
-                &mut hashlog,
+                audit,
                 &mut counters,
+                &mut vstat,
                 started,
                 deadline,
             )
@@ -205,6 +363,11 @@ fn receive_raw(
         };
     }
     reassembler.finish();
+    if let Some(audit) = audit_worker.take()
+        && let Err(error) = audit.finish(&mut publisher, &mut counters)
+    {
+        outcome = merge_error(outcome, error.context("finish Raw audit worker"));
+    }
     if let Some(writer) = hashlog.as_mut()
         && let Err(error) = writer.flush()
     {
@@ -259,6 +422,7 @@ fn receive_raw(
             "bytes_captured":counters.bytes,"bytes_recv":stats.bytes_recv,
         }),
     );
+    let (vcam_delivered, vseg_p99_ms, vseg) = vstat.final_fields();
     add_json_fields(
         &mut value,
         json!({
@@ -266,6 +430,9 @@ fn receive_raw(
             "fps_actual":counters.hashes as f64/elapsed,"cpu_pct":cpu_pct,"uptime_s":elapsed,
             "inter_arrival":timing_value(reassembler.inter_arrival_summary()),
             "rseg":timing_value(reassembler.rseg_summary()),
+            "vcam_delivered":vcam_delivered,
+            "vseg_p99_ms":vseg_p99_ms,
+            "vseg":vseg,
             "last_frame_id":counters.last_frame_id,
             "first_completed_qpc_ns":counters.first_completed_ns,
             "last_completed_qpc_ns":counters.last_completed_ns,
@@ -299,6 +466,160 @@ fn receive_raw(
     )
 }
 
+struct RawDispatchCtx<'a> {
+    args: &'a ReceiveArgs,
+    api: &'a Npcap,
+    handle: *mut c_void,
+    frame_bytes: usize,
+    reassembler: &'a mut Reassembler,
+    publisher: &'a mut Option<Publisher>,
+    audit: &'a RxAuditWorker,
+    counters: &'a mut RawCounters,
+    vstat: &'a mut VstatReader,
+    started: Instant,
+    deadline: Option<Instant>,
+    rate_window: RateWindow,
+    live_rseg: TimedWindow,
+    live_inter_arrival: TimedWindow,
+    last_progress: Instant,
+    pkt_tick: u32,
+    stop_loop: bool,
+    error: Option<anyhow::Error>,
+}
+
+impl RawDispatchCtx<'_> {
+    fn on_packet(&mut self, header: *const PcapHeader, data: *const c_uchar) -> anyhow::Result<()> {
+        if self.stop_loop {
+            return Ok(());
+        }
+        if self.pkt_tick & 15 == 0 && stopped(self.args.stop.as_deref()) {
+            self.counters.cancelled = true;
+            self.stop_loop = true;
+            unsafe { (self.api.breakloop)(self.handle) };
+            return Ok(());
+        }
+        if self.pkt_tick & 63 == 0 {
+            let now = Instant::now();
+            if self.deadline.is_some_and(|deadline| now >= deadline) {
+                self.counters.timed_out = true;
+                self.stop_loop = true;
+                unsafe { (self.api.breakloop)(self.handle) };
+                return Ok(());
+            }
+            if now.duration_since(self.last_progress) >= PROGRESS_INTERVAL {
+                self.audit
+                    .drain_done(self.publisher, Some(self.reassembler), self.counters);
+                live_raw_progress(
+                    self.args,
+                    self.reassembler,
+                    self.counters,
+                    self.vstat,
+                    self.started,
+                    &mut self.rate_window,
+                    &mut self.live_rseg,
+                    &mut self.live_inter_arrival,
+                );
+                self.last_progress = now;
+            }
+        }
+        self.pkt_tick = self.pkt_tick.wrapping_add(1);
+        if header.is_null() || data.is_null() {
+            return Ok(());
+        }
+        let caplen = unsafe { (*header).caplen as usize };
+        if !(14 + 28..=MAX_CAPTURE).contains(&caplen) {
+            return Ok(());
+        }
+        let packet = unsafe { std::slice::from_raw_parts(data, caplen) };
+        self.counters.bytes = self.counters.bytes.saturating_add(caplen as u64);
+        if let PushOutcome::Completed(frame) = self
+            .reassembler
+            .push_ethernet_timed_lazy(packet, qpc_ns, qpc_ns)
+        {
+            ensure!(
+                frame.data.len() == self.frame_bytes,
+                "completed frame {} has {} bytes, expected {}",
+                frame.frame_id,
+                frame.data.len(),
+                self.frame_bytes
+            );
+            // 先发布到 SHM，再把 FNV-1a64、图案比对与 hashlog 落盘交给有界审计线程。
+            let token = if let Some(shm) = self.publisher.as_mut() {
+                Some(shm.publish(frame.frame_id, frame.first_packet_ns, &frame.data, qpc_ns)?)
+            } else {
+                None
+            };
+            self.audit
+                .drain_done(self.publisher, Some(self.reassembler), self.counters);
+            let frame_id = frame.frame_id;
+            let first_packet_ns = frame.first_packet_ns;
+            let completed_ns = frame.completed_ns;
+            let pattern = frame.pattern;
+            self.audit.submit(RxAuditJob {
+                frame_id,
+                pattern,
+                first_packet_ns,
+                completed_ns,
+                token,
+                data: frame.data,
+            })?;
+            self.live_rseg
+                .push(completed_ns, completed_ns.saturating_sub(first_packet_ns));
+            if self.counters.hashes > 0 && self.counters.last_completed_ns > 0 {
+                self.live_inter_arrival.push(
+                    completed_ns,
+                    completed_ns.saturating_sub(self.counters.last_completed_ns),
+                );
+            }
+            self.counters.hashes += 1;
+            if self.counters.hashes == 1 {
+                self.counters.first_completed_ns = completed_ns;
+            }
+            self.counters.last_completed_ns = completed_ns;
+            self.counters.last_frame_id = Some(frame_id);
+            self.rate_window.maybe_record(
+                completed_ns,
+                self.counters.hashes,
+                self.reassembler.stats().packets_recv,
+                self.counters.bytes,
+            );
+            self.pkt_tick = 0;
+            if self.args.expect_frames > 0 && self.counters.hashes >= self.args.expect_frames {
+                self.stop_loop = true;
+                unsafe { (self.api.breakloop)(self.handle) };
+            }
+        }
+        Ok(())
+    }
+}
+
+unsafe extern "C" fn raw_dispatch_cb(
+    user: *mut c_uchar,
+    header: *const PcapHeader,
+    data: *const c_uchar,
+) {
+    let ctx = unsafe { &mut *user.cast::<RawDispatchCtx<'_>>() };
+    if ctx.stop_loop {
+        return;
+    }
+    match catch_unwind(AssertUnwindSafe(|| ctx.on_packet(header, data))) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            ctx.error = Some(error);
+            ctx.stop_loop = true;
+            unsafe { (ctx.api.breakloop)(ctx.handle) };
+        }
+        Err(panic) => {
+            ctx.error = Some(anyhow::anyhow!(
+                "Raw dispatch callback panicked: {}",
+                panic_text(panic.as_ref())
+            ));
+            ctx.stop_loop = true;
+            unsafe { (ctx.api.breakloop)(ctx.handle) };
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn raw_capture_loop(
     args: &ReceiveArgs,
@@ -307,146 +628,105 @@ fn raw_capture_loop(
     geometry: Geometry,
     reassembler: &mut Reassembler,
     publisher: &mut Option<Publisher>,
-    hashlog: &mut Option<BufferedLog>,
+    audit: &RxAuditWorker,
     counters: &mut RawCounters,
+    vstat: &mut VstatReader,
     started: Instant,
     deadline: Option<Instant>,
 ) -> anyhow::Result<()> {
-    let frame_bytes = geometry.frame_bytes();
-    let mut rate_window = RateWindow::new(qpc_ns());
-    let mut live_rseg = TimedWindow::default();
-    let mut live_inter_arrival = TimedWindow::default();
-    let mut last_progress = Instant::now();
-    let mut pkt_tick = 0u32;
+    let mut ctx = RawDispatchCtx {
+        args,
+        api,
+        handle,
+        frame_bytes: geometry.frame_bytes(),
+        reassembler,
+        publisher,
+        audit,
+        counters,
+        vstat,
+        started,
+        deadline,
+        rate_window: RateWindow::new(qpc_ns()),
+        live_rseg: TimedWindow::default(),
+        live_inter_arrival: TimedWindow::default(),
+        last_progress: Instant::now(),
+        pkt_tick: 0,
+        stop_loop: false,
+        error: None,
+    };
     loop {
-        if pkt_tick & 15 == 0 && stopped(args.stop.as_deref()) {
-            counters.cancelled = true;
+        if stopped(ctx.args.stop.as_deref()) {
+            ctx.counters.cancelled = true;
             break;
         }
-        if args.expect_frames > 0 && counters.hashes >= args.expect_frames {
+        if ctx.args.expect_frames > 0 && ctx.counters.hashes >= ctx.args.expect_frames {
             break;
         }
-        if pkt_tick & 63 == 0 {
-            let now = Instant::now();
-            if deadline.is_some_and(|deadline| now >= deadline) {
-                counters.timed_out = true;
-                break;
-            }
-            // 空闲超时、无关包或畸形包也不能冻结实际帧率；最近 1 秒滑窗会在空闲后归零。
-            if now.duration_since(last_progress) >= PROGRESS_INTERVAL {
-                live_raw_progress(
-                    args,
-                    reassembler,
-                    counters,
-                    started,
-                    &mut rate_window,
-                    &mut live_rseg,
-                    &mut live_inter_arrival,
-                );
-                last_progress = now;
-            }
+        let now = Instant::now();
+        if ctx.deadline.is_some_and(|deadline| now >= deadline) {
+            ctx.counters.timed_out = true;
+            break;
         }
-        pkt_tick = pkt_tick.wrapping_add(1);
-        let mut header = ptr::null_mut();
-        let mut data: *const c_uchar = ptr::null();
-        let rc = unsafe { (api.next_ex)(handle, &mut header, &mut data) };
+        // 空闲超时、无关包或畸形包也不能冻结实际帧率；最近 1 秒滑窗会在空闲后归零。
+        if now.duration_since(ctx.last_progress) >= PROGRESS_INTERVAL {
+            ctx.audit
+                .drain_done(ctx.publisher, Some(ctx.reassembler), ctx.counters);
+            live_raw_progress(
+                ctx.args,
+                ctx.reassembler,
+                ctx.counters,
+                ctx.vstat,
+                ctx.started,
+                &mut ctx.rate_window,
+                &mut ctx.live_rseg,
+                &mut ctx.live_inter_arrival,
+            );
+            ctx.last_progress = now;
+        }
+        let rc = unsafe {
+            (ctx.api.dispatch)(
+                ctx.handle,
+                64,
+                raw_dispatch_cb,
+                (&raw mut ctx).cast::<c_uchar>(),
+            )
+        };
+        if let Some(error) = ctx.error.take() {
+            return Err(error);
+        }
+        if ctx.stop_loop {
+            break;
+        }
+        if rc == -1 {
+            return Err(ctx
+                .api
+                .handle_error(ctx.handle, &format!("pcap_dispatch returned {rc}")));
+        }
+        if rc == -2 {
+            break;
+        }
         if rc == 0 {
-            pkt_tick = 0;
-            continue;
-        }
-        if rc < 0 {
-            return Err(api.handle_error(handle, &format!("pcap_next_ex returned {rc}")));
-        }
-        if header.is_null() || data.is_null() {
-            continue;
-        }
-        let caplen = unsafe { (*header).caplen as usize };
-        if !(14 + 28..=MAX_CAPTURE).contains(&caplen) {
-            continue;
-        }
-        let packet = unsafe { std::slice::from_raw_parts(data, caplen) };
-        counters.bytes = counters.bytes.saturating_add(caplen as u64);
-        if let PushOutcome::Completed(frame) =
-            reassembler.push_ethernet_timed_lazy(packet, qpc_ns, qpc_ns)
-        {
-            ensure!(
-                frame.data.len() == frame_bytes,
-                "completed frame {} has {} bytes, expected {frame_bytes}",
-                frame.frame_id,
-                frame.data.len()
-            );
-            // 先发布到 SHM，把哈希与图案校验留在延迟敏感发布之后。
-            let token = if let Some(shm) = publisher.as_mut() {
-                Some(shm.publish(frame.frame_id, frame.first_packet_ns, &frame.data, qpc_ns)?)
-            } else {
-                None
-            };
-            let hash = if publisher.is_some() || hashlog.is_some() {
-                fnv1a64(&frame.data)
-            } else {
-                0
-            };
-            if let (Some(shm), Some(token)) = (publisher.as_mut(), token) {
-                shm.mark_hash(token, hash);
-                counters.shm_published += 1;
-            }
-            if let Some(pattern) = Pattern::from_id(frame.pattern) {
-                pattern.fill(geometry, frame.frame_id, &mut counters.expected_frame);
-                if counters.expected_frame != frame.data {
-                    counters.hash_mismatch += 1;
-                }
-            }
-            if let Some(writer) = hashlog.as_mut() {
-                writer.write_line(|w| {
-                    writeln!(
-                        w,
-                        "{{\"frame_id\":{},\"hash\":\"{hash:016x}\",\"qpc_ns\":{},\"first_packet_qpc_ns\":{}}}",
-                        frame.frame_id, frame.completed_ns, frame.first_packet_ns
-                    )
-                })?;
-                counters.hash_rows += 1;
-            }
-            let frame_id = frame.frame_id;
-            let first_packet_ns = frame.first_packet_ns;
-            let completed_ns = frame.completed_ns;
-            reassembler.recycle(frame.data);
-            live_rseg.push(completed_ns, completed_ns.saturating_sub(first_packet_ns));
-            if counters.hashes > 0 && counters.last_completed_ns > 0 {
-                live_inter_arrival.push(
-                    completed_ns,
-                    completed_ns.saturating_sub(counters.last_completed_ns),
-                );
-            }
-            counters.hashes += 1;
-            if counters.hashes == 1 {
-                counters.first_completed_ns = completed_ns;
-            }
-            counters.last_completed_ns = completed_ns;
-            counters.last_frame_id = Some(frame_id);
-            rate_window.maybe_record(
-                completed_ns,
-                counters.hashes,
-                reassembler.stats().packets_recv,
-                counters.bytes,
-            );
-            pkt_tick = 0;
+            ctx.pkt_tick = 0;
         }
     }
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn live_raw_progress(
     args: &ReceiveArgs,
     reassembler: &Reassembler,
     counters: &RawCounters,
+    vstat: &mut VstatReader,
     started: Instant,
     rate_window: &mut RateWindow,
     live_rseg: &mut TimedWindow,
     live_inter_arrival: &mut TimedWindow,
 ) {
+    let now_ns = qpc_ns();
+    let (vcam_delivered, vseg_p99_ms, vseg) = vstat.live_fields(now_ns);
     if let Some(progress) = args.progress.as_deref() {
         let stats = reassembler.stats();
-        let now_ns = qpc_ns();
         let rate = rate_window.sample(now_ns, counters.hashes, stats.packets_recv, counters.bytes);
         let rseg = live_rseg.summary_at(now_ns);
         let inter_arrival = live_inter_arrival.summary_at(now_ns);
@@ -458,6 +738,9 @@ fn live_raw_progress(
             "duplicate":stats.duplicate,"gaps":stats.gaps,
             "hash_mismatch":counters.hash_mismatch,
             "shm_published":counters.shm_published,
+            "vcam_delivered":vcam_delivered,
+            "vseg_p99_ms":vseg_p99_ms,
+            "vseg":vseg,
             "bytes_captured":counters.bytes,
             "pps":rate.pps,
             "bps":rate.bps,
@@ -802,6 +1085,7 @@ fn receive_encoded(
         }
     }
     let ready_published = outcome.is_ok() && !cancelled;
+    let mut vstat = VstatReader::new(args.shm.as_deref());
     if ready_published {
         let loop_result = catch_unwind(AssertUnwindSafe(|| {
             encoded_capture_loop(
@@ -813,6 +1097,7 @@ fn receive_encoded(
                 &mut transport,
                 &shared,
                 &mut counters,
+                &mut vstat,
                 deadline,
             )
         }));
@@ -917,6 +1202,7 @@ fn receive_encoded(
             "bytes_captured":stats.bytes_recv,"bytes_recv":stats.bytes_recv,
         }),
     );
+    let (vcam_delivered, vseg_p99_ms, vseg) = vstat.final_fields();
     add_json_fields(
         &mut value,
         json!({
@@ -924,6 +1210,9 @@ fn receive_encoded(
             "fps_actual":decoded as f64/elapsed,"cpu_pct":cpu_pct,"uptime_s":elapsed,
             "inter_arrival":timing_value(reassembler.inter_arrival_summary()),
             "rseg":rseg,
+            "vcam_delivered":vcam_delivered,
+            "vseg_p99_ms":vseg_p99_ms,
+            "vseg":vseg,
             "last_frame_id":last_frame_id,
             "first_completed_qpc_ns":first_completed_ns,
             "last_completed_qpc_ns":last_completed_ns,
@@ -956,124 +1245,135 @@ fn receive_encoded(
     )
 }
 
-#[allow(clippy::too_many_arguments)]
-fn encoded_capture_loop(
-    args: &ReceiveArgs,
-    api: &Npcap,
+struct EncodedDispatchCtx<'a> {
+    args: &'a ReceiveArgs,
+    api: &'a Npcap,
     handle: *mut c_void,
     session: AuSession,
-    reassembler: &mut EncodedReassembler,
-    transport: &mut Option<BufferedLog>,
-    shared: &SharedDecoder,
-    counters: &mut EncodedCounters,
+    reassembler: &'a mut EncodedReassembler,
+    transport: &'a mut Option<BufferedLog>,
+    shared: &'a SharedDecoder,
+    counters: &'a mut EncodedCounters,
+    vstat: &'a mut VstatReader,
     deadline: Option<Instant>,
-) -> anyhow::Result<()> {
-    let mut discontinuity = false;
-    let mut rate_window = RateWindow::new(qpc_ns());
-    let mut live_rseg = TimedWindow::default();
-    let mut live_inter_arrival = TimedWindow::default();
-    let mut prev_completed_ns = 0u64;
-    let mut last_progress = Instant::now();
-    let started = Instant::now();
-    let mut pkt_tick = 0u32;
-    loop {
-        if pkt_tick & 15 == 0 && stopped(args.stop.as_deref()) {
-            counters.cancelled = true;
-            break;
+    discontinuity: bool,
+    rate_window: RateWindow,
+    live_rseg: TimedWindow,
+    live_inter_arrival: TimedWindow,
+    prev_completed_ns: u64,
+    last_progress: Instant,
+    started: Instant,
+    pkt_tick: u32,
+    stop_loop: bool,
+    error: Option<anyhow::Error>,
+}
+
+impl EncodedDispatchCtx<'_> {
+    fn break_now(&mut self) {
+        self.stop_loop = true;
+        unsafe { (self.api.breakloop)(self.handle) };
+    }
+
+    fn on_packet(&mut self, header: *const PcapHeader, data: *const c_uchar) -> anyhow::Result<()> {
+        if self.stop_loop {
+            return Ok(());
         }
-        if shared.failed() {
-            bail!(
-                "decoder worker failed: {}",
-                shared
-                    .error()
-                    .unwrap_or_else(|| "unknown decoder worker failure".into())
-            );
-        }
-        if args.operation.timed_out() {
-            bail!("{}", operation_timeout_message(&args.operation));
-        }
-        if args.expect_frames > 0 && shared.decoded() >= args.expect_frames {
-            break;
-        }
-        if pkt_tick & 63 == 0 {
-            let now = Instant::now();
-            if deadline.is_some_and(|deadline| now >= deadline) {
-                counters.timed_out = true;
-                break;
+        if self.pkt_tick & 15 == 0 {
+            if stopped(self.args.stop.as_deref()) {
+                self.counters.cancelled = true;
+                self.break_now();
+                return Ok(());
             }
-            // 空闲超时或无关/畸形包也不能冻结实际帧率；最近 1 秒滑窗会在空闲后归零。
-            if now.duration_since(last_progress) >= PROGRESS_INTERVAL {
-                live_encoded_progress(
-                    args,
-                    reassembler,
-                    shared,
-                    counters,
-                    started,
-                    &mut rate_window,
-                    &mut live_rseg,
-                    &mut live_inter_arrival,
+            if self.shared.failed() {
+                bail!(
+                    "decoder worker failed: {}",
+                    self.shared
+                        .error()
+                        .unwrap_or_else(|| "unknown decoder worker failure".into())
                 );
-                last_progress = now;
+            }
+            if self.args.operation.timed_out() {
+                bail!("{}", operation_timeout_message(&self.args.operation));
+            }
+            if self.args.expect_frames > 0 && self.shared.decoded() >= self.args.expect_frames {
+                self.break_now();
+                return Ok(());
             }
         }
-        pkt_tick = pkt_tick.wrapping_add(1);
-        let mut header = ptr::null_mut();
-        let mut data: *const c_uchar = ptr::null();
-        let rc = unsafe { (api.next_ex)(handle, &mut header, &mut data) };
-        if rc == 0 {
-            pkt_tick = 0;
-            continue;
+        if self.pkt_tick & 63 == 0 {
+            let now = Instant::now();
+            if self.deadline.is_some_and(|deadline| now >= deadline) {
+                self.counters.timed_out = true;
+                self.break_now();
+                return Ok(());
+            }
+            if now.duration_since(self.last_progress) >= PROGRESS_INTERVAL {
+                live_encoded_progress(
+                    self.args,
+                    self.reassembler,
+                    self.shared,
+                    self.counters,
+                    self.vstat,
+                    self.started,
+                    &mut self.rate_window,
+                    &mut self.live_rseg,
+                    &mut self.live_inter_arrival,
+                );
+                self.last_progress = now;
+            }
         }
-        if rc < 0 {
-            return Err(api.handle_error(handle, &format!("pcap_next_ex returned {rc}")));
-        }
+        self.pkt_tick = self.pkt_tick.wrapping_add(1);
         if header.is_null() || data.is_null() {
-            continue;
+            return Ok(());
         }
         let caplen = unsafe { (*header).caplen as usize };
         if !(14 + 28..=MAX_CAPTURE).contains(&caplen) {
-            continue;
+            return Ok(());
         }
         let packet = unsafe { std::slice::from_raw_parts(data, caplen) };
-        let PushOutcome::Completed(completed) =
-            reassembler.push_ethernet_timed_lazy(packet, qpc_ns, qpc_ns)
+        let PushOutcome::Completed(completed) = self
+            .reassembler
+            .push_ethernet_timed_lazy(packet, qpc_ns, qpc_ns)
         else {
-            continue;
+            return Ok(());
         };
-        live_rseg.push(
+        self.live_rseg.push(
             completed.completed_ns,
             completed
                 .completed_ns
                 .saturating_sub(completed.first_packet_ns),
         );
-        if prev_completed_ns > 0 {
-            live_inter_arrival.push(
+        if self.prev_completed_ns > 0 {
+            self.live_inter_arrival.push(
                 completed.completed_ns,
-                completed.completed_ns.saturating_sub(prev_completed_ns),
+                completed
+                    .completed_ns
+                    .saturating_sub(self.prev_completed_ns),
             );
         }
-        prev_completed_ns = completed.completed_ns;
-        let rx_stats = reassembler.stats();
-        rate_window.maybe_record(
+        self.prev_completed_ns = completed.completed_ns;
+        let rx_stats = self.reassembler.stats();
+        self.rate_window.maybe_record(
             completed.completed_ns,
-            shared.decoded(),
+            self.shared.decoded(),
             rx_stats.packets_recv,
             rx_stats.bytes_recv,
         );
-        pkt_tick = 0;
+        self.pkt_tick = 0;
         let transport_hash = completed.hash();
         match parse_au(
             &completed.data,
-            session,
+            self.session,
             completed.frame_id,
-            args.codec.max_au_bytes,
+            self.args.codec.max_au_bytes,
         ) {
             Ok(unit) => {
                 let eos = unit.is_eos();
-                if counters.received_eos {
-                    counters.invalid_au = counters.invalid_au.saturating_add(1);
-                    discontinuity = true;
-                    if counters.invalid_au <= 5 || counters.invalid_au.is_multiple_of(100) {
+                if self.counters.received_eos {
+                    self.counters.invalid_au = self.counters.invalid_au.saturating_add(1);
+                    self.discontinuity = true;
+                    if self.counters.invalid_au <= 5 || self.counters.invalid_au.is_multiple_of(100)
+                    {
                         eprintln!(
                             "[vc-stream] receiver rejected AU frame={} after EOS",
                             completed.frame_id
@@ -1081,8 +1381,8 @@ fn encoded_capture_loop(
                     }
                 } else {
                     if !eos {
-                        counters.valid_units = counters.valid_units.saturating_add(1);
-                        if let Some(writer) = transport.as_mut() {
+                        self.counters.valid_units = self.counters.valid_units.saturating_add(1);
+                        if let Some(writer) = self.transport.as_mut() {
                             writer.write_line(|w| {
                                 writeln!(
                                     w,
@@ -1093,7 +1393,7 @@ fn encoded_capture_loop(
                             })?;
                         }
                     } else {
-                        counters.received_eos = true;
+                        self.counters.received_eos = true;
                     }
                     let work = Work {
                         au: completed.data,
@@ -1102,39 +1402,45 @@ fn encoded_capture_loop(
                         queued_ns: qpc_ns(),
                         transport_hash,
                         key_frame: true,
-                        discontinuity,
+                        discontinuity: self.discontinuity,
                         eos,
                     };
-                    let mut queue = lock(&shared.queue);
+                    let mut queue = lock(&self.shared.queue);
                     let wait_started = qpc_ns();
                     let mut waited = false;
                     while queue.jobs.len() >= QUEUE_LIMIT && !queue.stopping {
-                        if shared.failed() {
+                        if self.shared.failed() {
                             bail!(
                                 "decoder worker failed: {}",
-                                shared
+                                self.shared
                                     .error()
                                     .unwrap_or_else(|| "unknown decoder worker failure".into())
                             );
                         }
-                        if stopped(args.stop.as_deref()) {
-                            counters.cancelled = true;
+                        if stopped(self.args.stop.as_deref()) {
+                            self.counters.cancelled = true;
+                            self.break_now();
                             return Ok(());
                         }
-                        if args.operation.timed_out() {
-                            bail!("{}", operation_timeout_message(&args.operation));
+                        if self.args.operation.timed_out() {
+                            bail!("{}", operation_timeout_message(&self.args.operation));
                         }
-                        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
-                            counters.timed_out = true;
+                        if self
+                            .deadline
+                            .is_some_and(|deadline| Instant::now() >= deadline)
+                        {
+                            self.counters.timed_out = true;
+                            self.break_now();
                             return Ok(());
                         }
                         if !waited {
-                            shared
+                            self.shared
                                 .queue_backpressure_events
                                 .fetch_add(1, Ordering::AcqRel);
                             waited = true;
                         }
-                        let (next_queue, _) = shared
+                        let (next_queue, _) = self
+                            .shared
                             .cv
                             .wait_timeout(queue, Duration::from_millis(1))
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -1142,32 +1448,161 @@ fn encoded_capture_loop(
                     }
                     if waited {
                         let wait_ns = qpc_ns().saturating_sub(wait_started);
-                        shared
+                        self.shared
                             .queue_backpressure_ns
                             .fetch_add(wait_ns, Ordering::AcqRel);
-                        shared
+                        self.shared
                             .queue_backpressure_max_ns
                             .fetch_max(wait_ns, Ordering::AcqRel);
                     }
                     if queue.stopping {
+                        self.break_now();
                         return Ok(());
                     }
                     queue.jobs.push_back(work);
                     drop(queue);
-                    discontinuity = false;
-                    shared.cv.notify_one();
+                    self.discontinuity = false;
+                    self.shared.cv.notify_one();
                 }
             }
             Err(error) => {
-                counters.invalid_au = counters.invalid_au.saturating_add(1);
-                discontinuity = true;
-                if counters.invalid_au <= 5 || counters.invalid_au.is_multiple_of(100) {
+                self.counters.invalid_au = self.counters.invalid_au.saturating_add(1);
+                self.discontinuity = true;
+                if self.counters.invalid_au <= 5 || self.counters.invalid_au.is_multiple_of(100) {
                     eprintln!(
                         "[vc-stream] receiver rejected AU frame={}: {error}",
                         completed.frame_id
                     );
                 }
             }
+        }
+        Ok(())
+    }
+}
+
+unsafe extern "C" fn encoded_dispatch_cb(
+    user: *mut c_uchar,
+    header: *const PcapHeader,
+    data: *const c_uchar,
+) {
+    let ctx = unsafe { &mut *user.cast::<EncodedDispatchCtx<'_>>() };
+    if ctx.stop_loop {
+        return;
+    }
+    match catch_unwind(AssertUnwindSafe(|| ctx.on_packet(header, data))) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            ctx.error = Some(error);
+            ctx.break_now();
+        }
+        Err(panic) => {
+            ctx.error = Some(anyhow::anyhow!(
+                "encoded dispatch callback panicked: {}",
+                panic_text(panic.as_ref())
+            ));
+            ctx.break_now();
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encoded_capture_loop(
+    args: &ReceiveArgs,
+    api: &Npcap,
+    handle: *mut c_void,
+    session: AuSession,
+    reassembler: &mut EncodedReassembler,
+    transport: &mut Option<BufferedLog>,
+    shared: &SharedDecoder,
+    counters: &mut EncodedCounters,
+    vstat: &mut VstatReader,
+    deadline: Option<Instant>,
+) -> anyhow::Result<()> {
+    let mut ctx = EncodedDispatchCtx {
+        args,
+        api,
+        handle,
+        session,
+        reassembler,
+        transport,
+        shared,
+        counters,
+        vstat,
+        deadline,
+        discontinuity: false,
+        rate_window: RateWindow::new(qpc_ns()),
+        live_rseg: TimedWindow::default(),
+        live_inter_arrival: TimedWindow::default(),
+        prev_completed_ns: 0,
+        last_progress: Instant::now(),
+        started: Instant::now(),
+        pkt_tick: 0,
+        stop_loop: false,
+        error: None,
+    };
+    loop {
+        if stopped(ctx.args.stop.as_deref()) {
+            ctx.counters.cancelled = true;
+            break;
+        }
+        if ctx.shared.failed() {
+            bail!(
+                "decoder worker failed: {}",
+                ctx.shared
+                    .error()
+                    .unwrap_or_else(|| "unknown decoder worker failure".into())
+            );
+        }
+        if ctx.args.operation.timed_out() {
+            bail!("{}", operation_timeout_message(&ctx.args.operation));
+        }
+        if ctx.args.expect_frames > 0 && ctx.shared.decoded() >= ctx.args.expect_frames {
+            break;
+        }
+        let now = Instant::now();
+        if ctx.deadline.is_some_and(|deadline| now >= deadline) {
+            ctx.counters.timed_out = true;
+            break;
+        }
+        // 空闲超时或无关/畸形包也不能冻结实际帧率；最近 1 秒滑窗会在空闲后归零。
+        if now.duration_since(ctx.last_progress) >= PROGRESS_INTERVAL {
+            live_encoded_progress(
+                ctx.args,
+                ctx.reassembler,
+                ctx.shared,
+                ctx.counters,
+                ctx.vstat,
+                ctx.started,
+                &mut ctx.rate_window,
+                &mut ctx.live_rseg,
+                &mut ctx.live_inter_arrival,
+            );
+            ctx.last_progress = now;
+        }
+        let rc = unsafe {
+            (ctx.api.dispatch)(
+                ctx.handle,
+                64,
+                encoded_dispatch_cb,
+                (&raw mut ctx).cast::<c_uchar>(),
+            )
+        };
+        if let Some(error) = ctx.error.take() {
+            return Err(error);
+        }
+        if ctx.stop_loop {
+            break;
+        }
+        if rc == -1 {
+            return Err(ctx
+                .api
+                .handle_error(ctx.handle, &format!("pcap_dispatch returned {rc}")));
+        }
+        if rc == -2 {
+            break;
+        }
+        if rc == 0 {
+            ctx.pkt_tick = 0;
         }
     }
     Ok(())
@@ -1179,16 +1614,18 @@ fn live_encoded_progress(
     reassembler: &EncodedReassembler,
     shared: &SharedDecoder,
     counters: &EncodedCounters,
+    vstat: &mut VstatReader,
     started: Instant,
     rate_window: &mut RateWindow,
     live_rseg: &mut TimedWindow,
     live_inter_arrival: &mut TimedWindow,
 ) {
+    let now_ns = qpc_ns();
+    let (vcam_delivered, vseg_p99_ms, vseg) = vstat.live_fields(now_ns);
     let Some(progress) = args.progress.as_deref() else {
         return;
     };
     let stats = reassembler.stats();
-    let now_ns = qpc_ns();
     let uptime = started.elapsed().as_secs_f64().max(0.000_001);
     let decoded = shared.decoded();
     let rate = rate_window.sample(now_ns, decoded, stats.packets_recv, stats.bytes_recv);
@@ -1212,6 +1649,9 @@ fn live_encoded_progress(
         "decode_in_flight_limit":args.codec.decode_in_flight,
         "waiting_idr":shared.waiting_idr.load(Ordering::Acquire),
         "shm_published":shared.shm_published.load(Ordering::Acquire),
+        "vcam_delivered":vcam_delivered,
+        "vseg_p99_ms":vseg_p99_ms,
+        "vseg":vseg,
         "bytes_captured":stats.bytes_recv,
         "pps":rate.pps,
         "bps":rate.bps,

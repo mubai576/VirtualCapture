@@ -84,9 +84,10 @@ const MAX_GROUPS_X: u64 = 65_535;
 /// 等待驱动完成已提交的回读；到期显式失败，不进入阻塞式 Map 或换用 CPU。
 const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
 /// 先短时自旋（不触发 syscall），再切到私有高分辨率 waitable timer，避免
-/// `thread::sleep(1ms)` 在默认 15.6 ms 时钟粒度下放大延迟。
-const READBACK_FAST_POLL: Duration = Duration::from_micros(150);
-const READBACK_TIMER_WAIT_NS: u64 = 250_000;
+/// `thread::sleep(1ms)` 在默认 15.6 ms 时钟粒度下放大延迟；450 us 覆盖绝大多数
+/// 硬件 GPU 计算+回读耗时，避免刚过 150 us 就掉进 OS 定时器过冲。
+const READBACK_FAST_POLL: Duration = Duration::from_micros(450);
+const READBACK_TIMER_WAIT_NS: u64 = 200_000;
 
 /// 可复用的 GPU 转换器。持有 shader、合并后的 NV12 UAV 与单份 CPU 回读 staging buffer。
 pub(crate) struct GpuConverter {
@@ -96,8 +97,9 @@ pub(crate) struct GpuConverter {
     cs_u: ID3D11ComputeShader,
     nv12_buf: ID3D11Buffer,
     nv12_staging: ID3D11Buffer,
-    nv12_uav: ID3D11UnorderedAccessView,
+    nv12_uav: [Option<ID3D11UnorderedAccessView>; 1],
     cbuf: ID3D11Buffer,
+    cbuf_bind: [Option<ID3D11Buffer>; 1],
     y_n: u32,
     uv_n: u32,
     y_bytes: usize,
@@ -147,6 +149,7 @@ impl GpuConverter {
         )?;
         let nv12_uav = create_uav(device, &nv12_buf, total_n)?;
         let cbuf = create_constant_buffer(device)?;
+        let cbuf_bind = [Some(cbuf.clone())];
 
         Ok(Self {
             device: device.clone(),
@@ -155,8 +158,9 @@ impl GpuConverter {
             cs_u,
             nv12_buf,
             nv12_staging,
-            nv12_uav,
+            nv12_uav: [Some(nv12_uav)],
             cbuf,
+            cbuf_bind,
             y_n,
             uv_n,
             y_bytes,
@@ -233,13 +237,11 @@ impl GpuConverter {
         let srv = srv.context("gpu-convert CreateShaderResourceView returned null")?;
 
         let srvs = [Some(srv)];
-        let uavs = [Some(self.nv12_uav.clone())];
-        let cbufs = [Some(self.cbuf.clone())];
         unsafe {
-            self.context.CSSetConstantBuffers(0, Some(&cbufs));
+            self.context.CSSetConstantBuffers(0, Some(&self.cbuf_bind));
             self.context.CSSetShaderResources(0, Some(&srvs));
             self.context
-                .CSSetUnorderedAccessViews(0, 1, Some(uavs.as_ptr()), None);
+                .CSSetUnorderedAccessViews(0, 1, Some(self.nv12_uav.as_ptr()), None);
 
             self.context.CSSetShader(&self.cs_y, None);
             let (gx, gy) = dispatch_grid(self.y_n);
@@ -457,13 +459,14 @@ fn wait_readback(
         if cancelled(stop) {
             return Ok(false);
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             bail!("gpu-convert readback timed out (DO_NOT_WAIT); no CPU/WARP fallback");
         }
         if try_map()? {
             return Ok(true);
         }
-        if started.elapsed() < READBACK_FAST_POLL {
+        if now.duration_since(started) < READBACK_FAST_POLL {
             std::hint::spin_loop();
         } else {
             wait_readback_step();

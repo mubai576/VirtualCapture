@@ -61,10 +61,8 @@ impl Agent {
         Ok(items)
     }
     pub fn stats(&mut self) -> Value {
-        let stats = self.slot.stats();
-        if !self.slot.cleanup_pending()
-            && stats.get("running").and_then(Value::as_bool) == Some(false)
-        {
+        let (running, stats) = self.slot.poll_status();
+        if !running {
             self.active_request = None;
         }
         stats

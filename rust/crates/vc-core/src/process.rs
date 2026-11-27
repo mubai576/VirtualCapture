@@ -129,6 +129,11 @@ impl NativeSlot {
         self.cleanup_pending
     }
 
+    /// 无活动会话且无待清理残留时为 true，轮询空闲路径可跳过统计构建。
+    pub fn is_idle(&self) -> bool {
+        self.session.is_none() && !self.cleanup_pending
+    }
+
     pub fn running(&mut self) -> bool {
         if self.cleanup_pending {
             self.retry_completed_cleanup();
@@ -421,22 +426,41 @@ impl NativeSlot {
 
     /// DLL 状态 + 控制面字段。会话停止后继续返回最后一次状态，便于 UI 展示。
     pub fn stats(&mut self) -> Value {
+        self.poll_status().1
+    }
+
+    /// 单次 FFI 状态轮询，同时返回 `(running, stats)`，避免同一轮询周期重复查询与克隆。
+    pub fn poll_status(&mut self) -> (bool, Value) {
         if self.cleanup_pending {
             self.retry_completed_cleanup();
         }
         let status = self.session.as_ref().map(StreamSession::stats);
         let mut query_error: Option<String> = None;
-        let mut map = self.last_stats.clone();
-        match status {
+        let mut map = match status {
             Some(Ok(Value::Object(status))) => {
                 self.record_status(&status);
-                map = status;
+                status
             }
-            Some(Ok(_)) => query_error = Some("数据面状态不是 JSON 对象。".into()),
-            Some(Err(error)) => query_error = Some(error),
-            None => {}
-        }
+            Some(Ok(_)) => {
+                query_error = Some("数据面状态不是 JSON 对象。".into());
+                self.last_stats.clone()
+            }
+            Some(Err(error)) => {
+                query_error = Some(error);
+                self.last_stats.clone()
+            }
+            None => self.last_stats.clone(),
+        };
         let live = self.session.is_some();
+        let running = if self.cleanup_pending {
+            true
+        } else if !live {
+            false
+        } else if query_error.is_some() {
+            true
+        } else {
+            status_running_map(&map)
+        };
         map.insert(
             "session_id".into(),
             Value::String(self.session_id.clone().unwrap_or_default()),
@@ -500,7 +524,7 @@ impl NativeSlot {
                 );
             }
         }
-        Value::Object(map)
+        (running, Value::Object(map))
     }
 
     fn record_status(&mut self, status: &Map<String, Value>) {
@@ -660,7 +684,7 @@ fn validate_ready_echo(
     Ok(())
 }
 
-fn has_error(status: &Value) -> bool {
+fn has_error_map(status: &Map<String, Value>) -> bool {
     status
         .get("error")
         .and_then(Value::as_str)
@@ -671,14 +695,18 @@ fn has_error(status: &Value) -> bool {
 ///
 /// 显式 `running` 优先；缺失时按终态字段兜底。`exit_code: null` 是 ABI 表示
 /// “运行中”的合法值，不能被当成终态，因此缺字段时一律 fail-closed。
-fn status_running(status: &Value) -> bool {
+fn status_running_map(status: &Map<String, Value>) -> bool {
     if let Some(running) = status.get("running").and_then(Value::as_bool) {
         return running;
     }
-    if has_error(status) {
+    if has_error_map(status) {
         return false;
     }
     status.get("exit_code").is_none_or(Value::is_null)
+}
+
+fn status_running(status: &Value) -> bool {
+    status.as_object().is_none_or(status_running_map)
 }
 
 /// 数据面就绪等待上限。PyroWave 预热包含多个各自受 5 秒看门狗约束的同步
@@ -1425,5 +1453,32 @@ mod tests {
         );
         assert!(!empty.cleanup_pending());
         assert!(started.elapsed() < Duration::from_millis(50));
+    }
+
+    #[test]
+    fn poll_status_matches_running_and_stats_for_idle_and_terminal_slots() {
+        let mut slot = NativeSlot::new(Kind::Receiver);
+        assert!(slot.is_idle());
+        let (running, stats) = slot.poll_status();
+        assert!(!running);
+        assert_eq!(stats["running"], json!(false));
+
+        slot.session_id = Some("r-term".into());
+        slot.record_status(
+            json!({"running": false, "exit_code": 0, "complete": 42})
+                .as_object()
+                .unwrap(),
+        );
+        let (running, stats) = slot.poll_status();
+        assert!(!running);
+        assert_eq!(stats["complete"], json!(42));
+        assert_eq!(stats["exit_code"], json!(0));
+
+        slot.cleanup_pending = true;
+        assert!(!slot.is_idle());
+        let (running, stats) = slot.poll_status();
+        assert!(!running);
+        assert!(!slot.cleanup_pending());
+        assert_eq!(stats["running"], json!(false));
     }
 }

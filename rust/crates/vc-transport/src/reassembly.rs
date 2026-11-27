@@ -21,9 +21,70 @@ use std::time::Instant;
 
 use crate::checksum::{crc32, fnv1a64, fnv1a64_hex};
 use crate::wire::{
-    ETHERNET_HEADER_LEN, ETHERTYPE, Geometry, HEADER_LEN, Header, L2_OVERHEAD, WireError,
-    ethertype_at, is_after, packet_count, payload_len_at, payload_max_for_mtu, source_mac_at,
+    ETHERNET_HEADER_LEN, ETHERTYPE, Geometry, HEADER_LEN, Header, L2_OVERHEAD, MAGIC, WireError,
+    is_after, packet_count, payload_len_at, payload_max_for_mtu,
 };
+
+const INLINE_BITSET_WORDS: usize = 8;
+pub(crate) const INLINE_BITSET_PACKETS: usize = INLINE_BITSET_WORDS * 64;
+
+/// 紧凑分片到达位图：<=512 包（如 640×640@MTU1500 的 422 包）直接内联 `[u64; 8]`
+/// 实现零堆分配；超过 512 包时从调用方池中复用 `Vec<u64>`。
+pub(crate) enum PacketBitset {
+    Inline([u64; INLINE_BITSET_WORDS]),
+    Heap(Vec<u64>),
+}
+
+impl PacketBitset {
+    #[inline]
+    pub(crate) fn take(pool: &mut Vec<Vec<u64>>, total: usize) -> Self {
+        if total <= INLINE_BITSET_PACKETS {
+            Self::Inline([0u64; INLINE_BITSET_WORDS])
+        } else {
+            let words = total.div_ceil(64);
+            if let Some(mut bits) = pool.pop() {
+                bits.fill(0);
+                bits.resize(words, 0);
+                Self::Heap(bits)
+            } else {
+                Self::Heap(vec![0u64; words])
+            }
+        }
+    }
+
+    #[inline]
+    pub(crate) fn recycle(self, pool: &mut Vec<Vec<u64>>, cap: usize) {
+        if let Self::Heap(bits) = self
+            && pool.len() < cap
+        {
+            pool.push(bits);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, seq: u16) -> bool {
+        let idx = (seq as usize) >> 6;
+        let mask = 1u64 << (seq & 63);
+        match self {
+            Self::Inline(words) => words[idx & (INLINE_BITSET_WORDS - 1)] & mask != 0,
+            Self::Heap(words) => words.get(idx).is_some_and(|&word| word & mask != 0),
+        }
+    }
+
+    #[inline]
+    pub(crate) fn insert(&mut self, seq: u16) {
+        let idx = (seq as usize) >> 6;
+        let mask = 1u64 << (seq & 63);
+        match self {
+            Self::Inline(words) => words[idx & (INLINE_BITSET_WORDS - 1)] |= mask,
+            Self::Heap(words) => {
+                if let Some(word) = words.get_mut(idx) {
+                    *word |= mask;
+                }
+            }
+        }
+    }
+}
 
 /// 重组窗口大小（与 C++ 相同的观测窗口）。
 const RSEG_WINDOW: usize = 10_000;
@@ -168,17 +229,19 @@ struct Slot {
     key_frame: bool,
     first_ns: u64,
     buffer: Vec<u8>,
-    got: Vec<bool>,
+    got: PacketBitset,
     got_n: u16,
 }
 
 /// 单线程重组器：调用方在同一线程按到达顺序 `push`。
 pub struct Reassembler {
     config: Config,
+    frame_bytes: usize,
+    tail_payload_len: usize,
     slots: Vec<Slot>,
-    /// 复用的帧缓冲区与到达标记切片，避免逐帧大内存分配与页清零。
+    /// 复用的帧缓冲区与超长位图切片，避免逐帧大内存分配与页清零。
     free_buffers: Vec<Vec<u8>>,
-    free_gots: Vec<Vec<bool>>,
+    free_bitsets: Vec<Vec<u64>>,
     free_pool_cap: usize,
     buffered_bytes: usize,
     stats: Stats,
@@ -209,13 +272,21 @@ impl Reassembler {
                 payload_max: config.payload_max,
             });
         }
+        let tail_payload_len = payload_len_at(
+            config.total - 1,
+            config.total,
+            frame_bytes,
+            config.payload_max,
+        );
         let slot_cap = config.max_inflight_frames.min(16);
         let free_pool_cap = slot_cap + 2;
         Ok(Self {
             config,
+            frame_bytes,
+            tail_payload_len,
             slots: Vec::with_capacity(slot_cap),
             free_buffers: Vec::with_capacity(free_pool_cap),
-            free_gots: Vec::with_capacity(free_pool_cap),
+            free_bitsets: Vec::with_capacity(free_pool_cap),
             free_pool_cap,
             buffered_bytes: 0,
             stats: Stats::default(),
@@ -231,35 +302,19 @@ impl Reassembler {
 
     /// 归还已消费的完整帧缓冲区以供后续帧复用，避免重复触发系统页分配。
     pub fn recycle(&mut self, mut buffer: Vec<u8>) {
-        let frame_bytes = self.config.geometry.frame_bytes();
+        let frame_bytes = self.frame_bytes;
         if buffer.capacity() >= frame_bytes && self.free_buffers.len() < self.free_pool_cap {
             buffer.resize(frame_bytes, 0);
             self.free_buffers.push(buffer);
         }
     }
 
-    fn take_buffer(&mut self, frame_bytes: usize) -> Vec<u8> {
+    fn take_buffer(&mut self) -> Vec<u8> {
         if let Some(mut buffer) = self.free_buffers.pop() {
-            buffer.resize(frame_bytes, 0);
+            buffer.resize(self.frame_bytes, 0);
             buffer
         } else {
-            vec![0u8; frame_bytes]
-        }
-    }
-
-    fn take_got(&mut self, total: usize) -> Vec<bool> {
-        if let Some(mut got) = self.free_gots.pop() {
-            got.fill(false);
-            got.resize(total, false);
-            got
-        } else {
-            vec![false; total]
-        }
-    }
-
-    fn recycle_got(&mut self, got: Vec<bool>) {
-        if self.free_gots.len() < self.free_pool_cap {
-            self.free_gots.push(got);
+            vec![0u8; self.frame_bytes]
         }
     }
 
@@ -324,32 +379,35 @@ impl Reassembler {
 
     /// 实时接收优化路径：仅在为新帧创建槽位时才调用 `on_first_packet`，避免非首片
     /// 或无关包触发不必要的时间戳读取。
+    #[inline]
     pub fn push_ethernet_timed_lazy(
         &mut self,
         frame: &[u8],
         on_first_packet: impl FnOnce() -> u64,
         completed_at: impl FnOnce() -> u64,
     ) -> PushOutcome {
-        if frame.len() < ETHERNET_HEADER_LEN + HEADER_LEN {
+        if frame.len() < L2_OVERHEAD {
             return PushOutcome::Ignored(IgnoreReason::ShortFrame);
         }
-        if ethertype_at(frame) != Some(ETHERTYPE) {
+        if u16::from_be_bytes([frame[12], frame[13]]) != ETHERTYPE {
             return PushOutcome::Ignored(IgnoreReason::WrongEtherType);
         }
-        let source = source_mac_at(frame);
         if let Some(expected) = self.config.source_mac
-            && source != Some(expected)
+            && frame[6..12] != expected
         {
             self.stats.ignored_other_source += 1;
             return PushOutcome::Ignored(IgnoreReason::OtherSource);
         }
-        let header = match Header::parse(&frame[ETHERNET_HEADER_LEN..]) {
+        let hdr_bytes: &[u8; HEADER_LEN] = frame[ETHERNET_HEADER_LEN..L2_OVERHEAD]
+            .try_into()
+            .expect("28 字节");
+        let header = match Header::parse_array(hdr_bytes) {
             Ok(header) => header,
             Err(WireError::BadMagic(_)) => return PushOutcome::Ignored(IgnoreReason::BadMagic),
             Err(_) => return PushOutcome::Ignored(IgnoreReason::ShortFrame),
         };
-        let payload = &frame[ETHERNET_HEADER_LEN + HEADER_LEN..];
-        self.push_packet_timed_lazy(header, payload, source, on_first_packet, completed_at)
+        let payload = &frame[L2_OVERHEAD..];
+        self.push_packet_core(header, payload, on_first_packet, completed_at)
     }
 
     /// 已解析包头的路径。`source_mac` 只在配置了会话源 MAC 时使用：
@@ -390,35 +448,43 @@ impl Reassembler {
             self.stats.ignored_other_source += 1;
             return PushOutcome::Ignored(IgnoreReason::OtherSource);
         }
-        if header.magic != crate::wire::MAGIC {
+        if header.magic != MAGIC {
             return PushOutcome::Ignored(IgnoreReason::BadMagic);
         }
-        let frame_bytes = self.config.geometry.frame_bytes();
+        self.push_packet_core(header, payload, on_first_packet, completed_at)
+    }
+
+    #[inline]
+    fn push_packet_core(
+        &mut self,
+        header: Header,
+        payload: &[u8],
+        on_first_packet: impl FnOnce() -> u64,
+        completed_at: impl FnOnce() -> u64,
+    ) -> PushOutcome {
         if header.total != self.config.total || header.seq >= header.total {
             self.stats.packets_lost += 1;
             return PushOutcome::Ignored(IgnoreReason::BadGeometry);
         }
-        let expected_len = payload_len_at(
-            header.seq,
-            header.total,
-            frame_bytes,
-            self.config.payload_max,
-        );
+        let expected_len = if header.seq + 1 < header.total {
+            self.config.payload_max
+        } else {
+            self.tail_payload_len
+        };
         if header.payload_len as usize != expected_len {
             self.stats.packets_lost += 1;
             return PushOutcome::Ignored(IgnoreReason::LengthMismatch);
         }
-        if payload.len() < header.payload_len as usize {
+        let Some(payload) = payload.get(..expected_len) else {
             return PushOutcome::Ignored(IgnoreReason::TruncatedPayload);
-        }
-        let payload = &payload[..header.payload_len as usize];
+        };
         if crc32(payload) != header.payload_crc {
             self.stats.packets_lost += 1;
             self.stats.crc_errors += 1;
             return PushOutcome::Ignored(IgnoreReason::BadCrc);
         }
         self.stats.packets_recv += 1;
-        self.stats.bytes_recv += (L2_OVERHEAD + payload.len()) as u64;
+        self.stats.bytes_recv += (L2_OVERHEAD + expected_len) as u64;
 
         // 与 C++ 相同的断档检测点：CRC 通过后、迟到判断前。
         if !self.have_seen {
@@ -444,8 +510,8 @@ impl Reassembler {
                     return PushOutcome::Ignored(reason);
                 }
                 let first_ns = on_first_packet();
-                let buffer = self.take_buffer(frame_bytes);
-                let got = self.take_got(header.total as usize);
+                let buffer = self.take_buffer();
+                let got = PacketBitset::take(&mut self.free_bitsets, header.total as usize);
                 self.slots.push(Slot {
                     frame_id: header.frame_id,
                     total: header.total,
@@ -456,7 +522,7 @@ impl Reassembler {
                     got,
                     got_n: 0,
                 });
-                self.buffered_bytes += frame_bytes;
+                self.buffered_bytes += self.frame_bytes;
                 self.slots.len() - 1
             }
         };
@@ -465,17 +531,18 @@ impl Reassembler {
             self.stats.packets_lost += 1;
             return PushOutcome::Ignored(IgnoreReason::SlotConflict);
         }
-        if slot.got[header.seq as usize] {
+        if slot.got.contains(header.seq) {
             self.stats.duplicate += 1;
             return PushOutcome::Ignored(IgnoreReason::Duplicate);
         }
         let offset = header.seq as usize * self.config.payload_max;
-        if offset + payload.len() > frame_bytes {
+        let end = offset + expected_len;
+        if end > slot.buffer.len() {
             self.stats.packets_lost += 1;
             return PushOutcome::Ignored(IgnoreReason::BadGeometry);
         }
-        slot.buffer[offset..offset + payload.len()].copy_from_slice(payload);
-        slot.got[header.seq as usize] = true;
+        slot.buffer[offset..end].copy_from_slice(payload);
+        slot.got.insert(header.seq);
         slot.got_n += 1;
 
         if slot.got_n != slot.total {
@@ -485,7 +552,7 @@ impl Reassembler {
 
         let slot = self.slots.remove(index);
         self.buffered_bytes -= slot.buffer.len();
-        self.recycle_got(slot.got);
+        slot.got.recycle(&mut self.free_bitsets, self.free_pool_cap);
         self.stats.complete += 1;
         let rseg = completed_ns.saturating_sub(slot.first_ns);
         push_window(&mut self.rseg_ns, rseg, RSEG_WINDOW);
@@ -518,7 +585,7 @@ impl Reassembler {
     }
 
     fn make_room(&mut self) -> Result<(), IgnoreReason> {
-        let frame_bytes = self.config.geometry.frame_bytes();
+        let frame_bytes = self.frame_bytes;
         while self.slots.len() >= self.config.max_inflight_frames {
             match self.oldest_index() {
                 Some(index) => self.drop_slot(index),
@@ -553,7 +620,7 @@ impl Reassembler {
         self.stats.dropped += 1;
         self.stats.packets_lost += slot.total.wrapping_sub(slot.got_n) as u64;
         self.recycle(slot.buffer);
-        self.recycle_got(slot.got);
+        slot.got.recycle(&mut self.free_bitsets, self.free_pool_cap);
     }
 }
 
@@ -581,14 +648,14 @@ impl LatestFrame {
     }
 }
 
-fn push_window(window: &mut VecDeque<u64>, value: u64, cap: usize) {
+pub(crate) fn push_window(window: &mut VecDeque<u64>, value: u64, cap: usize) {
     if window.len() >= cap {
         window.pop_front();
     }
     window.push_back(value);
 }
 
-fn summarize(window: &VecDeque<u64>) -> TimingSummary {
+pub(crate) fn summarize(window: &VecDeque<u64>) -> TimingSummary {
     if window.is_empty() {
         return TimingSummary::default();
     }
@@ -922,5 +989,126 @@ mod tests {
                 assert_eq!(done.data.as_ptr(), ptr_first, "应复用归还的帧缓冲区");
             }
         }
+    }
+
+    #[test]
+    fn packet_bitset_inline_up_to_512_and_pooled_heap_beyond() {
+        let mut pool = Vec::new();
+        let mut inline = PacketBitset::take(&mut pool, 422);
+        assert!(matches!(inline, PacketBitset::Inline(_)));
+        assert!(pool.is_empty());
+        for seq in [0u16, 1, 63, 64, 255, 421, 511] {
+            assert!(!inline.contains(seq));
+            inline.insert(seq);
+            assert!(inline.contains(seq));
+        }
+        inline.recycle(&mut pool, 4);
+        assert!(pool.is_empty(), "内联位图不应进堆池");
+
+        let mut heap = PacketBitset::take(&mut pool, 600);
+        assert!(matches!(heap, PacketBitset::Heap(_)));
+        heap.insert(0);
+        heap.insert(599);
+        assert!(heap.contains(0) && heap.contains(599) && !heap.contains(598));
+        heap.recycle(&mut pool, 4);
+        assert_eq!(pool.len(), 1);
+
+        let reused = PacketBitset::take(&mut pool, 550);
+        assert!(pool.is_empty(), "应从池中取出已释放的 Vec<u64>");
+        assert!(!reused.contains(0) && !reused.contains(549));
+    }
+
+    #[test]
+    fn mtu1500_422_packet_and_multi_buffer_out_of_order_reassembly() {
+        let geom = Geometry::default_product(); // 640x640 -> 614_400 B -> 422 pkts @ MTU 1500
+        let cfg = Config::new(geom, 1500).unwrap();
+        assert_eq!(cfg.total, 422);
+        let mut r = Reassembler::new(cfg).unwrap();
+
+        let f1 = frame(101, geom.frame_bytes());
+        let f2 = frame(202, geom.frame_bytes());
+        let p1 = packets(1, &f1, cfg.payload_max);
+        let p2 = packets(2, &f2, cfg.payload_max);
+        assert_eq!(p1.len(), 422);
+
+        let to_eth = |h: &Header, p: &[u8]| {
+            let mut eth = vec![0u8; L2_OVERHEAD + p.len()];
+            eth[12..14].copy_from_slice(&ETHERTYPE.to_be_bytes());
+            h.encode_into((&mut eth[14..42]).try_into().unwrap());
+            eth[42..].copy_from_slice(p);
+            eth
+        };
+
+        // 交错发 f1 与 f2（多槽位并行），并插一个坏 CRC 与重复包。
+        for i in (0..422).rev() {
+            if i == 200 {
+                let mut bad = to_eth(&p1[i].0, &p1[i].1);
+                bad[42] ^= 0xFF;
+                assert_eq!(
+                    r.push_ethernet_at(&bad, 1_000),
+                    PushOutcome::Ignored(IgnoreReason::BadCrc)
+                );
+            }
+            let out2 = r.push_ethernet_at(&to_eth(&p2[i].0, &p2[i].1), 1_000 + i as u64);
+            if i > 0 {
+                assert_eq!(out2, PushOutcome::Accepted);
+            } else {
+                // p2 完成会淘汰仍未完成的 p1
+                let PushOutcome::Completed(done) = out2 else {
+                    panic!("p2 末包应完成帧 2");
+                };
+                assert_eq!(done.frame_id, 2);
+                assert_eq!(done.data, f2);
+                r.recycle(done.data);
+            }
+            if i >= 10 {
+                let out1 = r.push_ethernet_at(&to_eth(&p1[i].0, &p1[i].1), 1_000);
+                if i == 0 {
+                    unreachable!();
+                }
+                assert_eq!(out1, PushOutcome::Accepted);
+                if i == 300 {
+                    assert_eq!(
+                        r.push_ethernet_at(&to_eth(&p1[i].0, &p1[i].1), 1_000),
+                        PushOutcome::Ignored(IgnoreReason::Duplicate)
+                    );
+                }
+            }
+        }
+        assert_eq!(r.stats().complete, 1);
+        assert_eq!(r.stats().dropped, 1);
+        assert_eq!(r.stats().crc_errors, 1);
+        assert_eq!(r.stats().duplicate, 1);
+        assert_eq!(r.inflight_frames(), 0);
+        assert_eq!(r.inflight_bytes(), 0);
+        assert!(r.free_bitsets.is_empty(), "422 包走内联位图，不分配堆位图");
+    }
+
+    #[test]
+    fn reassembles_over_512_packets_with_pooled_heap_bitset() {
+        let geom = Geometry::new(1280, 720).unwrap(); // 1_382_400 B -> 949 pkts @ MTU 1500
+        let cfg = Config::new(geom, 1500).unwrap();
+        assert_eq!(cfg.total, 949);
+        let mut r = Reassembler::new(cfg).unwrap();
+
+        for fid in 1..=2u32 {
+            let data = frame(fid + 50, geom.frame_bytes());
+            let pkts = packets(fid, &data, cfg.payload_max);
+            assert_eq!(pkts.len(), 949);
+            for (idx, (h, p)) in pkts.iter().rev().enumerate() {
+                let outcome = r.push_packet_at(*h, p, None, 5_000);
+                if idx + 1 == pkts.len() {
+                    let PushOutcome::Completed(done) = outcome else {
+                        panic!("帧 {fid} 应完成");
+                    };
+                    assert_eq!(done.data, data);
+                    r.recycle(done.data);
+                } else {
+                    assert_eq!(outcome, PushOutcome::Accepted);
+                }
+            }
+        }
+        assert_eq!(r.stats().complete, 2);
+        assert_eq!(r.free_bitsets.len(), 1, "超 512 包位图应被池化复用");
     }
 }

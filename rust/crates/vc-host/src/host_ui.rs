@@ -1729,7 +1729,6 @@ impl HostApp {
     }
 
     fn event_panel(&self) -> Div {
-        let events = self.snapshot.event_text();
         let mut content = div().flex().flex_col().gap_3().child(
             div()
                 .flex()
@@ -1743,7 +1742,7 @@ impl HostApp {
                         .child("仅本次运行"),
                 ),
         );
-        if events.is_empty() {
+        if self.snapshot.events.is_empty() {
             content = content.child(
                 div()
                     .text_size(px(12.))
@@ -1751,7 +1750,7 @@ impl HostApp {
                     .child("连接、开始和停止的记录会显示在这里。"),
             );
         }
-        for event in events.into_iter().take(6) {
+        for event in self.snapshot.events.iter().rev().take(6) {
             // 工作线程时间戳是固定长度的 ASCII 前缀，其后为事件正文。
             let (time, message) = if event.len() >= 10 && event.is_char_boundary(10) {
                 event.split_at(10)
@@ -1800,32 +1799,43 @@ impl Render for HostApp {
 }
 
 pub(crate) fn symbol(name: &str, pixels: f32, color: u32) -> Icon {
-    let path = match name {
+    let svg: &'static [u8] = match name {
         "capture" => {
-            "<path d='M8 3H4a1 1 0 0 0-1 1v4m13-5h4a1 1 0 0 1 1 1v4M3 16v4a1 1 0 0 0 1 1h4m8 0h4a1 1 0 0 0 1-1v-4'/><rect x='7' y='7' width='10' height='10' rx='2'/>"
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M8 3H4a1 1 0 0 0-1 1v4m13-5h4a1 1 0 0 1 1 1v4M3 16v4a1 1 0 0 0 1 1h4m8 0h4a1 1 0 0 0 1-1v-4'/><rect x='7' y='7' width='10' height='10' rx='2'/></svg>"
         }
-        "monitor" => "<rect x='3' y='4' width='18' height='13' rx='2'/><path d='M8 21h8m-4-4v4'/>",
+        "monitor" => {
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><rect x='3' y='4' width='18' height='13' rx='2'/><path d='M8 21h8m-4-4v4'/></svg>"
+        }
         "network" => {
-            "<rect x='8' y='3' width='8' height='6' rx='1'/><rect x='2' y='16' width='7' height='5' rx='1'/><rect x='15' y='16' width='7' height='5' rx='1'/><path d='M12 9v4H5.5v3M12 13h6.5v3'/>"
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><rect x='8' y='3' width='8' height='6' rx='1'/><rect x='2' y='16' width='7' height='5' rx='1'/><rect x='15' y='16' width='7' height='5' rx='1'/><path d='M12 9v4H5.5v3M12 13h6.5v3'/></svg>"
         }
         "link" => {
-            "<path d='m10 13 4-4m-5 6-2 2a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m2 2 2-2a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0' transform='translate(1 0)'/>"
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='m10 13 4-4m-5 6-2 2a4 4 0 0 1-6-6l4-4a4 4 0 0 1 6 0m2 2 2-2a4 4 0 0 1 6 6l-4 4a4 4 0 0 1-6 0' transform='translate(1 0)'/></svg>"
         }
-        "activity" => "<path d='M2 12h4l3-8 6 16 3-8h4'/>",
+        "activity" => {
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M2 12h4l3-8 6 16 3-8h4'/></svg>"
+        }
         "sliders" => {
-            "<path d='M4 6h7m4 0h5M4 12h2m4 0h10M4 18h10m4 0h2'/><circle cx='13' cy='6' r='2'/><circle cx='8' cy='12' r='2'/><circle cx='16' cy='18' r='2'/>"
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M4 6h7m4 0h5M4 12h2m4 0h10M4 18h10m4 0h2'/><circle cx='13' cy='6' r='2'/><circle cx='8' cy='12' r='2'/><circle cx='16' cy='18' r='2'/></svg>"
         }
-        "shield" => "<path d='m12 3 8 3v6c0 4-4 7-8 9-4-2-8-5-8-9V6z'/><path d='m8 12 3 3 5-6'/>",
-        "clock" => "<circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/>",
-        "check" => "<path d='m5 12 4 4L19 6'/>",
-        "download" => "<path d='M12 3v11m0 0 4-4m-4 4-4-4M4 17v3h16v-3'/>",
-        _ => "<circle cx='12' cy='12' r='9'/><path d='M12 7v6m0 4h.01'/>",
+        "shield" => {
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='m12 3 8 3v6c0 4-4 7-8 9-4-2-8-5-8-9V6z'/><path d='m8 12 3 3 5-6'/></svg>"
+        }
+        "clock" => {
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7v5l3 2'/></svg>"
+        }
+        "check" => {
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='m5 12 4 4L19 6'/></svg>"
+        }
+        "download" => {
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><path d='M12 3v11m0 0 4-4m-4 4-4-4M4 17v3h16v-3'/></svg>"
+        }
+        _ => {
+            b"<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'><circle cx='12' cy='12' r='9'/><path d='M12 7v6m0 4h.01'/></svg>"
+        }
     };
-    let svg = format!(
-        "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24' fill='none' stroke='currentColor' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'>{path}</svg>"
-    );
     Icon::default()
-        .data(svg.as_bytes())
+        .data(svg)
         .size(px(pixels))
         .text_color(rgb(color))
 }

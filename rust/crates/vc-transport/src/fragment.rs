@@ -7,7 +7,7 @@
 use crate::checksum::crc32;
 use crate::wire::{
     ETHERNET_HEADER_LEN, ETHERTYPE, FLAG_KEY_FRAME, HEADER_LEN, Header, MAGIC, WireError,
-    packet_count, payload_len_at,
+    packet_count,
 };
 
 /// 分片参数。`payload_max` 来自 `mtu - 42`，其余三个字段由会话/发送循环提供。
@@ -33,19 +33,24 @@ pub struct FragmentIter<'a> {
     config: FragmentConfig,
     total: u16,
     seq: u16,
+    offset: usize,
+    flags: u8,
 }
 
 impl<'a> Iterator for FragmentIter<'a> {
     type Item = Fragment<'a>;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         if self.seq >= self.total {
             return None;
         }
         let seq = self.seq;
         self.seq += 1;
-        let offset = seq as usize * self.config.payload_max;
-        let len = payload_len_at(seq, self.total, self.frame.len(), self.config.payload_max);
+        let offset = self.offset;
+        let remaining = self.frame.len() - offset;
+        let len = remaining.min(self.config.payload_max);
+        self.offset = offset + len;
         let payload = &self.frame[offset..offset + len];
         let header = Header {
             magic: MAGIC,
@@ -55,16 +60,13 @@ impl<'a> Iterator for FragmentIter<'a> {
             qpc_ns: self.config.qpc_ns,
             payload_crc: crc32(payload),
             payload_len: len as u16,
-            flags: if self.frame_id == 0 {
-                FLAG_KEY_FRAME
-            } else {
-                0
-            },
+            flags: self.flags,
             pattern: self.config.pattern,
         };
         Some(Fragment { header, payload })
     }
 
+    #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let remaining = (self.total - self.seq) as usize;
         (remaining, Some(remaining))
@@ -74,6 +76,7 @@ impl<'a> Iterator for FragmentIter<'a> {
 impl ExactSizeIterator for FragmentIter<'_> {}
 
 /// 为一帧建立分片迭代器。空帧、`payload_max == 0` 或包数超过 65535 时拒绝。
+#[inline]
 pub fn fragments<'a>(
     frame: &'a [u8],
     frame_id: u32,
@@ -86,6 +89,8 @@ pub fn fragments<'a>(
         config,
         total,
         seq: 0,
+        offset: 0,
+        flags: if frame_id == 0 { FLAG_KEY_FRAME } else { 0 },
     })
 }
 
@@ -93,21 +98,26 @@ pub fn fragments<'a>(
 ///
 /// 返回写入的字节数；`out` 不足时返回 `Err(needed)`。MAC 与 EtherType 属于调用方会话设置，
 /// 不经控制面确认前不要自行更改。
+#[inline]
 pub fn write_ethernet(
     dst: [u8; 6],
     src: [u8; 6],
     fragment: &Fragment<'_>,
     out: &mut [u8],
 ) -> Result<usize, usize> {
-    let needed = ETHERNET_HEADER_LEN + HEADER_LEN + fragment.payload.len();
-    if out.len() < needed {
+    let payload_len = fragment.payload.len();
+    let needed = ETHERNET_HEADER_LEN + HEADER_LEN + payload_len;
+    let Some(dst_buf) = out.get_mut(..needed) else {
         return Err(needed);
-    }
-    out[0..6].copy_from_slice(&dst);
-    out[6..12].copy_from_slice(&src);
-    out[12..14].copy_from_slice(&ETHERTYPE.to_be_bytes());
-    out[14..14 + HEADER_LEN].copy_from_slice(&fragment.header.encode());
-    out[14 + HEADER_LEN..needed].copy_from_slice(fragment.payload);
+    };
+    dst_buf[0..6].copy_from_slice(&dst);
+    dst_buf[6..12].copy_from_slice(&src);
+    dst_buf[12..14].copy_from_slice(&ETHERTYPE.to_be_bytes());
+    let hdr_buf: &mut [u8; HEADER_LEN] = (&mut dst_buf[14..14 + HEADER_LEN])
+        .try_into()
+        .expect("28 字节");
+    fragment.header.encode_into(hdr_buf);
+    dst_buf[14 + HEADER_LEN..needed].copy_from_slice(fragment.payload);
     Ok(needed)
 }
 
