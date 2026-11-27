@@ -18,7 +18,7 @@
 | 桌面角色 | 双击首次选择采集/接收；确认后独立 `vc-startup.json` 原子持久化，下次进入该角色；空闲角色页或 `--select-role` 可重新选择，Managed ROOT 保留重选及自定义监听参数；回滚保留已有 data 偏好，OTA 按 manifest 能力恢复实际图形/后台模式并兼容旧入口；见 references/rust-control.md |
 | Wire | proto/vc_wire.h冻结28B、0x88B5；payload=mtu−42，Raw帧B=w×h×3/2、N=ceil(B/payload)，不占保留位；skill references/wire-protocol.md |
 | 产品拓扑 | `VirtualCapture.exe` 首次选端并保存偏好，启动已选 GPUI 角色；接收端无本机 REST，采集端内嵌 REST v2（默认 5143），`capture` 子命令仍运行控制台 REST 后台；`vc-updater.exe` 独立更新/回滚。角色进程内加载 C ABI v1，EXE/DLL 共用数据面，不拉起旧 sender/receiver；references/rust-control.md |
-| 网卡/MTU | 仅列 Windows 状态为Up的物理非虚拟网卡，不按型号偏置；本机按控制连接路由精确匹配，对端多候选须明确选择。显式选择保持、失效后重选。新配置自动MTU，旧缺字段保留显式值；双端只读NlMtu取最小、上限9000，不改系统参数 |
+| 网卡/MTU | 仅列 Windows 状态为Up的物理非虚拟网卡，不按型号偏置；本机按控制连接路由精确匹配，对端多候选须明确选择。显式选择保持、失效后重选。新配置自动MTU，旧缺字段保留显式值；自动枚举与会话启动仍只读双端NlMtu取最小、上限9000；采集端桌面页提供用户显式触发的“开启网卡巨帧优化”滑块开关，空闲时经管理员授权切换所选物理网卡 `*JumboPacket`（9000/1500）并清除网卡枚举缓存 |
 | GPU/编码 | DDA/WGC强制硬件GPU；NV12 回读 DO_NOT_WAIT、两平面共用1s期限并响应同会话取消，超时失败无降级；WGC FreeThreaded 同设备启用 D3D11 多线程保护；DDA回显Acquire/超时/取得/转换计数，不以ready冒充有帧。pattern独立诊断。Raw不压缩；PyroWave显式开发/精确backend、GOP1、真实GPU Vulkan1.3；MJPEG明确拒绝，旧codec ID不复用；references/encoded-stream.md |
 | 批提交 | Raw物理卡整帧一个sendqueue，编码按实际AU整帧一次提交，零/短发送失败。显式Loopback固定batch1例外，不冒充产品性能 |
 | 生命周期 | stop/destroy仅0证明释放；pending保留worker/句柄/DLL，未知destroy不盲重试。PyroWave每操作5s粘性看门狗不退出宿主；待清理锁配置/OTA/虚拟卡；UI 不将停止未确认显示为普通待开始，实际帧率只读 fps_actual（运行中按最近1秒滑动窗口，空闲归零、终态保留全场统计），源/网络空闲仍更新；终结失败在回收前保留可见，不以目标 fps 回填 |
@@ -75,6 +75,7 @@ D1–D28为历史决策原记录，涉及已移除实现的路径/命令只在Gi
 | D38 | 停止/黑屏诊断与运行指标修正 | 2026-11-26 用户反馈无法停止、黑屏与无视频流量。只读本机保全确认收/发布 361 帧与远端 stop Pending 409；修正 UI 目标/实际 FPS 混用及待清理提示，补连续 pending 资源保留回归。416@240 私有 DLL 交付/格式打开顺序检查通过；未定位远端原生卡点或现场黑屏根因，未获 PC2/强制释放/部署授权，不以本机测试关闭故障。见[现场记录](docs/bringup/bringup-20261126-stop-pending-black-output.md)。 | Rust-R3a 指标修正 / R3b 故障未闭环 |
 | D39 | 实际出图与停止修复迭代 | owner（2026-11-26）要求“修复好他，就像我预期的一样”。加入有界GPU回读/同会话取消、WGC设备线程保护、先receiver SHM后注册、空闲实际FPS与终结错误保留及活跃停止回归。Rust344项/静态总门、Raw/REST与GUI回归通过；最终DLL私有WGC416@240目标链路271帧到DShow704样本哈希匹配。DDA本机及独立原生Acquire均0帧超时，保留FAIL；不放宽门限、不换源、无PC2/部署/真实注册或强制释放。见[本轮修复与失败证据](docs/bringup/bringup-20261126-stop-pending-black-output.md#实际修复迭代d39)。 | Rust-R3b 保持 IN PROGRESS |
 | D40 | 启动时自动移除旧虚拟卡注册 | ✅owner（2026-11-27）：“我希望在启动的遇到问题的时候 可以自动移除旧的注册”。启动预检/注册在全局 CLSID 锁内确认无存活宿主（排除 Busy/Unknown）后，自动移除旧版、他根、损坏或无全局 owner 的残留注册并重新注册当前目录 DLL；停止仍只回收自有归属，不删其他目录注册。 | Rust-R3a 虚拟卡恢复 |
+| D41 | 采集端桌面页巨帧优化滑块 | ✅owner（2026-11-27）：“在 采集端页面新增一键设置/修改本机 Windows 网卡巨帧（9000/1500）使用滑块 是否开启网卡巨帧优化”。自动枚举与会话启动仍保持只读 `NlMtu`；仅采集端桌面页空闲时由用户拨动滑块触发，按 GUID 精确锁定已连接物理网卡（非管理员触发 UAC），核验 `NlMtu` 并清空采集端网卡缓存；开发测试不写真实物理网卡。 | Rust-R3a 采集端巨帧开关 |
 
 ## 3. 当前任务卡
 

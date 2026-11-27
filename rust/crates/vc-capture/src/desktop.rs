@@ -131,6 +131,70 @@ impl DesktopService {
         let action = self.control.0.lock().ok().and_then(|state| state.action);
         Some(result.map(|()| action))
     }
+
+    /// 非阻塞检查采集后台当前是否处于运行、待清理或退出中，供 UI 禁用网卡切换。
+    pub fn is_capturing(&self) -> bool {
+        let Ok(state) = self.control.0.try_lock() else {
+            return true;
+        };
+        if state.status.busy {
+            return true;
+        }
+        let Some((agent, _)) = &state.target else {
+            return false;
+        };
+        let Ok(mut agent) = agent.try_lock() else {
+            return true;
+        };
+        agent.running() || agent.shutting_down
+    }
+
+    /// 返回可在后台线程中使用的采集空闲检查与缓存刷新句柄。
+    pub fn nic_guard(&self) -> CaptureNicGuard {
+        CaptureNicGuard(self.control.clone())
+    }
+}
+
+/// 供采集端修改网卡巨帧前检查会话空闲，并在完成后使 `/adapters` 缓存失效。
+#[derive(Clone)]
+pub struct CaptureNicGuard(Control);
+
+impl CaptureNicGuard {
+    pub fn ensure_idle(&self) -> Result<(), String> {
+        let target = {
+            let state = self.0.0.lock().map_err(|_| "图形采集状态锁不可用")?;
+            if state.status.busy {
+                return Err("正在等待采集后台退出，请稍后再调整网卡巨帧。".into());
+            }
+            state.target.clone()
+        };
+        if let Some((agent, _)) = target {
+            let mut agent = agent
+                .try_lock()
+                .map_err(|_| "采集后台正在处理请求，请稍后再试。".to_string())?;
+            require_idle_for_nic(agent.running(), agent.shutting_down)?;
+        }
+        Ok(())
+    }
+
+    pub fn invalidate_adapters_cache(&self) {
+        let target = self.0.0.lock().ok().and_then(|state| state.target.clone());
+        if let Some((agent, _)) = target
+            && let Ok(mut agent) = agent.lock()
+        {
+            agent.invalidate_adapters_cache();
+        }
+    }
+}
+
+fn require_idle_for_nic(running_or_pending: bool, shutting_down: bool) -> Result<(), String> {
+    if running_or_pending {
+        return Err("采集正在运行或待清理，请先在接收端停止后再调整网卡巨帧。".into());
+    }
+    if shutting_down {
+        return Err("采集后台正在更新或退出，不能修改网卡巨帧。".into());
+    }
+    Ok(())
 }
 
 fn require_idle(running_or_pending: bool, shutting_down: bool) -> Result<(), String> {
@@ -153,5 +217,13 @@ mod tests {
         assert!(require_idle(false, true).is_err());
         assert!(require_idle(true, true).is_err());
         assert!(require_idle(false, false).is_ok());
+    }
+
+    #[test]
+    fn nic_jumbo_guard_rejects_running_pending_and_shutdown() {
+        assert!(require_idle_for_nic(true, false).is_err());
+        assert!(require_idle_for_nic(false, true).is_err());
+        assert!(require_idle_for_nic(true, true).is_err());
+        assert!(require_idle_for_nic(false, false).is_ok());
     }
 }

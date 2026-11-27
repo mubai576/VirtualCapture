@@ -60,6 +60,10 @@ impl Agent {
         self.adapters_cache = Some((Instant::now(), items.clone()));
         Ok(items)
     }
+    /// 网卡参数（如巨帧/MTU）变化后清除枚举缓存，避免 `/adapters` 返回过期 `NlMtu`。
+    pub fn invalidate_adapters_cache(&mut self) {
+        self.adapters_cache = None;
+    }
     pub fn stats(&mut self) -> Value {
         let (running, stats) = self.slot.poll_status();
         if !running {
@@ -297,6 +301,14 @@ mod tests {
         agent.adapters_cache = Some((Instant::now(), vec![]));
         agent.set_loopback_diagnostics(false);
         assert!(!agent.loopback_diagnostics);
+        assert!(agent.adapters_cache.is_none());
+    }
+
+    #[test]
+    fn invalidate_adapters_cache_clears_cached_entries() {
+        let mut agent = Agent::new(Config::default());
+        agent.adapters_cache = Some((Instant::now(), vec![]));
+        agent.invalidate_adapters_cache();
         assert!(agent.adapters_cache.is_none());
     }
 

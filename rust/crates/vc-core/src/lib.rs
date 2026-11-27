@@ -9,6 +9,7 @@ pub mod client;
 pub mod config;
 pub mod dataplane;
 pub mod host;
+pub mod nic_jumbo;
 pub mod paths;
 pub mod process;
 pub mod session;

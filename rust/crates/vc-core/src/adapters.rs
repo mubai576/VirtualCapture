@@ -224,18 +224,21 @@ $ifs = @(Get-NetIPInterface -AddressFamily IPv4 -ErrorAction SilentlyContinue)
     map
 }
 
-struct BoundedOutput {
-    status: Option<std::process::ExitStatus>,
-    stdout: Vec<u8>,
+pub(crate) struct BoundedOutput {
+    pub(crate) status: Option<std::process::ExitStatus>,
+    pub(crate) stdout: Vec<u8>,
     /// 保留子进程错误输出，便于诊断时查看；当前没有消费方。
     #[allow(dead_code)]
-    stderr: Vec<u8>,
-    timed_out: bool,
-    truncated: bool,
+    pub(crate) stderr: Vec<u8>,
+    pub(crate) timed_out: bool,
+    pub(crate) truncated: bool,
 }
 
 /// 带超时与输出上限地运行子进程。超时后强杀并等待回收，避免僵尸进程。
-fn run_bounded(mut command: Command, timeout: Duration) -> Result<BoundedOutput, String> {
+pub(crate) fn run_bounded(
+    mut command: Command,
+    timeout: Duration,
+) -> Result<BoundedOutput, String> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

@@ -46,7 +46,8 @@ PreparedSession为 `{capture,batch_packets,session_id,source_mac,adapter:Adapter
 
 ## 网卡与MTU
 
-- AdapterInfo有 `mtu: u32|null`（IPv4 NlMtu），旧对端缺字段可反序列化但不能据此证明MTU。查询只读Get-NetAdapter/Get-NetIPInterface，不Set、不加14、不改Jumbo。
+- AdapterInfo有 `mtu: u32|null`（IPv4 NlMtu），旧对端缺字段可反序列化但不能据此证明MTU。自动枚举与会话启动只读Get-NetAdapter/Get-NetIPInterface，不Set、不加14、不改Jumbo。
+- 采集端桌面页面提供显式的“开启网卡巨帧优化”滑块开关（9000 / 1500）：仅在用户主动操作滑块且采集会话空闲/非退出中时触发；仅限已连接物理网卡，按 GUID 精确锁定（多卡由用户选择，不按厂商偏置），兼容枚举型与数值范围型 `*JumboPacket` 驱动，非管理员进程通过 UAC 提权执行，并在网卡恢复 `Up` 后核验 IPv4 `NlMtu`（必要时同步 `Set-NetIPInterface`），完成后立即清空采集端 `adapters` 缓存。
 - 产品只接受Windows明确 `hardware_interface=true`、`virtual=false` 且 `Status=Up` 的网卡，不把元数据未知当物理卡或已连接。列表/选择/prepare/start一致，不能手填隐藏设备绕过。保存的显式选择保持，失效后清除并要求重选。
 - 不按厂商或型号偏置。采集端及本机主机按控制连接的出站IPv4精确匹配自动选择；对端仅在唯一已连接物理网卡时自动预览，多候选要求明确选择。明确清空/失效选择不反复自动替换。prepare后start固定精确网卡名，不重新静默选卡。
 - 新Capture默认 `mtu_auto=true`；旧配置缺字段反序列化为false，保留旧显式mtu。自动值为 `min(本机接收NIC NlMtu, 被采集机发送NIC NlMtu, 9000)`，双端需先确定；缺报告、低于1500或Loopback均拒绝自动解析。无法预选被采集机网卡时须明确选择或使用显式MTU。

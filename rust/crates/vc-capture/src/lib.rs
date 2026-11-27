@@ -4,7 +4,7 @@ mod api;
 mod desktop;
 mod state;
 
-pub use desktop::{DesktopAction, DesktopService, DesktopStatus};
+pub use desktop::{CaptureNicGuard, DesktopAction, DesktopService, DesktopStatus};
 
 use std::net::{IpAddr, SocketAddr};
 use std::process::Command;
