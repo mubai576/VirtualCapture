@@ -20,7 +20,7 @@ use super::OperationState;
 use super::deadline::OperationDeadline;
 use super::device;
 use super::dll::DllDirectory;
-use crate::au::{AU_HEADER_BYTES, AuSession, CODEC_PYROWAVE, build_au};
+use crate::au::{AU_HEADER_BYTES, AuSession, CODEC_PYROWAVE, KIND_FRAME, write_au_header_in_place};
 use crate::config::{CodecConfig, pyrowave_frame_budget};
 
 const CANDIDATES: &[&str] = &["libpyrowave-shared-1.dll"];
@@ -328,6 +328,7 @@ impl PyroWaveEncoder {
             return Err(error);
         }
         let (device, encoder, device_info) = created?;
+        let budget = budget as usize;
         Ok(Self {
             _library: Some(library),
             api,
@@ -336,22 +337,23 @@ impl PyroWaveEncoder {
             width,
             height,
             fps,
-            budget: budget as usize,
-            bitstream: vec![0u8; budget as usize],
+            budget,
+            bitstream: vec![0u8; AU_HEADER_BYTES + budget],
             device_info,
             deadline,
         })
     }
 
-    pub(super) fn encode(&mut self, nv12: &[u8], frame_id: u32) -> Result<Vec<u8>> {
+    pub(super) fn encode_ref(&mut self, nv12: &[u8], frame_id: u32) -> Result<&[u8]> {
         // 编码/取包整体是一个同步操作；超时只由看门狗设置会话粘性标志，不终止进程。
-        let outcome = {
+        let total = {
             let _armed = self.deadline.begin("编码")?;
             self.encode_native(nv12, frame_id)
         };
         // 调用期间发生过超时：以粘性错误覆盖原生返回值，后续调用同样被拒绝。
         self.deadline.check()?;
-        outcome
+        let total = total?;
+        Ok(&self.bitstream[..total])
     }
 
     /// 用同几何合成 NV12 真实编码一次，强制创建 Vulkan 计算管线。
@@ -359,15 +361,16 @@ impl PyroWaveEncoder {
     /// 返回的访问单元由调用方丢弃；正式帧号、统计和哈希仍从 0 开始。预热与正式
     /// 编码使用同一份配置/帧预算，不改变任何正式编码参数。
     pub(super) fn warmup(&mut self, nv12: &[u8], frame_id: u32) -> Result<Vec<u8>> {
-        let outcome = {
+        let total = {
             let _armed = self.deadline.begin("预热")?;
             self.encode_native(nv12, frame_id)
         };
         self.deadline.check()?;
-        outcome
+        let total = total?;
+        Ok(self.bitstream[..total].to_vec())
     }
 
-    fn encode_native(&mut self, nv12: &[u8], frame_id: u32) -> Result<Vec<u8>> {
+    fn encode_native(&mut self, nv12: &[u8], frame_id: u32) -> Result<usize> {
         let y_bytes = self.width as usize * self.height as usize;
         ensure!(
             nv12.len() == y_bytes + y_bytes / 2,
@@ -410,16 +413,17 @@ impl PyroWaveEncoder {
         );
         let mut packet = Packet { offset: 0, size: 0 };
         let mut packet_count = 1usize;
+        let out_slice = &mut self.bitstream[AU_HEADER_BYTES..];
         check(
-            // SAFETY: 输出缓冲固定为 budget 字节；packet_count 为输入/输出。
+            // SAFETY: 输出缓冲预留 48B VCAU 头后剩余 budget 字节；packet_count 为输入/输出。
             unsafe {
                 (self.api.encoder_packetize)(
                     self.encoder,
                     &mut packet,
                     self.budget,
                     &mut packet_count,
-                    self.bitstream.as_mut_ptr().cast(),
-                    self.bitstream.len(),
+                    out_slice.as_mut_ptr().cast(),
+                    out_slice.len(),
                 )
             },
             "packetize",
@@ -433,23 +437,19 @@ impl PyroWaveEncoder {
             .offset
             .checked_add(packet.size)
             .context("PyroWave packet 偏移溢出")?;
+        ensure!(end <= self.budget, "PyroWave packet 越出 bitstream 缓冲");
         ensure!(
-            end <= self.bitstream.len(),
-            "PyroWave packet 越出 bitstream 缓冲"
-        );
-        let payload = &self.bitstream[packet.offset..end];
-        ensure!(
-            payload.len() >= 8,
+            packet.size >= 8,
             "PyroWave bitstream 至少 8 字节（当前 {} 字节）",
-            payload.len()
+            packet.size
         );
-        let total = AU_HEADER_BYTES + payload.len();
+        let total = AU_HEADER_BYTES + packet.size;
         ensure!(
             total <= self.budget + AU_HEADER_BYTES,
             "PyroWave 访问单元 {total} 字节超过每帧预算 {} + 48",
             self.budget
         );
-        build_au(
+        write_au_header_in_place(
             AuSession {
                 codec: CODEC_PYROWAVE,
                 width: self.width,
@@ -457,8 +457,10 @@ impl PyroWaveEncoder {
                 fps: self.fps,
             },
             frame_id,
-            payload,
-        )
+            KIND_FRAME,
+            &mut self.bitstream[..total],
+        )?;
+        Ok(total)
     }
 
     pub(super) fn settings(&self) -> Value {
@@ -565,12 +567,12 @@ impl PyroWaveDecoder {
         })
     }
 
-    /// 解码已通过 VCAU 封装的单 packet bitstream，返回完整 NV12（含亮度）。
-    pub(super) fn decode(&mut self, bitstream: &[u8]) -> Result<Vec<u8>> {
+    /// 解码已通过 VCAU 封装的单 packet bitstream，写入调用方提供的 NV12 缓冲区。
+    pub(super) fn decode_into(&mut self, bitstream: &[u8], out: &mut [u8]) -> Result<()> {
         // push/就绪检查/同步解码/回读是一个整体同步操作；超时只置会话粘性标志。
         let outcome = {
             let _armed = self.deadline.begin("解码")?;
-            self.decode_native(bitstream)
+            self.decode_native(bitstream, out)
         };
         self.deadline.check()?;
         outcome
@@ -580,16 +582,26 @@ impl PyroWaveDecoder {
     ///
     /// 输出由调用方丢弃；预热不是正式帧，不进入统计、哈希或帧号序列。
     pub(super) fn warmup(&mut self, bitstream: &[u8]) -> Result<Vec<u8>> {
+        let y_bytes = self.width as usize * self.height as usize;
+        let mut out = vec![0u8; y_bytes + y_bytes / 2];
         let outcome = {
             let _armed = self.deadline.begin("预热")?;
-            self.decode_native(bitstream)
+            self.decode_native(bitstream, &mut out)
         };
         self.deadline.check()?;
-        outcome
+        outcome?;
+        Ok(out)
     }
 
-    fn decode_native(&mut self, bitstream: &[u8]) -> Result<Vec<u8>> {
+    fn decode_native(&mut self, bitstream: &[u8], out: &mut [u8]) -> Result<()> {
         ensure!(!self.decoder.is_null(), "PyroWave 解码器未打开");
+        let y_bytes = self.width as usize * self.height as usize;
+        let frame_bytes = y_bytes + y_bytes / 2;
+        ensure!(
+            out.len() == frame_bytes,
+            "PyroWave 解码输出缓冲需要 {frame_bytes} 字节，实际 {}",
+            out.len()
+        );
         check(
             // SAFETY: bitstream 借用调用方载荷，调用期间有效。
             unsafe {
@@ -605,8 +617,6 @@ impl PyroWaveDecoder {
         if !unsafe { (self.api.decoder_decode_is_ready)(self.decoder, false) } {
             bail!("PyroWave 帧不完整（缺少 packet）");
         }
-        let y_bytes = self.width as usize * self.height as usize;
-        let mut out = vec![0u8; y_bytes + y_bytes / 2];
         let mut destination = CpuBuffer::zeroed();
         destination.data[0] = out.as_mut_ptr().cast();
         destination.data[1] = self.plane_cb.as_mut_ptr().cast();
@@ -626,19 +636,8 @@ impl PyroWaveDecoder {
             "decode",
         )?;
         // Cb/Cr → NV12 UV 交错；亮度已直接写入 out 的 Y 平面，绝不留旧数据。
-        let chroma_width = self.width as usize / 2;
-        let uv = y_bytes;
-        for row in 0..self.height as usize / 2 {
-            let cb = &self.plane_cb[row * chroma_width..(row + 1) * chroma_width];
-            let cr = &self.plane_cr[row * chroma_width..(row + 1) * chroma_width];
-            let target =
-                &mut out[uv + row * self.width as usize..uv + (row + 1) * self.width as usize];
-            for column in 0..chroma_width {
-                target[2 * column] = cb[column];
-                target[2 * column + 1] = cr[column];
-            }
-        }
-        Ok(out)
+        interleave_uv(&self.plane_cb, &self.plane_cr, &mut out[y_bytes..]);
+        Ok(())
     }
 
     /// 丢弃未完成 packet 并重建解码器；保留已选中的 Vulkan 设备。
@@ -757,6 +756,34 @@ impl Drop for PyroWaveDecoder {
     }
 }
 
+/// 把连续的 Cb/Cr 平面交错写入 NV12 UV 平面。`plane_cb` 与 `plane_cr` 在 YUV420P 下
+/// 行间无额外填充，整体交错与逐行交错完全等价。
+fn interleave_uv(cb: &[u8], cr: &[u8], dst: &mut [u8]) {
+    debug_assert_eq!(cb.len(), cr.len());
+    debug_assert_eq!(dst.len(), cb.len() * 2);
+    let mut i = 0usize;
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        while i + 16 <= cb.len() {
+            // SAFETY: 循环条件保证 cb[i..i+16]、cr[i..i+16] 与 dst[i*2..i*2+32] 均在界内。
+            unsafe {
+                let v_cb = _mm_loadu_si128(cb.as_ptr().add(i) as *const __m128i);
+                let v_cr = _mm_loadu_si128(cr.as_ptr().add(i) as *const __m128i);
+                let lo = _mm_unpacklo_epi8(v_cb, v_cr);
+                let hi = _mm_unpackhi_epi8(v_cb, v_cr);
+                _mm_storeu_si128(dst.as_mut_ptr().add(i * 2) as *mut __m128i, lo);
+                _mm_storeu_si128(dst.as_mut_ptr().add(i * 2 + 16) as *mut __m128i, hi);
+            }
+            i += 16;
+        }
+    }
+    for idx in i..cb.len() {
+        dst[2 * idx] = cb[idx];
+        dst[2 * idx + 1] = cr[idx];
+    }
+}
+
 #[cfg(test)]
 mod gpu_requirement_tests {
     use super::*;
@@ -784,6 +811,26 @@ mod gpu_requirement_tests {
             json!({"status":"selected", "type":"discrete_gpu", "api_version":u64::MAX}),
         ] {
             assert!(require_gpu_device(&info).is_err());
+        }
+    }
+
+    #[test]
+    fn interleave_uv_matches_scalar_across_widths_and_tails() {
+        for chroma_len in [1usize, 7, 8, 15, 16, 17, 32, 209, 320, 640 * 320] {
+            let cb: Vec<u8> = (0..chroma_len)
+                .map(|i| ((i * 7 + 3) & 0xFF) as u8)
+                .collect();
+            let cr: Vec<u8> = (0..chroma_len)
+                .map(|i| ((i * 13 + 91) & 0xFF) as u8)
+                .collect();
+            let mut expected = vec![0u8; chroma_len * 2];
+            for idx in 0..chroma_len {
+                expected[2 * idx] = cb[idx];
+                expected[2 * idx + 1] = cr[idx];
+            }
+            let mut actual = vec![0u8; chroma_len * 2];
+            interleave_uv(&cb, &cr, &mut actual);
+            assert_eq!(actual, expected, "chroma_len={chroma_len}");
         }
     }
 }

@@ -291,6 +291,9 @@ pub unsafe fn vstat_push(base: *mut u8, frame_id: u32, pub_ns: u64, deliver_ns: 
 
 /// 对应历史 C++ `vc_qpc_to_ns`：避免 `counter * 1e9` 溢出。
 pub const fn qpc_to_ns(counter: u64, freq: u64) -> u64 {
+    if freq == 10_000_000 && counter <= u64::MAX / 100 {
+        return counter * 100;
+    }
     (counter / freq) * 1_000_000_000 + (counter % freq) * 1_000_000_000 / freq
 }
 

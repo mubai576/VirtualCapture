@@ -8,8 +8,8 @@ use std::rc::Rc;
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
 use windows_sys::Win32::System::Threading::{
     CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, CreateWaitableTimerExW, GetCurrentThread,
-    GetThreadPriority, SetThreadPriority, SetWaitableTimer, THREAD_PRIORITY_TIME_CRITICAL,
-    TIMER_ALL_ACCESS, WaitForSingleObject,
+    GetThreadPriority, SetThreadPriority, SetWaitableTimer, THREAD_PRIORITY_BELOW_NORMAL,
+    THREAD_PRIORITY_TIME_CRITICAL, TIMER_ALL_ACCESS, WaitForSingleObject,
 };
 
 /// 每个发送线程一个私有定时器：不改变全局定时器分辨率，也不改变进程优先级。
@@ -67,6 +67,7 @@ pub(super) struct ThreadPriority {
     mmcss: *mut c_void,
     old: i32,
     raised: bool,
+    target_priority: i32,
     // MMCSS 注册属于调用线程；即使本结构体的原生字段以后改成实现了
     // Send/Sync 的类型，也不能让它跨线程。
     _same_thread: PhantomData<Rc<()>>,
@@ -80,17 +81,30 @@ unsafe extern "system" {
 
 impl ThreadPriority {
     pub(super) fn capture() -> Self {
+        Self::with_priority(THREAD_PRIORITY_TIME_CRITICAL, true)
+    }
+
+    pub(super) fn below_normal() -> Self {
+        Self::with_priority(THREAD_PRIORITY_BELOW_NORMAL, false)
+    }
+
+    fn with_priority(target_priority: i32, use_mmcss: bool) -> Self {
         let old = unsafe { GetThreadPriority(GetCurrentThread()) };
-        let mut index = 0;
-        let name: Vec<u16> = "Capture\0".encode_utf16().collect();
-        let mmcss = unsafe { AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut index) };
+        let mmcss = if use_mmcss {
+            let mut index = 0;
+            let name: Vec<u16> = "Capture\0".encode_utf16().collect();
+            unsafe { AvSetMmThreadCharacteristicsW(name.as_ptr(), &mut index) }
+        } else {
+            std::ptr::null_mut()
+        };
         let raised = mmcss.is_null()
             && old != PRIORITY_ERROR
-            && unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL) } != 0;
+            && unsafe { SetThreadPriority(GetCurrentThread(), target_priority) } != 0;
         Self {
             mmcss,
             old,
             raised,
+            target_priority,
             _same_thread: PhantomData,
         }
     }
@@ -99,7 +113,11 @@ impl ThreadPriority {
         if !self.mmcss.is_null() {
             "mmcss_capture"
         } else if self.raised {
-            "thread_time_critical"
+            if self.target_priority == THREAD_PRIORITY_BELOW_NORMAL {
+                "thread_below_normal"
+            } else {
+                "thread_time_critical"
+            }
         } else {
             "unchanged"
         }

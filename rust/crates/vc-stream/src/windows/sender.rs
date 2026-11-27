@@ -66,6 +66,7 @@ impl TxAuditWorker {
         let join = thread::Builder::new()
             .name(format!("vc-stream-tx-audit-{session}"))
             .spawn(move || -> anyhow::Result<(Samples, Samples)> {
+                let _priority = ThreadPriority::below_normal();
                 let mut audit_timing = Samples::default();
                 let mut log_timing = Samples::default();
                 while let Ok(job) = rx.recv() {
@@ -174,6 +175,7 @@ struct CaptureShared {
     ready: VecDeque<CapturedFrame>,
     free_bufs: Vec<Vec<u8>>,
     source_info: Option<Value>,
+    live_latest: bool,
     started: bool,
     finished: bool,
     error: Option<String>,
@@ -200,11 +202,13 @@ impl DesktopCapturePipeline {
         for _ in 0..CAPTURE_POOL_BUFFERS {
             free_bufs.push(vec![0u8; frame_bytes]);
         }
+        let live_latest = max_frames == 0;
         let state = Arc::new((
             Mutex::new(CaptureShared {
                 ready: VecDeque::with_capacity(CAPTURE_READY_LIMIT),
                 free_bufs,
                 source_info: None,
+                live_latest,
                 started: false,
                 finished: false,
                 error: None,
@@ -264,29 +268,35 @@ impl DesktopCapturePipeline {
                 }
 
                 let mut pacer = FramePacer::new(fps, qpc_ns());
+                let live_latest = max_frames == 0;
                 let mut captured_count = 0u64;
                 let mut last_info_at = Instant::now();
                 loop {
                     if max_frames > 0 && captured_count == max_frames {
                         break;
                     }
-                    if !loop_sleep_either(
+                    if !wait_non_spinning_either(
                         pacer.next_ns,
                         &worker_cap_stop,
                         worker_outer_stop.as_deref(),
                     ) {
                         break;
                     }
-                    let frame_start = qpc_ns();
-                    pacer.advance(frame_start);
 
-                    // 从空闲池取得缓冲区；若双缓冲已满则短暂等待 TX 取走，保持有界内存。
+                    // 先取空闲缓冲再打 `frame_start`，避免把等缓冲时间算入源采集耗时；
+                    // 无限 live 会话允许盗用未消费陈旧槽位或按需扩容（不超过 7 槽），绝不在缓冲池阻塞。
                     let mut buf = {
                         let (lock, cv) = &*worker_state;
                         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
                         loop {
                             if let Some(buf) = guard.free_bufs.pop() {
                                 break Some(buf);
+                            }
+                            if live_latest {
+                                if let Some(stale) = guard.ready.pop_front() {
+                                    break Some(stale.buf);
+                                }
+                                break Some(vec![0u8; frame_bytes]);
                             }
                             if guard.ready.len() < CAPTURE_READY_LIMIT {
                                 break Some(vec![0u8; frame_bytes]);
@@ -303,6 +313,9 @@ impl DesktopCapturePipeline {
                     let Some(mut buf) = buf.take() else {
                         break;
                     };
+
+                    let frame_start = qpc_ns();
+                    pacer.advance(frame_start);
 
                     let mut got_frame = false;
                     while !is_stopped() {
@@ -341,7 +354,7 @@ impl DesktopCapturePipeline {
                     if !got_frame {
                         let (lock, cv) = &*worker_state;
                         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-                        if guard.free_bufs.len() < CAPTURE_POOL_BUFFERS + 2 {
+                        if guard.free_bufs.len() < CAPTURE_POOL_BUFFERS + 4 {
                             guard.free_bufs.push(buf);
                         }
                         cv.notify_all();
@@ -360,12 +373,16 @@ impl DesktopCapturePipeline {
                         if let Some(info) = maybe_info {
                             guard.source_info = Some(info);
                         }
-                        guard.ready.push_back(CapturedFrame {
-                            buf,
-                            frame_start,
-                            source_ready,
-                        });
-                        cv.notify_all();
+                        push_captured_frame(
+                            &mut guard,
+                            CapturedFrame {
+                                buf,
+                                frame_start,
+                                source_ready,
+                            },
+                            live_latest,
+                        );
+                        cv.notify_one();
                     }
                 }
 
@@ -418,9 +435,11 @@ impl DesktopCapturePipeline {
     fn recycle(&self, buf: Vec<u8>) {
         let (lock, cv) = &*self.state;
         let mut guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.free_bufs.len() < CAPTURE_POOL_BUFFERS + 2 {
+        if guard.free_bufs.len() < CAPTURE_POOL_BUFFERS + 4 {
             guard.free_bufs.push(buf);
-            cv.notify_all();
+            if !guard.live_latest {
+                cv.notify_one();
+            }
         }
     }
 
@@ -434,7 +453,9 @@ impl DesktopCapturePipeline {
         let mut last_tick = Instant::now();
         loop {
             if let Some(frame) = guard.ready.pop_front() {
-                cv.notify_all();
+                if !guard.live_latest {
+                    cv.notify_one();
+                }
                 return Ok(Some(frame));
             }
             if let Some(error) = guard.error.as_deref() {
@@ -494,7 +515,20 @@ impl Drop for DesktopCapturePipeline {
     }
 }
 
-fn loop_sleep_either(
+fn push_captured_frame(shared: &mut CaptureShared, frame: CapturedFrame, live_latest: bool) {
+    if live_latest {
+        while let Some(stale) = shared.ready.pop_front() {
+            if shared.free_bufs.len() < CAPTURE_POOL_BUFFERS + 4 {
+                shared.free_bufs.push(stale.buf);
+            }
+        }
+    }
+    shared.ready.push_back(frame);
+}
+
+/// 非自旋限频：DDA 由显示器 VSync 自然节拍驱动，仅当提前超过 1 ms 时用高分辨率 timer 等待，
+/// 避免在采集线程上叠加 420 us MMCSS 忙等并与 DWM VSync 相位打架。
+fn wait_non_spinning_either(
     target_ns: u64,
     cap_stop: &AtomicBool,
     outer_stop: Option<&AtomicBool>,
@@ -504,14 +538,10 @@ fn loop_sleep_either(
             return false;
         }
         let remaining = target_ns.saturating_sub(qpc_ns());
-        if remaining == 0 {
+        if remaining <= 1_000_000 {
             return true;
         }
-        if remaining > 500_000 {
-            scheduling::wait_for((remaining - 420_000).min(5_000_000));
-        } else {
-            std::hint::spin_loop();
-        }
+        scheduling::wait_for((remaining - 500_000).min(5_000_000));
     }
 }
 
@@ -550,8 +580,13 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
             "per-packet pacing cannot be combined with one sendqueue batch per frame"
         );
     }
-    let handle = api.open(&adapter, 65536, 1)?;
+    // 发送端只发不收：禁用混杂模式、挂全丢弃 BPF 并缩减驱动读缓存，避免把 1.2 Gbps 自身发包拷贝进内核环。
+    let handle = api.open_with_promisc(&adapter, 64, 0, 1000)?;
     let _capture = Capture(handle, api.close);
+    let _ = api.set_reject_all_filter(handle);
+    unsafe {
+        let _ = (api.set_buff)(handle, 4096);
+    }
     let mut desktop_pipeline = match args.source.mode.as_str() {
         "pattern" => None,
         "dda" | "wgc" => Some(DesktopCapturePipeline::spawn(
@@ -712,27 +747,34 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
             break;
         }
         let encode_started = qpc_ns();
-        // Raw 直接借用实际 NV12 像素：没有编解码拷贝，也没有 AU 上限。
-        let encoded = if let Some(encoder) = encoder.as_mut() {
-            Some(encoder.encode(&source_frame, frame_id)?)
+        // Raw 直接借用实际 NV12 像素；编码模式借用编解码器预分配缓冲，消除每帧堆分配与冗余 VCAU 校验。
+        let frame = if let Some(encoder) = encoder.as_mut() {
+            let encoded = encoder.encode_ref(&source_frame, frame_id)?;
+            ensure!(
+                encoded.len() <= args.codec.max_au_bytes,
+                "encoded AU {} bytes exceeds max_au_bytes={}",
+                encoded.len(),
+                args.codec.max_au_bytes
+            );
+            debug_assert!(
+                parse_au(
+                    encoded,
+                    au_session(
+                        &args.codec.codec,
+                        args.common.width,
+                        args.common.height,
+                        args.common.fps,
+                    )?,
+                    frame_id,
+                    args.codec.max_au_bytes,
+                )
+                .is_ok()
+            );
+            encoded
         } else {
-            None
+            source_frame.as_slice()
         };
         let encode_done = qpc_ns();
-        let frame = encoded.as_deref().unwrap_or(&source_frame);
-        if !raw {
-            parse_au(
-                frame,
-                au_session(
-                    &args.codec.codec,
-                    args.common.width,
-                    args.common.height,
-                    args.common.fps,
-                )?,
-                frame_id,
-                args.codec.max_au_bytes,
-            )?;
-        }
 
         let earliest = if !raw && frames > 0 {
             previous_send.saturating_add(period)
@@ -782,12 +824,12 @@ fn run_sender(args: &mut SendArgs) -> anyhow::Result<()> {
         live_pc1.push(sent.end_ns, pc1_ns);
 
         if let Some(audit) = audit_worker.as_ref() {
-            let job = if let Some(encoded_buf) = encoded {
+            let job = if !raw {
                 TxAuditJob {
                     frame_id,
                     raw: false,
                     is_pattern,
-                    frame: encoded_buf,
+                    frame: frame.to_vec(),
                     source_frame: Some(source_frame),
                     frame_start,
                     source_ready,
@@ -1118,24 +1160,37 @@ impl<'a> FrameTransmitter<'a> {
                 continue;
             }
             if start_ns == 0 {
-                let waiting = qpc_ns();
-                let budget = if let Some(limiter) = limiter.as_mut() {
-                    limiter.deadline(waiting, frame.len())?
-                } else {
-                    0
-                };
-                if !loop_sleep(earliest.max(budget), stop) {
-                    if let Some(queue) = self.queue.as_ref() {
-                        unsafe {
-                            (*queue.0).len = 0;
+                if earliest == 0 && limiter.is_none() {
+                    if stopped(stop) {
+                        if let Some(queue) = self.queue.as_ref() {
+                            unsafe {
+                                (*queue.0).len = 0;
+                            }
                         }
+                        return Ok(None);
                     }
-                    return Ok(None);
-                }
-                start_ns = qpc_ns();
-                wait_ns = start_ns.saturating_sub(waiting);
-                if let Some(limiter) = limiter.as_mut() {
-                    limiter.record(start_ns, frame.len());
+                    start_ns = qpc_ns();
+                    wait_ns = 0;
+                } else {
+                    let waiting = qpc_ns();
+                    let budget = if let Some(limiter) = limiter.as_mut() {
+                        limiter.deadline(waiting, frame.len())?
+                    } else {
+                        0
+                    };
+                    if !loop_sleep(earliest.max(budget), stop) {
+                        if let Some(queue) = self.queue.as_ref() {
+                            unsafe {
+                                (*queue.0).len = 0;
+                            }
+                        }
+                        return Ok(None);
+                    }
+                    start_ns = qpc_ns();
+                    wait_ns = start_ns.saturating_sub(waiting);
+                    if let Some(limiter) = limiter.as_mut() {
+                        limiter.record(start_ns, frame.len());
+                    }
                 }
             }
             if let Some(queue) = self.queue.as_ref() {
@@ -1267,5 +1322,53 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(text.lines().count(), 8);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn live_mailbox_replaces_stale_frame_and_recycles_buffer() {
+        let mut shared = CaptureShared {
+            ready: VecDeque::with_capacity(2),
+            free_bufs: Vec::new(),
+            source_info: None,
+            live_latest: true,
+            started: true,
+            finished: false,
+            error: None,
+        };
+        push_captured_frame(
+            &mut shared,
+            CapturedFrame {
+                buf: vec![1; 16],
+                frame_start: 10,
+                source_ready: 20,
+            },
+            true,
+        );
+        push_captured_frame(
+            &mut shared,
+            CapturedFrame {
+                buf: vec![2; 16],
+                frame_start: 30,
+                source_ready: 40,
+            },
+            true,
+        );
+        assert_eq!(shared.ready.len(), 1);
+        assert_eq!(shared.ready[0].frame_start, 30);
+        assert_eq!(shared.ready[0].buf[0], 2);
+        assert_eq!(shared.free_bufs.len(), 1);
+        assert_eq!(shared.free_bufs[0][0], 1);
+
+        // 有限会话保留有界队列不覆盖。
+        push_captured_frame(
+            &mut shared,
+            CapturedFrame {
+                buf: vec![3; 16],
+                frame_start: 50,
+                source_ready: 60,
+            },
+            false,
+        );
+        assert_eq!(shared.ready.len(), 2);
     }
 }

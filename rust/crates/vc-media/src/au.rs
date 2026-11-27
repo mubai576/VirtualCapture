@@ -138,13 +138,13 @@ fn check_payload_shape(codec: u8, payload: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// 用显式 kind 构建 VCAU。主传输通常用 [`build_au`]，它按载荷是否为空选择 kind。
-pub fn build_au_kind(
+/// 原地校验并写入 48 字节 VCAU 头：`buf` 必须已包含 `[48B 头占位 | 编码载荷]`。
+pub fn write_au_header_in_place(
     session: AuSession,
     frame_id: u32,
     kind: u8,
-    payload: &[u8],
-) -> Result<Vec<u8>> {
+    buf: &mut [u8],
+) -> Result<()> {
     ensure!(
         matches!(session.codec, CODEC_MJPEG | CODEC_PYROWAVE),
         "VCAU codec={} 不受支持；Raw 没有 VCAU 封装",
@@ -154,6 +154,13 @@ pub fn build_au_kind(
         matches!(kind, KIND_FRAME | KIND_EOS),
         "VCAU kind 必须是 1（独立帧）或 2（EOS），当前 {kind}"
     );
+    ensure!(
+        buf.len() >= AU_HEADER_BYTES,
+        "VCAU 缓冲区 {} 字节，不足 {} 字节头",
+        buf.len(),
+        AU_HEADER_BYTES
+    );
+    let payload = &buf[AU_HEADER_BYTES..];
     if kind == KIND_EOS {
         ensure!(payload.is_empty(), "EOS 不得携带编码载荷");
     } else {
@@ -164,23 +171,37 @@ pub fn build_au_kind(
         payload.len() <= u32::MAX as usize,
         "编码载荷超过 u32 长度上限"
     );
+    let payload_len = payload.len() as u32;
+    let payload_hash = fnv1a64(payload);
+    write_u32(buf, 0, AU_MAGIC);
+    buf[4] = AU_REVISION;
+    buf[5] = session.codec;
+    buf[6] = kind;
+    buf[7] = AU_HEADER_BYTES as u8;
+    write_u32(buf, 8, session.width);
+    write_u32(buf, 12, session.height);
+    write_u32(buf, 16, session.fps);
+    write_u32(buf, 20, payload_len);
+    write_u32(buf, 24, frame_id);
+    buf[28..32].fill(0);
+    write_u64(buf, 32, payload_hash);
+    buf[40..48].fill(0);
+    Ok(())
+}
+
+/// 用显式 kind 构建 VCAU。主传输通常用 [`build_au`]，它按载荷是否为空选择 kind。
+pub fn build_au_kind(
+    session: AuSession,
+    frame_id: u32,
+    kind: u8,
+    payload: &[u8],
+) -> Result<Vec<u8>> {
     let total = AU_HEADER_BYTES
         .checked_add(payload.len())
         .context("VCAU 总长度溢出")?;
     let mut out = vec![0u8; total];
-    write_u32(&mut out, 0, AU_MAGIC);
-    out[4] = AU_REVISION;
-    out[5] = session.codec;
-    out[6] = kind;
-    out[7] = AU_HEADER_BYTES as u8;
-    write_u32(&mut out, 8, session.width);
-    write_u32(&mut out, 12, session.height);
-    write_u32(&mut out, 16, session.fps);
-    write_u32(&mut out, 20, payload.len() as u32);
-    write_u32(&mut out, 24, frame_id);
-    write_u64(&mut out, 32, fnv1a64(payload));
-    // 28 与 40 保留为 0（vec 已置零）。
     out[AU_HEADER_BYTES..].copy_from_slice(payload);
+    write_au_header_in_place(session, frame_id, kind, &mut out)?;
     Ok(out)
 }
 
@@ -329,6 +350,12 @@ mod tests {
         assert_eq!(unit.payload, payload.as_slice());
         assert!(!unit.is_eos());
         assert_eq!(unit.payload_hash, fnv1a64(&payload));
+
+        // 原地写入必须清零脏缓冲区保留位并与 build_au 逐字节一致。
+        let mut inplace = vec![0xCCu8; AU_HEADER_BYTES + payload.len()];
+        inplace[AU_HEADER_BYTES..].copy_from_slice(&payload);
+        write_au_header_in_place(session, 7, KIND_FRAME, &mut inplace).unwrap();
+        assert_eq!(inplace, bytes);
     }
 
     #[test]

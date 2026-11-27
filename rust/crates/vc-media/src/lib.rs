@@ -32,6 +32,7 @@ mod codec;
 pub use au::{
     AU_HEADER_BYTES, AU_MAGIC, AU_REVISION, AccessUnit, AuSession, CODEC_MJPEG, CODEC_PYROWAVE,
     KIND_EOS, KIND_FRAME, build_au, build_au_kind, codec_id, codec_name, parse_au,
+    write_au_header_in_place,
 };
 pub use config::{
     CodecConfig, MAX_AU_BYTES, MAX_BITRATE_BPS, MIN_AU_BYTES, MIN_BITRATE_BPS, MJPEG_UNSUPPORTED,

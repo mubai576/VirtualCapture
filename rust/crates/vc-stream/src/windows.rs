@@ -180,6 +180,21 @@ pub(crate) struct PcapSendQueue {
     pub(crate) buffer: *mut c_char,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BpfInsn {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+}
+
+#[repr(C)]
+struct BpfProgram {
+    bf_len: c_uint,
+    bf_insns: *mut BpfInsn,
+}
+
 type FindAllDevs = unsafe extern "C" fn(*mut *mut PcapIf, *mut c_char) -> c_int;
 type FreeAllDevs = unsafe extern "C" fn(*mut PcapIf);
 type OpenLive =
@@ -188,6 +203,7 @@ type SendPacket = unsafe extern "C" fn(*mut c_void, *const c_uchar, c_int) -> c_
 pub(crate) type PcapHandler = unsafe extern "C" fn(*mut c_uchar, *const PcapHeader, *const c_uchar);
 type Dispatch = unsafe extern "C" fn(*mut c_void, c_int, PcapHandler, *mut c_uchar) -> c_int;
 type BreakLoop = unsafe extern "C" fn(*mut c_void);
+type SetFilter = unsafe extern "C" fn(*mut c_void, *mut BpfProgram) -> c_int;
 type SetBuff = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type SetMinToCopy = unsafe extern "C" fn(*mut c_void, c_int) -> c_int;
 type DataLink = unsafe extern "C" fn(*mut c_void) -> c_int;
@@ -206,6 +222,7 @@ pub(crate) struct Npcap {
     send_packet: SendPacket,
     dispatch: Dispatch,
     breakloop: BreakLoop,
+    set_filter: Option<SetFilter>,
     set_buff: SetBuff,
     set_min_to_copy: SetMinToCopy,
     datalink: DataLink,
@@ -235,6 +252,10 @@ impl Npcap {
                 send_packet: symbol!("pcap_sendpacket", SendPacket),
                 dispatch: symbol!("pcap_dispatch", Dispatch),
                 breakloop: symbol!("pcap_breakloop", BreakLoop),
+                set_filter: library
+                    .get::<SetFilter>(b"pcap_setfilter\0")
+                    .ok()
+                    .map(|sym| *sym),
                 set_buff: symbol!("pcap_setbuff", SetBuff),
                 set_min_to_copy: symbol!("pcap_setmintocopy", SetMinToCopy),
                 datalink: symbol!("pcap_datalink", DataLink),
@@ -326,10 +347,26 @@ impl Npcap {
         snaplen: c_int,
         timeout_ms: c_int,
     ) -> anyhow::Result<*mut c_void> {
+        self.open_with_promisc(adapter, snaplen, 1, timeout_ms)
+    }
+
+    fn open_with_promisc(
+        &self,
+        adapter: &str,
+        snaplen: c_int,
+        promisc: c_int,
+        timeout_ms: c_int,
+    ) -> anyhow::Result<*mut c_void> {
         let c_adapter = cstring(adapter, "adapter")?;
         let mut err = [0i8; 256];
         let handle = unsafe {
-            (self.open_live)(c_adapter.as_ptr(), snaplen, 1, timeout_ms, err.as_mut_ptr())
+            (self.open_live)(
+                c_adapter.as_ptr(),
+                snaplen,
+                promisc,
+                timeout_ms,
+                err.as_mut_ptr(),
+            )
         };
         ensure!(
             !handle.is_null(),
@@ -337,6 +374,27 @@ impl Npcap {
             c_array(&err)
         );
         Ok(handle)
+    }
+
+    fn set_reject_all_filter(&self, handle: *mut c_void) -> bool {
+        let mut insns = reject_all_bpf();
+        self.apply_bpf(handle, &mut insns)
+    }
+
+    fn set_ethertype_filter(&self, handle: *mut c_void, ethertype: u16) -> bool {
+        let mut insns = ethertype_bpf(ethertype);
+        self.apply_bpf(handle, &mut insns)
+    }
+
+    fn apply_bpf(&self, handle: *mut c_void, insns: &mut [BpfInsn]) -> bool {
+        let Some(set_filter) = self.set_filter else {
+            return false;
+        };
+        let mut program = BpfProgram {
+            bf_len: insns.len() as c_uint,
+            bf_insns: insns.as_mut_ptr(),
+        };
+        unsafe { set_filter(handle, &mut program) == 0 }
     }
 
     fn handle_error(&self, handle: *mut c_void, operation: &str) -> anyhow::Error {
@@ -350,6 +408,44 @@ impl Npcap {
         };
         anyhow::anyhow!("{operation}: {detail}")
     }
+}
+
+fn reject_all_bpf() -> [BpfInsn; 1] {
+    [BpfInsn {
+        code: 0x0006, // BPF_RET | BPF_K
+        jt: 0,
+        jf: 0,
+        k: 0,
+    }]
+}
+
+fn ethertype_bpf(ethertype: u16) -> [BpfInsn; 4] {
+    [
+        BpfInsn {
+            code: 0x0028, // BPF_LD | BPF_H | BPF_ABS
+            jt: 0,
+            jf: 0,
+            k: 12,
+        },
+        BpfInsn {
+            code: 0x0015, // BPF_JMP | BPF_JEQ | BPF_K
+            jt: 0,
+            jf: 1,
+            k: u32::from(ethertype),
+        },
+        BpfInsn {
+            code: 0x0006, // BPF_RET | BPF_K (pass packet)
+            jt: 0,
+            jf: 0,
+            k: 0x0004_0000,
+        },
+        BpfInsn {
+            code: 0x0006, // BPF_RET | BPF_K (drop packet)
+            jt: 0,
+            jf: 0,
+            k: 0,
+        },
+    ]
 }
 
 pub(crate) struct Capture(*mut c_void, Close);
@@ -1122,6 +1218,9 @@ fn qpc_ns() -> u64 {
         query_frequency().expect("QPC frequency must be initialized before data-plane use")
     });
     let frequency = freq.max(1);
+    if frequency == 10_000_000 && ticks <= u64::MAX / 100 {
+        return ticks * 100;
+    }
     ticks / frequency * 1_000_000_000 + ticks % frequency * 1_000_000_000 / frequency
 }
 
@@ -1532,5 +1631,31 @@ mod tests {
             UnmapViewOfFile(view);
             CloseHandle(map);
         }
+    }
+
+    #[test]
+    fn bpf_programs_match_reject_all_and_ethertype_filter() {
+        let reject = reject_all_bpf();
+        assert_eq!(reject.len(), 1);
+        assert_eq!(
+            reject[0],
+            BpfInsn {
+                code: 0x0006,
+                jt: 0,
+                jf: 0,
+                k: 0,
+            }
+        );
+
+        let etype = ethertype_bpf(vc_transport::wire::ETHERTYPE);
+        assert_eq!(etype.len(), 4);
+        assert_eq!(etype[0].code, 0x0028);
+        assert_eq!(etype[0].k, 12);
+        assert_eq!(etype[1].code, 0x0015);
+        assert_eq!(etype[1].jt, 0);
+        assert_eq!(etype[1].jf, 1);
+        assert_eq!(etype[1].k, 0x88b5);
+        assert_eq!(etype[2].k, 0x0004_0000);
+        assert_eq!(etype[3].k, 0);
     }
 }

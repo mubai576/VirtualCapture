@@ -237,8 +237,8 @@ impl Encoder {
         self.operation_state.clone()
     }
 
-    /// Raw 返回输入 NV12；编码模式返回完整 48B VCAU + 编码载荷。
-    pub fn encode(&mut self, nv12: &[u8], frame_id: u32) -> Result<Vec<u8>> {
+    /// Raw 返回输入 NV12 切片；编码模式返回预分配缓冲中的完整 48B VCAU + 编码载荷切片（零分配）。
+    pub fn encode_ref<'a>(&'a mut self, nv12: &'a [u8], frame_id: u32) -> Result<&'a [u8]> {
         ensure!(
             nv12.len() == self.frame_bytes,
             "NV12 输入 {} 字节，与会话 {}x{} 需要 {} 字节不符",
@@ -248,9 +248,14 @@ impl Encoder {
             self.frame_bytes
         );
         match &mut self.kind {
-            EncoderKind::Raw => Ok(nv12.to_vec()),
-            EncoderKind::PyroWave(codec) => codec.encode(nv12, frame_id),
+            EncoderKind::Raw => Ok(nv12),
+            EncoderKind::PyroWave(codec) => codec.encode_ref(nv12, frame_id),
         }
+    }
+
+    /// Raw 返回输入 NV12；编码模式返回完整 48B VCAU + 编码载荷。
+    pub fn encode(&mut self, nv12: &[u8], frame_id: u32) -> Result<Vec<u8>> {
+        self.encode_ref(nv12, frame_id).map(|slice| slice.to_vec())
     }
 
     pub fn settings(&self) -> Value {
@@ -400,8 +405,38 @@ impl Decoder {
                 if unit.is_eos() {
                     return Ok(Vec::new());
                 }
-                codec.decode(unit.payload)
+                let mut out = vec![0u8; self.frame_bytes];
+                codec.decode_into(unit.payload, &mut out)?;
+                Ok(out)
             }
+        }
+    }
+
+    /// 对调用方已通过 `parse_au` 校验的非 EOS 编码载荷直接解码进复用的 NV12 缓冲区，
+    /// 避免重复 VCAU 校验与重复 FNV-1a64 计算。
+    pub fn decode_verified_payload_into(&mut self, payload: &[u8], out: &mut [u8]) -> Result<()> {
+        ensure!(
+            out.len() == self.frame_bytes,
+            "NV12 输出 {} 字节，与会话 {}x{} 需要 {} 字节不符",
+            out.len(),
+            self.width,
+            self.height,
+            self.frame_bytes
+        );
+        match &mut self.kind {
+            DecoderKind::Raw => {
+                ensure!(
+                    payload.len() == self.frame_bytes,
+                    "Raw NV12 输入 {} 字节，与会话 {}x{} 需要 {} 字节不符",
+                    payload.len(),
+                    self.width,
+                    self.height,
+                    self.frame_bytes
+                );
+                out.copy_from_slice(payload);
+                Ok(())
+            }
+            DecoderKind::PyroWave(codec) => codec.decode_into(payload, out),
         }
     }
 

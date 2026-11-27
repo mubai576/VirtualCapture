@@ -135,34 +135,64 @@ impl fmt::Display for Pattern {
     }
 }
 
+const RAMP: [u8; 512] = {
+    let mut ramp = [0u8; 512];
+    let mut i = 0;
+    while i < 512 {
+        ramp[i] = i as u8;
+        i += 1;
+    }
+    ramp
+};
+
+const SPLITMIX_INC: u64 = 0x9E37_79B9_7F4A_7C15;
+
 // splitmix64：与 pattern.h / pattern_ref.py 相同的 64 位回绕随机数。
-fn splitmix64(state: &mut u64) -> u64 {
-    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
-    let mut z = *state;
+#[inline]
+fn splitmix64_mix(mut z: u64) -> u64 {
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
     z ^ (z >> 31)
 }
 
-// 按 C++ 的写法逐段填充：先消费完整的 8 字节小端字，余数每个字节消耗一次
-// splitmix64 并取低 8 位。调用方按原实现的“段”来调用，以保留行/平面边界处的
-// 尾部规则（中央噪声窗每行重新开始 8 字节分组）。
+// 按 C++ 的写法逐段填充：先消费 32 字节（4 路独立混合打破串行乘法依赖）与完整
+// 8 字节小端字，余数每个字节消耗一次 splitmix64 并取低 8 位。调用方按原实现的
+// “段”来调用，以保留行/平面边界处的尾部规则（中央噪声窗每行重新开始 8 字节分组）。
 fn fill_prng(state: &mut u64, out: &mut [u8]) {
-    let mut chunks = out.chunks_exact_mut(8);
+    let mut s = *state;
+    let mut chunks32 = out.chunks_exact_mut(32);
+    for chunk in chunks32.by_ref() {
+        let s0 = s.wrapping_add(SPLITMIX_INC);
+        let s1 = s0.wrapping_add(SPLITMIX_INC);
+        let s2 = s1.wrapping_add(SPLITMIX_INC);
+        let s3 = s2.wrapping_add(SPLITMIX_INC);
+        s = s3;
+        chunk[0..8].copy_from_slice(&splitmix64_mix(s0).to_le_bytes());
+        chunk[8..16].copy_from_slice(&splitmix64_mix(s1).to_le_bytes());
+        chunk[16..24].copy_from_slice(&splitmix64_mix(s2).to_le_bytes());
+        chunk[24..32].copy_from_slice(&splitmix64_mix(s3).to_le_bytes());
+    }
+    let mut chunks = chunks32.into_remainder().chunks_exact_mut(8);
     for chunk in chunks.by_ref() {
-        chunk.copy_from_slice(&splitmix64(state).to_le_bytes());
+        s = s.wrapping_add(SPLITMIX_INC);
+        chunk.copy_from_slice(&splitmix64_mix(s).to_le_bytes());
     }
     for byte in chunks.into_remainder() {
-        *byte = splitmix64(state) as u8;
+        s = s.wrapping_add(SPLITMIX_INC);
+        *byte = splitmix64_mix(s) as u8;
     }
+    *state = s;
 }
 
 // 烟雾渐变：Y = x + y + fid，UV 为常量 0x80 ^ (fid & 0xFF)。
 fn counter(fid: u32, width: usize, y: &mut [u8], uv: &mut [u8]) {
     for (row, line) in y.chunks_exact_mut(width).enumerate() {
-        let row_y = row as u32;
-        for (col, pixel) in line.iter_mut().enumerate() {
-            *pixel = (col as u32).wrapping_add(row_y).wrapping_add(fid) as u8;
+        let start = (fid.wrapping_add(row as u32) & 0xFF) as usize;
+        let mut dst = line;
+        while !dst.is_empty() {
+            let take = dst.len().min(256);
+            dst[..take].copy_from_slice(&RAMP[start..start + take]);
+            dst = &mut dst[take..];
         }
     }
     let value = 0x80u8 ^ (fid & 0xFF) as u8;
@@ -173,23 +203,43 @@ fn counter(fid: u32, width: usize, y: &mut [u8], uv: &mut [u8]) {
 fn checker(fid: u32, width: usize, y: &mut [u8], uv: &mut [u8]) {
     let ox = fid & 7;
     let oy = (fid >> 3) & 7;
+    let mut y_tpl = [[0u8; 256]; 2];
+    for i in 0..256u32 {
+        let bit = ((i + ox) >> 3) & 1;
+        y_tpl[0][i as usize] = if bit != 0 { 255 } else { 0 };
+        y_tpl[1][i as usize] = if bit == 0 { 255 } else { 0 };
+    }
     for (row, line) in y.chunks_exact_mut(width).enumerate() {
-        let row_y = row as u32;
-        for (col, pixel) in line.iter_mut().enumerate() {
-            let x = col as u32;
-            let cell = ((x + ox) >> 3) + ((row_y + oy) >> 3);
-            *pixel = if cell & 1 != 0 { 255 } else { 0 };
+        let row_bit = (((row as u32 + oy) >> 3) & 1) as usize;
+        let tpl = &y_tpl[row_bit];
+        let mut dst = line;
+        while !dst.is_empty() {
+            let take = dst.len().min(256);
+            dst[..take].copy_from_slice(&tpl[..take]);
+            dst = &mut dst[take..];
+        }
+    }
+    let mut uv_tpl = [[0u8; 256]; 4];
+    for (mode, row_tpl) in uv_tpl.iter_mut().enumerate() {
+        let u_parity = (mode >> 1) as u32;
+        let v_parity = (mode & 1) as u32;
+        for col in 0..128usize {
+            let x = (col as u32) * 2;
+            let base = (x >> 3) & 1;
+            row_tpl[col * 2] = if base ^ u_parity != 0 { 16 } else { 240 };
+            row_tpl[col * 2 + 1] = if base ^ v_parity != 0 { 16 } else { 240 };
         }
     }
     for (row, line) in uv.chunks_exact_mut(width).enumerate() {
         let row_y = row as u32;
         let u_parity = row_y.wrapping_add(fid) & 1;
         let v_parity = row_y.wrapping_sub(fid) & 1;
-        for (col, pair) in line.chunks_exact_mut(2).enumerate() {
-            let x = (col as u32) * 2;
-            let base = (x >> 3) & 1;
-            pair[0] = if base ^ u_parity != 0 { 16 } else { 240 };
-            pair[1] = if base ^ v_parity != 0 { 16 } else { 240 };
+        let tpl = &uv_tpl[((u_parity << 1) | v_parity) as usize];
+        let mut dst = line;
+        while !dst.is_empty() {
+            let take = dst.len().min(256);
+            dst[..take].copy_from_slice(&tpl[..take]);
+            dst = &mut dst[take..];
         }
     }
 }
@@ -239,18 +289,14 @@ fn noise(fid: u32, y: &mut [u8], uv: &mut [u8]) {
 
 // 拟游戏压力帧：滚动背景 + 4 个 64 像素弹跳色块 + 中央 min(256,w,h) 噪声窗。
 fn motion(fid: u32, width: usize, height: usize, y: &mut [u8], uv: &mut [u8]) {
-    // 背景按 256 像素周期线性递增，每 4 行右移 1 像素；用 512 字节循环模板批量拷贝。
-    let mut ramp = [0u8; 512];
-    for (i, slot) in ramp.iter_mut().enumerate() {
-        *slot = i as u8;
-    }
+    // 背景按 256 像素周期线性递增，每 4 行右移 1 像素；用编译期 512 字节循环模板批量拷贝。
     let fid_offset = fid.wrapping_mul(3);
     for (row, line) in y.chunks_exact_mut(width).enumerate() {
         let start = (fid_offset.wrapping_add((row >> 2) as u32) & 0xFF) as usize;
         let mut dst = line;
         while !dst.is_empty() {
             let take = dst.len().min(256);
-            dst[..take].copy_from_slice(&ramp[start..start + take]);
+            dst[..take].copy_from_slice(&RAMP[start..start + take]);
             dst = &mut dst[take..];
         }
     }
@@ -269,12 +315,22 @@ fn motion(fid: u32, width: usize, height: usize, y: &mut [u8], uv: &mut [u8]) {
         let offset_y = offset_y as usize;
         let color = (60 + k * 50) as u8;
         let alternate = 255 - color;
+        let mut even_row = [color; 64];
+        let mut odd_row = [alternate; 64];
+        for sx in 0..sprite {
+            if sx & 8 != 0 {
+                even_row[sx] = alternate;
+                odd_row[sx] = color;
+            }
+        }
         for sy in 0..sprite {
             let row_start = (offset_y + sy) * width + offset_x;
-            let row = &mut y[row_start..row_start + sprite];
-            for (sx, pixel) in row.iter_mut().enumerate() {
-                *pixel = if (sx ^ sy) & 8 != 0 { alternate } else { color };
-            }
+            let src = if sy & 8 != 0 {
+                &odd_row[..sprite]
+            } else {
+                &even_row[..sprite]
+            };
+            y[row_start..row_start + sprite].copy_from_slice(src);
         }
     }
 

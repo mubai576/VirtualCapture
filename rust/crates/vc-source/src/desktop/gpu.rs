@@ -13,7 +13,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
-use windows::Win32::Graphics::Direct3D::Fxc::{D3DCOMPILE_ENABLE_STRICTNESS, D3DCompile};
+use windows::Win32::Graphics::Direct3D::Fxc::{
+    D3DCOMPILE_ENABLE_STRICTNESS, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCompile,
+};
 use windows::Win32::Graphics::Direct3D::{D3D_SRV_DIMENSION_TEXTURE2D, ID3DBlob, ID3DInclude};
 use windows::Win32::Graphics::Direct3D11::{
     D3D11_BIND_CONSTANT_BUFFER, D3D11_BIND_UNORDERED_ACCESS, D3D11_BUFFER_DESC, D3D11_BUFFER_UAV,
@@ -75,6 +77,60 @@ void CSU(uint3 tid : SV_DispatchThreadID){
   }
   g_nv12[y_u32_offset+index]=packed;
 }
+[numthreads(8,8,1)]
+void CSNV12(uint3 tid : SV_DispatchThreadID){
+  uint width_u32=width>>2;
+  uint half_h=height>>1;
+  if(tid.x>=width_u32 || tid.y>=half_h) return;
+  uint x0=tid.x<<2;
+  uint y0=tid.y<<1;
+  uint y1=y0+1;
+  bool y0_in=(y0>=dy && y0<dy+dh);
+  bool y1_in=(y1>=dy && y1<dy+dh);
+  uint sy0=oy+((rh==dh)?(y0-dy):((y0-dy)*rh/dh));
+  uint sy1=oy+((rh==dh)?(y1-dy):((y1-dy)*rh/dh));
+  int3 r0[4];
+  int3 r1[4];
+  [unroll]
+  for(uint k=0;k<4;k++){
+    uint x=x0+k;
+    bool x_in=(x>=dx && x<dx+dw);
+    uint sx=ox+((rw==dw)?(x-dx):((x-dx)*rw/dw));
+    if(x_in && y0_in){
+      float4 c0=g_src.Load(int3(int(sx),int(sy0),0));
+      r0[k]=int3(c0.xyz*255.0f+0.5f);
+    }else{
+      r0[k]=int3(0,0,0);
+    }
+    if(x_in && y1_in){
+      float4 c1=g_src.Load(int3(int(sx),int(sy1),0));
+      r1[k]=int3(c1.xyz*255.0f+0.5f);
+    }else{
+      r1[k]=int3(0,0,0);
+    }
+  }
+  uint py0=0;
+  uint py1=0;
+  [unroll]
+  for(uint k=0;k<4;k++){
+    int3 a=r0[k];
+    int3 b=r1[k];
+    py0 |= uint((77*a.x+150*a.y+29*a.z)>>8)<<(k*8);
+    py1 |= uint((77*b.x+150*b.y+29*b.z)>>8)<<(k*8);
+  }
+  g_nv12[y0*width_u32+tid.x]=py0;
+  g_nv12[y1*width_u32+tid.x]=py1;
+  uint puv=0;
+  [unroll]
+  for(uint k=0;k<2;k++){
+    uint i=k*2;
+    int3 c=(r0[i]+r0[i+1]+r1[i]+r1[i+1])>>2;
+    uint u=uint(C8(((-43*c.x-84*c.y+127*c.z)>>8)+128));
+    uint v=uint(C8(((127*c.x-106*c.y-21*c.z)>>8)+128));
+    puv |= (u<<(k*16)) | (v<<(k*16+8));
+  }
+  g_nv12[y_u32_offset+tid.y*width_u32+tid.x]=puv;
+}
 "#;
 
 const THREADS_PER_GROUP: u64 = 64;
@@ -83,18 +139,25 @@ const THREADS_PER_GROUP: u64 = 64;
 const MAX_GROUPS_X: u64 = 65_535;
 /// 等待驱动完成已提交的回读；到期显式失败，不进入阻塞式 Map 或换用 CPU。
 const READBACK_TIMEOUT: Duration = Duration::from_secs(1);
-/// 先短时自旋（不触发 syscall），再切到私有高分辨率 waitable timer，避免
-/// `thread::sleep(1ms)` 在默认 15.6 ms 时钟粒度下放大延迟；450 us 覆盖绝大多数
-/// 硬件 GPU 计算+回读耗时，避免刚过 150 us 就掉进 OS 定时器过冲。
-const READBACK_FAST_POLL: Duration = Duration::from_micros(450);
+/// 先短时自旋（不触发 syscall），再让出当前核时间片覆盖 120–450 us 常见硬件回读，
+/// 仅更长等待才进入私有高分辨率 waitable timer，避免过早落入 OS 定时器唤醒过冲。
+const READBACK_FAST_POLL: Duration = Duration::from_micros(120);
+const READBACK_YIELD_POLL: Duration = Duration::from_micros(450);
 const READBACK_TIMER_WAIT_NS: u64 = 200_000;
+
+enum ComputePipeline {
+    Fused(ID3D11ComputeShader),
+    Split {
+        y: ID3D11ComputeShader,
+        u: ID3D11ComputeShader,
+    },
+}
 
 /// 可复用的 GPU 转换器。持有 shader、合并后的 NV12 UAV 与单份 CPU 回读 staging buffer。
 pub(crate) struct GpuConverter {
     device: ID3D11Device,
     context: ID3D11DeviceContext,
-    cs_y: ID3D11ComputeShader,
-    cs_u: ID3D11ComputeShader,
+    pipeline: ComputePipeline,
     nv12_buf: ID3D11Buffer,
     nv12_staging: ID3D11Buffer,
     nv12_uav: [Option<ID3D11UnorderedAccessView>; 1],
@@ -131,8 +194,14 @@ impl GpuConverter {
             .checked_add(uv_n)
             .context("gpu-convert buffer element count overflow")?;
 
-        let cs_y = compile_shader(device, "CSY")?;
-        let cs_u = compile_shader(device, "CSU")?;
+        let pipeline = if width.is_multiple_of(4) {
+            ComputePipeline::Fused(compile_shader(device, "CSNV12")?)
+        } else {
+            ComputePipeline::Split {
+                y: compile_shader(device, "CSY")?,
+                u: compile_shader(device, "CSU")?,
+            }
+        };
         let nv12_buf = create_structured_buffer(
             device,
             total_n,
@@ -154,8 +223,7 @@ impl GpuConverter {
         Ok(Self {
             device: device.clone(),
             context: context.clone(),
-            cs_y,
-            cs_u,
+            pipeline,
             nv12_buf,
             nv12_staging,
             nv12_uav: [Some(nv12_uav)],
@@ -243,13 +311,22 @@ impl GpuConverter {
             self.context
                 .CSSetUnorderedAccessViews(0, 1, Some(self.nv12_uav.as_ptr()), None);
 
-            self.context.CSSetShader(&self.cs_y, None);
-            let (gx, gy) = dispatch_grid(self.y_n);
-            self.context.Dispatch(gx, gy, 1);
+            match &self.pipeline {
+                ComputePipeline::Fused(cs_nv12) => {
+                    self.context.CSSetShader(cs_nv12, None);
+                    let (gx, gy) = dispatch_grid_2d(self.width, self.height);
+                    self.context.Dispatch(gx, gy, 1);
+                }
+                ComputePipeline::Split { y, u } => {
+                    self.context.CSSetShader(y, None);
+                    let (gx, gy) = dispatch_grid(self.y_n);
+                    self.context.Dispatch(gx, gy, 1);
 
-            self.context.CSSetShader(&self.cs_u, None);
-            let (gx, gy) = dispatch_grid(self.uv_n);
-            self.context.Dispatch(gx, gy, 1);
+                    self.context.CSSetShader(u, None);
+                    let (gx, gy) = dispatch_grid(self.uv_n);
+                    self.context.Dispatch(gx, gy, 1);
+                }
+            }
 
             let no_uavs: [Option<ID3D11UnorderedAccessView>; 1] = [None];
             let no_srvs: [Option<ID3D11ShaderResourceView>; 1] = [None];
@@ -339,6 +416,7 @@ fn create_constant_buffer(device: &ID3D11Device) -> Result<ID3D11Buffer> {
 
 fn compile_shader(device: &ID3D11Device, entry: &str) -> Result<ID3D11ComputeShader> {
     let entry_ptr = match entry {
+        "CSNV12" => PCSTR::from_raw(c"CSNV12".as_ptr().cast()),
         "CSY" => PCSTR::from_raw(c"CSY".as_ptr().cast()),
         "CSU" => PCSTR::from_raw(c"CSU".as_ptr().cast()),
         other => bail!("unknown compute shader entry {other}"),
@@ -356,7 +434,7 @@ fn compile_shader(device: &ID3D11Device, entry: &str) -> Result<ID3D11ComputeSha
             None::<&ID3DInclude>,
             entry_ptr,
             target,
-            D3DCOMPILE_ENABLE_STRICTNESS,
+            D3DCOMPILE_ENABLE_STRICTNESS | D3DCOMPILE_OPTIMIZATION_LEVEL3,
             0,
             &mut code,
             Some(&mut errors),
@@ -399,6 +477,12 @@ fn dispatch_grid(elements: u32) -> (u32, u32) {
     let x = groups.clamp(1, MAX_GROUPS_X) as u32;
     let y = groups.div_ceil(MAX_GROUPS_X).max(1) as u32;
     (x, y)
+}
+
+fn dispatch_grid_2d(width: u32, height: u32) -> (u32, u32) {
+    let width_u32 = width >> 2;
+    let half_h = height >> 1;
+    (width_u32.div_ceil(8).max(1), half_h.div_ceil(8).max(1))
 }
 
 fn cancelled(stop: Option<&AtomicBool>) -> bool {
@@ -466,8 +550,13 @@ fn wait_readback(
         if try_map()? {
             return Ok(true);
         }
-        if now.duration_since(started) < READBACK_FAST_POLL {
-            std::hint::spin_loop();
+        let elapsed = now.duration_since(started);
+        if elapsed < READBACK_FAST_POLL {
+            for _ in 0..32 {
+                std::hint::spin_loop();
+            }
+        } else if elapsed < READBACK_YIELD_POLL {
+            std::thread::yield_now();
         } else {
             wait_readback_step();
         }
@@ -598,6 +687,10 @@ mod tests {
         // 8192×8192 的 Y 平面 uint 数：需要 262144 组，按 65535 上限分 5 行。
         let y_bytes = 8192u32 * 8192u32;
         assert_eq!(dispatch_grid(y_bytes.div_ceil(4)), (65_535, 5));
+
+        assert_eq!(dispatch_grid_2d(64, 64), (2, 4));
+        assert_eq!(dispatch_grid_2d(640, 640), (20, 40));
+        assert_eq!(dispatch_grid_2d(8192, 8192), (256, 512));
     }
 
     fn bgra_pattern(width: u32, height: u32) -> Vec<u8> {
@@ -653,37 +746,75 @@ mod tests {
             eprintln!("跳过：没有可用的硬件 D3D11 设备");
             return;
         };
-        let mut converter = GpuConverter::new(&context.device, &context.context, 64, 64)
-            .expect("GPU converter init");
-        let cases = [
-            (96u32, 80u32, TransformMode::Crop),
-            (320, 200, TransformMode::Fit),
-            (96, 80, TransformMode::Fill),
-            (100, 60, TransformMode::Stretch),
-        ];
-        for (width, height, mode) in cases {
-            let source = bgra_pattern(width, height);
-            let texture = upload_texture(&context.device, width, height, &source);
-            let transform = Transform::new(width, height, 64, 64, mode).unwrap();
-            let mut expected = vec![0u8; 64 * 64 * 3 / 2];
-            bgra_to_nv12(&source, width as usize * 4, &transform, &mut expected).unwrap();
-            let mut actual = vec![0u8; expected.len()];
-            assert!(
-                converter
-                    .convert(&texture, &transform, &mut actual, None)
-                    .expect("GPU conversion failed"),
-                "GPU conversion was unexpectedly cancelled"
-            );
-            if actual != expected {
-                let offset = actual
-                    .iter()
-                    .zip(&expected)
-                    .position(|(a, e)| a != e)
-                    .unwrap_or(0);
-                panic!(
-                    "GPU/CPU mismatch for {width}x{height} {mode:?} at byte {offset}: gpu={} cpu={}",
-                    actual[offset], expected[offset]
+        // 同时覆盖 width % 4 == 0 融合路径（64x64, 640x640）与 width % 4 == 2 回退路径（66x64, 2x2）。
+        for (out_w, out_h, cases) in [
+            (
+                64u32,
+                64u32,
+                [
+                    (96u32, 80u32, TransformMode::Crop),
+                    (320, 200, TransformMode::Fit),
+                    (96, 80, TransformMode::Fill),
+                    (100, 60, TransformMode::Stretch),
+                ],
+            ),
+            (
+                640,
+                640,
+                [
+                    (720u32, 680u32, TransformMode::Crop),
+                    (320, 200, TransformMode::Fit),
+                    (720, 680, TransformMode::Fill),
+                    (100, 60, TransformMode::Stretch),
+                ],
+            ),
+            (
+                66,
+                64,
+                [
+                    (96u32, 80u32, TransformMode::Crop),
+                    (320, 200, TransformMode::Fit),
+                    (96, 80, TransformMode::Fill),
+                    (100, 60, TransformMode::Stretch),
+                ],
+            ),
+            (
+                2,
+                2,
+                [
+                    (96u32, 80u32, TransformMode::Crop),
+                    (320, 200, TransformMode::Fit),
+                    (96, 80, TransformMode::Fill),
+                    (100, 60, TransformMode::Stretch),
+                ],
+            ),
+        ] {
+            let mut converter = GpuConverter::new(&context.device, &context.context, out_w, out_h)
+                .expect("GPU converter init");
+            for (width, height, mode) in cases {
+                let source = bgra_pattern(width, height);
+                let texture = upload_texture(&context.device, width, height, &source);
+                let transform = Transform::new(width, height, out_w, out_h, mode).unwrap();
+                let mut expected = vec![0u8; out_w as usize * out_h as usize * 3 / 2];
+                bgra_to_nv12(&source, width as usize * 4, &transform, &mut expected).unwrap();
+                let mut actual = vec![0u8; expected.len()];
+                assert!(
+                    converter
+                        .convert(&texture, &transform, &mut actual, None)
+                        .expect("GPU conversion failed"),
+                    "GPU conversion was unexpectedly cancelled"
                 );
+                if actual != expected {
+                    let offset = actual
+                        .iter()
+                        .zip(&expected)
+                        .position(|(a, e)| a != e)
+                        .unwrap_or(0);
+                    panic!(
+                        "GPU/CPU mismatch for {width}x{height}->{out_w}x{out_h} {mode:?} at byte {offset}: gpu={} cpu={}",
+                        actual[offset], expected[offset]
+                    );
+                }
             }
         }
     }

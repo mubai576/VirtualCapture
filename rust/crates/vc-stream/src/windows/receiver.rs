@@ -124,10 +124,14 @@ impl RxAuditWorker {
         let join = thread::Builder::new()
             .name(format!("vc-stream-rx-audit-{session}"))
             .spawn(move || -> anyhow::Result<()> {
-                let mut expected_frame = vec![0u8; frame_bytes];
+                let _priority = ThreadPriority::below_normal();
+                let mut expected_frame = Vec::new();
                 while let Ok(job) = rx.recv() {
                     let hash = if need_hash { fnv1a64(&job.data) } else { 0 };
                     let mismatch = if let Some(pattern) = Pattern::from_id(job.pattern) {
+                        if expected_frame.len() != frame_bytes {
+                            expected_frame.resize(frame_bytes, 0);
+                        }
                         pattern.fill(geometry, job.frame_id, &mut expected_frame);
                         expected_frame != job.data
                     } else {
@@ -247,6 +251,9 @@ fn receive_raw(
     };
     let _capture = Capture(handle, api.close);
     let linktype = unsafe { (api.datalink)(handle) };
+    if linktype == 1 {
+        let _ = api.set_ethertype_filter(handle, args.common.ethertype);
+    }
     unsafe {
         let _ = (api.set_buff)(handle, CAPTURE_BUFFER_BYTES);
         let _ = (api.set_min_to_copy)(handle, 0);
@@ -686,7 +693,7 @@ fn raw_capture_loop(
         let rc = unsafe {
             (ctx.api.dispatch)(
                 ctx.handle,
-                64,
+                256,
                 raw_dispatch_cb,
                 (&raw mut ctx).cast::<c_uchar>(),
             )
@@ -943,6 +950,9 @@ fn receive_encoded(
     };
     let _capture = Capture(handle, api.close);
     let linktype = unsafe { (api.datalink)(handle) };
+    if linktype == 1 {
+        let _ = api.set_ethertype_filter(handle, args.common.ethertype);
+    }
     unsafe {
         let _ = (api.set_buff)(handle, CAPTURE_BUFFER_BYTES);
         let _ = (api.set_min_to_copy)(handle, 0);
@@ -950,6 +960,8 @@ fn receive_encoded(
 
     let shared = Arc::new(SharedDecoder::new());
     let (init_tx, init_rx) = mpsc::channel();
+    let (recycle_tx, recycle_rx) = mpsc::channel::<Vec<u8>>();
+    let need_transport_hash = transport.is_some() || args.hashlog.is_some();
     let worker_codec = args.codec.clone();
     let worker_shm = args.shm.clone();
     let worker_hashlog = args.hashlog.clone();
@@ -971,6 +983,7 @@ fn receive_encoded(
                 worker_operation,
                 worker_shared,
                 init_tx,
+                recycle_tx,
             )
         }));
         match result {
@@ -1096,6 +1109,8 @@ fn receive_encoded(
                 &mut reassembler,
                 &mut transport,
                 &shared,
+                &recycle_rx,
+                need_transport_hash,
                 &mut counters,
                 &mut vstat,
                 deadline,
@@ -1253,6 +1268,8 @@ struct EncodedDispatchCtx<'a> {
     reassembler: &'a mut EncodedReassembler,
     transport: &'a mut Option<BufferedLog>,
     shared: &'a SharedDecoder,
+    recycle_rx: &'a mpsc::Receiver<Vec<u8>>,
+    need_transport_hash: bool,
     counters: &'a mut EncodedCounters,
     vstat: &'a mut VstatReader,
     deadline: Option<Instant>,
@@ -1272,6 +1289,12 @@ impl EncodedDispatchCtx<'_> {
     fn break_now(&mut self) {
         self.stop_loop = true;
         unsafe { (self.api.breakloop)(self.handle) };
+    }
+
+    fn drain_recycled(&mut self) {
+        while let Ok(buf) = self.recycle_rx.try_recv() {
+            self.reassembler.recycle(buf);
+        }
     }
 
     fn on_packet(&mut self, header: *const PcapHeader, data: *const c_uchar) -> anyhow::Result<()> {
@@ -1360,7 +1383,12 @@ impl EncodedDispatchCtx<'_> {
             rx_stats.bytes_recv,
         );
         self.pkt_tick = 0;
-        let transport_hash = completed.hash();
+        self.drain_recycled();
+        let transport_hash = if self.need_transport_hash {
+            completed.hash()
+        } else {
+            0
+        };
         match parse_au(
             &completed.data,
             self.session,
@@ -1514,6 +1542,8 @@ fn encoded_capture_loop(
     reassembler: &mut EncodedReassembler,
     transport: &mut Option<BufferedLog>,
     shared: &SharedDecoder,
+    recycle_rx: &mpsc::Receiver<Vec<u8>>,
+    need_transport_hash: bool,
     counters: &mut EncodedCounters,
     vstat: &mut VstatReader,
     deadline: Option<Instant>,
@@ -1526,6 +1556,8 @@ fn encoded_capture_loop(
         reassembler,
         transport,
         shared,
+        recycle_rx,
+        need_transport_hash,
         counters,
         vstat,
         deadline,
@@ -1582,7 +1614,7 @@ fn encoded_capture_loop(
         let rc = unsafe {
             (ctx.api.dispatch)(
                 ctx.handle,
-                64,
+                256,
                 encoded_dispatch_cb,
                 (&raw mut ctx).cast::<c_uchar>(),
             )
@@ -1678,6 +1710,7 @@ fn worker_main(
     operation: OperationState,
     shared: Arc<SharedDecoder>,
     init: mpsc::Sender<WorkerInit>,
+    recycle_tx: mpsc::Sender<Vec<u8>>,
 ) -> anyhow::Result<()> {
     let _priority = ThreadPriority::capture();
     let mut log = match take_log_writer(hash_file, hashlog.as_deref()) {
@@ -1736,6 +1769,7 @@ fn worker_main(
         fps,
         &operation,
         &shared,
+        &recycle_tx,
         &mut decoder,
         &mut publisher,
         &mut log,
@@ -1761,20 +1795,25 @@ fn worker_loop(
     fps: u32,
     operation: &OperationState,
     shared: &Arc<SharedDecoder>,
+    recycle_tx: &mpsc::Sender<Vec<u8>>,
     decoder: &mut Option<Decoder>,
     publisher: &mut Option<Publisher>,
     log: &mut Option<BufferedLog>,
 ) -> anyhow::Result<()> {
     let frame_bytes = geometry.frame_bytes();
+    let mut decoded = vec![0u8; frame_bytes];
     let mut have_last = false;
     let mut last_frame_id = 0u32;
     while let Some(work) = next_work(shared) {
         if work.discontinuity || (have_last && work.frame_id != last_frame_id.wrapping_add(1)) {
-            decoder
+            if let Err(error) = decoder
                 .as_mut()
                 .context("decoder disappeared before reset")?
                 .reset()
-                .context("reset decoder after stream discontinuity")?;
+            {
+                let _ = recycle_tx.send(work.au);
+                return Err(error).context("reset decoder after stream discontinuity");
+            }
             shared.resets.fetch_add(1, Ordering::AcqRel);
             // 每个编码 AU 都独立，但下面这个标志保留历史 C++ 接收端显式的
             // “等待关键帧/随机访问帧”可见状态。
@@ -1783,6 +1822,7 @@ fn worker_loop(
         have_last = true;
         last_frame_id = work.frame_id;
         if work.eos {
+            let _ = recycle_tx.send(work.au);
             // EOS 不携带画面。本 worker 同步解码，不存在待处理的解码器输出，
             // 因此接受 EOS 本身就已算“排空”。
             ensure!(
@@ -1792,6 +1832,7 @@ fn worker_loop(
             continue;
         }
         if shared.waiting_idr.load(Ordering::Acquire) && !work.key_frame {
+            let _ = recycle_tx.send(work.au);
             shared.discarded.fetch_add(1, Ordering::AcqRel);
             continue;
         }
@@ -1799,48 +1840,41 @@ fn worker_loop(
         shared.pending.store(1, Ordering::Release);
         let pending = PendingGuard(&shared.pending);
         let decode_started_ns = qpc_ns();
+        let au_len = work.au.len();
+        let payload = work
+            .au
+            .get(vc_media::AU_HEADER_BYTES..)
+            .context("encoded AU shorter than 48B header")?;
         let result = decoder
             .as_mut()
             .context("decoder disappeared before decode")?
-            .decode(&work.au, work.frame_id);
+            .decode_verified_payload_into(payload, &mut decoded);
+        let _ = recycle_tx.send(work.au);
         let now = qpc_ns();
-        let decoded = match result {
-            Ok(bytes) if bytes.len() == frame_bytes => bytes,
-            Ok(bytes) => {
-                let count = shared.decode_errors.fetch_add(1, Ordering::AcqRel) + 1;
-                if count <= 5 || count.is_multiple_of(100) {
-                    eprintln!(
-                        "[vc-stream] decode failure frame={}: decoded {} bytes, expected {frame_bytes}",
-                        work.frame_id,
-                        bytes.len()
-                    );
-                }
-                drop(pending);
-                recover_decoder(decoder, codec, geometry, fps, operation)
-                    .context("recreate decoder after decoded-size failure")?;
-                shared.resets.fetch_add(1, Ordering::AcqRel);
-                shared.waiting_idr.store(true, Ordering::Release);
-                continue;
+        if let Err(error) = result {
+            let count = shared.decode_errors.fetch_add(1, Ordering::AcqRel) + 1;
+            if count <= 5 || count.is_multiple_of(100) {
+                eprintln!(
+                    "[vc-stream] decode failure frame={}: {error:#}",
+                    work.frame_id
+                );
             }
-            Err(error) => {
-                let count = shared.decode_errors.fetch_add(1, Ordering::AcqRel) + 1;
-                if count <= 5 || count.is_multiple_of(100) {
-                    eprintln!(
-                        "[vc-stream] decode failure frame={}: {error:#}",
-                        work.frame_id
-                    );
-                }
-                drop(pending);
-                recover_decoder(decoder, codec, geometry, fps, operation)
-                    .context("recreate decoder after decode failure")?;
-                shared.resets.fetch_add(1, Ordering::AcqRel);
-                shared.waiting_idr.store(true, Ordering::Release);
-                continue;
-            }
+            drop(pending);
+            recover_decoder(decoder, codec, geometry, fps, operation)
+                .context("recreate decoder after decode failure")?;
+            shared.resets.fetch_add(1, Ordering::AcqRel);
+            shared.waiting_idr.store(true, Ordering::Release);
+            continue;
+        }
+        // 先发布 SHM 并唤醒虚拟卡，再在关键路径之外计算 FNV-1a64 与写入日志。
+        let token = if let Some(shm) = publisher.as_mut() {
+            Some(shm.publish(work.frame_id, work.first_ns, &decoded, qpc_ns)?)
+        } else {
+            None
         };
-        let hash = fnv1a64(&decoded);
-        if let Some(shm) = publisher.as_mut() {
-            let token = shm.publish(work.frame_id, work.first_ns, &decoded, || now)?;
+        let need_hash = token.is_some() || log.is_some();
+        let hash = if need_hash { fnv1a64(&decoded) } else { 0 };
+        if let (Some(shm), Some(token)) = (publisher.as_mut(), token) {
             shm.mark_hash(token, hash);
             shared.shm_published.fetch_add(1, Ordering::AcqRel);
         }
@@ -1852,10 +1886,9 @@ fn worker_loop(
             writer.write_line(|w| {
                 writeln!(
                     w,
-                    "{{\"frame_id\":{},\"decoded_hash\":\"{hash:016x}\",\"transport_hash\":\"{transport_hash:016x}\",\"qpc_ns\":{now},\"decode_pipeline_ms\":{decode_pipeline_ms},\"queued_qpc_ns\":{},\"decode_started_qpc_ns\":{decode_started_ns},\"queue_wait_ms\":{queue_wait_ms},\"decode_ms\":{decode_ms},\"encoded_bytes\":{}}}",
+                    "{{\"frame_id\":{},\"decoded_hash\":\"{hash:016x}\",\"transport_hash\":\"{transport_hash:016x}\",\"qpc_ns\":{now},\"decode_pipeline_ms\":{decode_pipeline_ms},\"queued_qpc_ns\":{},\"decode_started_qpc_ns\":{decode_started_ns},\"queue_wait_ms\":{queue_wait_ms},\"decode_ms\":{decode_ms},\"encoded_bytes\":{au_len}}}",
                     work.frame_id,
                     work.queued_ns,
-                    work.au.len()
                 )
             })?;
         }

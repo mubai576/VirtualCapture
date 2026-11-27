@@ -13,7 +13,7 @@
 //! 错误收尾；之后的原生调用一律被拒绝。会话由父层保持工作线程与 DLL 句柄存活
 //! （不 join 挂起线程，也不销毁可能永久挂起的设备），不使用 `process::exit`。
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -22,6 +22,30 @@ use anyhow::{Context, Result, anyhow};
 
 /// 单次同步编解码操作上限。
 const OPERATION_TIMEOUT: Duration = Duration::from_secs(5);
+
+const OPS: [&str; 8] = [
+    "同步调用",
+    "创建",
+    "预热",
+    "编码",
+    "解码",
+    "重置",
+    "销毁",
+    "测试操作",
+];
+
+fn op_to_index(operation: &'static str) -> u8 {
+    match operation {
+        "创建" => 1,
+        "预热" => 2,
+        "编码" => 3,
+        "解码" => 4,
+        "重置" => 5,
+        "销毁" => 6,
+        "测试操作" => 7,
+        _ => 0,
+    }
+}
 
 /// 单个编码器/解码器会话的同步操作状态。
 ///
@@ -72,16 +96,13 @@ impl OperationState {
     }
 }
 
-struct State {
-    generation: u64,
-    deadline: Option<Instant>,
-    operation: &'static str,
-    stopping: bool,
-}
-
 struct Shared {
-    state: Mutex<State>,
-    cv: Condvar,
+    /// 0 表示未武装；非零时高 56 位为 `elapsed_ms + 1`（相对 `epoch`），低 8 位为操作索引。
+    /// `begin`/`Armed::drop` 仅做无锁原子写，消除每帧互斥锁与看门狗线程唤醒。
+    armed_state: AtomicU64,
+    epoch: Instant,
+    stop_mu: Mutex<bool>,
+    stop_cv: Condvar,
     timeout: Duration,
     observer: OperationState,
 }
@@ -108,13 +129,10 @@ impl OperationDeadline {
 
     fn start_with(timeout: Duration, observer: OperationState) -> Result<Self> {
         let shared = Arc::new(Shared {
-            state: Mutex::new(State {
-                generation: 0,
-                deadline: None,
-                operation: "同步调用",
-                stopping: false,
-            }),
-            cv: Condvar::new(),
+            armed_state: AtomicU64::new(0),
+            epoch: Instant::now(),
+            stop_mu: Mutex::new(false),
+            stop_cv: Condvar::new(),
             timeout,
             observer,
         });
@@ -132,13 +150,10 @@ impl OperationDeadline {
     /// 开始一次同步原生调用。会话已超时时直接拒绝，不再触碰原生后端。
     pub(super) fn begin(&mut self, operation: &'static str) -> Result<Armed> {
         self.check()?;
-        {
-            let mut state = lock(&self.shared.state);
-            state.deadline = Some(Instant::now() + self.shared.timeout);
-            state.operation = operation;
-            state.generation = state.generation.wrapping_add(1);
-            self.shared.cv.notify_all();
-        }
+        let since_ms = self.shared.epoch.elapsed().as_millis() as u64;
+        let op_idx = op_to_index(operation);
+        let packed = (since_ms.saturating_add(1) << 8) | u64::from(op_idx);
+        self.shared.armed_state.store(packed, Ordering::Release);
         Ok(Armed {
             shared: Arc::clone(&self.shared),
         })
@@ -172,20 +187,17 @@ impl OperationDeadline {
 
 impl Drop for Armed {
     fn drop(&mut self) {
-        let mut state = lock(&self.shared.state);
-        state.deadline = None;
-        state.generation = state.generation.wrapping_add(1);
-        self.shared.cv.notify_all();
+        self.shared.armed_state.store(0, Ordering::Release);
     }
 }
 
 impl Drop for OperationDeadline {
     fn drop(&mut self) {
         {
-            let mut state = lock(&self.shared.state);
-            state.stopping = true;
-            state.deadline = None;
-            self.shared.cv.notify_all();
+            let mut stopping = lock(&self.shared.stop_mu);
+            *stopping = true;
+            self.shared.armed_state.store(0, Ordering::Release);
+            self.shared.stop_cv.notify_all();
         }
         if let Some(worker) = self.worker.take() {
             // 只 join 本结构创建的看门狗线程：它只等 Condvar、从不调用原生代码，
@@ -203,47 +215,32 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 fn watch(shared: Arc<Shared>) {
-    let mut state = lock(&shared.state);
+    let timeout_ms = shared.timeout.as_millis().max(1) as u64;
+    let poll = (shared.timeout / 4).clamp(Duration::from_millis(2), Duration::from_millis(100));
+    let mut stopping = lock(&shared.stop_mu);
     loop {
-        if state.stopping {
+        if *stopping {
             return;
         }
-        let Some(deadline) = state.deadline else {
-            state = shared
-                .cv
-                .wait(state)
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            continue;
-        };
-        let generation = state.generation;
-        let now = Instant::now();
-        if now >= deadline {
-            // 记录粘性超时后退出：不终止进程、不展开栈、不触碰原生线程。
-            record_timeout(&shared, &mut state);
-            return;
+        let packed = shared.armed_state.load(Ordering::Acquire);
+        if packed != 0 {
+            let since_ms = (packed >> 8).saturating_sub(1);
+            let op_idx = (packed & 0xFF) as usize;
+            let now_ms = shared.epoch.elapsed().as_millis() as u64;
+            if now_ms.saturating_sub(since_ms) >= timeout_ms {
+                // 记录粘性超时后退出：不终止进程、不展开栈、不触碰原生线程。
+                let op = OPS.get(op_idx).copied().unwrap_or(OPS[0]);
+                shared.observer.mark_timed_out(op);
+                shared.armed_state.store(0, Ordering::Release);
+                return;
+            }
         }
-        let (next, timed_out) = shared
-            .cv
-            .wait_timeout_while(state, deadline - now, |state| {
-                // 解除（deadline=None/代次变化）或停止时不触发。
-                !state.stopping && state.deadline.is_some() && state.generation == generation
-            })
+        let (next, _) = shared
+            .stop_cv
+            .wait_timeout_while(stopping, poll, |s| !*s)
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        state = next;
-        if timed_out.timed_out()
-            && !state.stopping
-            && state.deadline.is_some()
-            && state.generation == generation
-        {
-            record_timeout(&shared, &mut state);
-            return;
-        }
+        stopping = next;
     }
-}
-
-fn record_timeout(shared: &Shared, state: &mut State) {
-    shared.observer.mark_timed_out(state.operation);
-    state.deadline = None;
 }
 
 #[cfg(test)]
